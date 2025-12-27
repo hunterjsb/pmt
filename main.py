@@ -1,5 +1,7 @@
+from env import *
+
 def main():
-    print("Hello from pmt!")
+    print(f"Hello {PM_BUILDER_NAME}!")
 
 
 if __name__ == "__main__":
