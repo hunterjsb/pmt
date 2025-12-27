@@ -3,15 +3,598 @@ revision = 2
 requires-python = ">=3.14"
 
 [[package]]
+name = "annotated-types"
+version = "0.7.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/annotated-types/0.7.0/annotated_types-0.7.0.tar.gz", hash = "sha256:aff07c09a53a08bc8cfccb9c85b05f1aa9a2a6f23728d790723543408344ce89" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/annotated-types/0.7.0/annotated_types-0.7.0-py3-none-any.whl", hash = "sha256:1f02e8b43a8fbbc3f3e0d4f0f4bfc8131bcb4eebe8849b8e5c773f3a1c582a53" },
+]
+
+[[package]]
+name = "anyio"
+version = "4.12.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "idna" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/anyio/4.12.0/anyio-4.12.0.tar.gz", hash = "sha256:73c693b567b0c55130c104d0b43a9baf3aa6a31fc6110116509f27bf75e21ec0" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/anyio/4.12.0/anyio-4.12.0-py3-none-any.whl", hash = "sha256:dad2376a628f98eeca4881fc56cd06affd18f659b17a747d3ff0307ced94b1bb" },
+]
+
+[[package]]
+name = "bitarray"
+version = "3.8.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0.tar.gz", hash = "sha256:3eae38daffd77c9621ae80c16932eea3fb3a4af141fb7cc724d4ad93eff9210d" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-macosx_10_13_x86_64.whl", hash = "sha256:8cbd4bfc933b33b85c43ef4c1f4d5e3e9d91975ea6368acf5fbac02bac06ea89" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:9d35d8f8a1c9ed4e2b08187b513f8a3c71958600129db3aa26d85ea3abfd1310" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:99f55e14e7c56f4fafe1343480c32b110ef03836c21ff7c48bae7add6818f77c" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:dfbe2aa45b273f49e715c5345d94874cb65a28482bf231af408891c260601b8d" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-manylinux2014_s390x.manylinux_2_17_s390x.manylinux_2_28_s390x.whl", hash = "sha256:64af877116edf051375b45f0bda648143176a017b13803ec7b3a3111dc05f4c5" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cdfbb27f2c46bb5bbdcee147530cbc5ca8ab858d7693924e88e30ada21b2c5e2" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:4d73d4948dcc5591d880db8933004e01f1dd2296df9de815354d53469beb26fe" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-musllinux_1_2_ppc64le.whl", hash = "sha256:28a85b056c0eb7f5d864c0ceef07034117e8ebfca756f50648c71950a568ba11" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-musllinux_1_2_s390x.whl", hash = "sha256:79ec4498a545733ecace48d780d22407411b07403a2e08b9a4d7596c0b97ebd7" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:33af25c4ff7723363cb8404dfc2eefeab4110b654f6c98d26aba8a08c745d860" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-win32.whl", hash = "sha256:2c3bb96b6026643ce24677650889b09073f60b9860a71765f843c99f9ab38b25" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-win_amd64.whl", hash = "sha256:847c7f61964225fc489fe1d49eda7e0e0d253e98862c012cecf845f9ad45cdf4" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314-win_arm64.whl", hash = "sha256:a2cb35a6efaa0e3623d8272471371a12c7e07b51a33e5efce9b58f655d864b4e" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-macosx_10_13_x86_64.whl", hash = "sha256:15e8d0597cc6e8496de6f4dea2a6880c57e1251502a7072f5631108a1aa28521" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:8ffe660e963ae711cb9e2b8d8461c9b1ad6167823837fc17d59d5e539fb898fa" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4779f356083c62e29b4198d290b7b17a39a69702d150678b7efff0fdddf494a8" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:025d133bf4ca8cf75f904eeb8ea946228d7c043231866143f31946a6f4dd0bf3" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-manylinux2014_s390x.manylinux_2_17_s390x.manylinux_2_28_s390x.whl", hash = "sha256:451f9958850ea98440d542278368c8d1e1ea821e2494b204570ba34a340759df" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6d79f659965290af60d6acc8e2716341865fe74609a7ede2a33c2f86ad893b8f" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:fbf05678c2ae0064fb1b8de7e9e8f0fc30621b73c8477786dd0fb3868044a8c8" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-musllinux_1_2_ppc64le.whl", hash = "sha256:c396358023b876cff547ce87f4e8ff8a2280598873a137e8cc69e115262260b8" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-musllinux_1_2_s390x.whl", hash = "sha256:ed3493a369fe849cce98542d7405c88030b355e4d2e113887cb7ecc86c205773" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:c764fb167411d5afaef88138542a4bfa28bd5e5ded5e8e42df87cef965efd6e9" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-win32.whl", hash = "sha256:e12769d3adcc419e65860de946df8d2ed274932177ac1cdb05186e498aaa9149" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-win_amd64.whl", hash = "sha256:0ca70ccf789446a6dfde40b482ec21d28067172cd1f8efd50d5548159fccad9e" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/bitarray/3.8.0/bitarray-3.8.0-cp314-cp314t-win_arm64.whl", hash = "sha256:2a3d1b05ffdd3e95687942ae7b13c63689f85d3f15c39b33329e3cb9ce6c015f" },
+]
+
+[[package]]
+name = "certifi"
+version = "2025.11.12"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/certifi/2025.11.12/certifi-2025.11.12.tar.gz", hash = "sha256:d8ab5478f2ecd78af242878415affce761ca6bc54a22a27e026d7c25357c3316" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/certifi/2025.11.12/certifi-2025.11.12-py3-none-any.whl", hash = "sha256:97de8790030bbd5c2d96b7ec782fc2f7820ef8dba6db909ccf95449f2d062d4b" },
+]
+
+[[package]]
+name = "charset-normalizer"
+version = "3.4.4"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4.tar.gz", hash = "sha256:94537985111c35f28720e43603b8e7b43a6ecfb2ce1d3058bbe955b73404e21a" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-macosx_10_13_universal2.whl", hash = "sha256:da3326d9e65ef63a817ecbcc0df6e94463713b754fe293eaa03da99befb9a5bd" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8af65f14dc14a79b924524b1e7fffe304517b2bff5a58bf64f30b98bbc5079eb" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-manylinux2014_armv7l.manylinux_2_17_armv7l.manylinux_2_31_armv7l.whl", hash = "sha256:74664978bb272435107de04e36db5a9735e78232b85b77d45cfb38f758efd33e" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:752944c7ffbfdd10c074dc58ec2d5a8a4cd9493b314d367c14d24c17684ddd14" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-manylinux2014_s390x.manylinux_2_17_s390x.manylinux_2_28_s390x.whl", hash = "sha256:d1f13550535ad8cff21b8d757a3257963e951d96e20ec82ab44bc64aeb62a191" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ecaae4149d99b1c9e7b88bb03e3221956f68fd6d50be2ef061b2381b61d20838" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:cb6254dc36b47a990e59e1068afacdcd02958bdcce30bb50cc1700a8b9d624a6" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:c8ae8a0f02f57a6e61203a31428fa1d677cbe50c93622b4149d5c0f319c1d19e" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-musllinux_1_2_armv7l.whl", hash = "sha256:47cc91b2f4dd2833fddaedd2893006b0106129d4b94fdb6af1f4ce5a9965577c" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-musllinux_1_2_ppc64le.whl", hash = "sha256:82004af6c302b5d3ab2cfc4cc5f29db16123b1a8417f2e25f9066f91d4411090" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-musllinux_1_2_riscv64.whl", hash = "sha256:2b7d8f6c26245217bd2ad053761201e9f9680f8ce52f0fcd8d0755aeae5b2152" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-musllinux_1_2_s390x.whl", hash = "sha256:799a7a5e4fb2d5898c60b640fd4981d6a25f1c11790935a44ce38c54e985f828" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:99ae2cffebb06e6c22bdc25801d7b30f503cc87dbd283479e7b606f70aff57ec" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-win32.whl", hash = "sha256:f9d332f8c2a2fcbffe1378594431458ddbef721c1769d78e2cbc06280d8155f9" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-win_amd64.whl", hash = "sha256:8a6562c3700cce886c5be75ade4a5db4214fda19fede41d9792d100288d8f94c" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-cp314-cp314-win_arm64.whl", hash = "sha256:de00632ca48df9daf77a2c65a484531649261ec9f25489917f09e455cb09ddb2" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/charset-normalizer/3.4.4/charset_normalizer-3.4.4-py3-none-any.whl", hash = "sha256:7a32c560861a02ff789ad905a2fe94e3f840803362c84fecf1851cb4cf3dc37f" },
+]
+
+[[package]]
+name = "ckzg"
+version = "2.1.5"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5.tar.gz", hash = "sha256:e48e092f9b89ebb6aaa195de2e2bb72ad2d4b35c87d3a15e4545f13c51fbbe30" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:a0cab7deaed093898a92d3644d4ca8621b63cb49296833e2d8b3edac456656d5" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:caedc9eba3d28584be9b6051585f20745f6abfec0d0657cce3dd45edb7f28586" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314-manylinux2010_i686.manylinux_2_12_i686.manylinux_2_28_i686.whl", hash = "sha256:2f67e545d41ba960189b1011d078953311259674620c485e619c933494b88fd9" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d6f65ff296033c259d0829093d2c55bb45651e001e0269b8b88d072fdc86ecc6" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0d66d34ff33be94c8a1f0da86483cd5bfdc15842998f3654ed91b8fdbffa2a81" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:25cf954bae3e2b2db6fa5e811d9800f89199d3eb4fa906c96a1c03434d4893c9" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314-musllinux_1_2_i686.whl", hash = "sha256:34d7128735e0bcfcac876bff47d0f85e674f1e24f99014e326ec266abed7a82c" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:1dec3efae8679f7b8e26263b8bb0d3061ef4c9c6fe395e55b71f8f0df90ca8a0" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314-win_amd64.whl", hash = "sha256:ce37c0ee0effe55d4ceed1735a2d85a3556a86238f3c89b7b7d1ca4ce4e92358" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:db804d27f4b08e3aea440cdc6558af4ceb8256b18ea2b83681d80cc654a4085b" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:d472e3beeb95a110275b4d27e51d1c2b26ab99ddb91ac1c5587d710080c39c5e" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314t-manylinux2010_i686.manylinux_2_12_i686.manylinux_2_28_i686.whl", hash = "sha256:4b44a018124a79138fab8fde25221083574c181c324519be51eab09b1e43ae27" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:6a91d7b444300cf8ecae4f55983726630530cdde15cab92023026230a30d094e" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b8674c64efbf2a12edf6d776061847bbe182997737e7690a69af932ce61a9c2a" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:4290aa17c6402c98f16017fd6ee0bff8aeb5c97be5c3cee7c72aea1b7d176f3a" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314t-musllinux_1_2_i686.whl", hash = "sha256:a0f82b8958ea97df12e29094f0a672cbe7532399724ea61b2399545991ed6017" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:22300bf0d717a083c388de5cfafec08443c9938b3abde2e89f9d5d1fffde1c51" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/ckzg/2.1.5/ckzg-2.1.5-cp314-cp314t-win_amd64.whl", hash = "sha256:aa8228206c3e3729fc117ca38e27588c079b0928a5ab628ee4d9fccaa2b8467d" },
+]
+
+[[package]]
+name = "colorama"
+version = "0.4.6"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/colorama/0.4.6/colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/colorama/0.4.6/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6" },
+]
+
+[[package]]
+name = "cytoolz"
+version = "1.1.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "toolz" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0.tar.gz", hash = "sha256:13a7bf254c3c0d28b12e2290b82aed0f0977a4c2a2bf84854fcdc7796a29f3b0" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-ios_13_0_arm64_iphoneos.whl", hash = "sha256:d542cee7c7882d2a914a33dec4d3600416fb336734df979473249d4c53d207a1" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-ios_13_0_arm64_iphonesimulator.whl", hash = "sha256:31922849b701b0f24bb62e56eb2488dcd3aa6ae3057694bd6b3b7c4c2bc27c2f" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-ios_13_0_x86_64_iphonesimulator.whl", hash = "sha256:e68308d32afd31943314735c1335e4ab5696110e96b405f6bdb8f2a8dc771a16" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:fc4bb48b3b866e1867f7c6411a4229e5b44be3989060663713e10efc24c9bd5f" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:456f77207d1445025d7ef262b8370a05492dcb1490cb428b0f3bf1bd744a89b0" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:174ebc71ebb20a9baeffce6ee07ee2cd913754325c93f99d767380d8317930f7" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:8b3604fef602bcd53415055a4f68468339192fd17be39e687ae24f476d23d56e" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:3604b959a01f64c366e7d10ec7634d5f5cfe10301e27a8f090f6eb3b2a628a18" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-manylinux2014_armv7l.manylinux_2_17_armv7l.manylinux_2_31_armv7l.whl", hash = "sha256:6db2127a3c1bc2f59f08010d2ae53a760771a9de2f67423ad8d400e9ba4276e8" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:56584745ac647993a016a21bc76399113b7595e312f8d0a1b140c9fcf9b58a27" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-manylinux2014_s390x.manylinux_2_17_s390x.manylinux_2_28_s390x.whl", hash = "sha256:db2c4c3a7f7bd7e03bb1a236a125c8feb86c75802f4ecda6ecfaf946610b2930" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:48cb8a692111a285d2b9acd16d185428176bfbffa8a7c274308525fccd01dd42" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:d2f344ba5eb17dcf38ee37fdde726f69053f54927db8f8a1bed6ac61e5b1890d" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:abf76b1c1abd031f098f293b6d90ee08bdaa45f8b5678430e331d991b82684b1" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-musllinux_1_2_armv7l.whl", hash = "sha256:ddf9a38a5b686091265ff45b53d142e44a538cd6c2e70610d3bc6be094219032" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-musllinux_1_2_i686.whl", hash = "sha256:946786755274f07bb2be0400f28adb31d7d85a7c7001873c0a8e24a503428fb3" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-musllinux_1_2_ppc64le.whl", hash = "sha256:d5b8f78b9fed79cf185ad4ddec099abeef45951bdcb416c5835ba05f0a1242c7" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-musllinux_1_2_riscv64.whl", hash = "sha256:fccde6efefdbc02e676ccb352a2ccc8a8e929f59a1c6d3d60bb78e923a49ca44" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-musllinux_1_2_s390x.whl", hash = "sha256:717b7775313da5f51b0fbf50d865aa9c39cb241bd4cb605df3cf2246d6567397" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:5158744a09d0e0e4a4f82225e3a3c4ebf38f9ae74467aaa905467270e52f2794" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-win32.whl", hash = "sha256:1ed534bdbbf063b2bb28fca7d0f6723a3e5a72b086e7c7fe6d74ae8c3e4d00e2" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-win_amd64.whl", hash = "sha256:472c1c9a085f5ad973ec0ad7f0b9ba0969faea6f96c9e397f6293d386f3a25ec" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314-win_arm64.whl", hash = "sha256:a7ad7ca3386fa86bd301be3fa36e7f0acb024f412f665937955acfc8eb42deff" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-macosx_10_15_universal2.whl", hash = "sha256:64b63ed4b71b1ba813300ad0f06b8aff19a12cf51116e0e4f1ed837cea4debcf" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:a60ba6f2ed9eb0003a737e1ee1e9fa2258e749da6477946008d4324efa25149f" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:1aa58e2434d732241f7f051e6f17657e969a89971025e24578b5cbc6f1346485" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:6965af3fc7214645970e312deb9bd35a213a1eaabcfef4f39115e60bf2f76867" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ddd2863f321d67527d3b67a93000a378ad6f967056f68c06467fe011278a6d0e" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-manylinux2014_armv7l.manylinux_2_17_armv7l.manylinux_2_31_armv7l.whl", hash = "sha256:4e6b428e9eb5126053c2ae0efa62512ff4b38ed3951f4d0888ca7005d63e56f5" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:d758e5ef311d2671e0ae8c214c52e44617cf1e58bef8f022b547b9802a5a7f30" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-manylinux2014_s390x.manylinux_2_17_s390x.manylinux_2_28_s390x.whl", hash = "sha256:a95416eca473e6c1179b48d86adcf528b59c63ce78f4cb9934f2e413afa9b56b" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:36c8ede93525cf11e2cc787b7156e5cecd7340193ef800b816a16f1404a8dc6d" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-manylinux_2_31_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:c0c949755b6d8a649c5fbc888bc30915926f1b09fe42fea9f289e297c2f6ddd3" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:e1b6d37545816905a76d9ed59fa4e332f929e879f062a39ea0f6f620405cdc27" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-musllinux_1_2_armv7l.whl", hash = "sha256:05332112d4087904842b36954cd1d3fc0e463a2f4a7ef9477bd241427c593c3b" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-musllinux_1_2_i686.whl", hash = "sha256:31538ca2fad2d688cbd962ccc3f1da847329e2258a52940f10a2ac0719e526be" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-musllinux_1_2_ppc64le.whl", hash = "sha256:747562aa70abf219ea16f07d50ac0157db856d447f7f498f592e097cbc77df0b" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-musllinux_1_2_riscv64.whl", hash = "sha256:3dc15c48b20c0f467e15e341e102896c8422dccf8efc6322def5c1b02f074629" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-musllinux_1_2_s390x.whl", hash = "sha256:3c03137ee6103ba92d5d6ad6a510e86fded69cd67050bd8a1843f15283be17ac" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:be8e298d88f88bd172b59912240558be3b7a04959375646e7fd4996401452941" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-win32.whl", hash = "sha256:3d407140f5604a89578285d4aac7b18b8eafa055cf776e781aabb89c48738fad" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-win_amd64.whl", hash = "sha256:56e5afb69eb6e1b3ffc34716ee5f92ffbdb5cb003b3a5ca4d4b0fe700e217162" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/cytoolz/1.1.0/cytoolz-1.1.0-cp314-cp314t-win_arm64.whl", hash = "sha256:27b19b4a286b3ff52040efa42dbe403730aebe5fdfd2def704eb285e2125c63e" },
+]
+
+[[package]]
+name = "eth-abi"
+version = "5.2.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "eth-typing" },
+    { name = "eth-utils" },
+    { name = "parsimonious" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-abi/5.2.0/eth_abi-5.2.0.tar.gz", hash = "sha256:178703fa98c07d8eecd5ae569e7e8d159e493ebb6eeb534a8fe973fbc4e40ef0" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-abi/5.2.0/eth_abi-5.2.0-py3-none-any.whl", hash = "sha256:17abe47560ad753f18054f5b3089fcb588f3e3a092136a416b6c1502cb7e8877" },
+]
+
+[[package]]
+name = "eth-account"
+version = "0.13.7"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "bitarray" },
+    { name = "ckzg" },
+    { name = "eth-abi" },
+    { name = "eth-keyfile" },
+    { name = "eth-keys" },
+    { name = "eth-rlp" },
+    { name = "eth-utils" },
+    { name = "hexbytes" },
+    { name = "pydantic" },
+    { name = "rlp" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-account/0.13.7/eth_account-0.13.7.tar.gz", hash = "sha256:5853ecbcbb22e65411176f121f5f24b8afeeaf13492359d254b16d8b18c77a46" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-account/0.13.7/eth_account-0.13.7-py3-none-any.whl", hash = "sha256:39727de8c94d004ff61d10da7587509c04d2dc7eac71e04830135300bdfc6d24" },
+]
+
+[[package]]
+name = "eth-hash"
+version = "0.7.1"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-hash/0.7.1/eth_hash-0.7.1.tar.gz", hash = "sha256:d2411a403a0b0a62e8247b4117932d900ffb4c8c64b15f92620547ca5ce46be5" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-hash/0.7.1/eth_hash-0.7.1-py3-none-any.whl", hash = "sha256:0fb1add2adf99ef28883fd6228eb447ef519ea72933535ad1a0b28c6f65f868a" },
+]
+
+[[package]]
+name = "eth-keyfile"
+version = "0.8.1"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "eth-keys" },
+    { name = "eth-utils" },
+    { name = "pycryptodome" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-keyfile/0.8.1/eth_keyfile-0.8.1.tar.gz", hash = "sha256:9708bc31f386b52cca0969238ff35b1ac72bd7a7186f2a84b86110d3c973bec1" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-keyfile/0.8.1/eth_keyfile-0.8.1-py3-none-any.whl", hash = "sha256:65387378b82fe7e86d7cb9f8d98e6d639142661b2f6f490629da09fddbef6d64" },
+]
+
+[[package]]
+name = "eth-keys"
+version = "0.7.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "eth-typing" },
+    { name = "eth-utils" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-keys/0.7.0/eth_keys-0.7.0.tar.gz", hash = "sha256:79d24fd876201df67741de3e3fefb3f4dbcbb6ace66e47e6fe662851a4547814" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-keys/0.7.0/eth_keys-0.7.0-py3-none-any.whl", hash = "sha256:b0cdda8ffe8e5ba69c7c5ca33f153828edcace844f67aabd4542d7de38b159cf" },
+]
+
+[[package]]
+name = "eth-rlp"
+version = "2.2.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "eth-utils" },
+    { name = "hexbytes" },
+    { name = "rlp" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-rlp/2.2.0/eth_rlp-2.2.0.tar.gz", hash = "sha256:5e4b2eb1b8213e303d6a232dfe35ab8c29e2d3051b86e8d359def80cd21db83d" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-rlp/2.2.0/eth_rlp-2.2.0-py3-none-any.whl", hash = "sha256:5692d595a741fbaef1203db6a2fedffbd2506d31455a6ad378c8449ee5985c47" },
+]
+
+[[package]]
+name = "eth-typing"
+version = "5.2.1"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-typing/5.2.1/eth_typing-5.2.1.tar.gz", hash = "sha256:7557300dbf02a93c70fa44af352b5c4a58f94e997a0fd6797fb7d1c29d9538ee" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-typing/5.2.1/eth_typing-5.2.1-py3-none-any.whl", hash = "sha256:b0c2812ff978267563b80e9d701f487dd926f1d376d674f3b535cfe28b665d3d" },
+]
+
+[[package]]
+name = "eth-utils"
+version = "5.3.1"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "cytoolz", marker = "implementation_name == 'cpython'" },
+    { name = "eth-hash" },
+    { name = "eth-typing" },
+    { name = "pydantic" },
+    { name = "toolz", marker = "implementation_name == 'pypy'" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-utils/5.3.1/eth_utils-5.3.1.tar.gz", hash = "sha256:c94e2d2abd024a9a42023b4ddc1c645814ff3d6a737b33d5cfd890ebf159c2d1" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/eth-utils/5.3.1/eth_utils-5.3.1-py3-none-any.whl", hash = "sha256:1f5476d8f29588d25b8ae4987e1ffdfae6d4c09026e476c4aad13b32dda3ead0" },
+]
+
+[[package]]
+name = "h11"
+version = "0.16.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/h11/0.16.0/h11-0.16.0.tar.gz", hash = "sha256:4e35b956cf45792e4caa5885e69fba00bdbc6ffafbfa020300e549b208ee5ff1" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/h11/0.16.0/h11-0.16.0-py3-none-any.whl", hash = "sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86" },
+]
+
+[[package]]
+name = "h2"
+version = "4.3.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "hpack" },
+    { name = "hyperframe" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/h2/4.3.0/h2-4.3.0.tar.gz", hash = "sha256:6c59efe4323fa18b47a632221a1888bd7fde6249819beda254aeca909f221bf1" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/h2/4.3.0/h2-4.3.0-py3-none-any.whl", hash = "sha256:c438f029a25f7945c69e0ccf0fb951dc3f73a5f6412981daee861431b70e2bdd" },
+]
+
+[[package]]
+name = "hexbytes"
+version = "1.3.1"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/hexbytes/1.3.1/hexbytes-1.3.1.tar.gz", hash = "sha256:a657eebebdfe27254336f98d8af6e2236f3f83aed164b87466b6cf6c5f5a4765" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/hexbytes/1.3.1/hexbytes-1.3.1-py3-none-any.whl", hash = "sha256:da01ff24a1a9a2b1881c4b85f0e9f9b0f51b526b379ffa23832ae7899d29c2c7" },
+]
+
+[[package]]
+name = "hpack"
+version = "4.1.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/hpack/4.1.0/hpack-4.1.0.tar.gz", hash = "sha256:ec5eca154f7056aa06f196a557655c5b009b382873ac8d1e66e79e87535f1dca" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/hpack/4.1.0/hpack-4.1.0-py3-none-any.whl", hash = "sha256:157ac792668d995c657d93111f46b4535ed114f0c9c8d672271bbec7eae1b496" },
+]
+
+[[package]]
+name = "httpcore"
+version = "1.0.9"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "certifi" },
+    { name = "h11" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/httpcore/1.0.9/httpcore-1.0.9.tar.gz", hash = "sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/httpcore/1.0.9/httpcore-1.0.9-py3-none-any.whl", hash = "sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55" },
+]
+
+[[package]]
+name = "httpx"
+version = "0.28.1"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "anyio" },
+    { name = "certifi" },
+    { name = "httpcore" },
+    { name = "idna" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/httpx/0.28.1/httpx-0.28.1.tar.gz", hash = "sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/httpx/0.28.1/httpx-0.28.1-py3-none-any.whl", hash = "sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad" },
+]
+
+[package.optional-dependencies]
+http2 = [
+    { name = "h2" },
+]
+
+[[package]]
+name = "hyperframe"
+version = "6.1.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/hyperframe/6.1.0/hyperframe-6.1.0.tar.gz", hash = "sha256:f630908a00854a7adeabd6382b43923a4c4cd4b821fcb527e6ab9e15382a3b08" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/hyperframe/6.1.0/hyperframe-6.1.0-py3-none-any.whl", hash = "sha256:b03380493a519fce58ea5af42e4a42317bf9bd425596f7a0835ffce80f1a42e5" },
+]
+
+[[package]]
+name = "idna"
+version = "3.11"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/idna/3.11/idna-3.11.tar.gz", hash = "sha256:795dafcc9c04ed0c1fb032c2aa73654d8e8c5023a7df64a53f39190ada629902" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/idna/3.11/idna-3.11-py3-none-any.whl", hash = "sha256:771a87f49d9defaf64091e6e6fe9c18d4833f140bd19464795bc32d966ca37ea" },
+]
+
+[[package]]
+name = "iniconfig"
+version = "2.3.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/iniconfig/2.3.0/iniconfig-2.3.0.tar.gz", hash = "sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/iniconfig/2.3.0/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12" },
+]
+
+[[package]]
+name = "packaging"
+version = "25.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/packaging/25.0/packaging-25.0.tar.gz", hash = "sha256:d443872c98d677bf60f6a1f2f8c1cb748e8fe762d2bf9d3148b5599295b0fc4f" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/packaging/25.0/packaging-25.0-py3-none-any.whl", hash = "sha256:29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484" },
+]
+
+[[package]]
+name = "parsimonious"
+version = "0.10.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "regex" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/parsimonious/0.10.0/parsimonious-0.10.0.tar.gz", hash = "sha256:8281600da180ec8ae35427a4ab4f7b82bfec1e3d1e52f80cb60ea82b9512501c" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/parsimonious/0.10.0/parsimonious-0.10.0-py3-none-any.whl", hash = "sha256:982ab435fabe86519b57f6b35610aa4e4e977e9f02a14353edf4bbc75369fc0f" },
+]
+
+[[package]]
+name = "pluggy"
+version = "1.6.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pluggy/1.6.0/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pluggy/1.6.0/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746" },
+]
+
+[[package]]
 name = "pmt"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "py-clob-client" },
     { name = "python-dotenv" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "python-dotenv", specifier = ">=1.2.1" }]
+requires-dist = [
+    { name = "py-clob-client", specifier = ">=0.34.1" },
+    { name = "python-dotenv", specifier = ">=1.2.1" },
+]
+
+[[package]]
+name = "poly-eip712-structs"
+version = "0.0.1"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "eth-utils" },
+    { name = "pycryptodome" },
+    { name = "pytest" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/poly-eip712-structs/0.0.1/poly_eip712_structs-0.0.1.tar.gz", hash = "sha256:d9193766fde497b1ee01c79a50092733a34b7a94bed090deb5d3c1b1e41f6d8c" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/poly-eip712-structs/0.0.1/poly_eip712_structs-0.0.1-py3-none-any.whl", hash = "sha256:11e714e8c25c64d22dcb8a606c87cf052e7154caf701652d29687ddaf7dee342" },
+]
+
+[[package]]
+name = "py-builder-signing-sdk"
+version = "0.0.2"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "python-dotenv" },
+    { name = "requests" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/py-builder-signing-sdk/0.0.2/py_builder_signing_sdk-0.0.2.tar.gz", hash = "sha256:27fa4401944220c51809f549a263c6e53b5cd981fca98eda7ef6f21944e6bf94" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/py-builder-signing-sdk/0.0.2/py_builder_signing_sdk-0.0.2-py3-none-any.whl", hash = "sha256:114b9d57bec228177d759ce15c475589f47db2252ed1fd67cac3c9b0640abe76" },
+]
+
+[[package]]
+name = "py-clob-client"
+version = "0.34.1"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "eth-account" },
+    { name = "eth-utils" },
+    { name = "httpx", extra = ["http2"] },
+    { name = "poly-eip712-structs" },
+    { name = "py-builder-signing-sdk" },
+    { name = "py-order-utils" },
+    { name = "python-dotenv" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/py-clob-client/0.34.1/py_clob_client-0.34.1.tar.gz", hash = "sha256:d8ae237c0c047a1d8b98665e173411a1c5076aa371e9903b3b42f59be6110c8f" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/py-clob-client/0.34.1/py_clob_client-0.34.1-py3-none-any.whl", hash = "sha256:ad75358df29470ff9967831bd04060cca64ecf8e037fa938450abc587069f925" },
+]
+
+[[package]]
+name = "py-order-utils"
+version = "0.3.2"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "eth-account" },
+    { name = "eth-utils" },
+    { name = "poly-eip712-structs" },
+    { name = "pytest" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/py-order-utils/0.3.2/py_order_utils-0.3.2.tar.gz", hash = "sha256:4c0ecb939f4ce0313cd8a4ca32f2ba9a72449a6fc9ee17b9ce1937f594662988" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/py-order-utils/0.3.2/py_order_utils-0.3.2-py3-none-any.whl", hash = "sha256:5ab780e61ed532ddda852a6a12d470be7bbdaae01213ced3ebc6c887cedb1d3e" },
+]
+
+[[package]]
+name = "pycryptodome"
+version = "3.23.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pycryptodome/3.23.0/pycryptodome-3.23.0.tar.gz", hash = "sha256:447700a657182d60338bab09fdb27518f8856aecd80ae4c6bdddb67ff5da44ef" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pycryptodome/3.23.0/pycryptodome-3.23.0-cp37-abi3-macosx_10_9_universal2.whl", hash = "sha256:187058ab80b3281b1de11c2e6842a357a1f71b42cb1e15bce373f3d238135c27" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pycryptodome/3.23.0/pycryptodome-3.23.0-cp37-abi3-macosx_10_9_x86_64.whl", hash = "sha256:cfb5cd445280c5b0a4e6187a7ce8de5a07b5f3f897f235caa11f1f435f182843" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pycryptodome/3.23.0/pycryptodome-3.23.0-cp37-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:67bd81fcbe34f43ad9422ee8fd4843c8e7198dd88dd3d40e6de42ee65fbe1490" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pycryptodome/3.23.0/pycryptodome-3.23.0-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c8987bd3307a39bc03df5c8e0e3d8be0c4c3518b7f044b0f4c15d1aa78f52575" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pycryptodome/3.23.0/pycryptodome-3.23.0-cp37-abi3-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:aa0698f65e5b570426fc31b8162ed4603b0c2841cbb9088e2b01641e3065915b" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pycryptodome/3.23.0/pycryptodome-3.23.0-cp37-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:53ecbafc2b55353edcebd64bf5da94a2a2cdf5090a6915bcca6eca6cc452585a" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pycryptodome/3.23.0/pycryptodome-3.23.0-cp37-abi3-musllinux_1_2_i686.whl", hash = "sha256:156df9667ad9f2ad26255926524e1c136d6664b741547deb0a86a9acf5ea631f" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pycryptodome/3.23.0/pycryptodome-3.23.0-cp37-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:dea827b4d55ee390dc89b2afe5927d4308a8b538ae91d9c6f7a5090f397af1aa" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pycryptodome/3.23.0/pycryptodome-3.23.0-cp37-abi3-win32.whl", hash = "sha256:507dbead45474b62b2bbe318eb1c4c8ee641077532067fec9c1aa82c31f84886" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pycryptodome/3.23.0/pycryptodome-3.23.0-cp37-abi3-win_amd64.whl", hash = "sha256:c75b52aacc6c0c260f204cbdd834f76edc9fb0d8e0da9fbf8352ef58202564e2" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pycryptodome/3.23.0/pycryptodome-3.23.0-cp37-abi3-win_arm64.whl", hash = "sha256:11eeeb6917903876f134b56ba11abe95c0b0fd5e3330def218083c7d98bbcb3c" },
+]
+
+[[package]]
+name = "pydantic"
+version = "2.12.5"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "annotated-types" },
+    { name = "pydantic-core" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic/2.12.5/pydantic-2.12.5.tar.gz", hash = "sha256:4d351024c75c0f085a9febbb665ce8c0c6ec5d30e903bdb6394b7ede26aebb49" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic/2.12.5/pydantic-2.12.5-py3-none-any.whl", hash = "sha256:e561593fccf61e8a20fc46dfc2dfe075b8be7d0188df33f221ad1f0139180f9d" },
+]
+
+[[package]]
+name = "pydantic-core"
+version = "2.41.5"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5.tar.gz", hash = "sha256:08daa51ea16ad373ffd5e7606252cc32f07bc72b28284b6bc9c6df804816476e" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-macosx_10_12_x86_64.whl", hash = "sha256:3f37a19d7ebcdd20b96485056ba9e8b304e27d9904d233d7b1015db320e51f0a" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:1d1d9764366c73f996edd17abb6d9d7649a7eb690006ab6adbda117717099b14" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:25e1c2af0fce638d5f1988b686f3b3ea8cd7de5f244ca147c777769e798a9cd1" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:506d766a8727beef16b7adaeb8ee6217c64fc813646b424d0804d67c16eddb66" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:4819fa52133c9aa3c387b3328f25c1facc356491e6135b459f1de698ff64d869" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:2b761d210c9ea91feda40d25b4efe82a1707da2ef62901466a42492c028553a2" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:22f0fb8c1c583a3b6f24df2470833b40207e907b90c928cc8d3594b76f874375" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:2782c870e99878c634505236d81e5443092fba820f0373997ff75f90f68cd553" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-musllinux_1_1_aarch64.whl", hash = "sha256:0177272f88ab8312479336e1d777f6b124537d47f2123f89cb37e0accea97f90" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-musllinux_1_1_armv7l.whl", hash = "sha256:63510af5e38f8955b8ee5687740d6ebf7c2a0886d15a6d65c32814613681bc07" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-musllinux_1_1_x86_64.whl", hash = "sha256:e56ba91f47764cc14f1daacd723e3e82d1a89d783f0f5afe9c364b8bb491ccdb" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-win32.whl", hash = "sha256:aec5cf2fd867b4ff45b9959f8b20ea3993fc93e63c7363fe6851424c8a7e7c23" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-win_amd64.whl", hash = "sha256:8e7c86f27c585ef37c35e56a96363ab8de4e549a95512445b85c96d3e2f7c1bf" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314-win_arm64.whl", hash = "sha256:e672ba74fbc2dc8eea59fb6d4aed6845e6905fc2a8afe93175d94a83ba2a01a0" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:8566def80554c3faa0e65ac30ab0932b9e3a5cd7f8323764303d468e5c37595a" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:b80aa5095cd3109962a298ce14110ae16b8c1aece8b72f9dafe81cf597ad80b3" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:3006c3dd9ba34b0c094c544c6006cc79e87d8612999f1a5d43b769b89181f23c" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:72f6c8b11857a856bcfa48c86f5368439f74453563f951e473514579d44aa612" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:5cb1b2f9742240e4bb26b652a5aeb840aa4b417c7748b6f8387927bc6e45e40d" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:bd3d54f38609ff308209bd43acea66061494157703364ae40c951f83ba99a1a9" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2ff4321e56e879ee8d2a879501c8e469414d948f4aba74a2d4593184eb326660" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:d0d2568a8c11bf8225044aa94409e21da0cb09dcdafe9ecd10250b2baad531a9" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-musllinux_1_1_aarch64.whl", hash = "sha256:a39455728aabd58ceabb03c90e12f71fd30fa69615760a075b9fec596456ccc3" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-musllinux_1_1_armv7l.whl", hash = "sha256:239edca560d05757817c13dc17c50766136d21f7cd0fac50295499ae24f90fdf" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-musllinux_1_1_x86_64.whl", hash = "sha256:2a5e06546e19f24c6a96a129142a75cee553cc018ffee48a460059b1185f4470" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-win32.whl", hash = "sha256:b4ececa40ac28afa90871c2cc2b9ffd2ff0bf749380fbdf57d165fd23da353aa" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-win_amd64.whl", hash = "sha256:80aa89cad80b32a912a65332f64a4450ed00966111b6615ca6816153d3585a8c" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pydantic-core/2.41.5/pydantic_core-2.41.5-cp314-cp314t-win_arm64.whl", hash = "sha256:35b44f37a3199f771c3eaa53051bc8a70cd7b54f333531c59e29fd4db5d15008" },
+]
+
+[[package]]
+name = "pygments"
+version = "2.19.2"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pygments/2.19.2/pygments-2.19.2.tar.gz", hash = "sha256:636cb2477cec7f8952536970bc533bc43743542f70392ae026374600add5b887" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pygments/2.19.2/pygments-2.19.2-py3-none-any.whl", hash = "sha256:86540386c03d588bb81d44bc3928634ff26449851e99741617ecb9037ee5ec0b" },
+]
+
+[[package]]
+name = "pytest"
+version = "9.0.2"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "iniconfig" },
+    { name = "packaging" },
+    { name = "pluggy" },
+    { name = "pygments" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pytest/9.0.2/pytest-9.0.2.tar.gz", hash = "sha256:75186651a92bd89611d1d9fc20f0b4345fd827c41ccd5c299a868a05d70edf11" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pytest/9.0.2/pytest-9.0.2-py3-none-any.whl", hash = "sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b" },
+]
 
 [[package]]
 name = "python-dotenv"
@@ -20,4 +603,106 @@ source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-ea
 sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/python-dotenv/1.2.1/python_dotenv-1.2.1.tar.gz", hash = "sha256:42667e897e16ab0d66954af0e60a9caa94f0fd4ecf3aaf6d2d260eec1aa36ad6" }
 wheels = [
     { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/python-dotenv/1.2.1/python_dotenv-1.2.1-py3-none-any.whl", hash = "sha256:b81ee9561e9ca4004139c6cbba3a238c32b03e4894671e181b671e8cb8425d61" },
+]
+
+[[package]]
+name = "regex"
+version = "2025.11.3"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3.tar.gz", hash = "sha256:1fedc720f9bb2494ce31a58a1631f9c82df6a09b49c19517ea5cc280b4541e01" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-macosx_10_13_universal2.whl", hash = "sha256:9697a52e57576c83139d7c6f213d64485d3df5bf84807c35fa409e6c970801c6" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-macosx_10_13_x86_64.whl", hash = "sha256:e18bc3f73bd41243c9b38a6d9f2366cd0e0137a9aebe2d8ff76c5b67d4c0a3f4" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:61a08bcb0ec14ff4e0ed2044aad948d0659604f824cbd50b55e30b0ec6f09c73" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c9c30003b9347c24bcc210958c5d167b9e4f9be786cb380a7d32f14f9b84674f" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:4e1e592789704459900728d88d41a46fe3969b82ab62945560a31732ffc19a6d" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-manylinux2014_s390x.manylinux_2_17_s390x.manylinux_2_28_s390x.whl", hash = "sha256:6538241f45eb5a25aa575dbba1069ad786f68a4f2773a29a2bd3dd1f9de787be" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bce22519c989bb72a7e6b36a199384c53db7722fe669ba891da75907fe3587db" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:66d559b21d3640203ab9075797a55165d79017520685fb407b9234d72ab63c62" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-musllinux_1_2_ppc64le.whl", hash = "sha256:669dcfb2e38f9e8c69507bace46f4889e3abbfd9b0c29719202883c0a603598f" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-musllinux_1_2_s390x.whl", hash = "sha256:32f74f35ff0f25a5021373ac61442edcb150731fbaa28286bbc8bb1582c89d02" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:e6c7a21dffba883234baefe91bc3388e629779582038f75d2a5be918e250f0ed" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-win32.whl", hash = "sha256:795ea137b1d809eb6836b43748b12634291c0ed55ad50a7d72d21edf1cd565c4" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-win_amd64.whl", hash = "sha256:9f95fbaa0ee1610ec0fc6b26668e9917a582ba80c52cc6d9ada15e30aa9ab9ad" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314-win_arm64.whl", hash = "sha256:dfec44d532be4c07088c3de2876130ff0fbeeacaa89a137decbbb5f665855a0f" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-macosx_10_13_universal2.whl", hash = "sha256:ba0d8a5d7f04f73ee7d01d974d47c5834f8a1b0224390e4fe7c12a3a92a78ecc" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-macosx_10_13_x86_64.whl", hash = "sha256:442d86cf1cfe4faabf97db7d901ef58347efd004934da045c745e7b5bd57ac49" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:fd0a5e563c756de210bb964789b5abe4f114dacae9104a47e1a649b910361536" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:bf3490bcbb985a1ae97b2ce9ad1c0f06a852d5b19dde9b07bdf25bf224248c95" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-manylinux2014_ppc64le.manylinux_2_17_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:3809988f0a8b8c9dcc0f92478d6501fac7200b9ec56aecf0ec21f4a2ec4b6009" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-manylinux2014_s390x.manylinux_2_17_s390x.manylinux_2_28_s390x.whl", hash = "sha256:f4ff94e58e84aedb9c9fce66d4ef9f27a190285b451420f297c9a09f2b9abee9" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7eb542fd347ce61e1321b0a6b945d5701528dca0cd9759c2e3bb8bd57e47964d" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:d6c2d5919075a1f2e413c00b056ea0c2f065b3f5fe83c3d07d325ab92dce51d6" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-musllinux_1_2_ppc64le.whl", hash = "sha256:3f8bf11a4827cc7ce5a53d4ef6cddd5ad25595d3c1435ef08f76825851343154" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-musllinux_1_2_s390x.whl", hash = "sha256:22c12d837298651e5550ac1d964e4ff57c3f56965fc1812c90c9fb2028eaf267" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:62ba394a3dda9ad41c7c780f60f6e4a70988741415ae96f6d1bf6c239cf01379" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-win32.whl", hash = "sha256:4bf146dca15cdd53224a1bf46d628bd7590e4a07fbb69e720d561aea43a32b38" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-win_amd64.whl", hash = "sha256:adad1a1bcf1c9e76346e091d22d23ac54ef28e1365117d99521631078dfec9de" },
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/regex/2025.11.3/regex-2025.11.3-cp314-cp314t-win_arm64.whl", hash = "sha256:c54f768482cef41e219720013cd05933b6f971d9562544d691c68699bf2b6801" },
+]
+
+[[package]]
+name = "requests"
+version = "2.32.5"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "certifi" },
+    { name = "charset-normalizer" },
+    { name = "idna" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/requests/2.32.5/requests-2.32.5.tar.gz", hash = "sha256:dbba0bac56e100853db0ea71b82b4dfd5fe2bf6d3754a8893c3af500cec7d7cf" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/requests/2.32.5/requests-2.32.5-py3-none-any.whl", hash = "sha256:2462f94637a34fd532264295e186976db0f5d453d1cdd31473c85a6a161affb6" },
+]
+
+[[package]]
+name = "rlp"
+version = "4.1.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "eth-utils" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/rlp/4.1.0/rlp-4.1.0.tar.gz", hash = "sha256:be07564270a96f3e225e2c107db263de96b5bc1f27722d2855bd3459a08e95a9" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/rlp/4.1.0/rlp-4.1.0-py3-none-any.whl", hash = "sha256:8eca394c579bad34ee0b937aecb96a57052ff3716e19c7a578883e767bc5da6f" },
+]
+
+[[package]]
+name = "toolz"
+version = "1.1.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/toolz/1.1.0/toolz-1.1.0.tar.gz", hash = "sha256:27a5c770d068c110d9ed9323f24f1543e83b2f300a687b7891c1a6d56b697b5b" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/toolz/1.1.0/toolz-1.1.0-py3-none-any.whl", hash = "sha256:15ccc861ac51c53696de0a5d6d4607f99c210739caf987b5d2054f3efed429d8" },
+]
+
+[[package]]
+name = "typing-extensions"
+version = "4.15.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/typing-extensions/4.15.0/typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/typing-extensions/4.15.0/typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548" },
+]
+
+[[package]]
+name = "typing-inspection"
+version = "0.4.2"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/typing-inspection/0.4.2/typing_inspection-0.4.2.tar.gz", hash = "sha256:ba561c48a67c5958007083d386c3295464928b01faa735ab8547c5692e87f464" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/typing-inspection/0.4.2/typing_inspection-0.4.2-py3-none-any.whl", hash = "sha256:4ed1cacbdc298c220f1bd249ed5287caa16f34d44ef4e9c3d0cbad5b521545e7" },
+]
+
+[[package]]
+name = "urllib3"
+version = "2.6.2"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/urllib3/2.6.2/urllib3-2.6.2.tar.gz", hash = "sha256:016f9c98bb7e98085cb2b4b17b87d2c702975664e4f060c6532e64d1c1a5e797" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/urllib3/2.6.2/urllib3-2.6.2-py3-none-any.whl", hash = "sha256:ec21cddfe7724fc7cb4ba4bea7aa8e2ef36f607a4bab81aa6ce42a13dc3f03dd" },
 ]
