@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-@dataclass
+@dataclass(repr=False)
 class Token:
     """Represents a market outcome token."""
 
@@ -20,8 +20,11 @@ class Token:
         )
         return f"    [{self.outcome}] {price_str} | {token_preview}"
 
+    def __repr__(self) -> str:
+        return self.__str__()
 
-@dataclass
+
+@dataclass(repr=False)
 class Market:
     """Represents a prediction market."""
 
@@ -37,8 +40,11 @@ class Market:
         lines.extend(str(token) for token in self.tokens)
         return "\n".join(lines)
 
+    def __repr__(self) -> str:
+        return self.__str__()
 
-@dataclass
+
+@dataclass(repr=False)
 class OrderBookLevel:
     """Represents a price level in the order book."""
 
@@ -48,8 +54,11 @@ class OrderBookLevel:
     def __str__(self) -> str:
         return f"{self.price:.1%} x {self.size:,.0f} shares"
 
+    def __repr__(self) -> str:
+        return self.__str__()
 
-@dataclass
+
+@dataclass(repr=False)
 class OrderBook:
     """Represents an order book for a token."""
 
@@ -68,8 +77,11 @@ class OrderBook:
 
         return "\n".join(lines)
 
+    def __repr__(self) -> str:
+        return self.__str__()
 
-@dataclass
+
+@dataclass(repr=False)
 class Event:
     """Represents a Polymarket event."""
 
@@ -93,3 +105,6 @@ class Event:
             lines.append(f"   Volume: ${self.volume:,.0f}")
 
         return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        return self.__str__()
