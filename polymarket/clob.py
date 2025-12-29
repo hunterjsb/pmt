@@ -1,15 +1,4 @@
-"""Polymarket API client module.
-
-Thin wrappers around:
-- Gamma API: Market metadata (events, markets, tags, search)
-- CLOB API: Trading data (order books, prices, markets)
-- Authenticated CLOB: orders/trades + on-chain balances/positions
-
-Design notes:
-- Keep wrappers thin; allow errors to raise.
-- Authenticated client derives API creds from the private key (avoids stale env creds).
-- Positions are ERC-1155 balances queried via Polygon JSON-RPC against the funder address.
-"""
+"""CLOB (Central Limit Order Book) API client."""
 
 from __future__ import annotations
 
@@ -19,8 +8,9 @@ import requests
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OpenOrderParams
 
+from .models import Market, OrderBook, OrderBookLevel, Token
+
 CLOB_HOST = "https://clob.polymarket.com"
-GAMMA_HOST = "https://gamma-api.polymarket.com"
 CHAIN_ID = 137  # Polygon
 
 # Public Polygon RPC and contract addresses (not sensitive)
@@ -44,13 +34,34 @@ class Clob:
     def server_time(self):
         return self._client.get_server_time()
 
-    def sampling_markets(self, limit: int = 100) -> list[dict]:
+    def sampling_markets(self, limit: int = 100) -> list[Market]:
         response = requests.get(f"{self.host}/sampling-markets", timeout=10)
         response.raise_for_status()
-        return response.json().get("data", [])[:limit]
+        data = response.json().get("data", [])[:limit]
 
-    def order_book(self, token_id: str):
-        return self._client.get_order_book(token_id)
+        markets = []
+        for m in data:
+            tokens = [
+                Token(
+                    outcome=t.get("outcome", "?"),
+                    price=t.get("price"),
+                    token_id=t.get("token_id", ""),
+                )
+                for t in m.get("tokens", [])
+            ]
+            markets.append(Market(question=m.get("question", "Unknown"), tokens=tokens))
+
+        return markets
+
+    def order_book(self, token_id: str, name: str = "Token") -> OrderBook:
+        book = self._client.get_order_book(token_id)
+        bids = [
+            OrderBookLevel(float(b.price), float(b.size)) for b in (book.bids or [])
+        ]
+        asks = [
+            OrderBookLevel(float(a.price), float(a.size)) for a in (book.asks or [])
+        ]
+        return OrderBook(name=name, bids=bids, asks=asks)
 
     def midpoint(self, token_id: str):
         """Returns {'mid': '0.123'}."""
@@ -63,65 +74,6 @@ class Clob:
     def spread(self, token_id: str):
         """Returns (best_bid_dict, best_ask_dict)."""
         return self.price(token_id, "SELL"), self.price(token_id, "BUY")
-
-
-class Gamma:
-    """Client for the Polymarket Gamma API (market metadata)."""
-
-    def __init__(self, host: str = GAMMA_HOST) -> None:
-        self.host = host
-
-    def events(
-        self,
-        limit: int = 10,
-        closed: bool = False,
-        order: str = "id",
-        ascending: bool = False,
-    ) -> list[dict]:
-        params = {
-            "order": order,
-            "ascending": str(ascending).lower(),
-            "closed": str(closed).lower(),
-            "limit": limit,
-        }
-        response = requests.get(f"{self.host}/events", params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
-
-    def event_by_slug(self, slug: str) -> dict:
-        response = requests.get(f"{self.host}/events/slug/{slug}", timeout=10)
-        response.raise_for_status()
-        return response.json()
-
-    def markets(self, limit: int = 10, closed: bool = False) -> list[dict]:
-        params = {"closed": str(closed).lower(), "limit": limit}
-        response = requests.get(f"{self.host}/markets", params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
-
-    def market_by_slug(self, slug: str) -> dict:
-        response = requests.get(f"{self.host}/markets/slug/{slug}", timeout=10)
-        response.raise_for_status()
-        return response.json()
-
-    def tags(self) -> list[dict]:
-        response = requests.get(f"{self.host}/tags", timeout=10)
-        response.raise_for_status()
-        return response.json()
-
-    def events_by_tag(
-        self, tag_id: int, limit: int = 10, closed: bool = False
-    ) -> list[dict]:
-        params = {"tag_id": tag_id, "closed": str(closed).lower(), "limit": limit}
-        response = requests.get(f"{self.host}/events", params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
-
-    def search(self, query: str, limit: int = 10) -> list[dict]:
-        params = {"query": query, "limit": limit}
-        response = requests.get(f"{self.host}/search", params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
 
 
 class AuthenticatedClob:
@@ -181,8 +133,15 @@ class AuthenticatedClob:
     def ok(self):
         return self._client.get_ok()
 
-    def order_book(self, token_id: str):
-        return self._client.get_order_book(token_id)
+    def order_book(self, token_id: str, name: str = "Token") -> OrderBook:
+        book = self._client.get_order_book(token_id)
+        bids = [
+            OrderBookLevel(float(b.price), float(b.size)) for b in (book.bids or [])
+        ]
+        asks = [
+            OrderBookLevel(float(a.price), float(a.size)) for a in (book.asks or [])
+        ]
+        return OrderBook(name=name, bids=bids, asks=asks)
 
     def midpoint(self, token_id: str):
         return self._client.get_midpoint(token_id)
@@ -291,7 +250,3 @@ def create_authenticated_clob() -> AuthenticatedClob | None:
         funder_address=PM_FUNDER_ADDRESS,
         signature_type=PM_SIGNATURE_TYPE,
     )
-
-
-clob = Clob()
-gamma = Gamma()
