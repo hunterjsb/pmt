@@ -100,14 +100,19 @@ client.cancel_all()
 
 ## API Client
 ```python
-from polymarket import clob, gamma
+from polymarket import clob, gamma, get_order_book_depth
 
 # CLOB API (trading data)
 clob.sampling_markets(limit=10)  # Active markets with order books
-clob.order_book(token_id)        # Full order book
+clob.order_book(token_id)        # Order book (aggregated levels)
 clob.midpoint(token_id)          # {'mid': '0.123'}
 clob.price(token_id, "BUY")      # {'price': '0.123'}
 clob.spread(token_id)            # (bid_result, ask_result)
+
+# Full order book depth (all price levels)
+book = get_order_book_depth(token_id)
+for ask in book.asks[:5]:
+    print(f"{ask.price:.3f} - {ask.size:.0f} shares")
 
 # Gamma API (market metadata)
 gamma.events(limit=10)           # Get events

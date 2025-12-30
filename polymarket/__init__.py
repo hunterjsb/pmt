@@ -6,7 +6,12 @@ Thin wrappers around:
 - Authenticated CLOB: orders/trades + on-chain balances/positions
 """
 
-from .clob import AuthenticatedClob, Clob, create_authenticated_clob
+from .clob import (
+    AuthenticatedClob,
+    Clob,
+    create_authenticated_clob,
+    get_order_book_depth,
+)
 from .gamma import Gamma
 from .models import Event, Market, OrderBook, OrderBookLevel, Token
 
@@ -22,6 +27,8 @@ __all__ = [
     "Gamma",
     "AuthenticatedClob",
     "create_authenticated_clob",
+    # Utilities
+    "get_order_book_depth",
 ]
 
 # Singleton instances for convenience
