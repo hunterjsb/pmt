@@ -110,6 +110,84 @@ class AuthenticatedClob:
     # CLOB: orders & trades
     # -----------------------------
 
+    def create_order(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        side: str = "BUY",
+        order_type: str = "GTC",
+    ):
+        """Create a limit order.
+
+        Args:
+            token_id: The token ID to trade
+            price: Price per share (e.g., 0.65 for 65¢)
+            size: Number of shares to buy/sell
+            side: "BUY" or "SELL"
+            order_type: Order type - "GTC" (Good Til Cancelled), "FOK" (Fill or Kill), "GTD" (Good Til Date)
+
+        Returns:
+            Order response from API
+        """
+        return self._client.create_order(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=side,
+            order_type=order_type,
+        )
+
+    def post_order(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        side: str = "BUY",
+        order_type: str = "GTC",
+    ):
+        """Create and post a limit order in one call.
+
+        Args:
+            token_id: The token ID to trade
+            price: Price per share (e.g., 0.65 for 65¢)
+            size: Number of shares to buy/sell
+            side: "BUY" or "SELL"
+            order_type: Order type - "GTC", "FOK", "GTD"
+
+        Returns:
+            Order response from API
+        """
+        return self._client.create_and_post_order(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=side,
+            order_type=order_type,
+        )
+
+    def market_order(
+        self,
+        token_id: str,
+        amount: float,
+        side: str = "BUY",
+    ):
+        """Place a market order (executes immediately at best available price).
+
+        Args:
+            token_id: The token ID to trade
+            amount: Dollar amount to spend (for BUY) or shares to sell (for SELL)
+            side: "BUY" or "SELL"
+
+        Returns:
+            Order response from API
+        """
+        return self._client.create_market_order(
+            token_id=token_id,
+            amount=amount,
+            side=side,
+        )
+
     def trades(self):
         return self._client.get_trades()
 
