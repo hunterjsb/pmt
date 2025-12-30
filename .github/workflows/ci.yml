@@ -23,15 +23,18 @@ jobs:
         with:
           version: "latest"
 
-      - name: Install dependencies (ignore lock file)
-        run: |
-          uv pip install pytest rich python-dotenv py-clob-client
-        continue-on-error: true
+      - name: Create virtual environment
+        run: uv venv
 
-      - name: Install dependencies (minimal fallback)
-        if: failure()
+      - name: Install dependencies from PyPI (ignore lock file)
         run: |
           uv pip install pytest rich python-dotenv
+        continue-on-error: true
+
+      - name: Install py-clob-client if possible
+        run: |
+          uv pip install py-clob-client || echo "py-clob-client installation failed, skipping"
+        continue-on-error: true
 
       - name: Run tests
         run: uv run pytest tests/ -v
