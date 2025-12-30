@@ -10,6 +10,48 @@ from py_clob_client.clob_types import MarketOrderArgs, OpenOrderParams, OrderArg
 
 from .models import Market, OrderBook, OrderBookLevel, Token
 
+
+def get_order_book_depth(
+    token_id: str, host: str = "https://clob.polymarket.com"
+) -> OrderBook:
+    """Get full order book depth with all price levels via direct API call.
+
+    The py_clob_client library only returns aggregated levels. This function
+    fetches the complete order book ladder directly from the API.
+
+    Args:
+        token_id: The token ID to get order book for
+        host: CLOB API host URL
+
+    Returns:
+        OrderBook with full depth of bids and asks
+
+    Example:
+        >>> book = get_order_book_depth("123456789...")
+        >>> print(f"Best ask: {book.asks[0].price:.3f} (size: {book.asks[0].size})")
+        >>> print(f"Next ask: {book.asks[1].price:.3f} (size: {book.asks[1].size})")
+    """
+    url = f"{host}/book"
+    params = {"token_id": token_id}
+
+    response = requests.get(url, params=params, timeout=10)
+    response.raise_for_status()
+
+    data = response.json()
+
+    # Parse bids and asks
+    bids = [
+        OrderBookLevel(float(b["price"]), float(b["size"]))
+        for b in data.get("bids", [])
+    ]
+    asks = [
+        OrderBookLevel(float(a["price"]), float(a["size"]))
+        for a in data.get("asks", [])
+    ]
+
+    return OrderBook(name="Token", bids=bids, asks=asks)
+
+
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137  # Polygon
 
@@ -54,6 +96,11 @@ class Clob:
         return markets
 
     def order_book(self, token_id: str, name: str = "Token") -> OrderBook:
+        """Get order book for a token.
+
+        Note: py_clob_client aggregates order book levels. For full depth,
+        use get_order_book_depth() function instead.
+        """
         book = self._client.get_order_book(token_id)
         bids = [
             OrderBookLevel(float(b.price), float(b.size)) for b in (book.bids or [])
@@ -213,6 +260,11 @@ class AuthenticatedClob:
         return self._client.get_ok()
 
     def order_book(self, token_id: str, name: str = "Token") -> OrderBook:
+        """Get order book for a token.
+
+        Note: py_clob_client aggregates order book levels. For full depth,
+        use get_order_book_depth() function instead.
+        """
         book = self._client.get_order_book(token_id)
         bids = [
             OrderBookLevel(float(b.price), float(b.size)) for b in (book.bids or [])
