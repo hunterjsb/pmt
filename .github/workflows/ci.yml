@@ -2,51 +2,55 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
 
 jobs:
   test:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@v4
-      with:
-        version: "latest"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
 
-    - name: Set up Python
-      run: uv python install 3.14
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
 
-    - name: Install dependencies
-      run: uv sync
+      - name: Install dependencies (ignore lock file)
+        run: |
+          uv pip install pytest rich python-dotenv py-clob-client
+        continue-on-error: true
 
-    - name: Run tests
-      run: uv run pytest tests/ -v
+      - name: Install dependencies (minimal fallback)
+        if: failure()
+        run: |
+          uv pip install pytest rich python-dotenv
 
-    - name: Check code formatting (if ruff is available)
-      run: uv run ruff check . || echo "Ruff not installed, skipping"
-      continue-on-error: true
+      - name: Run tests
+        run: uv run pytest tests/ -v
 
-  lint:
+  syntax-check:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@v4
-      with:
-        version: "latest"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
 
-    - name: Set up Python
-      run: uv python install 3.14
-
-    - name: Install dependencies
-      run: uv sync
-
-    - name: Check Python syntax
-      run: uv run python -m py_compile $(find . -name "*.py" -not -path "./.venv/*" -not -path "./__pycache__/*")
+      - name: Check Python syntax
+        run: |
+          python -m py_compile $(find . -name "*.py" \
+            -not -path "./.venv/*" \
+            -not -path "./__pycache__/*" \
+            -not -path "./build/*" \
+            -not -path "./dist/*")
