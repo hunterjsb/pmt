@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from polymarket import Market, Token, clob, gamma
+from polymarket import clob, gamma
 
 
 @dataclass
 class ExpiringOpportunity:
     """Represents a high-certainty outcome on a market expiring soon."""
 
-    market: Market
-    token: Token
+    question: str
+    outcome: str
+    token_id: str
     price_pct: float
     end_date: str
     hours_until_expiry: float
@@ -59,88 +61,145 @@ def hours_until(end_date: datetime) -> float:
 def find_expiring_opportunities(
     min_price_pct: float = 98.0,
     max_hours: float = 2.0,
+    max_events: int = 2000,
 ) -> list[ExpiringOpportunity]:
     """Find high-certainty outcomes on markets expiring soon.
 
-    Strategy: Look for outcomes priced at 98%+ that expire in 2 hours or less.
+    Strategy: Look for outcomes priced at min_price_pct%+ that expire in max_hours or less.
     These are "almost certain" outcomes that will resolve soon, offering quick,
     low-risk returns.
+
+    This implementation uses the Gamma /events endpoint which includes full market
+    details with clobTokenIds, allowing us to scan ALL markets (not just sampling).
 
     Args:
         min_price_pct: Minimum outcome price percentage (default 98%)
         max_hours: Maximum hours until expiry (default 2 hours)
+        max_events: Maximum number of events to fetch (default 2000)
 
     Returns:
         List of expiring opportunities
     """
     opportunities = []
+    now = datetime.now(timezone.utc)
 
-    # Get active markets from CLOB (increased limit)
-    markets = clob.sampling_markets(limit=500)
+    # Fetch events with pagination
+    events_fetched = 0
+    offset = 0
+    batch_size = 100
 
-    # Get market metadata from Gamma to check end dates (increased limit)
-    gamma_markets = gamma.markets(limit=500, closed=False)
+    print(f"Fetching events (max {max_events})...")
 
-    # Build a lookup map: question -> market_data
-    # Also try matching by slug and other fields for better coverage
-    gamma_lookup = {}
-    gamma_by_slug = {}
-    for gm in gamma_markets:
-        question = gm.get("question", "")
-        slug = gm.get("slug", "")
-        if question:
-            gamma_lookup[question] = gm
-        if slug:
-            gamma_by_slug[slug] = gm
+    # Calculate max end date (now + max_hours)
+    max_end_date = now + timedelta(hours=max_hours)
+    end_date_max_str = max_end_date.isoformat().replace("+00:00", "Z")
 
-    for market in markets:
-        # Try to find matching market data with end date
-        market_data = gamma_lookup.get(market.question)
+    while events_fetched < max_events:
+        try:
+            # Fetch batch of events with markets, filtered by end date
+            events = gamma.events(
+                limit=batch_size,
+                offset=offset,
+                closed=False,
+                order="endDate",
+                ascending=True,  # Get soonest expiring first
+                end_date_max=end_date_max_str,
+            )
 
-        # If no exact match, try fuzzy matching on the question
-        if not market_data:
-            # Try to find by partial match
-            for q, data in gamma_lookup.items():
-                if (
-                    market.question.lower() in q.lower()
-                    or q.lower() in market.question.lower()
-                ):
-                    market_data = data
-                    break
+            if not events:
+                break  # No more events
 
-        if not market_data:
-            continue
+            print(f"Processing events {offset} to {offset + len(events)}...")
 
-        end_date_str = market_data.get("endDate")
-        end_date = parse_end_date(end_date_str)
+            for event in events:
+                events_fetched += 1
 
-        if not end_date:
-            continue
+                # Check if event has markets
+                markets = event.get("markets")
+                if not markets:
+                    continue
 
-        hours_left = hours_until(end_date)
+                # Get event end date
+                event_end_date_str = event.get("endDate")
+                event_end_date = parse_end_date(event_end_date_str)
 
-        # Skip if not expiring soon enough or already expired
-        if hours_left < 0 or hours_left > max_hours:
-            continue
+                for market in markets:
+                    # Get market details
+                    question = market.get("question", "Unknown")
+                    end_date_str = market.get("endDate") or event_end_date_str
+                    clob_token_ids = market.get("clobTokenIds")
+                    outcomes = market.get("outcomes")
+                    outcome_prices = market.get("outcomePrices")
+                    active = market.get("active", False)
+                    closed = market.get("closed", False)
+                    slug = market.get("slug", "")
 
-        # Check each token for high certainty outcomes
-        for token in market.tokens:
-            if token.price is None:
-                continue
+                    # Skip if not active or already closed
+                    if not active or closed:
+                        continue
 
-            price_pct = token.price * 100
+                    # Parse end date
+                    end_date = parse_end_date(end_date_str)
+                    if not end_date:
+                        # Try event end date as fallback
+                        end_date = event_end_date
 
-            if price_pct >= min_price_pct:
-                opportunities.append(
-                    ExpiringOpportunity(
-                        market=market,
-                        token=token,
-                        price_pct=price_pct,
-                        end_date=end_date_str or "Unknown",
-                        hours_until_expiry=hours_left,
-                        slug=market_data.get("slug", ""),
-                    )
-                )
+                    if not end_date:
+                        continue
+
+                    hours_left = hours_until(end_date)
+
+                    # Skip if expired or not expiring soon enough
+                    if hours_left < 0 or hours_left > max_hours:
+                        continue
+
+                    # Parse outcomes and token IDs
+                    if not clob_token_ids or not outcomes:
+                        continue
+
+                    try:
+                        # Outcomes, prices, and token IDs are JSON-encoded strings
+                        outcome_list = json.loads(outcomes)
+                        token_id_list = (
+                            json.loads(clob_token_ids)
+                            if isinstance(clob_token_ids, str)
+                            else clob_token_ids
+                        )
+
+                        # Parse outcome prices from market data only
+                        if not outcome_prices:
+                            continue  # Skip markets without price data
+
+                        price_list = [float(p) for p in json.loads(outcome_prices)]
+
+                        # Check each outcome for high certainty
+                        for idx, (outcome, token_id, price) in enumerate(
+                            zip(outcome_list, token_id_list, price_list)
+                        ):
+                            price_pct = price * 100
+
+                            if price_pct >= min_price_pct:
+                                opportunities.append(
+                                    ExpiringOpportunity(
+                                        question=question,
+                                        outcome=outcome.strip(),
+                                        token_id=token_id,
+                                        price_pct=price_pct,
+                                        end_date=end_date_str or "Unknown",
+                                        hours_until_expiry=hours_left,
+                                        slug=slug,
+                                    )
+                                )
+
+                    except (ValueError, IndexError, AttributeError) as e:
+                        # Skip markets with parsing issues
+                        continue
+
+            offset += batch_size
+
+        except Exception as e:
+            print(f"Warning: Error fetching events at offset {offset}: {e}")
+            break
 
     # Sort by hours until expiry (soonest first)
     opportunities.sort(key=lambda x: x.hours_until_expiry)
@@ -188,9 +247,10 @@ if __name__ == "__main__":
         for opp in opportunities:
             returns = calculate_max_return(opp.price_pct, opp.hours_until_expiry)
 
-            print(f"📊 {opp.market.question[:60]}...")
-            print(f"   Outcome: {opp.token.outcome} @ {opp.price_pct:.2f}%")
+            print(f"📊 {opp.question[:60]}...")
+            print(f"   Outcome: {opp.outcome} @ {opp.price_pct:.2f}%")
             print(f"   Expires in: {opp.hours_until_expiry:.1f} hours")
             print(f"   Max return: {returns['max_return_pct']:.2f}%")
             print(f"   Hourly rate: {returns['hourly_rate_pct']:.2f}%/hr")
+            print(f"   Token ID: {opp.token_id}")
             print()
