@@ -1,6 +1,9 @@
 """Unit tests for order book analysis and scanner logic."""
 
+from datetime import datetime, timedelta, timezone
+
 from polymarket.models import Market, OrderBook, OrderBookLevel, Token
+from strategies.expiring import calculate_max_return, hours_until, parse_end_date
 from strategies.scanner import analyze_order_book
 
 
@@ -84,3 +87,50 @@ def test_order_book_spread():
     # Spread is the difference
     spread = order_book.asks[0].price - order_book.bids[0].price
     assert abs(spread - 0.04) < 0.001  # Use tolerance for floating point comparison
+
+
+def test_parse_end_date():
+    """Test that ISO 8601 date strings are parsed correctly."""
+    # Standard ISO format with Z suffix
+    date_str = "2024-12-31T23:59:59Z"
+    parsed = parse_end_date(date_str)
+
+    assert parsed is not None
+    assert parsed.year == 2024
+    assert parsed.month == 12
+    assert parsed.day == 31
+
+    # Invalid date should return None
+    invalid = parse_end_date("not a date")
+    assert invalid is None
+
+    # None should return None
+    none_result = parse_end_date(None)
+    assert none_result is None
+
+
+def test_hours_until_calculation():
+    """Test hours remaining calculation for expiring markets."""
+    # Create a datetime 2 hours in the future
+    now = datetime.now(timezone.utc)
+    future = now + timedelta(hours=2)
+
+    hours = hours_until(future)
+
+    # Should be approximately 2 hours (within 1 second tolerance)
+    assert 1.99 < hours < 2.01
+
+
+def test_max_return_calculation():
+    """Test return percentage calculations for expiring opportunities."""
+    # 98% outcome expiring in 2 hours
+    returns = calculate_max_return(price_pct=98.0, hours_left=2.0)
+
+    # Max return if it resolves to 100%: (100-98)/98 * 100 ≈ 2.04%
+    assert 2.0 < returns["max_return_pct"] < 2.1
+
+    # Hourly rate: 2.04% / 2 hours ≈ 1.02%/hr
+    assert 1.0 < returns["hourly_rate_pct"] < 1.1
+
+    # Break even drop: 100 - 98 = 2%
+    assert returns["break_even_drop_pct"] == 2.0

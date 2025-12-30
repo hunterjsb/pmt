@@ -9,15 +9,29 @@ uv run python main.py
 ```
 
 ### Scan for Opportunities
+
+#### Volume Cliff Scanner
 ```bash
-# Single scan for 1-3% outcomes
-uv run python scan.py --once
+# Single scan for volume cliffs (85-99% outcomes)
+uv run python scan.py cliff --once
 
 # Continuous scanning every 30 seconds
-uv run python scan.py
+uv run python scan.py cliff --interval 30
 
 # Custom range and interval
-uv run python scan.py --min 2.0 --max 5.0 --interval 60
+uv run python scan.py cliff --min 85.0 --max 99.0 --interval 60
+```
+
+#### Expiring Markets Scanner
+```bash
+# Find 98%+ certain outcomes expiring within 2 hours
+uv run python scan.py expiring --once
+
+# Continuous scanning with custom criteria
+uv run python scan.py expiring --min-price 95 --max-hours 24 --interval 60
+
+# Verbose mode to see what's being scanned
+uv run python scan.py expiring --once --verbose
 ```
 
 ## API Client
@@ -39,17 +53,15 @@ gamma.tags()                     # Available categories
 gamma.search(query)              # Search markets
 ```
 
-## Market Scanner
+## Trading Strategies
 
-The scanner finds trading opportunities by monitoring outcome probabilities:
+The scanner supports multiple trading strategies:
 
-```bash
-# Scan for low-probability outcomes (1-3%)
-uv run python scan.py --once
+### Volume Cliff Scanner
+Finds order book inefficiencies where thin ask levels are followed by thick levels. Buy at the thin levels and resell just below the cliff.
 
-# Run continuously
-uv run python scan.py --interval 30
-```
+### Expiring Markets Scanner
+Identifies high-certainty outcomes (98%+) on markets expiring soon (default: 2 hours). These offer quick, low-risk returns as "almost certain" outcomes resolve.
 
 See [strategies/README.md](strategies/README.md) for more details.
 
@@ -83,11 +95,11 @@ pmt/
 │   ├── gamma.py         # Gamma API client
 │   └── __init__.py      # Public exports
 ├── strategies/          # Trading strategies
-│   ├── scanner.py       # Market opportunity scanner
+│   ├── scanner.py       # Volume cliff scanner
+│   ├── expiring.py      # Expiring markets scanner
 │   └── README.md        # Strategy documentation
 ├── tests/               # Unit tests
-│   ├── test_models.py   # Model tests
-│   ├── test_formatting.py  # Formatting tests
+│   ├── test_models.py   # Business logic tests
 │   └── README.md        # Testing documentation
 ├── .github/workflows/   # CI/CD configuration
 ├── formatting.py        # Console output utilities
