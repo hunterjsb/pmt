@@ -29,5 +29,5 @@ PM_PASSPHRASE = os.getenv("PM_PASSPHRASE")
 PM_PRIVATE_KEY = os.getenv("PM_PRIVATE_KEY")  # Ethereum private key
 PM_FUNDER_ADDRESS = os.getenv("PM_FUNDER_ADDRESS")  # Ethereum wallet address
 PM_SIGNATURE_TYPE = int(
-    os.getenv("PM_SIGNATURE_TYPE", "0")
-)  # 0=EOA, 1=Poly Proxy, 2=EIP-1271
+    os.getenv("PM_SIGNATURE_TYPE", "1")
+)  # 0=EOA, 1=Poly Proxy (default, used by web UI), 2=EIP-1271
