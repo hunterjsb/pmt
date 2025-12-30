@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OpenOrderParams
+from py_clob_client.clob_types import MarketOrderArgs, OpenOrderParams, OrderArgs
 
 from .models import Market, OrderBook, OrderBookLevel, Token
 
@@ -128,15 +128,15 @@ class AuthenticatedClob:
             order_type: Order type - "GTC" (Good Til Cancelled), "FOK" (Fill or Kill), "GTD" (Good Til Date)
 
         Returns:
-            Order response from API
+            Signed order object
         """
-        return self._client.create_order(
+        order_args = OrderArgs(
             token_id=token_id,
             price=price,
             size=size,
             side=side,
-            order_type=order_type,
         )
+        return self._client.create_order(order_args)
 
     def post_order(
         self,
@@ -158,13 +158,13 @@ class AuthenticatedClob:
         Returns:
             Order response from API
         """
-        return self._client.create_and_post_order(
+        order_args = OrderArgs(
             token_id=token_id,
             price=price,
             size=size,
             side=side,
-            order_type=order_type,
         )
+        return self._client.create_and_post_order(order_args)
 
     def market_order(
         self,
@@ -182,11 +182,12 @@ class AuthenticatedClob:
         Returns:
             Order response from API
         """
-        return self._client.create_market_order(
+        order_args = MarketOrderArgs(
             token_id=token_id,
             amount=amount,
             side=side,
         )
+        return self._client.create_market_order(order_args)
 
     def trades(self):
         return self._client.get_trades()
