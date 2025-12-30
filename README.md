@@ -53,6 +53,26 @@ uv run python scan.py --interval 30
 
 See [strategies/README.md](strategies/README.md) for more details.
 
+## Testing
+
+Run the test suite:
+```bash
+# Run all tests
+uv run pytest
+
+# Run with verbose output
+uv run pytest -v
+
+# Run specific test file
+uv run pytest tests/test_models.py
+```
+
+See [tests/README.md](tests/README.md) for more details.
+
+## CI/CD
+
+GitHub Actions automatically runs tests on every push and pull request. See `.github/workflows/ci.yml` for configuration.
+
 ## Project Structure
 
 ```
@@ -65,6 +85,11 @@ pmt/
 ├── strategies/          # Trading strategies
 │   ├── scanner.py       # Market opportunity scanner
 │   └── README.md        # Strategy documentation
+├── tests/               # Unit tests
+│   ├── test_models.py   # Model tests
+│   ├── test_formatting.py  # Formatting tests
+│   └── README.md        # Testing documentation
+├── .github/workflows/   # CI/CD configuration
 ├── formatting.py        # Console output utilities
 ├── main.py              # Market viewer demo
 └── scan.py              # Scanner CLI
