@@ -18,35 +18,41 @@ class Gamma:
     def events(
         self,
         limit: int = 10,
+        offset: int = 0,
         closed: bool = False,
         order: str = "id",
         ascending: bool = False,
-    ) -> list[Event]:
+        end_date_min: str | None = None,
+        end_date_max: str | None = None,
+    ) -> list[dict]:
+        """Fetch events with their markets.
+
+        Returns raw dict data including nested markets with clobTokenIds.
+
+        Args:
+            limit: Maximum number of events to return
+            offset: Pagination offset
+            closed: Include closed events
+            order: Field to order by
+            ascending: Sort order
+            end_date_min: ISO 8601 datetime string for minimum end date
+            end_date_max: ISO 8601 datetime string for maximum end date
+        """
         params = {
             "order": order,
             "ascending": str(ascending).lower(),
             "closed": str(closed).lower(),
             "limit": limit,
+            "offset": offset,
         }
+        if end_date_min:
+            params["end_date_min"] = end_date_min
+        if end_date_max:
+            params["end_date_max"] = end_date_max
+
         response = requests.get(f"{self.host}/events", params=params, timeout=10)
         response.raise_for_status()
-        data = response.json()
-
-        events = []
-        for e in data:
-            liquidity = e.get("liquidity")
-            volume = e.get("volume")
-            events.append(
-                Event(
-                    title=e.get("title", "Unknown"),
-                    slug=e.get("slug", "N/A"),
-                    end_date=e.get("endDate"),
-                    liquidity=float(liquidity) if liquidity else None,
-                    volume=float(volume) if volume else None,
-                )
-            )
-
-        return events
+        return response.json()
 
     def event_by_slug(self, slug: str) -> Event:
         response = requests.get(f"{self.host}/events/slug/{slug}", timeout=10)
@@ -90,5 +96,39 @@ class Gamma:
     def search(self, query: str, limit: int = 10) -> list[dict]:
         params = {"query": query, "limit": limit}
         response = requests.get(f"{self.host}/search", params=params, timeout=10)
+        response.raise_for_status()
+        return response.json()
+
+    def series(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        closed: bool = False,
+        active: bool = True,
+    ) -> list[dict]:
+        """Fetch series markets.
+
+        Series contain recurring markets like sports games, crypto prices, etc.
+        Each series can contain multiple events and markets.
+
+        Args:
+            limit: Maximum number of series to return
+            offset: Offset for pagination
+            closed: Include closed series
+            active: Include only active series
+
+        Returns:
+            List of series data with nested events and markets
+        """
+        params = {
+            "limit": limit,
+            "offset": offset,
+        }
+        if not closed:
+            params["closed"] = "false"
+        if active:
+            params["active"] = "true"
+
+        response = requests.get(f"{self.host}/series", params=params, timeout=10)
         response.raise_for_status()
         return response.json()

@@ -197,13 +197,13 @@ def main() -> None:
                         opp.price_pct, opp.hours_until_expiry
                     )
 
-                    question = opp.market.question
+                    question = opp.question
                     if len(question) > 35:
                         question = question[:32] + "..."
 
                     table.add_row(
                         question,
-                        opp.token.outcome,
+                        opp.outcome,
                         f"{opp.price_pct:.2f}%",
                         f"{opp.hours_until_expiry:.1f}h",
                         f"{returns['max_return_pct']:.2f}%",
@@ -249,13 +249,13 @@ def main() -> None:
                                 opp.price_pct, opp.hours_until_expiry
                             )
 
-                            question = opp.market.question
+                            question = opp.question
                             if len(question) > 35:
                                 question = question[:32] + "..."
 
                             table.add_row(
                                 question,
-                                opp.token.outcome,
+                                opp.outcome,
                                 f"{opp.price_pct:.2f}%",
                                 f"{opp.hours_until_expiry:.1f}h",
                                 f"{returns['max_return_pct']:.2f}%",
