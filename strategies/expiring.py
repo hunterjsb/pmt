@@ -65,16 +65,21 @@ def find_expiring_opportunities(
 ) -> list[ExpiringOpportunity]:
     """Find high-certainty outcomes on markets expiring soon.
 
-    Strategy: Look for outcomes priced at min_price_pct%+ that expire in max_hours or less.
-    These are "almost certain" outcomes that will resolve soon, offering quick,
-    low-risk returns.
+    Strategy: Look for outcomes priced at min_price_pct%+ where the endDate (reference date)
+    has already passed or is passing soon. Markets resolve shortly after their endDate,
+    so we look for markets with endDate = today or recent past.
+
+    BUG FIX: endDate is the REFERENCE date for the outcome (e.g., "DJT market cap on Dec 31"),
+    not when trading stops. Markets with endDate in the FUTURE won't resolve until that date
+    passes. We need endDate <= now to find markets that will resolve soon.
 
     This implementation uses the Gamma /events endpoint which includes full market
     details with clobTokenIds, allowing us to scan ALL markets (not just sampling).
 
     Args:
         min_price_pct: Minimum outcome price percentage (default 98%)
-        max_hours: Maximum hours until expiry (default 2 hours)
+        max_hours: Maximum hours after endDate to consider (default 2 hours) - this gives
+                   a buffer for markets that just passed their endDate and are about to resolve
         max_events: Maximum number of events to fetch (default 2000)
 
     Returns:
@@ -90,9 +95,19 @@ def find_expiring_opportunities(
 
     print(f"Fetching events (max {max_events})...")
 
-    # Calculate max end date (now + max_hours)
-    max_end_date = now + timedelta(hours=max_hours)
+    # Look for markets with endDate around NOW (not far in past or future)
+    # - Markets with endDate in the recent past (last few hours) are resolving now
+    # - Markets with endDate = now or very soon will resolve shortly
+    # - Markets with endDate far in past have likely already resolved
+    # - Markets with endDate in future won't resolve until that date passes
+    # So we want: (now - 3h) <= endDate <= (now + max_hours)
+    min_end_date = now - timedelta(hours=3)  # Only recent past, not full 24h
+    max_end_date = now + timedelta(hours=max_hours)  # Small buffer
+
+    end_date_min_str = min_end_date.isoformat().replace("+00:00", "Z")
     end_date_max_str = max_end_date.isoformat().replace("+00:00", "Z")
+
+    print(f"Looking for markets with endDate between {end_date_min_str} and {end_date_max_str}")
 
     while events_fetched < max_events:
         try:
@@ -103,6 +118,7 @@ def find_expiring_opportunities(
                 closed=False,
                 order="endDate",
                 ascending=True,  # Get soonest expiring first
+                end_date_min=end_date_min_str,
                 end_date_max=end_date_max_str,
             )
 
@@ -149,8 +165,10 @@ def find_expiring_opportunities(
 
                     hours_left = hours_until(end_date)
 
-                    # Skip if expired or not expiring soon enough
-                    if hours_left < 0 or hours_left > max_hours:
+                    # With new logic: negative hours_left means endDate has passed (resolving now!)
+                    # Skip if endDate is too far in the past (already resolved) or too far in future
+                    # We want: -3h <= hours_left <= +max_hours (recently passed or about to pass)
+                    if hours_left < -3 or hours_left > max_hours:
                         continue
 
                     # Parse outcomes and token IDs
@@ -212,7 +230,7 @@ def calculate_max_return(price_pct: float, hours_left: float) -> dict:
 
     Args:
         price_pct: Current price percentage (e.g., 98.5)
-        hours_left: Hours until market expires
+        hours_left: Hours until market expires (negative means endDate has passed)
 
     Returns:
         Dictionary with return_pct, hourly_rate, and break_even info
@@ -221,7 +239,17 @@ def calculate_max_return(price_pct: float, hours_left: float) -> dict:
     max_return_pct = (100 - price_pct) / price_pct * 100
 
     # Hourly rate of return
-    hourly_rate = max_return_pct / hours_left if hours_left > 0 else 0
+    # If endDate has passed (hours_left < 0), estimate resolution in 1-2 hours
+    # If endDate is in future (hours_left > 0), use actual time
+    if hours_left < 0:
+        # endDate has passed, assume resolves within 1-2 hours
+        estimated_resolution_hours = abs(hours_left) + 1.5  # Past time + ~1.5h for resolution
+        hourly_rate = max_return_pct / estimated_resolution_hours
+    elif hours_left > 0:
+        hourly_rate = max_return_pct / hours_left
+    else:
+        # endDate is exactly now, assume resolves in 1 hour
+        hourly_rate = max_return_pct
 
     # How much the price can drop before we lose money
     break_even_drop = 100 - price_pct

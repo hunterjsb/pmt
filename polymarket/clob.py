@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OpenOrderParams, OrderArgs
+from py_clob_client.clob_types import MarketOrderArgs, OpenOrderParams, OrderArgs, OrderType
 
 from .models import Market, OrderBook, OrderBookLevel, Token
 
@@ -234,7 +234,10 @@ class AuthenticatedClob:
             amount=amount,
             side=side,
         )
-        return self._client.create_market_order(order_args)
+        # Create the signed order
+        signed_order = self._client.create_market_order(order_args)
+        # Post it to the exchange (FOK = Fill or Kill, executes immediately or cancels)
+        return self._client.post_order(signed_order, OrderType.FOK)
 
     def trades(self):
         return self._client.get_trades()
