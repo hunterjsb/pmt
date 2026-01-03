@@ -1,0 +1,38 @@
+name: Publish pmproxy client
+
+on:
+  push:
+    tags:
+      - 'pmproxy-v*'  # Trigger on tags like pmproxy-v0.1.0
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build tools
+        run: pip install build twine
+
+      - name: Build package
+        working-directory: proxy/client
+        run: python -m build
+
+      - name: Publish to GitHub Packages
+        working-directory: proxy/client
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          twine upload \
+            --repository-url https://upload.pypi.pkg.github.com/${{ github.repository_owner }} \
+            dist/*
