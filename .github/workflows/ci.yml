@@ -57,7 +57,9 @@ jobs:
 
       - name: Install pmproxy client
         working-directory: proxy/client
-        run: uv sync
+        run: |
+          uv venv
+          uv pip install -e ".[dev]" --index-url https://pypi.org/simple/
 
       - name: Run pmproxy client tests
         working-directory: proxy/client

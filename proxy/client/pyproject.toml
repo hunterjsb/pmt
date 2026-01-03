@@ -11,6 +11,11 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+[project.urls]
+Homepage = "https://github.com/hunterjsb/pmt"
+Repository = "https://github.com/hunterjsb/pmt/tree/master/proxy/client"
+Issues = "https://github.com/hunterjsb/pmt/issues"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
