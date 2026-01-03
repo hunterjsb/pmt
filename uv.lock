@@ -2,6 +2,12 @@ version = 1
 revision = 2
 requires-python = ">=3.14"
 
+[manifest]
+members = [
+    "pmproxy",
+    "pmt",
+]
+
 [[package]]
 name = "annotated-types"
 version = "0.7.0"
@@ -445,6 +451,28 @@ wheels = [
 ]
 
 [[package]]
+name = "pmproxy"
+version = "0.1.0"
+source = { editable = "proxy/client" }
+dependencies = [
+    { name = "httpx" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
+]
+provides-extras = ["dev"]
+
+[[package]]
 name = "pmt"
 version = "0.1.0"
 source = { virtual = "." }
@@ -625,6 +653,18 @@ dependencies = [
 sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pytest/9.0.2/pytest-9.0.2.tar.gz", hash = "sha256:75186651a92bd89611d1d9fc20f0b4345fd827c41ccd5c299a868a05d70edf11" }
 wheels = [
     { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pytest/9.0.2/pytest-9.0.2-py3-none-any.whl", hash = "sha256:711ffd45bf766d5264d487b917733b453d917afd2b0ad65223959f59089f875b" },
+]
+
+[[package]]
+name = "pytest-asyncio"
+version = "1.3.0"
+source = { registry = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/" }
+dependencies = [
+    { name = "pytest" },
+]
+sdist = { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pytest-asyncio/1.3.0/pytest_asyncio-1.3.0.tar.gz", hash = "sha256:d7f52f36d231b80ee124cd216ffb19369aa168fc10095013c6b014a34d3ee9e5" }
+wheels = [
+    { url = "https://gnosis-packages-310660289096.d.codeartifact.us-east-1.amazonaws.com/pypi/gnosis_packages_repo/simple/pytest-asyncio/1.3.0/pytest_asyncio-1.3.0-py3-none-any.whl", hash = "sha256:611e26147c7f77640e6d0a92a38ed17c3e9848063698d5c93d5aa7aa11cebff5" },
 ]
 
 [[package]]

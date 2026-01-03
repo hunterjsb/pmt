@@ -53,10 +53,17 @@ pub async fn proxy_handler(
     );
 
     // Determine upstream based on path prefix
-    let (upstream_base, upstream_path) = if let Some(rest) = path.strip_prefix("/clob/") {
+    // Handle both /clob and /clob/... patterns
+    let (upstream_base, upstream_path) = if path == "/clob" {
+        ("https://clob.polymarket.com", "")
+    } else if let Some(rest) = path.strip_prefix("/clob/") {
         ("https://clob.polymarket.com", rest)
+    } else if path == "/gamma" {
+        ("https://gamma-api.polymarket.com", "")
     } else if let Some(rest) = path.strip_prefix("/gamma/") {
         ("https://gamma-api.polymarket.com", rest)
+    } else if path == "/chain" {
+        ("https://polygon-rpc.com", "")
     } else if let Some(rest) = path.strip_prefix("/chain/") {
         ("https://polygon-rpc.com", rest)
     } else {
