@@ -3,14 +3,13 @@ name: Publish pmproxy client
 on:
   push:
     tags:
-      - 'pmproxy-v*'  # Trigger on tags like pmproxy-v0.1.0
+      - 'pmproxy-v*'
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -21,18 +20,21 @@ jobs:
           python-version: "3.13"
 
       - name: Install build tools
-        run: pip install build twine
+        run: pip install build
 
       - name: Build package
         working-directory: proxy/client
         run: python -m build
 
-      - name: Publish to GitHub Packages
-        working-directory: proxy/client
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          twine upload \
-            --repository-url https://upload.pypi.pkg.github.com/${{ github.repository_owner }} \
-            dist/*
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/pmproxy-}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: pmproxy ${{ steps.version.outputs.version }}
+          files: |
+            proxy/client/dist/*.whl
+            proxy/client/dist/*.tar.gz
+          generate_release_notes: true
