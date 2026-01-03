@@ -1,9 +1,8 @@
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderMap, StatusCode, Uri},
+    http::StatusCode,
     response::{IntoResponse, Response},
-    routing::any,
     Router,
 };
 use clap::Parser;
@@ -12,7 +11,10 @@ use tracing::{debug, error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser, Debug)]
-#[command(name = "pmproxy", about = "Simple HTTP reverse proxy for Polymarket APIs")]
+#[command(
+    name = "pmproxy",
+    about = "Simple HTTP reverse proxy for Polymarket APIs"
+)]
 struct Args {
     /// Host to bind to
     #[arg(short = 'H', long, default_value = "0.0.0.0")]
@@ -60,9 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(ProxyState { client });
 
     // Build router - catch all paths and forward
-    let app = Router::new()
-        .fallback(proxy_handler)
-        .with_state(state);
+    let app = Router::new().fallback(proxy_handler).with_state(state);
 
     let addr = format!("{}:{}", args.host, args.port);
     info!("pmproxy starting on http://{}", addr);
@@ -77,10 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn proxy_handler(
-    State(state): State<Arc<ProxyState>>,
-    req: Request,
-) -> impl IntoResponse {
+async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> impl IntoResponse {
     let uri = req.uri().clone();
     let method = req.method().clone();
     let headers = req.headers().clone();
@@ -88,7 +85,12 @@ async fn proxy_handler(
     let path = uri.path();
     let query = uri.query().unwrap_or("");
 
-    info!("Proxying {} {} {}", method, path, if query.is_empty() { "" } else { query });
+    info!(
+        "Proxying {} {} {}",
+        method,
+        path,
+        if query.is_empty() { "" } else { query }
+    );
 
     // Determine upstream based on path prefix
     let (upstream_base, upstream_path) = if let Some(rest) = path.strip_prefix("/clob/") {
@@ -168,7 +170,8 @@ async fn proxy_handler(
             && name_str != "proxy-authenticate"
             && name_str != "proxy-authorization"
             && name_str != "trailer"
-            && name_str != "upgrade" {
+            && name_str != "upgrade"
+        {
             response = response.header(name, value);
         }
     }
