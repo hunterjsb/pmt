@@ -18,12 +18,31 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Config
-clap = { version = "4", features = ["derive"] }
+# Config (EC2 only)
+clap = { version = "4", features = ["derive"], optional = true }
+
+# Lambda runtime
+lambda_http = { version = "0.14", optional = true }
+lambda_runtime = { version = "0.14", optional = true }
+
+[features]
+default = ["ec2"]
+ec2 = ["clap"]
+lambda = ["lambda_http", "lambda_runtime"]
+
+[lib]
+name = "pmproxy"
+path = "src/lib.rs"
 
 [[bin]]
 name = "pmproxy"
 path = "src/main.rs"
+required-features = ["ec2"]
+
+[[bin]]
+name = "pmproxy-lambda"
+path = "src/lambda.rs"
+required-features = ["lambda"]
 
 [profile.release]
 opt-level = 3

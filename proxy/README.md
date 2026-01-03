@@ -12,12 +12,24 @@ Python client → pmproxy → Polymarket APIs
 
 ## Build & Run
 
+**EC2/Server (for performance)**:
 ```bash
-cargo build --release
+cargo build --release --features ec2
 ./target/release/pmproxy
 ```
 
 Runs on `http://0.0.0.0:8080` by default.
+
+**Lambda (for cost-effective proxy)**:
+```bash
+# Cross-compile for Lambda (Amazon Linux 2023)
+cargo lambda build --release --features lambda --bin pmproxy-lambda
+
+# Deploy
+cargo lambda deploy pmproxy-lambda
+```
+
+See [Deploy](#deploy) section for full Lambda setup.
 
 ## Routes
 
@@ -59,19 +71,60 @@ requests.get("http://localhost:8080/gamma/events")
 
 ## Deploy
 
-**Docker**:
+### EC2 (eu-west-1 for performance)
+
+```bash
+# Build for Linux
+cargo build --release --features ec2 --target x86_64-unknown-linux-gnu
+
+# On EC2
+./pmproxy -p 8080
+```
+
+### Lambda (cost-effective, no performance requirements)
+
+Install [cargo-lambda](https://www.cargo-lambda.info/):
+```bash
+brew tap cargo-lambda/cargo-lambda
+brew install cargo-lambda
+```
+
+Build and deploy:
+```bash
+# Build for Lambda runtime
+cargo lambda build --release --features lambda --bin pmproxy-lambda
+
+# Deploy to eu-west-1 with Function URL
+cargo lambda deploy pmproxy-lambda \
+  --region eu-west-1 \
+  --enable-function-url
+
+# Or with API Gateway (more control over routing)
+# Use AWS SAM/CDK/Pulumi for production
+```
+
+Lambda considerations:
+- ~50-100ms cold start (Rust is fast)
+- Pay per request, not per hour
+- Function URL gives you `https://<id>.lambda-url.eu-west-1.on.aws`
+- Good for low-volume or bursty traffic
+
+### Docker
+
 ```bash
 docker build -t pmproxy .
 docker run -p 8080:8080 pmproxy
 ```
 
-**fly.io** (Amsterdam near you in NL):
+### fly.io
+
+Amsterdam (near NL):
 ```bash
 fly launch --name pmproxy --region ams
 fly deploy
 ```
 
-**Near Polymarket** (US-East for lowest order latency):
+Near Polymarket (US-East for lowest order latency):
 ```bash
 fly launch --name pmproxy --region iad
 ```
@@ -89,7 +142,14 @@ Options:
 
 ## Architecture
 
-**155 lines of Rust** - just routes requests and forwards responses. No parsing, no auth logic, no complexity.
+Simple Rust proxy - routes requests and forwards responses. No parsing, no auth logic, no complexity.
+
+```
+src/
+├── lib.rs      # Core proxy logic (shared)
+├── main.rs     # EC2 server binary (tokio)
+└── lambda.rs   # Lambda handler binary
+```
 
 Your Python client does all the auth signing. The proxy just passes headers/body through unchanged.
 
