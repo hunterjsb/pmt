@@ -123,6 +123,7 @@ gamma.search(query)              # Search markets
 ```
 
 ## Trading Strategies
+### :warning: WIP
 
 The scanner supports multiple trading strategies:
 
@@ -153,26 +154,3 @@ See [tests/README.md](tests/README.md) for more details.
 ## CI/CD
 
 GitHub Actions automatically runs tests on every push and pull request. See `.github/workflows/ci.yml` for configuration.
-
-## Project Structure
-
-```
-pmt/
-├── polymarket/          # API client modules
-│   ├── models.py        # Domain models (Market, Event, OrderBook, etc.)
-│   ├── clob.py          # CLOB API client
-│   ├── gamma.py         # Gamma API client
-│   └── __init__.py      # Public exports
-├── strategies/          # Trading strategies
-│   ├── scanner.py       # Volume cliff scanner
-│   ├── expiring.py      # Expiring markets scanner
-│   └── README.md        # Strategy documentation
-├── tests/               # Unit tests
-│   ├── test_models.py   # Business logic tests
-│   └── README.md        # Testing documentation
-├── .github/workflows/   # CI/CD configuration
-├── formatting.py        # Console output utilities
-├── main.py              # Market viewer demo
-├── scan.py              # Scanner CLI
-└── trade.py             # Interactive trading interface
-```
