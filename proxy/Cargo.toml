@@ -1,0 +1,32 @@
+[package]
+name = "pmproxy"
+version = "0.2.0"
+edition = "2021"
+description = "Simple HTTP reverse proxy for Polymarket APIs"
+
+[dependencies]
+# HTTP server
+axum = "0.8"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Config
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "pmproxy"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
