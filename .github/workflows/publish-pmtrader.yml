@@ -1,9 +1,9 @@
-name: Publish pmproxy client
+name: Publish pmtrader
 
 on:
   push:
     tags:
-      - 'pmproxy-v*'
+      - "pmtrader-v*"
 
 jobs:
   publish:
@@ -17,24 +17,24 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
 
       - name: Install build tools
         run: pip install build
 
       - name: Build package
-        working-directory: proxy/client
+        working-directory: pmtrader
         run: python -m build
 
       - name: Get version from tag
         id: version
-        run: echo "version=${GITHUB_REF#refs/tags/pmproxy-}" >> $GITHUB_OUTPUT
+        run: echo "version=${GITHUB_REF#refs/tags/pmtrader-}" >> $GITHUB_OUTPUT
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          name: pmproxy ${{ steps.version.outputs.version }}
+          name: pmtrader ${{ steps.version.outputs.version }}
           files: |
-            proxy/client/dist/*.whl
-            proxy/client/dist/*.tar.gz
+            pmtrader/dist/*.whl
+            pmtrader/dist/*.tar.gz
           generate_release_notes: true

@@ -1,0 +1,55 @@
+"""Tests for proxy connectivity."""
+
+import os
+
+import pytest
+import requests
+
+PROXY_URL = os.environ.get("PMPROXY_URL", "").rstrip("/")
+
+
+@pytest.mark.skipif(not PROXY_URL, reason="PMPROXY_URL not set")
+class TestProxy:
+    """Test API calls through the proxy."""
+
+    def test_clob_ok(self):
+        """CLOB health check through proxy."""
+        resp = requests.get(f"{PROXY_URL}/clob/", timeout=10)
+        assert resp.status_code == 200
+        assert resp.json() == "OK"
+
+    def test_clob_sampling_markets(self):
+        """Fetch sampling markets through proxy."""
+        resp = requests.get(f"{PROXY_URL}/clob/sampling-markets", timeout=10)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "data" in data
+        assert len(data["data"]) > 0
+        # Check market structure
+        market = data["data"][0]
+        assert "tokens" in market
+        assert "question" in market
+
+    def test_gamma_events(self):
+        """Fetch events through proxy."""
+        resp = requests.get(
+            f"{PROXY_URL}/gamma/events", params={"limit": 3}, timeout=10
+        )
+        assert resp.status_code == 200
+        events = resp.json()
+        assert len(events) > 0
+        assert "title" in events[0]
+
+    def test_chain_block_number(self):
+        """RPC call through proxy."""
+        resp = requests.post(
+            f"{PROXY_URL}/chain",
+            json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
+            timeout=10,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "result" in data
+        # Block number should be a hex string
+        block = int(data["result"], 16)
+        assert block > 50_000_000  # Polygon is well past this

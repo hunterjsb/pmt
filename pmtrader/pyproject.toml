@@ -1,0 +1,28 @@
+[project]
+name = "pmtrader"
+version = "0.1.0"
+description = "Polymarket trading client with CLI and Streamlit UI"
+requires-python = ">=3.14"
+dependencies = [
+    "py-clob-client>=0.34.1",
+    "python-dotenv>=1.2.1",
+    "rich>=14.2.0",
+    "streamlit>=1.45.0",
+    "plotly>=5.18.0",
+    "pandas>=2.0.0",
+]
+
+[project.scripts]
+pmtrader-ui = "polymarket.ui.app:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["polymarket*"]

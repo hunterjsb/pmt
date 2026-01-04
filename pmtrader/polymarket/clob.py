@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OpenOrderParams, OrderArgs, OrderType
+from py_clob_client.clob_types import (
+    MarketOrderArgs,
+    OpenOrderParams,
+    OrderArgs,
+    OrderType,
+)
 
 from .models import Market, OrderBook, OrderBookLevel, Token
 
@@ -61,6 +67,36 @@ USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CTF_CONTRACT = (
     "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # Conditional Tokens (ERC-1155)
 )
+GAMMA_HOST = "https://gamma-api.polymarket.com"
+
+
+def get_proxy_url() -> str:
+    """Get proxy URL from environment (read at runtime)."""
+    return os.environ.get("PMPROXY_URL", "")
+
+
+def get_clob_host(proxy: bool = False) -> str:
+    """Get the CLOB host URL, optionally routing through proxy."""
+    proxy_url = get_proxy_url()
+    if proxy and proxy_url:
+        return f"{proxy_url.rstrip('/')}/clob"
+    return CLOB_HOST
+
+
+def get_gamma_host(proxy: bool = False) -> str:
+    """Get the Gamma host URL, optionally routing through proxy."""
+    proxy_url = get_proxy_url()
+    if proxy and proxy_url:
+        return f"{proxy_url.rstrip('/')}/gamma"
+    return GAMMA_HOST
+
+
+def get_chain_host(proxy: bool = False) -> str:
+    """Get the Chain/RPC host URL, optionally routing through proxy."""
+    proxy_url = get_proxy_url()
+    if proxy and proxy_url:
+        return f"{proxy_url.rstrip('/')}/chain"
+    return POLYGON_RPC
 
 
 class Clob:

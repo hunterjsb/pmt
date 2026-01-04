@@ -10,7 +10,11 @@ from .clob import (
     AuthenticatedClob,
     Clob,
     create_authenticated_clob,
+    get_chain_host,
+    get_clob_host,
+    get_gamma_host,
     get_order_book_depth,
+    get_proxy_url,
 )
 from .gamma import Gamma
 from .models import Event, Market, OrderBook, OrderBookLevel, Token
@@ -29,6 +33,11 @@ __all__ = [
     "create_authenticated_clob",
     # Utilities
     "get_order_book_depth",
+    # Proxy helpers
+    "get_proxy_url",
+    "get_clob_host",
+    "get_gamma_host",
+    "get_chain_host",
 ]
 
 # Singleton instances for convenience
