@@ -1,6 +1,6 @@
 [package]
 name = "pmproxy"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Simple HTTP reverse proxy for Polymarket APIs"
 
@@ -9,7 +9,7 @@ description = "Simple HTTP reverse proxy for Polymarket APIs"
 axum = "0.8"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
