@@ -98,10 +98,26 @@ pub async fn proxy_handler(
     let mut upstream_req = state.client.request(method.clone(), &upstream_url);
 
     // Forward all headers except Host (reqwest sets it automatically)
+    // Note: axum/hyper lowercases header names, but Polymarket's L1 auth
+    // requires specific casing for POLY_* headers
     for (name, value) in headers.iter() {
-        if name != "host" {
-            upstream_req = upstream_req.header(name, value);
+        let name_str = name.as_str();
+        if name_str == "host" {
+            continue;
         }
+
+        // Restore original casing for POLY_* headers
+        let header_name = match name_str {
+            "poly_address" => "POLY_ADDRESS",
+            "poly_signature" => "POLY_SIGNATURE",
+            "poly_timestamp" => "POLY_TIMESTAMP",
+            "poly_nonce" => "POLY_NONCE",
+            "poly_api_key" => "POLY_API_KEY",
+            "poly_passphrase" => "POLY_PASSPHRASE",
+            _ => name_str,
+        };
+
+        upstream_req = upstream_req.header(header_name, value);
     }
 
     // Forward body if present

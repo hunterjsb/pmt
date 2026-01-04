@@ -1,9 +1,13 @@
 """Main Streamlit application entry point."""
 
+import os
 import sys
 
 import streamlit as st
+from dotenv import load_dotenv
 from streamlit.web import cli as stcli
+
+load_dotenv()
 
 
 def run_app():
@@ -28,18 +32,21 @@ def run_app():
     st.sidebar.markdown("---")
 
     # Connection settings in sidebar
+    proxy_url = os.environ.get("PMPROXY_URL", "")
     with st.sidebar.expander("⚙️ Settings", expanded=False):
-        use_proxy = st.checkbox("Use Proxy", value=False)
-        proxy_url = st.text_input(
-            "Proxy URL",
-            value="http://localhost:8080",
-            disabled=not use_proxy,
-        )
-        st.caption("Set PMPROXY_URL env var or configure here")
+        if proxy_url:
+            st.success(f"Proxy: {proxy_url}")
+            use_proxy = st.checkbox("Use Proxy", value=True)
+        else:
+            st.warning("PMPROXY_URL not set")
+            use_proxy = False
 
-    # Store settings in session state
+    # Store settings in session state - clear client cache if setting changed
+    if st.session_state.get("use_proxy") != use_proxy:
+        st.session_state.pop("client", None)
+        st.session_state.pop("gamma", None)
+        st.session_state.pop("clob", None)
     st.session_state["use_proxy"] = use_proxy
-    st.session_state["proxy_url"] = proxy_url
 
     # Render selected page
     if page == "🏦 Broker":

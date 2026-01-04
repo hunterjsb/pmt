@@ -188,6 +188,7 @@ class AuthenticatedClob:
         proxy: bool = False,
     ) -> None:
         self.host = host or get_clob_host(proxy)
+        print(f"DEBUG AuthenticatedClob: proxy={proxy}, host={self.host}")
         self._funder = funder_address
         self._rpc = polygon_rpc or get_chain_host(proxy)
 
@@ -419,7 +420,7 @@ def create_authenticated_clob(*, proxy: bool = False) -> AuthenticatedClob | Non
     - PM_PRIVATE_KEY
     - PM_FUNDER_ADDRESS
     Optional:
-    - PM_SIGNATURE_TYPE (default 0)
+    - PM_SIGNATURE_TYPE (default 1)
     - PMPROXY_URL (for proxy support)
 
     Args:
