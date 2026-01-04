@@ -283,9 +283,10 @@ def render_trading_page():
     col2.metric("Volume", f"${float(volume or 0):,.0f}")
     col3.metric("Status", "Open" if market.get("active") else "Closed")
 
-    # Parse tokens
+    # Parse tokens, outcomes, and prices
     tokens = market.get("clobTokenIds") or market.get("tokens", [])
     outcomes = market.get("outcomes", ["Yes", "No"])
+    outcome_prices = market.get("outcomePrices", [])
 
     if isinstance(tokens, str):
         try:
@@ -297,6 +298,11 @@ def render_trading_page():
             outcomes = json.loads(outcomes)
         except json.JSONDecodeError:
             outcomes = ["Yes", "No"]
+    if isinstance(outcome_prices, str):
+        try:
+            outcome_prices = json.loads(outcome_prices)
+        except json.JSONDecodeError:
+            outcome_prices = []
 
     if not tokens:
         st.warning("No tradeable tokens found for this market")
@@ -320,6 +326,17 @@ def render_trading_page():
         else tokens[selected_idx].get("token_id")
     )
     outcome_name = outcomes[selected_idx] if selected_idx < len(outcomes) else "Yes"
+
+    # Display implied probabilities for all outcomes
+    st.markdown("---")
+    st.write("**Implied Probabilities**")
+    prob_cols = st.columns(len(outcomes))
+    for i, (outcome, col) in enumerate(zip(outcomes, prob_cols)):
+        if i < len(outcome_prices):
+            prob = float(outcome_prices[i]) * 100
+            col.metric(outcome, f"{prob:.1f}%")
+        else:
+            col.metric(outcome, "N/A")
 
     st.markdown("---")
 

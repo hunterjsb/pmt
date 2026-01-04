@@ -45,15 +45,24 @@ def get_order_book_depth(
 
     data = response.json()
 
-    # Parse bids and asks
-    bids = [
-        OrderBookLevel(float(b["price"]), float(b["size"]))
-        for b in data.get("bids", [])
-    ]
-    asks = [
-        OrderBookLevel(float(a["price"]), float(a["size"]))
-        for a in data.get("asks", [])
-    ]
+    # Parse bids and asks, sorted for display
+    # Bids: highest price first (best bid at top)
+    # Asks: lowest price first (best ask at top)
+    bids = sorted(
+        [
+            OrderBookLevel(float(b["price"]), float(b["size"]))
+            for b in data.get("bids", [])
+        ],
+        key=lambda x: x.price,
+        reverse=True,
+    )
+    asks = sorted(
+        [
+            OrderBookLevel(float(a["price"]), float(a["size"]))
+            for a in data.get("asks", [])
+        ],
+        key=lambda x: x.price,
+    )
 
     return OrderBook(name="Token", bids=bids, asks=asks)
 
