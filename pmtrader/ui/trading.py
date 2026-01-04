@@ -15,9 +15,9 @@ from polymarket import (
 def get_client() -> AuthenticatedClob | None:
     """Get or create authenticated client from session state."""
     if "client" not in st.session_state:
-        use_proxy = st.session_state.get("use_proxy", False)
-        st.write(f"DEBUG: Creating client with proxy={use_proxy}")
-        st.session_state["client"] = create_authenticated_clob(proxy=use_proxy)
+        st.session_state["client"] = create_authenticated_clob(
+            proxy=st.session_state.get("use_proxy", False)
+        )
     return st.session_state["client"]
 
 

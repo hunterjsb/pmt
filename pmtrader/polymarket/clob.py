@@ -188,7 +188,6 @@ class AuthenticatedClob:
         proxy: bool = False,
     ) -> None:
         self.host = host or get_clob_host(proxy)
-        print(f"DEBUG AuthenticatedClob: proxy={proxy}, host={self.host}")
         self._funder = funder_address
         self._rpc = polygon_rpc or get_chain_host(proxy)
 
