@@ -39,15 +39,31 @@ def parse_market_query(query: str) -> dict | None:
 
         parsed = urlparse(query)
         path = parsed.path.rstrip("/")
-        slug = path.split("/")[-1] if path else query
+        parts = path.split("/")
 
         if "/event/" in path:
             import requests
 
-            r = requests.get(f"https://gamma-api.polymarket.com/events/slug/{slug}")
+            # URL format: /event/{event_slug} or /event/{event_slug}/{market_slug}
+            event_slug = parts[2] if len(parts) > 2 else None
+            market_slug = parts[3] if len(parts) > 3 else None
+
+            if not event_slug:
+                return None
+
+            r = requests.get(
+                f"https://gamma-api.polymarket.com/events/slug/{event_slug}"
+            )
             if r.ok:
-                return {"type": "event", "data": r.json()}
+                event_data = r.json()
+                # If market_slug provided, find and select that specific market
+                if market_slug:
+                    for m in event_data.get("markets", []):
+                        if m.get("slug") == market_slug:
+                            return {"type": "market", "data": m}
+                return {"type": "event", "data": event_data}
         else:
+            slug = parts[-1] if parts else query
             try:
                 return {"type": "market", "data": gamma.market_by_slug(slug)}
             except Exception:
