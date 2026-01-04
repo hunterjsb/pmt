@@ -7,10 +7,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  AWS_REGION: eu-west-1
 
 jobs:
-  release:
-    name: Release
+  build:
+    name: Build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -36,6 +37,12 @@ jobs:
           cross build --release --target aarch64-unknown-linux-gnu --features ec2
           tar -czvf pmproxy-aarch64-unknown-linux-gnu.tar.gz -C target/aarch64-unknown-linux-gnu/release pmproxy
 
+      - name: Upload x86_64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmproxy-x86_64
+          path: pmproxy/target/x86_64-unknown-linux-gnu/release/pmproxy
+
       - name: Get version from tag
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/pmproxy-}" >> $GITHUB_OUTPUT
@@ -46,3 +53,57 @@ jobs:
           name: pmproxy ${{ steps.version.outputs.version }}
           files: pmproxy/pmproxy-*.tar.gz
           generate_release_notes: true
+
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pmproxy-x86_64
+          path: bundle/
+
+      - name: Prepare deployment bundle
+        run: |
+          mkdir -p bundle/scripts
+          cp pmproxy/appspec.yml bundle/
+          cp pmproxy/scripts/*.sh bundle/scripts/
+          chmod +x bundle/scripts/*.sh
+          cd bundle && zip -r ../pmproxy-deploy.zip .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp pmproxy-deploy.zip s3://pmproxy-deployments/${{ github.ref_name }}/pmproxy-deploy.zip
+
+      - name: Trigger CodeDeploy
+        id: deploy
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name pmproxy \
+            --deployment-group-name production \
+            --s3-location bucket=pmproxy-deployments,key=${{ github.ref_name }}/pmproxy-deploy.zip,bundleType=zip \
+            --query 'deploymentId' --output text)
+          echo "Deployment started: $DEPLOYMENT_ID"
+          echo "deployment_id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for deployment
+        run: |
+          aws deploy wait deployment-successful --deployment-id ${{ steps.deploy.outputs.deployment_id }} || true
+          STATUS=$(aws deploy get-deployment --deployment-id ${{ steps.deploy.outputs.deployment_id }} --query 'deploymentInfo.status' --output text)
+          echo "Deployment status: $STATUS"
+          if [ "$STATUS" != "Succeeded" ]; then
+            echo "Deployment failed or timed out"
+            exit 1
+          fi
