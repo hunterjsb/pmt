@@ -65,46 +65,62 @@ def parse_market_query(query: str) -> dict | None:
     return None
 
 
-def render_market_selector():
-    """Render market search/selection in sidebar."""
-    st.sidebar.subheader("🔍 Find Market")
+def render_market_search():
+    """Render market search in main pane."""
+    with st.form("market_search_form"):
+        query = st.text_input(
+            "Find Market",
+            placeholder="Paste URL, slug, or search term",
+            key="market_query",
+        )
+        submitted = st.form_submit_button("🔍 Search", use_container_width=True)
 
-    query = st.sidebar.text_input(
-        "Search",
-        placeholder="URL, slug, or search term",
-        key="market_query",
-    )
-
-    if not query:
+    if not submitted or not query:
+        # Show cached results if available
+        if "search_result" in st.session_state and st.session_state["search_result"]:
+            render_search_results(st.session_state["search_result"])
         return
 
-    result = parse_market_query(query)
+    with st.spinner("Searching..."):
+        result = parse_market_query(query)
+        st.session_state["search_result"] = result
 
-    if not result:
-        st.sidebar.error("Market not found")
-        return
+    if result:
+        render_search_results(result)
+    else:
+        st.error("Market not found")
 
+
+def render_search_results(result: dict):
+    """Render search results for selection."""
     if result["type"] == "event":
         event = result["data"]
         markets = event.get("markets", [])
-        st.sidebar.write(f"**{event.get('title', 'Event')}**")
+        st.write(f"**{event.get('title', 'Event')}**")
 
+        cols = st.columns(min(len(markets), 3))
         for i, m in enumerate(markets):
-            question = m.get("question", f"Market {i}")[:50]
-            if st.sidebar.button(question, key=f"event_market_{i}"):
-                st.session_state["selected_market"] = m
-                st.rerun()
+            question = m.get("question", f"Market {i}")[:60]
+            with cols[i % 3]:
+                if st.button(
+                    question, key=f"event_market_{i}", use_container_width=True
+                ):
+                    st.session_state["selected_market"] = m
+                    st.session_state["search_result"] = None
+                    st.rerun()
 
     elif result["type"] == "market":
         st.session_state["selected_market"] = result["data"]
+        st.session_state["search_result"] = None
         st.rerun()
 
     elif result["type"] == "search":
-        st.sidebar.write("**Search Results:**")
+        st.write("**Search Results:**")
         for i, m in enumerate(result["data"][:10]):
-            question = m.get("question", f"Market {i}")[:50]
-            if st.sidebar.button(question, key=f"search_{i}"):
+            question = m.get("question", f"Market {i}")[:60]
+            if st.button(question, key=f"search_{i}", use_container_width=True):
                 st.session_state["selected_market"] = m
+                st.session_state["search_result"] = None
                 st.rerun()
 
 
@@ -262,15 +278,19 @@ def render_trading_page():
     """Main trading page entry point."""
     st.title("📈 Trading")
 
-    # Market selector in sidebar
-    render_market_selector()
-
     # Check if we have a selected market
     market = st.session_state.get("selected_market")
 
     if not market:
-        st.info("👈 Search for a market in the sidebar to start trading")
+        render_market_search()
         return
+
+    # Show current market with option to change
+    col1, col2 = st.columns([4, 1])
+    with col2:
+        if st.button("🔄 Change Market"):
+            st.session_state.pop("selected_market", None)
+            st.rerun()
 
     # Market header
     st.subheader(market.get("question", "Unknown Market"))
