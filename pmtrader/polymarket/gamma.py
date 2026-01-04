@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import requests
 
 from .models import Event
@@ -9,11 +11,24 @@ from .models import Event
 GAMMA_HOST = "https://gamma-api.polymarket.com"
 
 
+def get_proxy_url() -> str:
+    """Get proxy URL from environment (read at runtime)."""
+    return os.environ.get("PMPROXY_URL", "")
+
+
+def get_gamma_host(proxy: bool = False) -> str:
+    """Get the Gamma host URL, optionally routing through proxy."""
+    proxy_url = get_proxy_url()
+    if proxy and proxy_url:
+        return f"{proxy_url.rstrip('/')}/gamma"
+    return GAMMA_HOST
+
+
 class Gamma:
     """Client for the Polymarket Gamma API (market metadata)."""
 
-    def __init__(self, host: str = GAMMA_HOST) -> None:
-        self.host = host
+    def __init__(self, host: str | None = None, *, proxy: bool = False) -> None:
+        self.host = host or get_gamma_host(proxy)
 
     def events(
         self,
@@ -120,7 +135,7 @@ class Gamma:
         Returns:
             List of series data with nested events and markets
         """
-        params = {
+        params: dict[str, str | int] = {
             "limit": limit,
             "offset": offset,
         }

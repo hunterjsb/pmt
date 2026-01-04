@@ -21,7 +21,7 @@ def run_app():
 
     page = st.sidebar.radio(
         "Navigation",
-        ["🏦 Broker", "🔍 Scanner", "🤖 Bot"],
+        ["🏦 Broker", "📈 Trading", "🔍 Scanner", "🤖 Bot"],
         label_visibility="collapsed",
     )
 
@@ -46,6 +46,10 @@ def run_app():
         from ui.broker import render_broker_page
 
         render_broker_page()
+    elif page == "📈 Trading":
+        from ui.trading import render_trading_page
+
+        render_trading_page()
     elif page == "🔍 Scanner":
         st.title("🔍 Scanner")
         st.info("Scanner page coming soon...")
