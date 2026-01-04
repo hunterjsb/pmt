@@ -2,7 +2,13 @@
 
 import streamlit as st
 
-from polymarket import AuthenticatedClob, Clob, Gamma, create_authenticated_clob
+from polymarket import (
+    AuthenticatedClob,
+    Clob,
+    Gamma,
+    create_authenticated_clob,
+    get_order_book_depth,
+)
 
 
 def get_client() -> AuthenticatedClob | None:
@@ -279,7 +285,6 @@ def render_market_trading(market: dict):
 
 def render_order_book(token_id: str, outcome: str):
     """Render order book visualization."""
-    from polymarket import get_order_book_depth
 
     st.write(f"**📖 Order Book: {outcome}**")
 

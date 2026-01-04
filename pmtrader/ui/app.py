@@ -43,7 +43,7 @@ def run_app():
 
     # Render selected page
     if page == "🏦 Broker":
-        from polymarket.ui.broker import render_broker_page
+        from ui.broker import render_broker_page
 
         render_broker_page()
     elif page == "🔍 Scanner":

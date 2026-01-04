@@ -102,9 +102,9 @@ def get_chain_host(proxy: bool = False) -> str:
 class Clob:
     """Read-only client for the Polymarket CLOB (Central Limit Order Book) API."""
 
-    def __init__(self, host: str = CLOB_HOST) -> None:
-        self.host = host
-        self._client = ClobClient(host)
+    def __init__(self, host: str | None = None, *, proxy: bool = False) -> None:
+        self.host = host or get_clob_host(proxy)
+        self._client = ClobClient(self.host)
 
     def ok(self):
         return self._client.get_ok()
@@ -172,16 +172,18 @@ class AuthenticatedClob:
         private_key: str,
         funder_address: str,
         signature_type: int = 0,
-        host: str = CLOB_HOST,
+        host: str | None = None,
         chain_id: int = CHAIN_ID,
-        polygon_rpc: str = POLYGON_RPC,
+        polygon_rpc: str | None = None,
+        *,
+        proxy: bool = False,
     ) -> None:
-        self.host = host
+        self.host = host or get_clob_host(proxy)
         self._funder = funder_address
-        self._rpc = polygon_rpc
+        self._rpc = polygon_rpc or get_chain_host(proxy)
 
         self._client = ClobClient(
-            host,
+            self.host,
             key=private_key,
             chain_id=chain_id,
             signature_type=signature_type,
@@ -401,7 +403,7 @@ class AuthenticatedClob:
         return positions
 
 
-def create_authenticated_clob() -> AuthenticatedClob | None:
+def create_authenticated_clob(*, proxy: bool = False) -> AuthenticatedClob | None:
     """Create an authenticated client from environment variables.
 
     Requires:
@@ -409,14 +411,25 @@ def create_authenticated_clob() -> AuthenticatedClob | None:
     - PM_FUNDER_ADDRESS
     Optional:
     - PM_SIGNATURE_TYPE (default 0)
-    """
-    from env import PM_FUNDER_ADDRESS, PM_PRIVATE_KEY, PM_SIGNATURE_TYPE
+    - PMPROXY_URL (for proxy support)
 
-    if not PM_PRIVATE_KEY or not PM_FUNDER_ADDRESS:
+    Args:
+        proxy: If True, route requests through proxy (requires PMPROXY_URL env var)
+    """
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    private_key = os.environ.get("PM_PRIVATE_KEY")
+    funder_address = os.environ.get("PM_FUNDER_ADDRESS")
+    signature_type = int(os.environ.get("PM_SIGNATURE_TYPE", "1"))
+
+    if not private_key or not funder_address:
         return None
 
     return AuthenticatedClob(
-        private_key=PM_PRIVATE_KEY,
-        funder_address=PM_FUNDER_ADDRESS,
-        signature_type=PM_SIGNATURE_TYPE,
+        private_key=private_key,
+        funder_address=funder_address,
+        signature_type=signature_type,
+        proxy=proxy,
     )
