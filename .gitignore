@@ -208,3 +208,6 @@ __marimo__/
 
 # Sandbox - temporary test scripts
 sandbox/
+
+# Infrastructure secrets (SSH keys, deploy scripts)
+.infra/
