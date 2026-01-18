@@ -8,6 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   AWS_REGION: eu-west-1
+  # Use cmake builder to avoid GCC memcmp bug in aws-lc-sys
+  AWS_LC_SYS_CMAKE_BUILDER: 1
 
 jobs:
   build:
@@ -27,12 +29,16 @@ jobs:
 
       - name: Build Linux x86_64
         working-directory: pmengine
+        env:
+          CROSS_CONTAINER_OPTS: "-e AWS_LC_SYS_CMAKE_BUILDER=1"
         run: |
           cross build --release --target x86_64-unknown-linux-gnu --features ec2
           tar -czvf pmengine-x86_64-unknown-linux-gnu.tar.gz -C target/x86_64-unknown-linux-gnu/release pmengine
 
       - name: Build Linux aarch64
         working-directory: pmengine
+        env:
+          CROSS_CONTAINER_OPTS: "-e AWS_LC_SYS_CMAKE_BUILDER=1"
         run: |
           cross build --release --target aarch64-unknown-linux-gnu --features ec2
           tar -czvf pmengine-aarch64-unknown-linux-gnu.tar.gz -C target/aarch64-unknown-linux-gnu/release pmengine
