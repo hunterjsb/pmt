@@ -1,6 +1,6 @@
 use clap::Parser;
 use pmengine::{Config, Engine};
-use pmengine::strategies::OrderTest;
+use pmengine::strategies::{OrderTest, SpreadWatcher};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -21,6 +21,10 @@ struct Args {
     /// Run the order test strategy (places and cancels a small order)
     #[arg(long)]
     test_order: bool,
+
+    /// Run the spread watcher strategy
+    #[arg(long)]
+    spread_watcher: bool,
 }
 
 #[tokio::main]
@@ -62,6 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.test_order {
         info!("Running order test strategy");
         engine.register_strategy(Box::new(OrderTest::new()));
+    }
+    if args.spread_watcher {
+        info!("Running spread watcher strategy");
+        engine.register_strategy(Box::new(SpreadWatcher::new()));
     }
 
     // Run the main event loop

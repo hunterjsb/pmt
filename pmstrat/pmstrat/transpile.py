@@ -360,9 +360,9 @@ impl Strategy for {self.struct_name} {{
         return ops.get(type(op), "==")
 
     def _gen_boolop(self, expr: ast.BoolOp) -> str:
-        op = "&&" if isinstance(expr.op, ast.And) else "||"
+        op_str = " && " if isinstance(expr.op, ast.And) else " || "
         values = [self._gen_expr(v) for v in expr.values]
-        return f"({' {op} '.join(values)})"
+        return f"({op_str.join(values)})"
 
     def _gen_binop_expr(self, expr: ast.BinOp) -> str:
         left = self._gen_expr(expr.left)

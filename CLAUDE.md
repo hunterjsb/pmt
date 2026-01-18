@@ -93,13 +93,15 @@ PMPROXY_URL=http://localhost:8080  # Optional
 
 ### pmengine
 ```
-PMENGINE_PRIVATE_KEY or PRIVATE_KEY  # Required
-PMENGINE_CLOB_URL (default: https://clob.polymarket.com)
-PMENGINE_WS_URL (default: wss://ws-subscriptions-clob.polymarket.com)
+PMENGINE_PRIVATE_KEY or PM_PRIVATE_KEY or PRIVATE_KEY  # Required (checked in order)
+PMENGINE_FUNDER_ADDRESS or PM_FUNDER_ADDRESS  # Optional proxy wallet
+PMENGINE_CLOB_URL (default: https://clob.polymarket.com/)
+PMENGINE_WS_URL (default: wss://ws-subscriptions-clob.polymarket.com/ws)
 PMENGINE_MAX_POSITION_SIZE (default: 1000)
 PMENGINE_MAX_TOTAL_EXPOSURE (default: 5000)
 PMENGINE_TICK_INTERVAL_MS (default: 1000)
 PMENGINE_LOG_LEVEL or RUST_LOG (default: info)
+PM_SIGNATURE_TYPE or PMENGINE_SIGNATURE_TYPE (default: 0)  # 0=EOA, 1=PolyProxy, 2=GnosisSafe
 ```
 
 ## Key Files

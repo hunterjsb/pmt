@@ -32,6 +32,18 @@ Currently testing the core business logic:
   - `test_volume_cliff_detection()` - Verifies we correctly identify volume cliffs (thin levels followed by thick levels)
   - `test_no_cliff_when_gradual()` - Ensures gradual volume increases don't trigger false positives
   - `test_order_book_spread()` - Validates order book bid/ask spread calculations
+  - `test_parse_end_date()` - Tests parsing of market end dates
+  - `test_hours_until_calculation()` - Tests time-until-expiry calculations
+  - `test_max_return_calculation()` - Tests return calculations for expiring markets
+
+- **`test_order_book_depth.py`** - Tests for full order book depth retrieval
+  - `test_order_book_depth_returns_all_levels()` - Verifies all price levels are returned
+  - `test_order_book_has_liquidity_depth()` - Tests liquidity depth calculations
+  - `test_live_api_call()` - Integration test against live API
+  - `test_multiple_ask_levels()` - Tests handling of multiple ask levels
+  - `test_raw_api_response_structure()` - Validates raw API response parsing
+
+- **`test_proxy.py`** - Tests for proxy URL handling and routing
 
 ## Writing New Tests
 
