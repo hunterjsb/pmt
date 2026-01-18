@@ -65,11 +65,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register strategies
     if args.test_order {
         info!("Running order test strategy");
-        engine.register_strategy(Box::new(OrderTest::new()));
+        engine.register_strategy(Box::new(OrderTest::new())).await;
     }
     if args.spread_watcher {
         info!("Running spread watcher strategy");
-        engine.register_strategy(Box::new(SpreadWatcher::new()));
+        engine.register_strategy(Box::new(SpreadWatcher::new())).await;
     }
 
     // Run the main event loop

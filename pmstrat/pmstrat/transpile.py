@@ -41,8 +41,10 @@ class RustCodeGen:
     OPTION_EXPRESSIONS = {
         "ctx.book", "ctx.position", "ctx.mid",
     }
-    # Attributes on OrderBook that are Option<Decimal>
-    OPTION_BOOK_ATTRS = {"best_bid", "best_ask", "mid_price"}
+    # Attributes on OrderBook that are Option<&Level> (method calls that need .price extraction)
+    OPTION_LEVEL_ATTRS = {"best_bid", "best_ask"}
+    # Attributes on OrderBook that are Option<Decimal> (method calls)
+    OPTION_DECIMAL_ATTRS = {"mid_price", "spread", "spread_bps", "imbalance"}
 
     def __init__(self, meta: StrategyMeta):
         self.meta = meta
@@ -299,7 +301,7 @@ impl Strategy for {self.struct_name} {{
         # Check that left side is an attribute access to an Option field
         if not isinstance(test.left, ast.Attribute):
             return False
-        if test.left.attr not in self.OPTION_BOOK_ATTRS:
+        if test.left.attr not in (self.OPTION_LEVEL_ATTRS | self.OPTION_DECIMAL_ATTRS):
             return False
 
         return True
@@ -347,11 +349,22 @@ impl Strategy for {self.struct_name} {{
 
     def _gen_match_unwrap(self, node: MatchUnwrap) -> str:
         """Generate a match expression that unwraps an Option or returns early."""
-        option_expr = self._gen_expr(node.option_expr)
         return_expr = self._gen_expr(node.return_value)
 
+        # Check if this is a Level attribute (best_bid, best_ask) that needs .price extraction
+        is_level_attr = False
+        if isinstance(node.option_expr, ast.Attribute):
+            if node.option_expr.attr in self.OPTION_LEVEL_ATTRS:
+                is_level_attr = True
+
+        # Generate the option expression (converts attributes to method calls)
+        option_expr = self._gen_expr(node.option_expr)
+
+        # For Level attributes, extract .price; otherwise just use v
+        unwrap_expr = "v.price" if is_level_attr else "v"
+
         return f"""{self._indent()}let {node.var_name} = match {option_expr} {{
-{self._indent()}    Some(v) => v,
+{self._indent()}    Some(v) => {unwrap_expr},
 {self._indent()}    None => return {return_expr},
 {self._indent()}}};"""
 
@@ -478,9 +491,9 @@ impl Strategy for {self.struct_name} {{
             # ctx.position(token_id) -> ctx.positions.get(&token_id)
             elif obj == "ctx" and method == "position":
                 return f"ctx.positions.get(&{args})"
-            # ctx.mid(token_id) -> ctx.order_books.get(&token_id).and_then(|b| b.mid_price)
+            # ctx.mid(token_id) -> ctx.order_books.get(&token_id).and_then(|b| b.mid_price())
             elif obj == "ctx" and method == "mid":
-                return f"ctx.order_books.get(&{args}).and_then(|b| b.mid_price)"
+                return f"ctx.order_books.get(&{args}).and_then(|b| b.mid_price())"
             # vec.append(x) -> vec.push(x)
             elif method == "append":
                 return f"{obj}.push({args})"
@@ -559,6 +572,10 @@ impl Strategy for {self.struct_name} {{
                 "IMMEDIATE": "Immediate",
             }
             return f"Urgency::{urgency_map.get(attr, attr)}"
+
+        # OrderBook method attributes - convert to method calls
+        if attr in self.OPTION_LEVEL_ATTRS or attr in self.OPTION_DECIMAL_ATTRS:
+            return f"{obj}.{attr}()"
 
         return f"{obj}.{attr}"
 

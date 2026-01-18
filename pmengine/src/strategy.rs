@@ -1,8 +1,10 @@
 //! Strategy trait and runtime for trading strategies.
 
+use crate::orderbook::OrderBook;
 use crate::position::{Fill, PositionTracker};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Urgency level for order execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,12 +49,12 @@ pub enum Signal {
 }
 
 /// Context provided to strategies for decision making.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StrategyContext {
     /// Current timestamp
     pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// Order books by token ID (best bid, best ask, bid_size, ask_size)
-    pub order_books: HashMap<String, OrderBookSnapshot>,
+    /// Order books by token ID (full depth)
+    pub order_books: HashMap<String, Arc<OrderBook>>,
     /// Current positions
     pub positions: PositionTracker,
     /// Total unrealized P&L
@@ -61,51 +63,6 @@ pub struct StrategyContext {
     pub realized_pnl: Decimal,
 }
 
-/// Snapshot of order book top-of-book.
-#[derive(Debug, Clone, Default)]
-pub struct OrderBookSnapshot {
-    pub token_id: String,
-    pub best_bid: Option<Decimal>,
-    pub best_ask: Option<Decimal>,
-    pub bid_size: Decimal,
-    pub ask_size: Decimal,
-    pub mid_price: Option<Decimal>,
-    pub spread: Option<Decimal>,
-    pub last_update: chrono::DateTime<chrono::Utc>,
-}
-
-impl OrderBookSnapshot {
-    pub fn new(token_id: String) -> Self {
-        Self {
-            token_id,
-            best_bid: None,
-            best_ask: None,
-            bid_size: Decimal::ZERO,
-            ask_size: Decimal::ZERO,
-            mid_price: None,
-            spread: None,
-            last_update: chrono::Utc::now(),
-        }
-    }
-
-    pub fn update(&mut self, best_bid: Option<Decimal>, best_ask: Option<Decimal>, bid_size: Decimal, ask_size: Decimal) {
-        self.best_bid = best_bid;
-        self.best_ask = best_ask;
-        self.bid_size = bid_size;
-        self.ask_size = ask_size;
-        self.last_update = chrono::Utc::now();
-
-        // Calculate derived fields
-        self.mid_price = match (best_bid, best_ask) {
-            (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::TWO),
-            _ => None,
-        };
-        self.spread = match (best_bid, best_ask) {
-            (Some(bid), Some(ask)) => Some(ask - bid),
-            _ => None,
-        };
-    }
-}
 
 /// Trait for implementing trading strategies.
 pub trait Strategy: Send + Sync {
@@ -221,9 +178,11 @@ impl Strategy for DummyStrategy {
             if let Some(book) = ctx.order_books.get(token_id) {
                 tracing::debug!(
                     token_id,
-                    best_bid = ?book.best_bid,
-                    best_ask = ?book.best_ask,
-                    mid = ?book.mid_price,
+                    best_bid = ?book.best_bid().map(|l| l.price),
+                    best_ask = ?book.best_ask().map(|l| l.price),
+                    mid = ?book.mid_price(),
+                    bid_levels = book.bids.len(),
+                    ask_levels = book.asks.len(),
                     "Market state"
                 );
             }

@@ -3,9 +3,10 @@
 use crate::client::PolymarketClient;
 use crate::config::Config;
 use crate::order::OrderManager;
+use crate::orderbook::MarketDataHub;
 use crate::position::{Fill, PositionTracker};
 use crate::risk::{RiskCheckResult, RiskLimits, RiskManager};
-use crate::strategy::{DummyStrategy, OrderBookSnapshot, Signal, StrategyContext, StrategyRuntime};
+use crate::strategy::{DummyStrategy, Signal, StrategyContext, StrategyRuntime};
 
 use futures::StreamExt;
 use polymarket_client_sdk::clob::ws::Client as WsClient;
@@ -27,7 +28,10 @@ pub struct Engine {
     order_manager: OrderManager,
     risk_manager: RiskManager,
     positions: PositionTracker,
-    order_books: HashMap<String, OrderBookSnapshot>,
+    /// Market data hub with full-depth order books and broadcast channel
+    market_data: Arc<MarketDataHub>,
+    /// Token IDs we're subscribed to
+    subscribed_tokens: Vec<String>,
     fill_receiver: mpsc::Receiver<Fill>,
     shutdown: bool,
 }
@@ -61,6 +65,9 @@ impl Engine {
         // Create strategy runtime (empty, strategies added via register)
         let strategy_runtime = StrategyRuntime::new();
 
+        // Create market data hub with broadcast channel
+        let market_data = Arc::new(MarketDataHub::new(1000));
+
         Ok(Self {
             config,
             client,
@@ -68,7 +75,8 @@ impl Engine {
             order_manager,
             risk_manager,
             positions: PositionTracker::new(),
-            order_books: HashMap::new(),
+            market_data,
+            subscribed_tokens: Vec::new(),
             fill_receiver,
             shutdown: false,
         })
@@ -80,19 +88,30 @@ impl Engine {
     }
 
     /// Register a strategy.
-    pub fn register_strategy(&mut self, strategy: Box<dyn crate::strategy::Strategy>) {
-        // Initialize order book snapshots for subscriptions
+    pub async fn register_strategy(&mut self, strategy: Box<dyn crate::strategy::Strategy>) {
+        // Initialize order books for subscriptions
         for token_id in strategy.subscriptions() {
-            self.order_books
-                .entry(token_id.clone())
-                .or_insert_with(|| OrderBookSnapshot::new(token_id));
+            if !self.subscribed_tokens.contains(&token_id) {
+                self.market_data.init_book(&token_id).await;
+                self.subscribed_tokens.push(token_id);
+            }
         }
         self.strategy_runtime.register(strategy);
     }
 
     /// Register a dummy strategy for testing.
-    pub fn register_dummy_strategy(&mut self, tokens: Vec<String>) {
-        self.register_strategy(Box::new(DummyStrategy::new("dummy", tokens)));
+    pub async fn register_dummy_strategy(&mut self, tokens: Vec<String>) {
+        self.register_strategy(Box::new(DummyStrategy::new("dummy", tokens))).await;
+    }
+
+    /// Get a market data subscriber for external consumers.
+    pub fn subscribe_market_data(&self) -> async_broadcast::Receiver<crate::orderbook::MarketEvent> {
+        self.market_data.subscribe()
+    }
+
+    /// Get the market data hub for direct access.
+    pub fn market_data(&self) -> Arc<MarketDataHub> {
+        self.market_data.clone()
     }
 
     /// Run the main event loop.
@@ -103,8 +122,8 @@ impl Engine {
         let tick_duration = Duration::from_millis(self.config.tick_interval_ms);
         let mut tick_timer = interval(tick_duration);
 
-        // Collect token IDs from registered strategies for WebSocket subscriptions
-        let subscribed_tokens: Vec<String> = self.order_books.keys().cloned().collect();
+        // Token IDs for WebSocket subscriptions
+        let subscribed_tokens = self.subscribed_tokens.clone();
 
         // Connect to WebSocket for market data if we have subscriptions
         // Keep ws_client alive since the stream borrows from it
@@ -167,10 +186,10 @@ impl Engine {
                         continue;
                     }
 
-                    // Build strategy context
+                    // Build strategy context with full-depth order books
                     let ctx = StrategyContext {
                         timestamp: chrono::Utc::now(),
-                        order_books: self.order_books.clone(),
+                        order_books: self.market_data.get_all_books().await,
                         positions: self.positions.clone(),
                         unrealized_pnl: self.positions.total_unrealized_pnl(),
                         realized_pnl: self.positions.total_realized_pnl(),
@@ -236,27 +255,27 @@ impl Engine {
                             ws_update_count += 1;
                             let token_id = book.asset_id.to_string();
 
-                            // Extract best bid/ask from the orderbook
-                            let best_bid = book.bids.first().map(|b| b.price);
-                            let best_ask = book.asks.first().map(|a| a.price);
-                            let bid_size = book.bids.first()
-                                .map(|b| b.size)
-                                .unwrap_or(Decimal::ZERO);
-                            let ask_size = book.asks.first()
-                                .map(|a| a.size)
-                                .unwrap_or(Decimal::ZERO);
-
                             tracing::debug!(
                                 token_id = %token_id,
-                                best_bid = ?best_bid,
-                                best_ask = ?best_ask,
-                                bids = book.bids.len(),
-                                asks = book.asks.len(),
+                                best_bid = ?book.bids.first().map(|b| b.price),
+                                best_ask = ?book.asks.first().map(|a| a.price),
+                                bid_levels = book.bids.len(),
+                                ask_levels = book.asks.len(),
                                 update_count = ws_update_count,
                                 "Orderbook update"
                             );
 
-                            self.update_order_book(&token_id, best_bid, best_ask, bid_size, ask_size);
+                            // Process through market data hub (full depth + broadcast)
+                            self.market_data.process_book_update(book).await;
+
+                            // Update position prices for P&L tracking
+                            if let Some(book) = self.market_data.get_book(&token_id).await {
+                                if let Some(mid) = book.mid_price() {
+                                    let mut prices = HashMap::new();
+                                    prices.insert(token_id, mid);
+                                    self.positions.update_prices(&prices);
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "WebSocket orderbook error");
@@ -301,26 +320,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Update order book from market data.
-    pub fn update_order_book(
-        &mut self,
-        token_id: &str,
-        best_bid: Option<Decimal>,
-        best_ask: Option<Decimal>,
-        bid_size: Decimal,
-        ask_size: Decimal,
-    ) {
-        if let Some(book) = self.order_books.get_mut(token_id) {
-            book.update(best_bid, best_ask, bid_size, ask_size);
-        }
-
-        // Update position prices for P&L
-        if let Some(mid) = self.order_books.get(token_id).and_then(|b| b.mid_price) {
-            let mut prices = HashMap::new();
-            prices.insert(token_id.to_string(), mid);
-            self.positions.update_prices(&prices);
-        }
-    }
 }
 
 #[derive(Debug)]

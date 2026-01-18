@@ -19,6 +19,7 @@ pub mod client;
 pub mod config;
 pub mod engine;
 pub mod order;
+pub mod orderbook;
 pub mod position;
 pub mod risk;
 pub mod strategy;
@@ -31,6 +32,7 @@ pub use client::{ClientError, PolymarketClient, Side};
 pub use config::Config;
 pub use engine::Engine;
 pub use order::OrderManager;
+pub use orderbook::{Level, MarketDataHub, MarketEvent, OrderBook};
 pub use position::{Fill, Position, PositionTracker};
 pub use risk::{RiskLimits, RiskManager};
 pub use strategy::{Signal, Strategy, StrategyContext, StrategyRuntime, Urgency};
@@ -38,8 +40,9 @@ pub use strategy::{Signal, Strategy, StrategyContext, StrategyRuntime, Urgency};
 /// Re-export commonly used types from dependencies
 pub mod prelude {
     pub use crate::{
-        Config, Engine, Fill, OrderManager, Position, PositionTracker,
-        RiskLimits, RiskManager, Signal, Strategy, StrategyContext, Urgency,
+        Config, Engine, Fill, Level, MarketDataHub, MarketEvent, OrderBook,
+        OrderManager, Position, PositionTracker, RiskLimits, RiskManager,
+        Signal, Strategy, StrategyContext, Urgency,
     };
     pub use rust_decimal::Decimal;
     pub use rust_decimal_macros::dec;
