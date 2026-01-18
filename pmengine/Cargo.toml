@@ -41,6 +41,9 @@ secrecy = "0.10"
 # HTTP client (for L2 auth requests)
 reqwest = { version = "0.12", features = ["json"] }
 
+# OpenSSL with vendored feature for static linking (avoids version mismatches)
+openssl = { version = "0.10", features = ["vendored"] }
+
 # Async utilities
 async-broadcast = "0.7"
 
