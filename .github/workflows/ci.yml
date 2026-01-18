@@ -31,11 +31,15 @@ jobs:
           version: "latest"
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --extra cognito
 
       - name: Run tests
         env:
           PMPROXY_URL: ${{ secrets.PMPROXY_URL }}
+          PMPROXY_COGNITO_CLIENT_ID: ${{ secrets.PMPROXY_COGNITO_CLIENT_ID }}
+          PMPROXY_COGNITO_REGION: ${{ secrets.PMPROXY_COGNITO_REGION }}
+          PMPROXY_USERNAME: ${{ secrets.PMPROXY_USERNAME }}
+          PMPROXY_PASSWORD: ${{ secrets.PMPROXY_PASSWORD }}
         run: uv run pytest tests/ -v
 
   syntax-check:
