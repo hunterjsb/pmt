@@ -7,27 +7,14 @@ import requests
 
 PROXY_URL = os.environ.get("PMPROXY_URL", "").rstrip("/")
 
-# Check if proxy requires auth (returns 401 on unauthenticated request)
-def _proxy_requires_auth() -> bool:
-    if not PROXY_URL:
-        return False
-    try:
-        resp = requests.get(f"{PROXY_URL}/clob/", timeout=5)
-        return resp.status_code == 401
-    except Exception:
-        return False
-
-# Check if we have cognito credentials
-def _has_cognito_creds() -> bool:
-    return bool(
-        os.environ.get("PMPROXY_COGNITO_CLIENT_ID")
-        and os.environ.get("PMPROXY_USERNAME")
-        and os.environ.get("PMPROXY_PASSWORD")
-    )
 
 def _get_auth_headers() -> dict[str, str]:
     """Get auth headers if cognito credentials are available."""
-    if not _has_cognito_creds():
+    if not (
+        os.environ.get("PMPROXY_COGNITO_CLIENT_ID")
+        and os.environ.get("PMPROXY_USERNAME")
+        and os.environ.get("PMPROXY_PASSWORD")
+    ):
         return {}
     try:
         from polymarket.cognito import CognitoAuth
@@ -36,15 +23,8 @@ def _get_auth_headers() -> dict[str, str]:
     except Exception:
         return {}
 
-# Skip if proxy requires auth but we don't have credentials
-_skip_no_auth = pytest.mark.skipif(
-    PROXY_URL and _proxy_requires_auth() and not _has_cognito_creds(),
-    reason="Proxy requires auth but no credentials available"
-)
-
 
 @pytest.mark.skipif(not PROXY_URL, reason="PMPROXY_URL not set")
-@_skip_no_auth
 class TestProxy:
     """Test API calls through the proxy."""
 
