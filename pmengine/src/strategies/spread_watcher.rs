@@ -49,10 +49,9 @@ impl Strategy for SpreadWatcher {
             Some(v) => v.price,
             None => return signals,
         };
-        let spread = (ask - bid);
-        if spread > dec!(0.5) {
-            let mid = ((bid + ask) / dec!(2));
-            // TODO: unsupported stmt ImportFrom
+        let spread = ask - bid;
+        if spread > dec!(0.50) {
+            let mid = (bid + ask) / dec!(2);
             signals.push(Signal::Buy { token_id: token, price: mid, size: dec!(1), urgency: Urgency::Low });
         }
         return signals;

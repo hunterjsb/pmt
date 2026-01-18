@@ -624,10 +624,18 @@ impl Strategy for {self.struct_name} {{
         return f"({op_str.join(values)})"
 
     def _gen_binop_expr(self, expr: ast.BinOp) -> str:
+        # For nested binops, wrap in parens for correct precedence
         left = self._gen_expr(expr.left)
         right = self._gen_expr(expr.right)
         op = self._gen_binop(expr.op)
-        return f"({left} {op} {right})"
+
+        # Wrap operands in parens if they are binary ops (for precedence)
+        if isinstance(expr.left, ast.BinOp):
+            left = f"({left})"
+        if isinstance(expr.right, ast.BinOp):
+            right = f"({right})"
+
+        return f"{left} {op} {right}"
 
     def _gen_binop(self, op: ast.operator) -> str:
         ops = {

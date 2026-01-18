@@ -2,7 +2,6 @@
 
 import sys
 from decimal import Decimal
-from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
@@ -135,42 +134,114 @@ def run_backtest(args: list[str]):
 
 
 def run_scan(args: list[str]):
-    """Scan for live opportunities."""
+    """Scan for live opportunities using Gamma API directly."""
+    import json
+    from datetime import datetime, timezone
+
+    import httpx
+
     console.print("[bold]Scanning for sure_bets opportunities...[/bold]\n")
 
-    try:
-        # Import from pmtrader if available
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent / "pmtrader"))
-        from strategies.expiring import find_expiring_opportunities, calculate_max_return
+    # Parse args
+    min_price = 95.0
+    max_hours = 2.0
 
-        opportunities = find_expiring_opportunities(min_price_pct=95.0, max_hours=2.0)
+    i = 0
+    while i < len(args):
+        if args[i] == "--min-price" and i + 1 < len(args):
+            min_price = float(args[i + 1])
+            i += 2
+        elif args[i] == "--max-hours" and i + 1 < len(args):
+            max_hours = float(args[i + 1])
+            i += 2
+        else:
+            i += 1
+
+    try:
+        # Fetch markets from Gamma API
+        response = httpx.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"closed": "false", "limit": 500},
+            timeout=30,
+        )
+        response.raise_for_status()
+        markets = response.json()
+
+        now = datetime.now(timezone.utc)
+        opportunities = []
+
+        for m in markets:
+            end_date = m.get("endDate")
+            if not end_date:
+                continue
+
+            # Parse end date
+            try:
+                if end_date.endswith("Z"):
+                    end_date = end_date[:-1] + "+00:00"
+                end_dt = datetime.fromisoformat(end_date)
+                hours_left = (end_dt - now).total_seconds() / 3600
+            except (ValueError, AttributeError):
+                continue
+
+            if hours_left < 0 or hours_left > max_hours:
+                continue
+
+            # Check outcome prices (these come as JSON strings from API)
+            outcomes_raw = m.get("outcomes", "[]")
+            prices_raw = m.get("outcomePrices", "[]")
+
+            try:
+                outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+            except json.JSONDecodeError:
+                continue
+
+            for i, price_str in enumerate(prices or []):
+                try:
+                    price_pct = float(price_str) * 100
+                except (ValueError, TypeError):
+                    continue
+
+                if price_pct >= min_price:
+                    exp_return = (100.0 - price_pct) / price_pct * 100
+                    opportunities.append({
+                        "question": m.get("question", "Unknown"),
+                        "outcome": outcomes[i] if i < len(outcomes) else "Unknown",
+                        "price_pct": price_pct,
+                        "hours_left": hours_left,
+                        "expected_return": exp_return,
+                    })
+
+        # Sort by expected return
+        opportunities.sort(key=lambda x: x["expected_return"], reverse=True)
 
         if not opportunities:
-            console.print("[yellow]No opportunities found matching criteria.[/yellow]")
+            console.print(f"[yellow]No opportunities found (>={min_price:.0f}% expiring within {max_hours:.0f}h)[/yellow]")
             return
 
         table = Table(title=f"Found {len(opportunities)} Opportunities")
-        table.add_column("Market", style="cyan", max_width=40)
+        table.add_column("Market", style="cyan", max_width=50)
         table.add_column("Outcome", style="yellow")
         table.add_column("Price", justify="right")
         table.add_column("Expiry", justify="right")
         table.add_column("Return", justify="right", style="green")
 
-        for opp in opportunities[:10]:
-            returns = calculate_max_return(opp.price_pct, opp.hours_until_expiry)
+        for opp in opportunities[:15]:
             table.add_row(
-                opp.question[:40],
-                opp.outcome,
-                f"{opp.price_pct:.1f}%",
-                f"{opp.hours_until_expiry:.1f}h",
-                f"{returns['max_return_pct']:.2f}%",
+                opp["question"][:50],
+                opp["outcome"],
+                f"{opp['price_pct']:.1f}%",
+                f"{opp['hours_left']:.1f}h",
+                f"{opp['expected_return']:.2f}%",
             )
 
         console.print(table)
 
-    except ImportError as e:
-        console.print(f"[red]Could not import pmtrader: {e}[/red]")
-        console.print("[dim]Make sure pmtrader is in your path.[/dim]")
+    except httpx.HTTPError as e:
+        console.print(f"[red]HTTP error: {e}[/red]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
 
 
 def run_simulate(args: list[str]):
