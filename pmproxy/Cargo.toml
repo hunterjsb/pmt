@@ -1,6 +1,6 @@
 [package]
 name = "pmproxy"
-version = "0.3.6"
+version = "0.4.0"
 edition = "2021"
 description = "Simple HTTP reverse proxy for Polymarket APIs"
 
@@ -17,6 +17,22 @@ tokio = { version = "1", features = ["full"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# JWT authentication
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Rate limiting
+governor = "0.6"
+dashmap = "6"
+
+# Error handling
+thiserror = "1"
+
+# Async utilities
+async-trait = "0.1"
+tokio-util = { version = "0.7", features = ["time"] }
 
 # Config (EC2 only)
 clap = { version = "4", features = ["derive"], optional = true }

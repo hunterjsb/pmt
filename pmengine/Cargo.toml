@@ -1,6 +1,6 @@
 [package]
 name = "pmengine"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "Rust HFT engine for Polymarket trading"
 
@@ -47,9 +47,14 @@ openssl = { version = "0.10", features = ["vendored"] }
 # Async utilities
 async-broadcast = "0.7"
 
+# AWS SDK for Cognito authentication (optional, for pmproxy multi-tenant auth)
+aws-config = { version = "1", optional = true }
+aws-sdk-cognitoidentityprovider = { version = "1", optional = true }
+
 [features]
 default = ["ec2"]
 ec2 = ["clap"]
+cognito = ["aws-config", "aws-sdk-cognitoidentityprovider"]
 
 [lib]
 name = "pmengine"

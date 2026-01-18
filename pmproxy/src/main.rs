@@ -1,7 +1,7 @@
 use clap::Parser;
-use pmproxy::{build_router, ProxyState};
+use pmproxy::{build_router, config::ProxyConfig, ProxyState};
 use std::sync::Arc;
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser, Debug)]
@@ -43,15 +43,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compact()
         .init();
 
-    let state = Arc::new(ProxyState::new()?);
+    // Load configuration
+    let config = ProxyConfig::from_env();
+
+    // Create state with or without auth
+    let state = Arc::new(ProxyState::with_auth(&config)?);
+
+    // Pre-fetch JWKS if auth is enabled
+    if config.auth_enabled {
+        info!(
+            cognito_region = %config.cognito_region,
+            cognito_pool_id = %config.cognito_pool_id,
+            "Authentication enabled, fetching JWKS..."
+        );
+
+        if let Err(e) = state.prefetch_jwks().await {
+            warn!(error = %e, "Failed to pre-fetch JWKS (will retry on first request)");
+        }
+    }
+
     let app = build_router(state);
 
     let addr = format!("{}:{}", args.host, args.port);
     info!("pmproxy starting on http://{}", addr);
     info!("  Routes:");
+    info!("    /health   → Health check (no auth)");
     info!("    /clob/*   → https://clob.polymarket.com/*");
     info!("    /gamma/*  → https://gamma-api.polymarket.com/*");
     info!("    /chain/*  → https://polygon-rpc.com");
+    if config.auth_enabled {
+        info!("  Authentication: ENABLED (Cognito JWT)");
+        info!("    Region: {}", config.cognito_region);
+        info!("    Pool ID: {}", config.cognito_pool_id);
+        info!("    Rate limits:");
+        info!("      Free: 60 rpm, burst 10");
+        info!("      Pro: 300 rpm, burst 50");
+        info!("      Enterprise: 1000 rpm, burst 100");
+    } else {
+        info!("  Authentication: DISABLED");
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

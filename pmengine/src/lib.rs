@@ -24,6 +24,9 @@ pub mod risk;
 pub mod strategy;
 pub mod strategies;
 
+#[cfg(feature = "cognito")]
+pub mod cognito;
+
 pub use client::{ClientError, PolymarketClient, Side};
 pub use config::Config;
 pub use engine::Engine;

@@ -3,7 +3,7 @@ index-url = "https://pypi.org/simple"
 
 [project]
 name = "pmtrader"
-version = "0.3.1"
+version = "0.3.2"
 description = "Polymarket trading client with CLI and Streamlit UI"
 requires-python = ">=3.14"
 dependencies = [
@@ -14,6 +14,9 @@ dependencies = [
     "plotly>=5.18.0",
     "pandas>=2.0.0",
 ]
+
+[project.optional-dependencies]
+cognito = ["boto3>=1.35.0"]
 
 [project.scripts]
 pmtrader-ui = "ui.app:main"

@@ -27,6 +27,11 @@ use sha2::Sha256;
 
 use crate::config::Config;
 
+#[cfg(feature = "cognito")]
+use std::sync::Arc;
+#[cfg(feature = "cognito")]
+use crate::cognito::CognitoAuth;
+
 /// Authenticated Polymarket client.
 pub struct PolymarketClient {
     /// SDK client for order building/signing
@@ -43,11 +48,38 @@ pub struct PolymarketClient {
     proxy_url: Option<String>,
     /// Dry run mode
     dry_run: bool,
+    /// Optional Cognito auth for pmproxy multi-tenant auth
+    #[cfg(feature = "cognito")]
+    cognito_auth: Option<Arc<CognitoAuth>>,
 }
 
 impl PolymarketClient {
     /// Create and authenticate a new client.
+    #[cfg(not(feature = "cognito"))]
     pub async fn new(config: &Config, dry_run: bool) -> Result<Self, ClientError> {
+        Self::new_internal(config, dry_run).await
+    }
+
+    /// Create and authenticate a new client with optional Cognito auth.
+    #[cfg(feature = "cognito")]
+    pub async fn new(config: &Config, dry_run: bool) -> Result<Self, ClientError> {
+        Self::new_with_cognito(config, dry_run, None).await
+    }
+
+    /// Create and authenticate a new client with Cognito auth.
+    #[cfg(feature = "cognito")]
+    pub async fn new_with_cognito(
+        config: &Config,
+        dry_run: bool,
+        cognito_auth: Option<Arc<CognitoAuth>>,
+    ) -> Result<Self, ClientError> {
+        let mut client = Self::new_internal(config, dry_run).await?;
+        client.cognito_auth = cognito_auth;
+        Ok(client)
+    }
+
+    /// Internal constructor shared by all public constructors.
+    async fn new_internal(config: &Config, dry_run: bool) -> Result<Self, ClientError> {
         // Create signer from private key
         let signer = LocalSigner::from_str(&config.private_key)
             .map_err(|e| ClientError::InvalidPrivateKey(e.to_string()))?
@@ -120,6 +152,8 @@ impl PolymarketClient {
             http,
             proxy_url,
             dry_run,
+            #[cfg(feature = "cognito")]
+            cognito_auth: None,
         })
     }
 
@@ -160,11 +194,23 @@ impl PolymarketClient {
     }
 
     /// Make an L2-authenticated POST request.
+    #[allow(unused_mut)] // mut needed only when cognito feature is enabled
     async fn l2_post<T: serde::de::DeserializeOwned>(&self, path: &str, body: &impl serde::Serialize) -> Result<T, ClientError> {
         let body_str = serde_json::to_string(body)
             .map_err(|e| ClientError::OrderError(format!("JSON serialization failed: {}", e)))?;
 
-        let headers = self.create_l2_headers("POST", path, &body_str)?;
+        let mut headers = self.create_l2_headers("POST", path, &body_str)?;
+
+        // Add Cognito auth header if using proxy with auth
+        #[cfg(feature = "cognito")]
+        if self.proxy_url.is_some() {
+            if let Some(ref cognito) = self.cognito_auth {
+                let auth_header = cognito.get_auth_header().await
+                    .map_err(|e| ClientError::AuthError(format!("Cognito auth failed: {}", e)))?;
+                headers.insert("Authorization", HeaderValue::from_str(&auth_header)
+                    .map_err(|e| ClientError::OrderError(e.to_string()))?);
+            }
+        }
 
         // Determine URL: if using proxy, use proxy URL with /clob prefix; otherwise use CLOB directly
         // Note: We compute HMAC for the canonical path (/order), but send to proxy path (/clob/order)

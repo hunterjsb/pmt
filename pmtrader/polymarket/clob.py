@@ -17,9 +17,25 @@ from py_clob_client.clob_types import (
 
 from .models import Market, OrderBook, OrderBookLevel, Token
 
+# Optional cognito support (requires boto3)
+try:
+    from .cognito import CognitoAuth, create_cognito_auth
+except ImportError:
+    CognitoAuth = None  # type: ignore
+    create_cognito_auth = lambda: None  # type: ignore
+
+
+def _get_proxy_headers(cognito_auth: CognitoAuth | None = None) -> dict[str, str]:
+    """Get headers for proxy requests, including auth if available."""
+    if cognito_auth is None:
+        return {}
+    return cognito_auth.get_auth_header()
+
 
 def get_order_book_depth(
-    token_id: str, host: str = "https://clob.polymarket.com"
+    token_id: str,
+    host: str = "https://clob.polymarket.com",
+    cognito_auth: CognitoAuth | None = None,
 ) -> OrderBook:
     """Get full order book depth with all price levels via direct API call.
 
@@ -40,8 +56,9 @@ def get_order_book_depth(
     """
     url = f"{host}/book"
     params = {"token_id": token_id}
+    headers = _get_proxy_headers(cognito_auth)
 
-    response = requests.get(url, params=params, timeout=10)
+    response = requests.get(url, params=params, headers=headers, timeout=10)
     response.raise_for_status()
 
     data = response.json()
@@ -112,9 +129,17 @@ def get_chain_host(proxy: bool = False) -> str:
 class Clob:
     """Read-only client for the Polymarket CLOB (Central Limit Order Book) API."""
 
-    def __init__(self, host: str | None = None, *, proxy: bool = False) -> None:
+    def __init__(
+        self,
+        host: str | None = None,
+        *,
+        proxy: bool = False,
+        cognito_auth: CognitoAuth | None = None,
+    ) -> None:
         self.host = host or get_clob_host(proxy)
         self._client = ClobClient(self.host)
+        self._cognito_auth = cognito_auth
+        self._is_proxy = proxy or bool(get_proxy_url())
 
     def ok(self):
         return self._client.get_ok()
@@ -122,14 +147,28 @@ class Clob:
     def server_time(self):
         return self._client.get_server_time()
 
+    def _get_headers(self) -> dict[str, str]:
+        """Get headers for requests, including auth if using proxy."""
+        if self._is_proxy and self._cognito_auth:
+            return self._cognito_auth.get_auth_header()
+        return {}
+
     def market(self, condition_id: str) -> dict:
         """Get market info by condition_id."""
-        response = requests.get(f"{self.host}/markets/{condition_id}", timeout=10)
+        response = requests.get(
+            f"{self.host}/markets/{condition_id}",
+            headers=self._get_headers(),
+            timeout=10,
+        )
         response.raise_for_status()
         return response.json()
 
     def sampling_markets(self, limit: int = 100) -> list[Market]:
-        response = requests.get(f"{self.host}/sampling-markets", timeout=10)
+        response = requests.get(
+            f"{self.host}/sampling-markets",
+            headers=self._get_headers(),
+            timeout=10,
+        )
         response.raise_for_status()
         data = response.json().get("data", [])[:limit]
 
@@ -193,10 +232,13 @@ class AuthenticatedClob:
         polygon_rpc: str | None = None,
         *,
         proxy: bool = False,
+        cognito_auth: CognitoAuth | None = None,
     ) -> None:
         self.host = host or get_clob_host(proxy)
         self._funder = funder_address
         self._rpc = polygon_rpc or get_chain_host(proxy)
+        self._cognito_auth = cognito_auth
+        self._is_proxy = proxy or bool(get_proxy_url())
 
         self._client = ClobClient(
             self.host,
@@ -207,9 +249,18 @@ class AuthenticatedClob:
         )
         self._client.set_api_creds(self._client.create_or_derive_api_creds())
 
+    def _get_headers(self) -> dict[str, str]:
+        """Get headers for requests, including auth if using proxy."""
+        if self._is_proxy and self._cognito_auth:
+            return self._cognito_auth.get_auth_header()
+        return {}
+
     # -----------------------------
     # CLOB: orders & trades
     # -----------------------------
+    # Note: Order-related methods use py_clob_client which handles POLY_* headers
+    # for Polymarket authentication. For proxy authentication (Bearer token),
+    # the py_clob_client would need to be extended to support custom headers.
 
     def create_order(
         self,
@@ -451,6 +502,7 @@ def create_authenticated_clob(*, proxy: bool = False) -> AuthenticatedClob | Non
     Optional:
     - PM_SIGNATURE_TYPE (default 1)
     - PMPROXY_URL (for proxy support)
+    - PMPROXY_COGNITO_CLIENT_ID, PMPROXY_USERNAME, PMPROXY_PASSWORD (for proxy auth)
 
     Args:
         proxy: If True, route requests through proxy (requires PMPROXY_URL env var)
@@ -466,9 +518,15 @@ def create_authenticated_clob(*, proxy: bool = False) -> AuthenticatedClob | Non
     if not private_key or not funder_address:
         return None
 
+    # Create Cognito auth if using proxy and credentials are available
+    cognito_auth = None
+    if proxy:
+        cognito_auth = create_cognito_auth()
+
     return AuthenticatedClob(
         private_key=private_key,
         funder_address=funder_address,
         signature_type=signature_type,
         proxy=proxy,
+        cognito_auth=cognito_auth,
     )
