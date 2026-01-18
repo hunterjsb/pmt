@@ -7,8 +7,13 @@ use crate::position::{Fill, PositionTracker};
 use crate::risk::{RiskCheckResult, RiskLimits, RiskManager};
 use crate::strategy::{DummyStrategy, OrderBookSnapshot, Signal, StrategyContext, StrategyRuntime};
 
+use futures::StreamExt;
+use polymarket_client_sdk::clob::ws::Client as WsClient;
+use polymarket_client_sdk::types::U256;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -98,8 +103,39 @@ impl Engine {
         let tick_duration = Duration::from_millis(self.config.tick_interval_ms);
         let mut tick_timer = interval(tick_duration);
 
-        // TODO: Connect to WebSocket for market data
-        // let ws_stream = connect_ws(&self.config.ws_url).await?;
+        // Collect token IDs from registered strategies for WebSocket subscriptions
+        let subscribed_tokens: Vec<String> = self.order_books.keys().cloned().collect();
+
+        // Connect to WebSocket for market data if we have subscriptions
+        // Keep ws_client alive since the stream borrows from it
+        let ws_client = WsClient::default();
+        let mut ws_stream: Option<Pin<Box<dyn futures::Stream<Item = Result<_, _>> + Send>>> =
+            if !subscribed_tokens.is_empty() {
+                let asset_ids: Result<Vec<U256>, _> = subscribed_tokens
+                    .iter()
+                    .map(|t| U256::from_str(t))
+                    .collect();
+
+                match asset_ids {
+                    Ok(ids) => {
+                        tracing::info!(count = ids.len(), "Subscribing to orderbook updates");
+                        match ws_client.subscribe_orderbook(ids) {
+                            Ok(stream) => Some(Box::pin(stream)),
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to subscribe to orderbook");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Invalid token ID format");
+                        None
+                    }
+                }
+            } else {
+                tracing::info!("No subscriptions, running without WebSocket");
+                None
+            };
 
         // Set up ctrl-c handler
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -111,6 +147,7 @@ impl Engine {
 
         let mut last_tick = Instant::now();
         let mut tick_count: u64 = 0;
+        let mut ws_update_count: u64 = 0;
 
         loop {
             tokio::select! {
@@ -187,10 +224,45 @@ impl Engine {
                     self.risk_manager.order_closed(&fill.token_id);
                 }
 
-                // TODO: WebSocket market data
-                // Some(msg) = ws_stream.next() => {
-                //     self.handle_ws_message(msg)?;
-                // }
+                // WebSocket market data
+                Some(book_result) = async {
+                    match ws_stream.as_mut() {
+                        Some(stream) => stream.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match book_result {
+                        Ok(book) => {
+                            ws_update_count += 1;
+                            let token_id = book.asset_id.to_string();
+
+                            // Extract best bid/ask from the orderbook
+                            let best_bid = book.bids.first().map(|b| b.price);
+                            let best_ask = book.asks.first().map(|a| a.price);
+                            let bid_size = book.bids.first()
+                                .map(|b| b.size)
+                                .unwrap_or(Decimal::ZERO);
+                            let ask_size = book.asks.first()
+                                .map(|a| a.size)
+                                .unwrap_or(Decimal::ZERO);
+
+                            tracing::debug!(
+                                token_id = %token_id,
+                                best_bid = ?best_bid,
+                                best_ask = ?best_ask,
+                                bids = book.bids.len(),
+                                asks = book.asks.len(),
+                                update_count = ws_update_count,
+                                "Orderbook update"
+                            );
+
+                            self.update_order_book(&token_id, best_bid, best_ask, bid_size, ask_size);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "WebSocket orderbook error");
+                        }
+                    }
+                }
 
                 // Shutdown signal
                 _ = shutdown_rx.recv() => {
