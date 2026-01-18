@@ -2,6 +2,7 @@
 
 import json
 
+import plotly.graph_objects as go
 import streamlit as st
 
 from polymarket import (
@@ -141,7 +142,7 @@ def render_search_results(result: dict):
 
 
 def render_order_book(token_id: str, outcome: str):
-    """Render order book visualization."""
+    """Render order book with depth chart visualization."""
     st.write(f"**📖 Order Book: {outcome}**")
 
     try:
@@ -150,34 +151,87 @@ def render_order_book(token_id: str, outcome: str):
         st.error(f"Failed to load order book: {e}")
         return
 
-    col_bids, col_asks = st.columns(2)
+    if not book.bids and not book.asks:
+        st.info("No orders in book")
+        return
 
-    with col_bids:
-        st.write("**Bids (Buy)**")
-        if book.bids:
-            for level in book.bids[:10]:
-                st.markdown(
-                    f"<span style='color: green'>{level.price:.1%}</span> × {level.size:,.0f}",
-                    unsafe_allow_html=True,
-                )
-        else:
-            st.write("No bids")
+    # Build cumulative depth data
+    bid_prices, bid_cumulative = [], []
+    ask_prices, ask_cumulative = [], []
 
-    with col_asks:
-        st.write("**Asks (Sell)**")
-        if book.asks:
-            for level in book.asks[:10]:
-                st.markdown(
-                    f"<span style='color: red'>{level.price:.1%}</span> × {level.size:,.0f}",
-                    unsafe_allow_html=True,
-                )
-        else:
-            st.write("No asks")
+    cumsum = 0
+    for level in reversed(book.bids):  # Start from lowest bid
+        cumsum += level.size
+        bid_prices.append(level.price * 100)
+        bid_cumulative.append(cumsum)
+    bid_prices.reverse()
+    bid_cumulative.reverse()
 
+    cumsum = 0
+    for level in book.asks:  # Start from lowest ask
+        cumsum += level.size
+        ask_prices.append(level.price * 100)
+        ask_cumulative.append(cumsum)
+
+    # Create depth chart
+    fig = go.Figure()
+
+    if bid_prices:
+        fig.add_trace(
+            go.Scatter(
+                x=bid_prices,
+                y=bid_cumulative,
+                fill="tozeroy",
+                fillcolor="rgba(0, 200, 83, 0.3)",
+                line=dict(color="rgb(0, 200, 83)", width=2),
+                name="Bids",
+                hovertemplate="Price: %{x:.1f}¢<br>Depth: %{y:,.0f}<extra></extra>",
+            )
+        )
+
+    if ask_prices:
+        fig.add_trace(
+            go.Scatter(
+                x=ask_prices,
+                y=ask_cumulative,
+                fill="tozeroy",
+                fillcolor="rgba(255, 82, 82, 0.3)",
+                line=dict(color="rgb(255, 82, 82)", width=2),
+                name="Asks",
+                hovertemplate="Price: %{x:.1f}¢<br>Depth: %{y:,.0f}<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        height=300,
+        margin=dict(l=0, r=0, t=10, b=0),
+        xaxis=dict(
+            title="Price (¢)",
+            ticksuffix="¢",
+            showgrid=True,
+            gridcolor="rgba(128, 128, 128, 0.2)",
+        ),
+        yaxis=dict(
+            title="Cumulative Size",
+            showgrid=True,
+            gridcolor="rgba(128, 128, 128, 0.2)",
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        hovermode="x unified",
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Show spread info
     if book.bids and book.asks:
         spread = book.asks[0].price - book.bids[0].price
         mid = (book.asks[0].price + book.bids[0].price) / 2
-        st.caption(f"Mid: {mid:.1%} | Spread: {spread:.1%}")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Best Bid", f"{book.bids[0].price:.1%}")
+        col2.metric("Best Ask", f"{book.asks[0].price:.1%}")
+        col3.metric("Spread", f"{spread:.1%}")
 
 
 def render_order_form(token_id: str, outcome: str):
@@ -376,13 +430,15 @@ def render_trading_page():
 
     st.markdown("---")
 
-    # Three column layout: order book, order form, positions
-    col_book, col_form, col_pos = st.columns([2, 1, 1])
+    # Order book takes full width for depth chart
+    render_order_book(token_id, outcome_name)
+    if st.button("🔄 Refresh Book"):
+        st.rerun()
 
-    with col_book:
-        render_order_book(token_id, outcome_name)
-        if st.button("🔄 Refresh Book"):
-            st.rerun()
+    st.markdown("---")
+
+    # Order form and positions side by side
+    col_form, col_pos = st.columns([1, 1])
 
     with col_form:
         render_order_form(token_id, outcome_name)

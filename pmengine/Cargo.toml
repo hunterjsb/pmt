@@ -30,7 +30,8 @@ rust_decimal_macros = "1"
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
-# Crypto (alloy comes from polymarket-client-sdk)
+# Crypto
+alloy = { version = "1.4", features = ["signers", "signer-local"] }
 hex = "0.4"
 
 # Async utilities

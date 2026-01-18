@@ -19,6 +19,8 @@ pub struct Config {
     pub tick_interval_ms: u64,
     /// Log level
     pub log_level: String,
+    /// Signature type (0=EOA, 1=PolyProxy, 2=GnosisSafe)
+    pub signature_type: u8,
 }
 
 impl Config {
@@ -53,6 +55,12 @@ impl Config {
             .or_else(|_| env::var("RUST_LOG"))
             .unwrap_or_else(|_| "info".to_string());
 
+        let signature_type = env::var("PM_SIGNATURE_TYPE")
+            .or_else(|_| env::var("PMENGINE_SIGNATURE_TYPE"))
+            .unwrap_or_else(|_| "0".to_string())
+            .parse()
+            .unwrap_or(0);
+
         Ok(Self {
             private_key,
             clob_url,
@@ -61,6 +69,7 @@ impl Config {
             max_total_exposure,
             tick_interval_ms,
             log_level,
+            signature_type,
         })
     }
 

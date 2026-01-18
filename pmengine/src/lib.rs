@@ -15,6 +15,7 @@
 //!
 //! Strategies generate signals that pass through risk management before execution.
 
+pub mod client;
 pub mod config;
 pub mod engine;
 pub mod order;
