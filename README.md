@@ -1,5 +1,10 @@
 # pmt
 
+[![CI](https://github.com/hunterjsb/pmt/actions/workflows/ci.yml/badge.svg)](https://github.com/hunterjsb/pmt/actions/workflows/ci.yml)
+[![pmproxy](https://img.shields.io/github/v/release/hunterjsb/pmt?filter=pmproxy-*&label=pmproxy)](https://github.com/hunterjsb/pmt/releases?q=pmproxy)
+[![pmengine](https://img.shields.io/github/v/release/hunterjsb/pmt?filter=pmengine-*&label=pmengine)](https://github.com/hunterjsb/pmt/releases?q=pmengine)
+[![pmtrader](https://img.shields.io/github/v/release/hunterjsb/pmt?filter=pmtrader-*&label=pmtrader)](https://github.com/hunterjsb/pmt/releases?q=pmtrader)
+
 Polymarket trading toolkit.
 
 ```

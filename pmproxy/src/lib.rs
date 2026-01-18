@@ -101,6 +101,7 @@ impl Default for ProxyState {
 pub fn build_router(state: Arc<ProxyState>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
+        .route("/badge", get(badge_handler))
         .fallback(proxy_handler)
         .with_state(state)
 }
@@ -111,6 +112,17 @@ pub async fn health_handler() -> impl IntoResponse {
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .body(Body::from(r#"{"status":"healthy"}"#))
+        .unwrap()
+}
+
+/// Shields.io badge endpoint for server status.
+pub async fn badge_handler() -> impl IntoResponse {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            r#"{"schemaVersion":1,"label":"pmproxy","message":"online","color":"brightgreen"}"#,
+        ))
         .unwrap()
 }
 
