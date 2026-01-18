@@ -1,9 +1,11 @@
 //! Order management wrapping the Polymarket SDK.
 
+use crate::client::{PolymarketClient, Side};
 use crate::position::Fill;
 use crate::strategy::{Signal, Urgency};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Order state.
@@ -42,20 +44,23 @@ impl Order {
 
 /// Order manager wraps the SDK and tracks orders.
 pub struct OrderManager {
+    client: Arc<PolymarketClient>,
     orders: HashMap<String, Order>,
     fill_sender: mpsc::Sender<Fill>,
-    dry_run: bool,
-    next_order_id: u64,
 }
 
 impl OrderManager {
-    pub fn new(fill_sender: mpsc::Sender<Fill>, dry_run: bool) -> Self {
+    pub fn new(client: Arc<PolymarketClient>, fill_sender: mpsc::Sender<Fill>) -> Self {
         Self {
+            client,
             orders: HashMap::new(),
             fill_sender,
-            dry_run,
-            next_order_id: 1,
         }
+    }
+
+    /// Check if running in dry-run mode.
+    pub fn is_dry_run(&self) -> bool {
+        self.client.is_dry_run()
     }
 
     /// Execute a signal by placing/canceling orders.
@@ -84,11 +89,18 @@ impl OrderManager {
         is_buy: bool,
         price: Decimal,
         size: Decimal,
-        urgency: Urgency,
+        _urgency: Urgency,
     ) -> Result<Option<String>, OrderError> {
-        let order_id = format!("ord_{}", self.next_order_id);
-        self.next_order_id += 1;
+        let side = if is_buy { Side::Buy } else { Side::Sell };
 
+        // Place order via SDK (handles dry-run internally)
+        let order_id = self
+            .client
+            .place_limit_order(token_id, side, price, size)
+            .await
+            .map_err(|e| OrderError::SdkError(e.to_string()))?;
+
+        // Track order locally
         let order = Order {
             id: order_id.clone(),
             token_id: token_id.to_string(),
@@ -96,43 +108,11 @@ impl OrderManager {
             price,
             size,
             filled_size: Decimal::ZERO,
-            status: OrderStatus::Pending,
+            status: OrderStatus::Open,
             created_at: chrono::Utc::now(),
         };
 
-        tracing::info!(
-            order_id = order_id,
-            token_id = token_id,
-            side = if is_buy { "BUY" } else { "SELL" },
-            price = %price,
-            size = %size,
-            urgency = ?urgency,
-            dry_run = self.dry_run,
-            "Placing order"
-        );
-
-        if self.dry_run {
-            // In dry run mode, simulate immediate fill for testing
-            self.orders.insert(order_id.clone(), order);
-            return Ok(Some(order_id));
-        }
-
-        // TODO: Use polymarket-client-sdk to place actual order
-        // For now, store as pending
         self.orders.insert(order_id.clone(), order);
-
-        // Example SDK usage (commented until SDK integrated):
-        // let order_builder = match urgency {
-        //     Urgency::Immediate => client.market_order(),
-        //     _ => client.limit_order().price(price),
-        // };
-        // let response = order_builder
-        //     .token_id(token_id)
-        //     .side(if is_buy { Side::Buy } else { Side::Sell })
-        //     .size(size)
-        //     .send()
-        //     .await?;
-
         Ok(Some(order_id))
     }
 
@@ -158,11 +138,13 @@ impl OrderManager {
     pub async fn cancel_order(&mut self, order_id: &str) -> Result<(), OrderError> {
         if let Some(order) = self.orders.get_mut(order_id) {
             if order.is_active() {
-                tracing::info!(order_id = order_id, "Cancelling order");
-                order.status = OrderStatus::Cancelled;
+                // Cancel via SDK (handles dry-run internally)
+                self.client
+                    .cancel_order(order_id)
+                    .await
+                    .map_err(|e| OrderError::SdkError(e.to_string()))?;
 
-                // TODO: Use SDK to cancel on exchange
-                // client.cancel_order(order_id).await?;
+                order.status = OrderStatus::Cancelled;
             }
         }
         Ok(())
@@ -178,8 +160,20 @@ impl OrderManager {
             .collect();
 
         let count = active.len();
-        for order_id in active {
-            self.cancel_order(&order_id).await?;
+        if count > 0 {
+            // Batch cancel via SDK
+            let order_refs: Vec<&str> = active.iter().map(|s| s.as_str()).collect();
+            self.client
+                .cancel_orders(&order_refs)
+                .await
+                .map_err(|e| OrderError::SdkError(e.to_string()))?;
+
+            // Update local state
+            for order_id in &active {
+                if let Some(order) = self.orders.get_mut(order_id) {
+                    order.status = OrderStatus::Cancelled;
+                }
+            }
         }
 
         tracing::info!(count = count, "Cancelled all orders on shutdown");

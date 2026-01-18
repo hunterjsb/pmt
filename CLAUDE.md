@@ -13,6 +13,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Test Commands
 
+**IMPORTANT**: Always use `uv` for Python commands (not raw `python` or `pip`). Use `uv run` to execute scripts, `uv sync` to install dependencies. After modifying `pyproject.toml` (version bump, dependencies), always run `uv lock && uv sync`.
+
 ### pmtrader (Python)
 ```bash
 cd pmtrader

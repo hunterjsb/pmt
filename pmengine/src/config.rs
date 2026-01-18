@@ -7,6 +7,8 @@ use std::env;
 pub struct Config {
     /// Ethereum private key for signing orders (hex, with or without 0x prefix)
     pub private_key: String,
+    /// Funder address (the proxy wallet that holds funds)
+    pub funder_address: Option<String>,
     /// CLOB API base URL
     pub clob_url: String,
     /// WebSocket URL for market data
@@ -27,11 +29,19 @@ impl Config {
     /// Load configuration from environment variables.
     pub fn from_env() -> Result<Self, ConfigError> {
         let private_key = env::var("PMENGINE_PRIVATE_KEY")
+            .or_else(|_| env::var("PM_PRIVATE_KEY"))
             .or_else(|_| env::var("PRIVATE_KEY"))
-            .map_err(|_| ConfigError::MissingVar("PMENGINE_PRIVATE_KEY or PRIVATE_KEY"))?;
+            .map_err(|_| ConfigError::MissingVar("PMENGINE_PRIVATE_KEY or PM_PRIVATE_KEY"))?;
 
+        let funder_address = env::var("PMENGINE_FUNDER_ADDRESS")
+            .or_else(|_| env::var("PM_FUNDER_ADDRESS"))
+            .ok();
+
+        // PMPROXY_URL routes /clob/* to clob.polymarket.com/*
+        // SDK concatenates paths without separator, so we need trailing slash
         let clob_url = env::var("PMENGINE_CLOB_URL")
-            .unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
+            .or_else(|_| env::var("PMPROXY_URL").map(|u| format!("{}/clob/", u.trim_end_matches('/'))))
+            .unwrap_or_else(|_| "https://clob.polymarket.com/".to_string());
 
         let ws_url = env::var("PMENGINE_WS_URL")
             .unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com/ws".to_string());
@@ -63,6 +73,7 @@ impl Config {
 
         Ok(Self {
             private_key,
+            funder_address,
             clob_url,
             ws_url,
             max_position_size,

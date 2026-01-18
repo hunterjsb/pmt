@@ -1,5 +1,6 @@
 //! Main event loop for the trading engine.
 
+use crate::client::PolymarketClient;
 use crate::config::Config;
 use crate::order::OrderManager;
 use crate::position::{Fill, PositionTracker};
@@ -8,6 +9,7 @@ use crate::strategy::{DummyStrategy, OrderBookSnapshot, Signal, StrategyContext,
 
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Instant};
@@ -15,24 +17,31 @@ use tokio::time::{interval, Instant};
 /// The main trading engine.
 pub struct Engine {
     config: Config,
+    client: Arc<PolymarketClient>,
     strategy_runtime: StrategyRuntime,
     order_manager: OrderManager,
     risk_manager: RiskManager,
     positions: PositionTracker,
     order_books: HashMap<String, OrderBookSnapshot>,
     fill_receiver: mpsc::Receiver<Fill>,
-    dry_run: bool,
     shutdown: bool,
 }
 
 impl Engine {
     /// Create a new engine instance.
     pub async fn new(config: Config, dry_run: bool) -> Result<Self, EngineError> {
+        // Create and authenticate client
+        let client = Arc::new(
+            PolymarketClient::new(&config, dry_run)
+                .await
+                .map_err(|e| EngineError::SdkError(e.to_string()))?,
+        );
+
         // Create fill channel
         let (fill_sender, fill_receiver) = mpsc::channel(1000);
 
-        // Create order manager
-        let order_manager = OrderManager::new(fill_sender, dry_run);
+        // Create order manager with client
+        let order_manager = OrderManager::new(client.clone(), fill_sender);
 
         // Create risk manager with limits from config
         let risk_limits = RiskLimits {
@@ -49,15 +58,20 @@ impl Engine {
 
         Ok(Self {
             config,
+            client,
             strategy_runtime,
             order_manager,
             risk_manager,
             positions: PositionTracker::new(),
             order_books: HashMap::new(),
             fill_receiver,
-            dry_run,
             shutdown: false,
         })
+    }
+
+    /// Check if running in dry-run mode.
+    pub fn is_dry_run(&self) -> bool {
+        self.client.is_dry_run()
     }
 
     /// Register a strategy.

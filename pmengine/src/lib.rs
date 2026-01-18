@@ -22,7 +22,9 @@ pub mod order;
 pub mod position;
 pub mod risk;
 pub mod strategy;
+pub mod strategies;
 
+pub use client::{ClientError, PolymarketClient, Side};
 pub use config::Config;
 pub use engine::Engine;
 pub use order::OrderManager;

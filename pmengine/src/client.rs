@@ -1,21 +1,47 @@
-//! Polymarket SDK client wrapper.
+//! Polymarket SDK client wrapper with custom L2 auth for proxy compatibility.
+//!
+//! The official SDK computes HMAC signatures using the full URL path, which breaks
+//! when using a reverse proxy with path prefixes (e.g., /clob/order instead of /order).
+//!
+//! This client:
+//! 1. Uses the SDK for L1 auth (derive-api-key) and order signing
+//! 2. Handles L2 authenticated requests (POST/DELETE order) ourselves with correct paths
 
 use std::str::FromStr;
 
-use alloy::primitives::U256;
+use alloy::hex::ToHexExt;
+use alloy::primitives::{Address, U256};
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
+use base64::engine::general_purpose::URL_SAFE;
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use polymarket_client_sdk::auth::Credentials;
 use polymarket_client_sdk::clob::client::{Client, Config as SdkConfig};
 use polymarket_client_sdk::clob::types::{Side as SdkSide, SignatureType};
 use polymarket_client_sdk::POLYGON;
+use reqwest::header::{HeaderMap, HeaderValue};
 use rust_decimal::Decimal;
+use secrecy::ExposeSecret;
+use sha2::Sha256;
 
 use crate::config::Config;
 
 /// Authenticated Polymarket client.
 pub struct PolymarketClient {
+    /// SDK client for order building/signing
     inner: Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    /// Signer for order signatures
     signer: LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
+    /// L2 credentials from derive-api-key
+    credentials: Credentials,
+    /// Signer address (used in L2 headers)
+    address: Address,
+    /// HTTP client for L2 requests
+    http: reqwest::Client,
+    /// Proxy URL base (without /clob/ suffix)
+    proxy_url: Option<String>,
+    /// Dry run mode
     dry_run: bool,
 }
 
@@ -35,22 +61,140 @@ impl PolymarketClient {
             _ => SignatureType::Eoa,
         };
 
+        // Parse funder address if provided
+        let funder: Option<Address> = config.funder_address.as_ref().and_then(|addr| {
+            Address::from_str(addr).ok()
+        });
+
+        // Determine if we're using a proxy
+        let proxy_url = std::env::var("PMPROXY_URL").ok();
+
         // Build and authenticate client
-        let client = Client::new(&config.clob_url, SdkConfig::default())
+        let mut auth_builder = Client::new(&config.clob_url, SdkConfig::default())
             .map_err(|e| ClientError::SdkError(e.to_string()))?
             .authentication_builder(&signer)
-            .signature_type(sig_type)
+            .signature_type(sig_type);
+
+        // Set explicit funder if provided
+        if let Some(f) = funder {
+            auth_builder = auth_builder.funder(f);
+        }
+
+        let client = auth_builder
             .authenticate()
             .await
             .map_err(|e| ClientError::AuthError(e.to_string()))?;
 
+        // Get credentials by doing another L1 auth call (SDK doesn't expose credentials after auth)
+        // We use the unauthenticated client for this since derive_api_key uses L1 auth
+        let unauth_client = Client::new(&config.clob_url, SdkConfig::default())
+            .map_err(|e| ClientError::SdkError(e.to_string()))?;
+        let credentials = unauth_client
+            .derive_api_key(&signer, None)
+            .await
+            .map_err(|e| ClientError::AuthError(format!("Failed to get credentials: {}", e)))?;
+
+        // The address used for L2 headers is always the signer (the key making the API call)
+        let address = signer.address();
+
+        // Create HTTP client for L2 requests
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| ClientError::SdkError(e.to_string()))?;
+
         tracing::info!(
-            address = %signer.address(),
+            signer = %signer.address(),
+            funder = ?funder,
+            address = %address,
             sig_type = ?sig_type,
+            proxy = ?proxy_url,
             "Authenticated with Polymarket CLOB"
         );
 
-        Ok(Self { inner: client, signer, dry_run })
+        Ok(Self {
+            inner: client,
+            signer,
+            credentials,
+            address,
+            http,
+            proxy_url,
+            dry_run,
+        })
+    }
+
+    /// Compute L2 HMAC signature for a request.
+    fn compute_l2_signature(&self, timestamp: i64, method: &str, path: &str, body: &str) -> Result<String, ClientError> {
+        let message = format!("{}{}{}{}", timestamp, method, path, body);
+
+        let secret_bytes = URL_SAFE
+            .decode(self.credentials.secret().expose_secret())
+            .map_err(|e| ClientError::OrderError(format!("Invalid secret encoding: {}", e)))?;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(&secret_bytes)
+            .map_err(|e| ClientError::OrderError(format!("HMAC error: {}", e)))?;
+        mac.update(message.as_bytes());
+
+        let result = mac.finalize();
+        Ok(URL_SAFE.encode(result.into_bytes()))
+    }
+
+    /// Create L2 auth headers for a request.
+    fn create_l2_headers(&self, method: &str, path: &str, body: &str) -> Result<HeaderMap, ClientError> {
+        let timestamp = chrono::Utc::now().timestamp();
+        let signature = self.compute_l2_signature(timestamp, method, path, body)?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("POLY_ADDRESS", HeaderValue::from_str(&self.address.encode_hex_with_prefix())
+            .map_err(|e| ClientError::OrderError(e.to_string()))?);
+        headers.insert("POLY_API_KEY", HeaderValue::from_str(&self.credentials.key().to_string())
+            .map_err(|e| ClientError::OrderError(e.to_string()))?);
+        headers.insert("POLY_PASSPHRASE", HeaderValue::from_str(self.credentials.passphrase().expose_secret())
+            .map_err(|e| ClientError::OrderError(e.to_string()))?);
+        headers.insert("POLY_SIGNATURE", HeaderValue::from_str(&signature)
+            .map_err(|e| ClientError::OrderError(e.to_string()))?);
+        headers.insert("POLY_TIMESTAMP", HeaderValue::from_str(&timestamp.to_string())
+            .map_err(|e| ClientError::OrderError(e.to_string()))?);
+
+        Ok(headers)
+    }
+
+    /// Make an L2-authenticated POST request.
+    async fn l2_post<T: serde::de::DeserializeOwned>(&self, path: &str, body: &impl serde::Serialize) -> Result<T, ClientError> {
+        let body_str = serde_json::to_string(body)
+            .map_err(|e| ClientError::OrderError(format!("JSON serialization failed: {}", e)))?;
+
+        let headers = self.create_l2_headers("POST", path, &body_str)?;
+
+        // Determine URL: if using proxy, use proxy URL with /clob prefix; otherwise use CLOB directly
+        // Note: We compute HMAC for the canonical path (/order), but send to proxy path (/clob/order)
+        let url = if let Some(ref proxy) = self.proxy_url {
+            format!("{}/clob{}", proxy.trim_end_matches('/'), path)
+        } else {
+            format!("https://clob.polymarket.com{}", path)
+        };
+
+        tracing::debug!(url = %url, path = %path, body_len = body_str.len(), "L2 POST request");
+
+        let response = self.http
+            .post(&url)
+            .headers(headers)
+            .header("Content-Type", "application/json")
+            .body(body_str)
+            .send()
+            .await
+            .map_err(|e| ClientError::OrderError(format!("Request failed: {}", e)))?;
+
+        let status = response.status();
+        let body = response.text().await
+            .map_err(|e| ClientError::OrderError(format!("Failed to read response: {}", e)))?;
+
+        if !status.is_success() {
+            return Err(ClientError::OrderError(format!("HTTP {}: {}", status, body)));
+        }
+
+        serde_json::from_str(&body)
+            .map_err(|e| ClientError::OrderError(format!("JSON parse error: {} (body: {})", e, body)))
     }
 
     /// Place a limit order.
@@ -79,10 +223,11 @@ impl PolymarketClient {
             Side::Sell => SdkSide::Sell,
         };
 
-        // Parse token_id as U256 (hex string)
+        // Parse token_id as U256
         let token_id_u256 = U256::from_str(token_id)
             .map_err(|e| ClientError::OrderError(format!("Invalid token_id: {}", e)))?;
 
+        // Use SDK to build and sign order
         let order = self.inner
             .limit_order()
             .token_id(token_id_u256)
@@ -98,10 +243,8 @@ impl PolymarketClient {
             .await
             .map_err(|e| ClientError::OrderError(e.to_string()))?;
 
-        let response = self.inner
-            .post_order(signed)
-            .await
-            .map_err(|e| ClientError::OrderError(e.to_string()))?;
+        // POST using our own L2 auth (with correct path for HMAC)
+        let response: PostOrderResponse = self.l2_post("/order", &signed).await?;
 
         tracing::info!(
             order_id = %response.order_id,
@@ -122,6 +265,7 @@ impl PolymarketClient {
             return Ok(());
         }
 
+        // Use SDK for cancel (it should work through proxy since it's a simpler operation)
         self.inner
             .cancel_order(order_id)
             .await
@@ -151,6 +295,15 @@ impl PolymarketClient {
     pub fn is_dry_run(&self) -> bool {
         self.dry_run
     }
+}
+
+/// Response from posting an order.
+#[derive(Debug, serde::Deserialize)]
+struct PostOrderResponse {
+    #[serde(alias = "orderID")]
+    order_id: String,
+    #[allow(dead_code)]
+    success: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

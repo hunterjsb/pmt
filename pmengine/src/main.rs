@@ -1,5 +1,6 @@
 use clap::Parser;
 use pmengine::{Config, Engine};
+use pmengine::strategies::OrderTest;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -16,6 +17,10 @@ struct Args {
     /// Dry run mode - don't place real orders
     #[arg(long, default_value = "false")]
     dry_run: bool,
+
+    /// Run the order test strategy (places and cancels a small order)
+    #[arg(long)]
+    test_order: bool,
 }
 
 #[tokio::main]
@@ -52,6 +57,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create and run engine
     let mut engine = Engine::new(config, args.dry_run).await?;
     info!("Engine initialized");
+
+    // Register strategies
+    if args.test_order {
+        info!("Running order test strategy");
+        engine.register_strategy(Box::new(OrderTest::new()));
+    }
 
     // Run the main event loop
     engine.run().await?;
