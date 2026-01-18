@@ -46,7 +46,9 @@ cargo test                       # Run tests
 ```bash
 cd pmstrat
 uv sync
-uv run pytest tests/
+uv run pytest tests/               # Run tests
+uv run pmstrat simulate --ticks 500  # Backtest on synthetic data
+uv run pmstrat scan                  # Scan for live opportunities (needs pmtrader)
 ```
 
 ## Architecture
@@ -89,10 +91,13 @@ PMPROXY_URL=http://localhost:8080  # Optional
 
 ### pmengine
 ```
-PMENGINE_PRIVATE_KEY or PRIVATE_KEY
+PMENGINE_PRIVATE_KEY or PRIVATE_KEY  # Required
+PMENGINE_CLOB_URL (default: https://clob.polymarket.com)
+PMENGINE_WS_URL (default: wss://ws-subscriptions-clob.polymarket.com)
 PMENGINE_MAX_POSITION_SIZE (default: 1000)
 PMENGINE_MAX_TOTAL_EXPOSURE (default: 5000)
 PMENGINE_TICK_INTERVAL_MS (default: 1000)
+PMENGINE_LOG_LEVEL or RUST_LOG (default: info)
 ```
 
 ## Key Files
@@ -110,16 +115,21 @@ PMENGINE_TICK_INTERVAL_MS (default: 1000)
 - `src/lambda.rs` - Lambda handler
 
 ### pmengine
-- `src/engine.rs` - Main event loop
+- `src/engine.rs` - Main event loop with tokio::select!
 - `src/strategy.rs` - Strategy trait, Signal enum, StrategyContext
 - `src/order.rs` - Order lifecycle management
 - `src/position.rs` - Position tracking & P&L
 - `src/risk.rs` - Risk limits & RiskManager
+- `src/config.rs` - Environment configuration loading
 
 ### pmstrat
-- `pmstrat/signal.py` - Signal types with Urgency levels
+- `pmstrat/signal.py` - Signal types (Buy, Sell, Cancel, Hold) with Urgency levels
+- `pmstrat/context.py` - Context, OrderBookSnapshot, Position, MarketInfo
 - `pmstrat/dsl.py` - `@strategy` decorator for defining strategies
-- `pmstrat/backtest.py` - Backtesting harness
+- `pmstrat/rewards.py` - RewardsSimulator for Polymarket liquidity rewards
+- `pmstrat/backtest.py` - Backtesting harness with synthetic tick generation
+- `pmstrat/cli.py` - CLI commands (simulate, scan, backtest)
+- `pmstrat/strategies/sure_bets.py` - Low-risk strategy for expiring markets
 
 ## Strategy Workflow
 
