@@ -5,7 +5,7 @@ index-url = "https://pypi.org/simple"
 name = "pmtrader"
 version = "0.3.3"
 description = "Polymarket trading client with CLI and Streamlit UI"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "py-clob-client>=0.34.1",
     "python-dotenv>=1.2.1",
