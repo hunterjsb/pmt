@@ -3,7 +3,7 @@ index-url = "https://pypi.org/simple"
 
 [project]
 name = "pmstrat"
-version = "0.1.0"
+version = "0.1.1"
 description = "Strategy DSL and backtesting for Polymarket"
 requires-python = ">=3.14"
 dependencies = [
