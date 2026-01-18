@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import requests
 
 from .models import Event
+
+# Optional Cognito auth support
+try:
+    from .cognito import CognitoAuth
+except ImportError:
+    CognitoAuth = None  # type: ignore[misc, assignment]
+
+if TYPE_CHECKING:
+    from .cognito import CognitoAuth as CognitoAuthType
 
 GAMMA_HOST = "https://gamma-api.polymarket.com"
 
@@ -27,8 +37,23 @@ def get_gamma_host(proxy: bool = False) -> str:
 class Gamma:
     """Client for the Polymarket Gamma API (market metadata)."""
 
-    def __init__(self, host: str | None = None, *, proxy: bool = False) -> None:
+    def __init__(
+        self,
+        host: str | None = None,
+        *,
+        proxy: bool = False,
+        cognito_auth: "CognitoAuthType | None" = None,
+    ) -> None:
         self.host = host or get_gamma_host(proxy)
+        self._proxy = proxy
+        self._cognito_auth = cognito_auth
+
+    def _get_headers(self) -> dict[str, str]:
+        """Get request headers, including auth if using proxy with Cognito."""
+        headers: dict[str, str] = {}
+        if self._proxy and self._cognito_auth is not None:
+            headers.update(self._cognito_auth.get_auth_header())
+        return headers
 
     def events(
         self,
@@ -65,12 +90,16 @@ class Gamma:
         if end_date_max:
             params["end_date_max"] = end_date_max
 
-        response = requests.get(f"{self.host}/events", params=params, timeout=10)
+        response = requests.get(
+            f"{self.host}/events", params=params, headers=self._get_headers(), timeout=10
+        )
         response.raise_for_status()
         return response.json()
 
     def event_by_slug(self, slug: str) -> Event:
-        response = requests.get(f"{self.host}/events/slug/{slug}", timeout=10)
+        response = requests.get(
+            f"{self.host}/events/slug/{slug}", headers=self._get_headers(), timeout=10
+        )
         response.raise_for_status()
         e = response.json()
 
@@ -86,17 +115,23 @@ class Gamma:
 
     def markets(self, limit: int = 10, closed: bool = False) -> list[dict]:
         params = {"closed": str(closed).lower(), "limit": limit}
-        response = requests.get(f"{self.host}/markets", params=params, timeout=10)
+        response = requests.get(
+            f"{self.host}/markets", params=params, headers=self._get_headers(), timeout=10
+        )
         response.raise_for_status()
         return response.json()
 
     def market_by_slug(self, slug: str) -> dict:
-        response = requests.get(f"{self.host}/markets/slug/{slug}", timeout=10)
+        response = requests.get(
+            f"{self.host}/markets/slug/{slug}", headers=self._get_headers(), timeout=10
+        )
         response.raise_for_status()
         return response.json()
 
     def tags(self) -> list[dict]:
-        response = requests.get(f"{self.host}/tags", timeout=10)
+        response = requests.get(
+            f"{self.host}/tags", headers=self._get_headers(), timeout=10
+        )
         response.raise_for_status()
         return response.json()
 
@@ -104,13 +139,17 @@ class Gamma:
         self, tag_id: int, limit: int = 10, closed: bool = False
     ) -> list[dict]:
         params = {"tag_id": tag_id, "closed": str(closed).lower(), "limit": limit}
-        response = requests.get(f"{self.host}/events", params=params, timeout=10)
+        response = requests.get(
+            f"{self.host}/events", params=params, headers=self._get_headers(), timeout=10
+        )
         response.raise_for_status()
         return response.json()
 
     def search(self, query: str, limit: int = 10) -> list[dict]:
         params = {"query": query, "limit": limit}
-        response = requests.get(f"{self.host}/search", params=params, timeout=10)
+        response = requests.get(
+            f"{self.host}/search", params=params, headers=self._get_headers(), timeout=10
+        )
         response.raise_for_status()
         return response.json()
 
@@ -144,6 +183,8 @@ class Gamma:
         if active:
             params["active"] = "true"
 
-        response = requests.get(f"{self.host}/series", params=params, timeout=10)
+        response = requests.get(
+            f"{self.host}/series", params=params, headers=self._get_headers(), timeout=10
+        )
         response.raise_for_status()
         return response.json()
