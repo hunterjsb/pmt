@@ -19,13 +19,41 @@ class TranspileResult:
     tokens: List[str]
 
 
+@dataclass
+class MatchUnwrap:
+    """Synthetic AST node representing an Option unwrap via match.
+
+    Represents the pattern:
+        let var_name = match option_expr {
+            Some(v) => v,
+            None => return return_value,
+        };
+    """
+    var_name: str
+    option_expr: ast.expr
+    return_value: ast.expr
+
+
 class RustCodeGen:
     """Generates Rust code from Python AST."""
+
+    # Expressions that return Option types
+    OPTION_EXPRESSIONS = {
+        "ctx.book", "ctx.position", "ctx.mid",
+    }
+    # Attributes on OrderBook that are Option<Decimal>
+    OPTION_BOOK_ATTRS = {"best_bid", "best_ask", "mid_price"}
 
     def __init__(self, meta: StrategyMeta):
         self.meta = meta
         self.struct_name = self._to_pascal_case(meta.name)
         self.indent_level = 0
+        # Track variables that hold Option values (not yet unwrapped)
+        self.option_vars: set[str] = set()
+        # Track variables that were unwrapped from Options
+        self.unwrapped_vars: set[str] = set()
+        # Track variables that need to be mutable
+        self.mutable_vars: set[str] = set()
 
     def _to_pascal_case(self, name: str) -> str:
         """Convert snake_case to PascalCase."""
@@ -88,23 +116,220 @@ impl Strategy for {self.struct_name} {{
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {{
 {on_tick_body}
     }}
+
+    fn on_fill(&mut self, _fill: &Fill) {{}}
+    fn on_shutdown(&mut self) {{}}
 }}
 '''
 
     def _gen_function_body(self, stmts: List[ast.stmt]) -> str:
-        """Generate Rust code for a list of statements."""
+        """Generate Rust code for a list of statements.
+
+        Performs pattern matching to detect Option unwrapping patterns like:
+            x = ctx.book(token)
+            if x is None:
+                return signals
+        And converts them to proper Rust match expressions.
+        """
         self.indent_level = 2  # Start at 2 for method body
         lines = []
-        for stmt in stmts:
+
+        # Scan for variables that need to be mutable
+        self._scan_mutability(stmts)
+
+        # Pre-process to combine assign + None check patterns
+        processed_stmts = self._preprocess_option_patterns(stmts)
+
+        for stmt in processed_stmts:
             # Skip docstrings
             if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
                 continue
             lines.append(self._gen_stmt(stmt))
         return "\n".join(lines)
 
-    def _gen_stmt(self, stmt: ast.stmt) -> str:
+    def _scan_mutability(self, stmts: List[ast.stmt]) -> None:
+        """Scan statements to find variables that need to be mutable.
+
+        A variable needs `mut` if:
+        - It has .push()/.append()/.pop() called on it
+        - It's used with augmented assignment (+=, -=, etc.)
+        """
+        for stmt in stmts:
+            self._scan_stmt_mutability(stmt)
+
+    def _scan_stmt_mutability(self, stmt: ast.stmt) -> None:
+        """Recursively scan a statement for mutability requirements."""
+        if isinstance(stmt, ast.Expr):
+            # Check for method calls like x.push(), x.append()
+            if isinstance(stmt.value, ast.Call):
+                call = stmt.value
+                if isinstance(call.func, ast.Attribute):
+                    if call.func.attr in ("push", "append", "pop", "clear", "extend"):
+                        # The object being mutated
+                        if isinstance(call.func.value, ast.Name):
+                            self.mutable_vars.add(call.func.value.id)
+
+        elif isinstance(stmt, ast.AugAssign):
+            # x += y means x needs to be mutable
+            if isinstance(stmt.target, ast.Name):
+                self.mutable_vars.add(stmt.target.id)
+
+        elif isinstance(stmt, ast.If):
+            for s in stmt.body:
+                self._scan_stmt_mutability(s)
+            for s in stmt.orelse:
+                self._scan_stmt_mutability(s)
+
+        elif isinstance(stmt, ast.For):
+            for s in stmt.body:
+                self._scan_stmt_mutability(s)
+
+    def _preprocess_option_patterns(self, stmts: List[ast.stmt]) -> List[ast.stmt]:
+        """Detect and mark Option unwrapping patterns.
+
+        Patterns detected:
+        1. x = option_expr; if x is None: return y  -> MatchUnwrap(x, option_expr, y)
+        2. if x.attr is None: return y; ... z = x.attr  -> MatchUnwrap(z, x.attr, y)
+           (assignment can be anywhere after the None check)
+        """
+        result = []
+        skip_indices: set[int] = set()
+        # Track which attr None checks we've seen: {(obj_name, attr_name): (return_value, index)}
+        pending_attr_checks: dict[tuple[str, str], tuple[ast.expr, int]] = {}
+
+        for i, stmt in enumerate(stmts):
+            if i in skip_indices:
+                continue
+
+            next_stmt = stmts[i + 1] if i + 1 < len(stmts) else None
+
+            # Pattern 1: x = option_expr; if x is None: return
+            if (isinstance(stmt, ast.Assign) and
+                len(stmt.targets) == 1 and
+                isinstance(stmt.targets[0], ast.Name) and
+                next_stmt is not None and
+                self._is_none_check_return(next_stmt, stmt.targets[0].id)):
+
+                var_name = stmt.targets[0].id
+                option_expr = stmt.value
+                return_value = next_stmt.body[0].value  # The return value
+
+                # Create a synthetic node to represent match unwrap
+                result.append(MatchUnwrap(var_name, option_expr, return_value))
+                self.unwrapped_vars.add(var_name)
+                skip_indices.add(i + 1)
+                continue
+
+            # Pattern 2a: if x.attr is None: return - record for later matching
+            if self._is_attr_none_check_return(stmt):
+                attr_expr = stmt.test.left  # x.attr
+                if isinstance(attr_expr, ast.Attribute) and isinstance(attr_expr.value, ast.Name):
+                    obj_name = attr_expr.value.id
+                    attr_name = attr_expr.attr
+                    return_value = stmt.body[0].value
+                    pending_attr_checks[(obj_name, attr_name)] = (return_value, i)
+                    continue  # Don't add to result yet
+
+            # Pattern 2b: z = x.attr - check if we have a pending None check for this
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                if isinstance(stmt.value, ast.Attribute) and isinstance(stmt.value.value, ast.Name):
+                    obj_name = stmt.value.value.id
+                    attr_name = stmt.value.attr
+                    key = (obj_name, attr_name)
+
+                    if key in pending_attr_checks:
+                        return_value, check_idx = pending_attr_checks.pop(key)
+                        var_name = stmt.targets[0].id
+                        attr_expr = stmt.value
+
+                        result.append(MatchUnwrap(var_name, attr_expr, return_value))
+                        self.unwrapped_vars.add(var_name)
+                        # The None check was already skipped (not added to result)
+                        continue
+
+            result.append(stmt)
+
+        # Any remaining pending checks that weren't matched - add them back as regular if statements
+        # (This shouldn't happen with well-formed code, but handle it gracefully)
+
+        return result
+
+    def _is_none_check_return(self, stmt: ast.stmt, var_name: str) -> bool:
+        """Check if stmt is 'if var_name is None: return ...'"""
+        if not isinstance(stmt, ast.If):
+            return False
+        if len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.Return):
+            return False
+        if stmt.orelse:  # No else clause
+            return False
+
+        test = stmt.test
+        if not isinstance(test, ast.Compare):
+            return False
+        if len(test.ops) != 1 or len(test.comparators) != 1:
+            return False
+        if not isinstance(test.ops[0], (ast.Is, ast.Eq)):
+            return False
+        if not isinstance(test.comparators[0], ast.Constant) or test.comparators[0].value is not None:
+            return False
+        if not isinstance(test.left, ast.Name) or test.left.id != var_name:
+            return False
+
+        return True
+
+    def _is_attr_none_check_return(self, stmt: ast.stmt) -> bool:
+        """Check if stmt is 'if x.attr is None: return ...' where attr is an Option field."""
+        if not isinstance(stmt, ast.If):
+            return False
+        if len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.Return):
+            return False
+        if stmt.orelse:
+            return False
+
+        test = stmt.test
+        if not isinstance(test, ast.Compare):
+            return False
+        if len(test.ops) != 1 or len(test.comparators) != 1:
+            return False
+        if not isinstance(test.ops[0], (ast.Is, ast.Eq)):
+            return False
+        if not isinstance(test.comparators[0], ast.Constant) or test.comparators[0].value is not None:
+            return False
+
+        # Check that left side is an attribute access to an Option field
+        if not isinstance(test.left, ast.Attribute):
+            return False
+        if test.left.attr not in self.OPTION_BOOK_ATTRS:
+            return False
+
+        return True
+
+    def _assigns_same_attr(self, assign_stmt: ast.Assign, if_stmt: ast.If) -> bool:
+        """Check if assign_stmt assigns the same attribute that if_stmt checks."""
+        if not isinstance(assign_stmt.value, ast.Attribute):
+            return False
+
+        if_attr = if_stmt.test.left  # x.attr from the if check
+        assign_attr = assign_stmt.value  # x.attr from the assignment
+
+        # Compare object and attribute
+        if not isinstance(if_attr, ast.Attribute) or not isinstance(assign_attr, ast.Attribute):
+            return False
+        if if_attr.attr != assign_attr.attr:
+            return False
+
+        # Compare the object being accessed
+        if isinstance(if_attr.value, ast.Name) and isinstance(assign_attr.value, ast.Name):
+            return if_attr.value.id == assign_attr.value.id
+
+        return False
+
+    def _gen_stmt(self, stmt) -> str:
         """Generate Rust code for a statement."""
-        if isinstance(stmt, ast.Return):
+        # Handle our synthetic MatchUnwrap node
+        if isinstance(stmt, MatchUnwrap):
+            return self._gen_match_unwrap(stmt)
+        elif isinstance(stmt, ast.Return):
             return self._gen_return(stmt)
         elif isinstance(stmt, ast.Assign):
             return self._gen_assign(stmt)
@@ -120,6 +345,16 @@ impl Strategy for {self.struct_name} {{
         else:
             return f"{self._indent()}// TODO: unsupported stmt {type(stmt).__name__}"
 
+    def _gen_match_unwrap(self, node: MatchUnwrap) -> str:
+        """Generate a match expression that unwraps an Option or returns early."""
+        option_expr = self._gen_expr(node.option_expr)
+        return_expr = self._gen_expr(node.return_value)
+
+        return f"""{self._indent()}let {node.var_name} = match {option_expr} {{
+{self._indent()}    Some(v) => v,
+{self._indent()}    None => return {return_expr},
+{self._indent()}}};"""
+
     def _gen_return(self, stmt: ast.Return) -> str:
         if stmt.value is None:
             return f"{self._indent()}return vec![];"
@@ -130,9 +365,16 @@ impl Strategy for {self.struct_name} {{
         return f"{self._indent()}return {expr};"
 
     def _gen_assign(self, stmt: ast.Assign) -> str:
-        target = self._gen_expr(stmt.targets[0])
+        target_node = stmt.targets[0]
+        target = self._gen_expr(target_node)
         value = self._gen_expr(stmt.value)
-        return f"{self._indent()}let {target} = {value};"
+
+        # Check if this variable needs to be mutable
+        mut = ""
+        if isinstance(target_node, ast.Name) and target_node.id in self.mutable_vars:
+            mut = "mut "
+
+        return f"{self._indent()}let {mut}{target} = {value};"
 
     def _gen_aug_assign(self, stmt: ast.AugAssign) -> str:
         target = self._gen_expr(stmt.target)

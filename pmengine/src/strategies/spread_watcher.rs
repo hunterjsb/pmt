@@ -1,5 +1,5 @@
 //! Auto-generated from Python strategy: spread_watcher
-//! Fixed for Rust Option handling
+//! DO NOT EDIT - regenerate with `pmstrat transpile`
 
 use crate::strategy::{Signal, Strategy, StrategyContext, Urgency};
 use crate::position::Fill;
@@ -35,40 +35,26 @@ impl Strategy for SpreadWatcher {
     }
 
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
-        let token = "41583919731714354912849507182398941127545694257513505398713274521520484370640";
+        let token = "41583919731714354912849507182398941127545694257513505398713274521520484370640".to_string();
         let mut signals = vec![];
-
-        let book = match ctx.order_books.get(token) {
-            Some(b) => b,
+        let book = match ctx.order_books.get(&token) {
+            Some(v) => v,
             None => return signals,
         };
-
-        let (bid, ask) = match (book.best_bid, book.best_ask) {
-            (Some(b), Some(a)) => (b, a),
-            _ => return signals,
+        let bid = match book.best_bid {
+            Some(v) => v,
+            None => return signals,
         };
-
-        let spread = ask - bid;
-
-        // If spread is wide (> 0.50), place a bid in the middle
+        let ask = match book.best_ask {
+            Some(v) => v,
+            None => return signals,
+        };
+        let spread = (ask - bid);
         if spread > dec!(0.50) {
-            let mid = (bid + ask) / dec!(2);
-            tracing::info!(
-                spread = %spread,
-                bid = %bid,
-                ask = %ask,
-                mid = %mid,
-                "Wide spread detected, placing order"
-            );
-            signals.push(Signal::Buy {
-                token_id: token.to_string(),
-                price: mid,
-                size: dec!(1),
-                urgency: Urgency::Low,
-            });
+            let mid = ((bid + ask) / dec!(2));
+            signals.push(Signal::Buy { token_id: token, price: mid, size: dec!(1), urgency: Urgency::Low });
         }
-
-        signals
+        return signals;
     }
 
     fn on_fill(&mut self, _fill: &Fill) {}
