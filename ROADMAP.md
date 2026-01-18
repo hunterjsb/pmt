@@ -32,57 +32,65 @@ Core principle: **dogfooding**. We run our own strategies on our own infra.
 
 ---
 
-## Current State (Phase 0)
+## Current State (Phase 1 Complete)
 
 | Component   | Status | Description                                    |
 |-------------|--------|------------------------------------------------|
 | pmtrader    | ✅      | Python SDK + CLI + Streamlit UI                |
-| pmproxy     | ✅      | Rust reverse proxy (EC2/Lambda deployable)     |
+| pmproxy     | ✅      | Rust reverse proxy (EC2 deployed)              |
+| pmengine    | ✅      | Rust HFT engine with WebSocket + strategies    |
+| pmstrat     | ✅      | Python strategy DSL + transpiler               |
 
 ---
 
-## Phase 1: pmplatform Foundation
+## Phase 1: pmplatform Foundation ✅
 
 **Goal:** Stand up core infrastructure for strategy execution.
 
-- [ ] **Co-located server**
-  - Provision server near Polymarket infrastructure
-  - Deploy pmproxy on co-located hardware
-  - Establish baseline latency metrics
+- [x] **Co-located server**
+  - EC2 instance in eu-west-1 (near Polymarket infra)
+  - pmproxy deployed via CodeDeploy
+  - pmengine deployed via CodeDeploy
 
-- [ ] **Rust HFT engine (core)**
-  - Order execution layer (place/cancel/amend)
+- [x] **Rust HFT engine (pmengine)**
+  - Order execution layer (place/cancel via CLOB API)
+  - Custom L2 auth for proxy compatibility
   - Strategy runtime interface
   - Position and risk tracking
-  - Event loop with sub-millisecond tick processing
+  - WebSocket orderbook subscriptions
+  - Event loop with tokio::select!
 
-- [ ] **pmtrader SDK extensions**
-  - Strategy definition API (extends existing pmtrader)
-  - Dev mode: AWS Lambda execution (cheap, slow)
-  - Local backtesting harness
-  - Seamless switch between dev/prod execution targets
+- [x] **pmstrat (Strategy DSL)**
+  - @strategy decorator with tokens/subscriptions
+  - Signal types: Buy, Sell, Cancel, Hold
+  - Context API: ctx.book(), ctx.position(), ctx.mid()
+  - Urgency levels for order priority
 
 ---
 
-## Phase 2: Transpiler + Strategies (concurrent)
+## Phase 2: Transpiler + Strategies (in progress)
 
 **Goal:** Build the Python→Rust transpiler while developing strategies to validate it.
 
-These workstreams run in parallel — strategies provide real-world test cases for the transpiler.
-
 ### Transpiler (pmplatform)
 
-- [ ] **Strategy DSL**
-  - Define constrained Python subset for strategies
-  - Signal/indicator primitives
-  - Order action primitives (market, limit, cancel)
-  - Position/portfolio introspection
+- [x] **Strategy DSL**
+  - Constrained Python subset for strategies
+  - Signal/indicator primitives (Buy, Sell, Cancel, Hold)
+  - Order action primitives (limit orders)
+  - Position/portfolio introspection via context
 
-- [ ] **Transpiler**
+- [x] **Transpiler MVP**
   - Parse Python AST
-  - Generate idiomatic Rust code
-  - Integrate with Rust HFT engine runtime
-  - Compile-time validation and error reporting
+  - Generate Rust code
+  - Integrate with pmengine runtime
+  - First strategy transpiled: spread_watcher
+
+- [ ] **Transpiler Polish**
+  - Handle Option types automatically
+  - Mutability inference
+  - Constant propagation
+  - Better error messages
 
 - [ ] **Testing & Validation**
   - Equivalence testing (Python vs generated Rust)
@@ -96,10 +104,11 @@ These workstreams run in parallel — strategies provide real-world test cases f
   - Normalized event/signal pipeline
   - Historical data storage and replay
 
-- [ ] **Internal strategies (dogfooding)**
-  - Basic arbitrage (cross-market, cross-platform)
-  - Sure-bet yield farming (low-risk, consistent returns)
-  - Market making / LP (order flow and spread analytics)
+- [x] **Internal strategies (dogfooding)**
+  - spread_watcher: buys when spread > 50%
+  - order_test: validates order placement
+  - [ ] Sure-bet yield farming
+  - [ ] Market making / LP
 
 - [ ] **Analytics & order flow**
   - Real-time order book analysis
@@ -135,19 +144,21 @@ These workstreams run in parallel — strategies provide real-world test cases f
 
 ## Milestones
 
-| Milestone                          | Phase | Target |
+| Milestone                          | Phase | Status |
 |------------------------------------|-------|--------|
-| Co-located server operational      | 1     | TBD    |
-| Rust engine MVP (manual orders)    | 1     | TBD    |
-| pmtrader strategy API (dev mode)   | 1     | TBD    |
-| First strategy running on Lambda   | 2     | TBD    |
-| Transpiler MVP                     | 2     | TBD    |
-| First strategy compiled to Rust    | 2     | TBD    |
-| Data aggregation pipeline live     | 2     | TBD    |
-| Internal strategies profitable     | 2     | TBD    |
-| Public strategy posts launch       | 3     | TBD    |
-| pmplatform external beta           | 3     | TBD    |
+| Co-located server operational      | 1     | ✅ Done |
+| Rust engine MVP (order placement)  | 1     | ✅ Done |
+| WebSocket orderbook integration    | 1     | ✅ Done |
+| pmstrat DSL defined                | 2     | ✅ Done |
+| Transpiler MVP                     | 2     | ✅ Done |
+| First strategy compiled to Rust    | 2     | ✅ Done (spread_watcher) |
+| Transpiler polish (Option handling)| 2     | 🔄 Next |
+| Sure-bet strategy                  | 2     | 🔄 Next |
+| Data aggregation pipeline live     | 2     | ⏳ Planned |
+| Internal strategies profitable     | 2     | ⏳ Planned |
+| Public strategy posts launch       | 3     | ⏳ Planned |
+| pmplatform external beta           | 3     | ⏳ Planned |
 
 ---
 
-*Last updated: 2025-01-16*
+*Last updated: 2026-01-18*
