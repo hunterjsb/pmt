@@ -23,6 +23,7 @@ pmtrader-ui = "ui.app:main"
 
 [dependency-groups]
 dev = [
+    "pynacl>=1.6.2",
     "pytest>=8.0.0",
 ]
 
