@@ -158,3 +158,55 @@ Rust binaries deploy to EC2 via CodeDeploy (eu-west-1):
 - `appspec.yml` defines lifecycle hooks
 - `scripts/` contains install.sh, start.sh, stop.sh, validate.sh
 - Cross-compiled for both x86_64 and aarch64
+
+## EC2 Instance
+
+The production EC2 instance runs in **eu-west-1** (Ireland), co-located near Polymarket infrastructure for low latency.
+
+### Connecting
+
+```bash
+# SSH connection script
+.infra/ssh-connect.sh
+
+# Or manually:
+ssh -i .infra/pmt-kp.pem ec2-user@34.250.56.199
+```
+
+### Services
+
+| Service | Port | Description |
+|---------|------|-------------|
+| pmproxy | 8080 | Reverse proxy (localhost only, behind nginx) |
+| pmengine | - | HFT engine (no network port, runs strategies) |
+
+### Managing Services
+
+```bash
+# Check status
+sudo systemctl status pmproxy pmengine
+
+# View logs
+sudo journalctl -u pmproxy -f
+sudo journalctl -u pmengine -f
+
+# Restart services
+sudo systemctl restart pmproxy
+sudo systemctl restart pmengine
+
+# Health check
+curl http://127.0.0.1:8080/health
+```
+
+### Environment
+
+- pmproxy config: `/etc/systemd/system/pmproxy.service`
+- pmengine config: `/etc/systemd/system/pmengine.service`
+- pmengine env: `~/.pmengine.env` (contains PM_PRIVATE_KEY, etc.)
+- Binaries: `/usr/local/bin/pmproxy`, `/usr/local/bin/pmengine`
+
+### Notes
+
+- pmengine runs with `--dry-run` by default (no real orders)
+- To enable a strategy: edit service file, add `--spread-watcher`
+- Public access is via `https://pmt.xandaris.space` (nginx → pmproxy)
