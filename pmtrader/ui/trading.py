@@ -156,19 +156,19 @@ def render_order_book(token_id: str, outcome: str):
         return
 
     # Build cumulative depth data
+    # Bids: best (highest) to worst (lowest), cumulative outward
+    # Asks: best (lowest) to worst (highest), cumulative outward
     bid_prices, bid_cumulative = [], []
     ask_prices, ask_cumulative = [], []
 
     cumsum = 0
-    for level in reversed(book.bids):  # Start from lowest bid
+    for level in book.bids:  # Already sorted high to low
         cumsum += level.size
         bid_prices.append(level.price * 100)
         bid_cumulative.append(cumsum)
-    bid_prices.reverse()
-    bid_cumulative.reverse()
 
     cumsum = 0
-    for level in book.asks:  # Start from lowest ask
+    for level in book.asks:  # Already sorted low to high
         cumsum += level.size
         ask_prices.append(level.price * 100)
         ask_cumulative.append(cumsum)

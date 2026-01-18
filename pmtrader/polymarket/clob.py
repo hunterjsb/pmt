@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -120,6 +121,12 @@ class Clob:
 
     def server_time(self):
         return self._client.get_server_time()
+
+    def market(self, condition_id: str) -> dict:
+        """Get market info by condition_id."""
+        response = requests.get(f"{self.host}/markets/{condition_id}", timeout=10)
+        response.raise_for_status()
+        return response.json()
 
     def sampling_markets(self, limit: int = 100) -> list[Market]:
         response = requests.get(f"{self.host}/sampling-markets", timeout=10)
@@ -337,23 +344,50 @@ class AuthenticatedClob:
     # On-chain balances (funder)
     # -----------------------------
 
+    def _rpc_call(self, to: str, data: str, retries: int = 3) -> str:
+        """Make an eth_call and return the result hex string with retry logic."""
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": to, "data": data}, "latest"],
+            "id": 1,
+        }
+
+        last_error = None
+        for attempt in range(retries):
+            try:
+                response = requests.post(self._rpc, json=payload, timeout=10)
+                response.raise_for_status()
+                result = response.json()
+
+                if "error" in result:
+                    error_msg = result["error"].get("message", str(result["error"]))
+                    # Retry on rate limit
+                    if "rate limit" in error_msg.lower() or "too many" in error_msg.lower():
+                        last_error = RuntimeError(f"RPC rate limited: {error_msg}")
+                        time.sleep(2 + attempt * 2)  # Backoff: 2s, 4s, 6s
+                        continue
+                    raise RuntimeError(f"RPC error: {error_msg}")
+
+                if "result" not in result:
+                    raise RuntimeError(f"RPC response missing 'result': {result}")
+
+                return result["result"]
+
+            except requests.RequestException as e:
+                last_error = e
+                time.sleep(2 ** attempt)
+                continue
+
+        raise last_error or RuntimeError("RPC call failed after retries")
+
     def usdc_balance(self) -> float:
         """USDC balance for funder address via JSON-RPC eth_call."""
         address_padded = self._funder[2:].lower().zfill(64)
         data = "0x70a08231" + address_padded  # balanceOf(address)
 
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "eth_call",
-            "params": [{"to": USDC_CONTRACT, "data": data}, "latest"],
-            "id": 1,
-        }
-
-        response = requests.post(self._rpc, json=payload, timeout=10)
-        response.raise_for_status()
-        result = response.json()
-
-        balance_wei = int(result["result"], 16)
+        hex_result = self._rpc_call(USDC_CONTRACT, data)
+        balance_wei = int(hex_result, 16)
         return balance_wei / 1e6  # USDC has 6 decimals
 
     def token_balance(self, token_id: str) -> float:
@@ -362,44 +396,38 @@ class AuthenticatedClob:
         token_padded = hex(int(token_id))[2:].zfill(64)
         data = "0x00fdd58e" + address_padded + token_padded  # balanceOf(address,id)
 
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "eth_call",
-            "params": [{"to": CTF_CONTRACT, "data": data}, "latest"],
-            "id": 1,
-        }
-
-        response = requests.post(self._rpc, json=payload, timeout=10)
-        response.raise_for_status()
-        result = response.json()
-
-        balance = int(result["result"], 16)
+        hex_result = self._rpc_call(CTF_CONTRACT, data)
+        balance = int(hex_result, 16)
         return balance / 1e6  # Polymarket outcome tokens use 6 decimals
 
-    def positions(self) -> list[dict]:
+    def positions(self, max_tokens: int = 20) -> list[dict]:
         """Current positions by on-chain balances for tokens seen in trade history.
+
+        Args:
+            max_tokens: Max unique tokens to check (most recent trades first)
 
         Returns list of:
           { token_id, outcome, market, shares }
         """
         trades = self.trades()
 
+        # Build token metadata from most recent trades first
         token_meta: dict[str, dict] = {}
         for t in trades:
+            if len(token_meta) >= max_tokens:
+                break
             token_id = t["asset_id"]
             if token_id not in token_meta:
                 token_meta[token_id] = {"outcome": t["outcome"], "market": t["market"]}
 
-        def fetch(token_id: str) -> tuple[str, float]:
-            return token_id, self.token_balance(token_id)
-
+        # Sequential with delay to avoid RPC rate limits
         positions: list[dict] = []
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            futures = {ex.submit(fetch, tid): tid for tid in token_meta}
-            for fut in as_completed(futures):
-                token_id, bal = fut.result()
+        for i, (token_id, meta) in enumerate(token_meta.items()):
+            if i > 0:
+                time.sleep(0.3)  # Rate limit throttle
+            try:
+                bal = self.token_balance(token_id)
                 if bal > 0.01:
-                    meta = token_meta[token_id]
                     positions.append(
                         {
                             "token_id": token_id,
@@ -408,6 +436,8 @@ class AuthenticatedClob:
                             "shares": bal,
                         }
                     )
+            except Exception:
+                continue  # Skip tokens we can't fetch
 
         return positions
 

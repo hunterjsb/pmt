@@ -3,7 +3,7 @@ index-url = "https://pypi.org/simple"
 
 [project]
 name = "pmtrader"
-version = "0.3.0"
+version = "0.3.1"
 description = "Polymarket trading client with CLI and Streamlit UI"
 requires-python = ">=3.14"
 dependencies = [
