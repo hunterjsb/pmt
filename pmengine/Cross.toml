@@ -1,0 +1,13 @@
+[target.x86_64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install -y libssl-dev pkg-config cmake"
+]
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update && apt-get install -y libssl-dev:arm64 pkg-config cmake"
+]
+
+[build.env]
+passthrough = ["AWS_LC_SYS_CMAKE_BUILDER"]
