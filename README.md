@@ -3,8 +3,10 @@
 Polymarket trading toolkit.
 
 ```
-pmtrader/   Python client + Streamlit UI
-pmproxy/    Rust reverse proxy
+pmtrader/   Python SDK + CLI + Streamlit UI
+pmproxy/    Rust reverse proxy (EC2/Lambda)
+pmengine/   Rust HFT trading engine
+pmstrat/    Python strategy DSL + backtesting
 ```
 
 ## Architecture
@@ -21,6 +23,20 @@ flowchart LR
         LIB["polymarket module"]
         AUTH["Auth & Signing"]
     end
+
+    subgraph STRATDSL["pmstrat (Python)"]
+        DSL["Strategy DSL"]
+        TRANS["Transpiler"]
+    end
+
+    subgraph ENGINE["pmengine (Rust)"]
+        STRAT["Strategy Runtime"]
+        ORDER["Order Manager"]
+        RISK["Risk Manager"]
+    end
+
+    DSL --> TRANS
+    TRANS -->|"generates"| STRAT
 
     CLI --> PMT
     UI --> PMT
@@ -43,6 +59,7 @@ flowchart LR
     end
 
     PROXY --> POLY
+    ENGINE --> POLY
 ```
 
 ## pmtrader
@@ -85,7 +102,7 @@ gamma.search(query)
 ## pmproxy
 
 ```bash
-cd pmproxy && cargo build --release
+cd pmproxy && cargo build --release --features ec2
 ./target/release/pmproxy
 ```
 
@@ -93,8 +110,47 @@ Routes `/clob/*`, `/gamma/*`, `/chain/*` to Polymarket APIs.
 
 See [pmproxy/README.md](pmproxy/README.md).
 
+## pmengine
+
+```bash
+cd pmengine && cargo build --release --features ec2
+./target/release/pmengine --dry-run
+```
+
+### Config
+
+```bash
+# .env
+PMENGINE_PRIVATE_KEY=0x...
+PMENGINE_MAX_POSITION_SIZE=1000
+PMENGINE_MAX_TOTAL_EXPOSURE=5000
+PMENGINE_TICK_INTERVAL_MS=1000
+```
+
+## pmstrat
+
+```bash
+cd pmstrat && uv sync
+uv run pmstrat
+```
+
+Strategy DSL and backtesting framework. Define strategies in a constrained Python subset using the `@strategy` decorator, backtest locally, then transpile to Rust for execution by pmengine.
+
+```
+Python Strategy (pmstrat DSL)
+    ↓ transpile
+Rust Strategy Code
+    ↓ compile into
+pmengine binary
+    ↓ execute
+Polymarket (production)
+```
+
 ## Test
 
 ```bash
-cd pmtrader && uv run pytest
+cd pmtrader && uv run pytest      # Python SDK tests
+cd pmstrat && uv run pytest       # Strategy tests
+cd pmproxy && cargo test          # Proxy tests
+cd pmengine && cargo test         # Engine tests
 ```

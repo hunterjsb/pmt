@@ -1,0 +1,56 @@
+[package]
+name = "pmengine"
+version = "0.1.0"
+edition = "2021"
+description = "Rust HFT engine for Polymarket trading"
+
+[dependencies]
+# Polymarket official SDK
+polymarket-client-sdk = { version = "0.4", features = ["clob", "ws", "data"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Config (EC2 only)
+clap = { version = "4", features = ["derive"], optional = true }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Numerics
+rust_decimal = "1"
+rust_decimal_macros = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Crypto (alloy comes from polymarket-client-sdk)
+hex = "0.4"
+
+# Async utilities
+async-broadcast = "0.7"
+
+[features]
+default = ["ec2"]
+ec2 = ["clap"]
+
+[lib]
+name = "pmengine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pmengine"
+path = "src/main.rs"
+required-features = ["ec2"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

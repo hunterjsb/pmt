@@ -1,0 +1,109 @@
+name: Publish pmengine
+
+on:
+  push:
+    tags:
+      - "pmengine-v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  AWS_REGION: eu-west-1
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build Linux x86_64
+        working-directory: pmengine
+        run: |
+          cross build --release --target x86_64-unknown-linux-gnu --features ec2
+          tar -czvf pmengine-x86_64-unknown-linux-gnu.tar.gz -C target/x86_64-unknown-linux-gnu/release pmengine
+
+      - name: Build Linux aarch64
+        working-directory: pmengine
+        run: |
+          cross build --release --target aarch64-unknown-linux-gnu --features ec2
+          tar -czvf pmengine-aarch64-unknown-linux-gnu.tar.gz -C target/aarch64-unknown-linux-gnu/release pmengine
+
+      - name: Upload x86_64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmengine-x86_64
+          path: pmengine/target/x86_64-unknown-linux-gnu/release/pmengine
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/pmengine-}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: pmengine ${{ steps.version.outputs.version }}
+          files: pmengine/pmengine-*.tar.gz
+          generate_release_notes: true
+
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pmengine-x86_64
+          path: bundle/
+
+      - name: Prepare deployment bundle
+        run: |
+          mkdir -p bundle/scripts
+          cp pmengine/appspec.yml bundle/
+          cp pmengine/scripts/*.sh bundle/scripts/
+          chmod +x bundle/scripts/*.sh
+          cd bundle && zip -r ../pmengine-deploy.zip .
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp pmengine-deploy.zip s3://pmproxy-deployments/${{ github.ref_name }}/pmengine-deploy.zip
+
+      - name: Trigger CodeDeploy
+        id: deploy
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name pmengine \
+            --deployment-group-name production \
+            --s3-location bucket=pmproxy-deployments,key=${{ github.ref_name }}/pmengine-deploy.zip,bundleType=zip \
+            --query 'deploymentId' --output text)
+          echo "Deployment started: $DEPLOYMENT_ID"
+          echo "deployment_id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for deployment
+        run: |
+          aws deploy wait deployment-successful --deployment-id ${{ steps.deploy.outputs.deployment_id }} || true
+          STATUS=$(aws deploy get-deployment --deployment-id ${{ steps.deploy.outputs.deployment_id }} --query 'deploymentInfo.status' --output text)
+          echo "Deployment status: $STATUS"
+          if [ "$STATUS" != "Succeeded" ]; then
+            echo "Deployment failed or timed out"
+            exit 1
+          fi
