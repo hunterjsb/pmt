@@ -2,6 +2,7 @@
 
 use crate::orderbook::OrderBook;
 use crate::position::{Fill, PositionTracker};
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,15 +49,55 @@ pub enum Signal {
     Hold,
 }
 
+/// Market metadata from Gamma API.
+///
+/// This provides information about the market that a token belongs to,
+/// including the question, outcome name, and expiration time.
+#[derive(Debug, Clone)]
+pub struct MarketInfo {
+    /// The market question (e.g., "Will X happen?")
+    pub question: String,
+    /// Which outcome this token represents (e.g., "Yes" or "No")
+    pub outcome: String,
+    /// When the market expires/resolves
+    pub end_date: Option<DateTime<Utc>>,
+    /// Hours until expiry (computed at context creation time)
+    pub hours_until_expiry: Option<f64>,
+}
+
+impl MarketInfo {
+    /// Create a new MarketInfo.
+    pub fn new(
+        question: String,
+        outcome: String,
+        end_date: Option<DateTime<Utc>>,
+    ) -> Self {
+        let hours_until_expiry = end_date.map(|end| {
+            let now = Utc::now();
+            let duration = end.signed_duration_since(now);
+            duration.num_seconds() as f64 / 3600.0
+        });
+
+        Self {
+            question,
+            outcome,
+            end_date,
+            hours_until_expiry,
+        }
+    }
+}
+
 /// Context provided to strategies for decision making.
 #[derive(Debug, Clone)]
 pub struct StrategyContext {
     /// Current timestamp
-    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub timestamp: DateTime<Utc>,
     /// Order books by token ID (full depth)
     pub order_books: HashMap<String, Arc<OrderBook>>,
     /// Current positions
     pub positions: PositionTracker,
+    /// Market metadata by token ID (from Gamma API)
+    pub markets: HashMap<String, MarketInfo>,
     /// Total unrealized P&L
     pub unrealized_pnl: Decimal,
     /// Total realized P&L

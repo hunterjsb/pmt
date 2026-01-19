@@ -2,11 +2,12 @@
 
 use crate::client::PolymarketClient;
 use crate::config::Config;
+use crate::gamma::{GammaClient, GammaMarket};
 use crate::order::OrderManager;
 use crate::orderbook::MarketDataHub;
 use crate::position::{Fill, PositionTracker};
 use crate::risk::{RiskCheckResult, RiskLimits, RiskManager};
-use crate::strategy::{DummyStrategy, Signal, StrategyContext, StrategyRuntime};
+use crate::strategy::{DummyStrategy, MarketInfo, Signal, StrategyContext, StrategyRuntime};
 
 use futures::StreamExt;
 use polymarket_client_sdk::clob::ws::Client as WsClient;
@@ -34,6 +35,12 @@ pub struct Engine {
     subscribed_tokens: Vec<String>,
     fill_receiver: mpsc::Receiver<Fill>,
     shutdown: bool,
+    /// Gamma API client for market discovery
+    gamma_client: Option<GammaClient>,
+    /// Market metadata by token ID
+    market_info: HashMap<String, MarketInfo>,
+    /// Whether market discovery is enabled
+    market_discovery_enabled: bool,
 }
 
 impl Engine {
@@ -90,7 +97,99 @@ impl Engine {
             subscribed_tokens: Vec::new(),
             fill_receiver,
             shutdown: false,
+            gamma_client: None,
+            market_info: HashMap::new(),
+            market_discovery_enabled: false,
         })
+    }
+
+    /// Enable market discovery with Gamma API.
+    ///
+    /// This allows the engine to dynamically discover markets and subscribe
+    /// to tokens that meet certain criteria (e.g., high-certainty expiring markets).
+    pub fn enable_market_discovery(&mut self) {
+        self.gamma_client = Some(GammaClient::new());
+        self.market_discovery_enabled = true;
+        tracing::info!("Market discovery enabled");
+    }
+
+    /// Check if market discovery is enabled.
+    pub fn is_market_discovery_enabled(&self) -> bool {
+        self.market_discovery_enabled
+    }
+
+    /// Build market info map from Gamma markets.
+    fn build_market_info(&self, markets: &[GammaMarket]) -> HashMap<String, MarketInfo> {
+        let mut info_map = HashMap::new();
+
+        for market in markets {
+            // Each market has multiple tokens (one per outcome)
+            for (i, token_id) in market.clob_token_ids.iter().enumerate() {
+                let outcome = market.outcomes.get(i).cloned().unwrap_or_default();
+                let info = MarketInfo::new(
+                    market.question.clone(),
+                    outcome,
+                    market.end_date,
+                );
+                info_map.insert(token_id.clone(), info);
+            }
+        }
+
+        info_map
+    }
+
+    /// Refresh markets from Gamma API.
+    ///
+    /// This fetches high-certainty expiring markets and subscribes to new tokens.
+    async fn refresh_markets(&mut self) -> Result<(), EngineError> {
+        let gamma = match &self.gamma_client {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        // Fetch sure bet candidates: expiring within 2 hours, 95%+ certainty
+        let markets = gamma
+            .fetch_sure_bet_candidates(2.0, rust_decimal_macros::dec!(0.95))
+            .await
+            .map_err(|e| EngineError::SdkError(format!("Gamma API error: {}", e)))?;
+
+        tracing::info!(
+            count = markets.len(),
+            "Discovered high-certainty expiring markets"
+        );
+
+        // Log discovered opportunities
+        for market in &markets {
+            if let Some(hours) = market.hours_until_expiry() {
+                if let Some(idx) = market.highest_certainty_index() {
+                    let price = market.outcome_prices.get(idx).copied().unwrap_or_default();
+                    let outcome = market.outcomes.get(idx).cloned().unwrap_or_default();
+                    tracing::info!(
+                        question = market.question.as_str(),
+                        outcome = outcome.as_str(),
+                        price = %price,
+                        hours_left = format!("{:.2}", hours).as_str(),
+                        "Sure bet opportunity"
+                    );
+                }
+            }
+        }
+
+        // Subscribe to new tokens
+        for market in &markets {
+            for token_id in &market.clob_token_ids {
+                if !self.subscribed_tokens.contains(token_id) {
+                    self.market_data.init_book(token_id).await;
+                    self.subscribed_tokens.push(token_id.clone());
+                    tracing::debug!(token_id = token_id.as_str(), "Subscribed to new token");
+                }
+            }
+        }
+
+        // Update market info
+        self.market_info = self.build_market_info(&markets);
+
+        Ok(())
     }
 
     /// Check if running in dry-run mode.
@@ -179,8 +278,26 @@ impl Engine {
         let mut tick_count: u64 = 0;
         let mut ws_update_count: u64 = 0;
 
+        // Market discovery timer (60 seconds)
+        let mut market_refresh_timer = interval(Duration::from_secs(60));
+        // Skip the first immediate tick
+        market_refresh_timer.tick().await;
+
+        // Do initial market discovery if enabled
+        if self.market_discovery_enabled {
+            if let Err(e) = self.refresh_markets().await {
+                tracing::warn!(error = %e, "Initial market discovery failed");
+            }
+        }
+
         loop {
             tokio::select! {
+                // Market discovery refresh (if enabled)
+                _ = market_refresh_timer.tick(), if self.market_discovery_enabled => {
+                    if let Err(e) = self.refresh_markets().await {
+                        tracing::warn!(error = %e, "Market discovery refresh failed");
+                    }
+                }
                 // Tick timer for strategy evaluation
                 _ = tick_timer.tick() => {
                     tick_count += 1;
@@ -202,6 +319,7 @@ impl Engine {
                         timestamp: chrono::Utc::now(),
                         order_books: self.market_data.get_all_books().await,
                         positions: self.positions.clone(),
+                        markets: self.market_info.clone(),
                         unrealized_pnl: self.positions.total_unrealized_pnl(),
                         realized_pnl: self.positions.total_realized_pnl(),
                     };

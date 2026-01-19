@@ -1,6 +1,6 @@
 use clap::Parser;
 use pmengine::{Config, Engine};
-use pmengine::strategies::{OrderTest, SpreadWatcher};
+use pmengine::strategies::{OrderTest, SpreadWatcher, SureBets};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -25,6 +25,10 @@ struct Args {
     /// Run the spread watcher strategy
     #[arg(long)]
     spread_watcher: bool,
+
+    /// Run the sure bets strategy (high-certainty expiring markets)
+    #[arg(long)]
+    sure_bets: bool,
 }
 
 #[tokio::main]
@@ -70,6 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.spread_watcher {
         info!("Running spread watcher strategy");
         engine.register_strategy(Box::new(SpreadWatcher::new())).await;
+    }
+    if args.sure_bets {
+        info!("Running sure bets strategy");
+        engine.enable_market_discovery();
+        engine.register_strategy(Box::new(SureBets::new())).await;
     }
 
     // Run the main event loop

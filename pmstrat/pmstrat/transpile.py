@@ -45,6 +45,10 @@ class RustCodeGen:
     OPTION_LEVEL_ATTRS = {"best_bid", "best_ask"}
     # Attributes on OrderBook that are Option<Decimal> (method calls)
     OPTION_DECIMAL_ATTRS = {"mid_price", "spread", "spread_bps", "imbalance"}
+    # Attributes on MarketInfo that are Option types
+    MARKET_OPTION_ATTRS = {"end_date", "hours_until_expiry"}
+    # Attributes on MarketInfo that are String types (need .clone())
+    MARKET_STRING_ATTRS = {"question", "outcome"}
 
     def __init__(self, meta: StrategyMeta):
         self.meta = meta
@@ -419,9 +423,56 @@ impl Strategy for {self.struct_name} {{
         return "\n".join(lines)
 
     def _gen_for(self, stmt: ast.For) -> str:
+        # Check for `for token_id, market in ctx.markets.items()` pattern
+        if self._is_markets_iteration(stmt):
+            return self._gen_markets_for(stmt)
+
         target = self._gen_expr(stmt.target)
         iter_expr = self._gen_expr(stmt.iter)
         lines = [f"{self._indent()}for {target} in {iter_expr} {{"]
+        self.indent_level += 1
+        for s in stmt.body:
+            lines.append(self._gen_stmt(s))
+        self.indent_level -= 1
+        lines.append(f"{self._indent()}}}")
+        return "\n".join(lines)
+
+    def _is_markets_iteration(self, stmt: ast.For) -> bool:
+        """Check if this is a `for token_id, market in ctx.markets.items()` loop."""
+        # Check for tuple unpacking target
+        if not isinstance(stmt.target, ast.Tuple):
+            return False
+        if len(stmt.target.elts) != 2:
+            return False
+
+        # Check for ctx.markets.items() call
+        if not isinstance(stmt.iter, ast.Call):
+            return False
+        if not isinstance(stmt.iter.func, ast.Attribute):
+            return False
+        if stmt.iter.func.attr != "items":
+            return False
+
+        # Check for ctx.markets
+        iter_value = stmt.iter.func.value
+        if not isinstance(iter_value, ast.Attribute):
+            return False
+        if iter_value.attr != "markets":
+            return False
+        if not isinstance(iter_value.value, ast.Name):
+            return False
+        if iter_value.value.id != "ctx":
+            return False
+
+        return True
+
+    def _gen_markets_for(self, stmt: ast.For) -> str:
+        """Generate Rust code for iterating over ctx.markets."""
+        # Extract variable names
+        token_var = stmt.target.elts[0].id if isinstance(stmt.target.elts[0], ast.Name) else "token_id"
+        market_var = stmt.target.elts[1].id if isinstance(stmt.target.elts[1], ast.Name) else "market"
+
+        lines = [f"{self._indent()}for ({token_var}, {market_var}) in ctx.markets.iter() {{"]
         self.indent_level += 1
         for s in stmt.body:
             lines.append(self._gen_stmt(s))
@@ -576,6 +627,14 @@ impl Strategy for {self.struct_name} {{
         # OrderBook method attributes - convert to method calls
         if attr in self.OPTION_LEVEL_ATTRS or attr in self.OPTION_DECIMAL_ATTRS:
             return f"{obj}.{attr}()"
+
+        # MarketInfo string attributes - need .clone()
+        if attr in self.MARKET_STRING_ATTRS:
+            return f"{obj}.{attr}.clone()"
+
+        # MarketInfo Option attributes - direct access
+        if attr in self.MARKET_OPTION_ATTRS:
+            return f"{obj}.{attr}"
 
         return f"{obj}.{attr}"
 
