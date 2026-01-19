@@ -46,18 +46,34 @@ Options:
   -l, --log-level <LEVEL> Log level [default: info]
 ```
 
+## Environment Variables
+
+For multi-tenant authentication (optional):
+```
+PMPROXY_AUTH_ENABLED=true              # Enable JWT auth (default: false)
+PMPROXY_COGNITO_REGION=us-east-1       # AWS region
+PMPROXY_COGNITO_POOL_ID=us-east-1_xxx  # Cognito User Pool ID
+PMPROXY_COGNITO_APP_CLIENT_ID=xxx      # Optional: validate audience claim
+PMPROXY_RATE_LIMIT_RPM=60              # Requests per minute (default: 60)
+PMPROXY_RATE_LIMIT_BURST=10            # Burst allowance (default: 10)
+```
+
 ## Architecture
 
-Simple Rust proxy - routes requests and forwards responses. No parsing, no auth logic, no complexity.
+Rust proxy with optional Cognito JWT authentication and per-tenant rate limiting.
 
 ```
 src/
-├── lib.rs      # Core proxy logic (shared)
-├── main.rs     # EC2 server binary (tokio)
-└── lambda.rs   # Lambda handler binary
+├── lib.rs       # Core proxy logic (shared)
+├── main.rs      # EC2 server binary (tokio)
+├── lambda.rs    # Lambda handler binary
+├── auth.rs      # Cognito JWT validation
+├── config.rs    # Environment configuration
+├── ratelimit.rs # Per-tenant rate limiting
+└── error.rs     # Error types
 ```
 
-`pmproxy` has a Python client does all the auth signing. The proxy just passes headers/body through unchanged.
+The Python client handles Polymarket auth signing. The proxy forwards those headers unchanged, but can optionally validate Cognito JWTs for multi-tenant access control.
 
 ## Testing
 
