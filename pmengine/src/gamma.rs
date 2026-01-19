@@ -4,8 +4,11 @@
 //! - Market questions and outcomes
 //! - End dates for expiration tracking
 //! - Token IDs for trading
+//!
+//! NOTE: We use the /events endpoint with date filtering to find markets
+//! expiring soon. The /markets endpoint doesn't support date filtering.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -39,7 +42,7 @@ pub struct GammaMarket {
 }
 
 impl GammaMarket {
-    /// Calculate hours until market expires.
+    /// Calculate hours until market expires (can be negative if past).
     pub fn hours_until_expiry(&self) -> Option<f64> {
         self.end_date.map(|end| {
             let now = Utc::now();
@@ -61,6 +64,14 @@ impl GammaMarket {
             .max_by(|(_, a), (_, b)| a.cmp(b))
             .map(|(i, _)| i)
     }
+}
+
+/// Raw event response from Gamma API /events endpoint.
+#[derive(Debug, Deserialize)]
+struct RawGammaEvent {
+    #[serde(rename = "endDate")]
+    end_date: Option<String>,
+    markets: Option<Vec<RawGammaMarket>>,
 }
 
 /// Raw market response from Gamma API.
@@ -119,62 +130,137 @@ impl GammaClient {
         }
     }
 
-    /// Fetch all active markets from Gamma API.
-    pub async fn fetch_markets(&self) -> Result<Vec<GammaMarket>, GammaError> {
-        let url = format!("{}/markets?closed=false&limit=500", self.base_url);
+    /// Fetch events with markets expiring in a time window.
+    ///
+    /// Uses the /events endpoint with end_date_min and end_date_max filtering.
+    /// This is the correct way to find markets expiring soon.
+    async fn fetch_events_in_window(
+        &self,
+        end_date_min: DateTime<Utc>,
+        end_date_max: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<RawGammaEvent>, GammaError> {
+        let mut all_events = Vec::new();
+        let mut offset = 0;
+        let batch_size = 100;
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| GammaError::RequestError(e.to_string()))?;
+        let min_str = end_date_min.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let max_str = end_date_max.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-        if !response.status().is_success() {
-            return Err(GammaError::RequestError(format!(
-                "HTTP {}: {}",
-                response.status(),
-                response.status().canonical_reason().unwrap_or("Unknown")
-            )));
+        tracing::debug!(
+            end_date_min = min_str.as_str(),
+            end_date_max = max_str.as_str(),
+            "Fetching events in time window"
+        );
+
+        while all_events.len() < limit {
+            let url = format!(
+                "{}/events?closed=false&limit={}&offset={}&order=endDate&ascending=true&end_date_min={}&end_date_max={}",
+                self.base_url, batch_size, offset, min_str, max_str
+            );
+
+            let response = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| GammaError::RequestError(e.to_string()))?;
+
+            if !response.status().is_success() {
+                return Err(GammaError::RequestError(format!(
+                    "HTTP {}: {}",
+                    response.status(),
+                    response.status().canonical_reason().unwrap_or("Unknown")
+                )));
+            }
+
+            let events: Vec<RawGammaEvent> = response
+                .json()
+                .await
+                .map_err(|e| GammaError::ParseError(e.to_string()))?;
+
+            if events.is_empty() {
+                break;
+            }
+
+            let count = events.len();
+            all_events.extend(events);
+            offset += batch_size;
+
+            if count < batch_size {
+                break; // Last page
+            }
         }
 
-        let raw_markets: Vec<RawGammaMarket> = response
-            .json()
-            .await
-            .map_err(|e| GammaError::ParseError(e.to_string()))?;
-
-        let markets = raw_markets
-            .into_iter()
-            .filter_map(|raw| self.parse_market(raw).ok())
-            .collect();
-
-        Ok(markets)
+        Ok(all_events)
     }
 
     /// Fetch markets that are expiring soon with high certainty outcomes.
+    ///
+    /// This uses the /events endpoint with date filtering to find markets
+    /// where endDate is between (now - 3h) and (now + max_hours).
+    /// Markets with endDate in the recent past are about to resolve.
     pub async fn fetch_sure_bet_candidates(
         &self,
         max_hours_to_expiry: f64,
         min_certainty: Decimal,
     ) -> Result<Vec<GammaMarket>, GammaError> {
-        let markets = self.fetch_markets().await?;
+        let now = Utc::now();
+        // Look for markets with endDate recently passed (resolving now) or about to pass
+        let end_date_min = now - Duration::hours(3);
+        let end_date_max = now + Duration::hours(max_hours_to_expiry as i64 + 1);
 
-        let candidates: Vec<GammaMarket> = markets
-            .into_iter()
-            .filter(|m| m.active && !m.closed)
-            .filter(|m| {
-                m.hours_until_expiry()
-                    .map(|h| h > 0.0 && h < max_hours_to_expiry)
-                    .unwrap_or(false)
-            })
-            .filter(|m| m.has_high_certainty_outcome(min_certainty))
-            .collect();
+        let events = self.fetch_events_in_window(end_date_min, end_date_max, 2000).await?;
+
+        tracing::info!(
+            event_count = events.len(),
+            "Fetched events from Gamma API"
+        );
+
+        let mut candidates = Vec::new();
+
+        for event in events {
+            let event_end_date = event.end_date.as_ref();
+
+            if let Some(markets) = event.markets {
+                for raw_market in markets {
+                    // Skip inactive or closed markets
+                    if !raw_market.active.unwrap_or(false) || raw_market.closed.unwrap_or(true) {
+                        continue;
+                    }
+
+                    // Use market end_date, fall back to event end_date
+                    let end_date_str = raw_market.end_date.clone().or_else(|| event_end_date.cloned());
+
+                    if let Ok(market) = self.parse_market_with_end_date(raw_market, end_date_str.as_ref()) {
+                        // Check hours until expiry: -3h to +max_hours
+                        if let Some(hours) = market.hours_until_expiry() {
+                            if hours >= -3.0 && hours <= max_hours_to_expiry {
+                                // Check for high certainty outcome
+                                if market.has_high_certainty_outcome(min_certainty) {
+                                    candidates.push(market);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            candidate_count = candidates.len(),
+            "Found sure bet candidates"
+        );
 
         Ok(candidates)
     }
 
     /// Parse a raw market response into structured data.
-    fn parse_market(&self, raw: RawGammaMarket) -> Result<GammaMarket, GammaError> {
+    fn parse_market_with_end_date(
+        &self,
+        raw: RawGammaMarket,
+        fallback_end_date: Option<&String>,
+    ) -> Result<GammaMarket, GammaError> {
         // Parse outcomes from JSON string
         let outcomes: Vec<String> = raw
             .outcomes
@@ -195,6 +281,11 @@ impl GammaClient {
             })
             .unwrap_or_default();
 
+        // Skip markets without prices
+        if outcome_prices.is_empty() {
+            return Err(GammaError::InvalidData("No outcome prices".to_string()));
+        }
+
         // Parse CLOB token IDs from JSON string
         let clob_token_ids: Vec<String> = raw
             .clob_token_ids
@@ -202,12 +293,14 @@ impl GammaClient {
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
 
-        // Parse end date
-        let end_date = raw.end_date.as_ref().and_then(|s| {
-            DateTime::parse_from_rfc3339(s)
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-        });
+        // Skip markets without token IDs
+        if clob_token_ids.is_empty() {
+            return Err(GammaError::InvalidData("No token IDs".to_string()));
+        }
+
+        // Parse end date (use market's or fallback to event's)
+        let end_date_str = raw.end_date.as_ref().or(fallback_end_date);
+        let end_date = end_date_str.and_then(|s| parse_datetime(s));
 
         Ok(GammaMarket {
             question: raw.question.unwrap_or_default(),
@@ -220,6 +313,25 @@ impl GammaClient {
             closed: raw.closed.unwrap_or(true),
         })
     }
+}
+
+/// Parse a datetime string in various formats.
+fn parse_datetime(s: &str) -> Option<DateTime<Utc>> {
+    // Try RFC3339 first
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+
+    // Try with Z suffix converted
+    let s_fixed = if s.ends_with('Z') {
+        format!("{}+00:00", &s[..s.len() - 1])
+    } else {
+        s.to_string()
+    };
+
+    DateTime::parse_from_rfc3339(&s_fixed)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 impl Default for GammaClient {
