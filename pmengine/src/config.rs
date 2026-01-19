@@ -47,12 +47,12 @@ impl Config {
             .unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com/ws".to_string());
 
         let max_position_size = env::var("PMENGINE_MAX_POSITION_SIZE")
-            .unwrap_or_else(|_| "1000".to_string())
+            .unwrap_or_else(|_| "50".to_string())
             .parse()
             .map_err(|_| ConfigError::InvalidValue("PMENGINE_MAX_POSITION_SIZE"))?;
 
         let max_total_exposure = env::var("PMENGINE_MAX_TOTAL_EXPOSURE")
-            .unwrap_or_else(|_| "5000".to_string())
+            .unwrap_or_else(|_| "50".to_string())
             .parse()
             .map_err(|_| ConfigError::InvalidValue("PMENGINE_MAX_TOTAL_EXPOSURE"))?;
 

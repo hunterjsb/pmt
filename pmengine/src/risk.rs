@@ -5,12 +5,19 @@ use crate::strategy::Signal;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
+/// Tracked open order for exposure calculation.
+#[derive(Debug, Clone)]
+pub struct TrackedOrder {
+    pub token_id: String,
+    pub notional: Decimal,
+}
+
 /// Risk limits configuration.
 #[derive(Debug, Clone)]
 pub struct RiskLimits {
     /// Maximum position size per token (in USDC notional)
     pub max_position_size: Decimal,
-    /// Maximum total exposure across all positions (in USDC)
+    /// Maximum total exposure across all positions AND open orders (in USDC)
     pub max_total_exposure: Decimal,
     /// Maximum loss before circuit breaker triggers (in USDC)
     pub max_loss: Decimal,
@@ -23,11 +30,11 @@ pub struct RiskLimits {
 impl Default for RiskLimits {
     fn default() -> Self {
         Self {
-            max_position_size: Decimal::from(1000),
-            max_total_exposure: Decimal::from(5000),
-            max_loss: Decimal::from(500),
-            max_open_orders: 50,
-            max_order_size: Decimal::from(500),
+            max_position_size: Decimal::from(50),
+            max_total_exposure: Decimal::from(50),
+            max_loss: Decimal::from(25),
+            max_open_orders: 10,
+            max_order_size: Decimal::from(25),
         }
     }
 }
@@ -47,7 +54,8 @@ pub enum RiskCheckResult {
 pub struct RiskManager {
     limits: RiskLimits,
     circuit_breaker_triggered: bool,
-    open_orders: HashMap<String, usize>, // token_id -> count
+    /// Open orders tracked by order_id -> TrackedOrder
+    open_orders: HashMap<String, TrackedOrder>,
 }
 
 impl RiskManager {
@@ -179,12 +187,18 @@ impl RiskManager {
             }
         }
 
-        // Check total exposure limit
-        let current_exposure = positions.total_notional();
+        // Check total exposure limit (positions + open orders + this new order)
+        let position_notional = positions.total_notional();
+        let open_order_notional = self.open_order_notional();
+        let current_exposure = position_notional + open_order_notional;
+
         if current_exposure + notional > self.limits.max_total_exposure {
             let allowed = self.limits.max_total_exposure - current_exposure;
             if allowed <= Decimal::ZERO {
-                return RiskCheckResult::Rejected("Total exposure limit reached".to_string());
+                return RiskCheckResult::Rejected(format!(
+                    "Total exposure limit reached (positions: {}, open orders: {}, limit: {})",
+                    position_notional, open_order_notional, self.limits.max_total_exposure
+                ));
             }
             let allowed_size = allowed / price;
             return RiskCheckResult::Reduced(
@@ -203,7 +217,10 @@ impl RiskManager {
                         urgency,
                     }
                 },
-                format!("Order size reduced to {} (total exposure limit)", allowed_size),
+                format!(
+                    "Order size reduced to {} (total exposure: {} + {} = {}, limit: {})",
+                    allowed_size, position_notional, open_order_notional, current_exposure, self.limits.max_total_exposure
+                ),
             );
         }
 
@@ -225,21 +242,54 @@ impl RiskManager {
         })
     }
 
-    /// Update open order count.
-    pub fn order_placed(&mut self, token_id: &str) {
-        *self.open_orders.entry(token_id.to_string()).or_insert(0) += 1;
+    /// Track an open order with its notional value.
+    pub fn order_placed(&mut self, order_id: &str, token_id: &str, notional: Decimal) {
+        tracing::debug!(
+            order_id = order_id,
+            token_id = token_id,
+            notional = %notional,
+            "Tracking order"
+        );
+        self.open_orders.insert(
+            order_id.to_string(),
+            TrackedOrder {
+                token_id: token_id.to_string(),
+                notional,
+            },
+        );
     }
 
-    /// Update open order count on fill/cancel.
-    pub fn order_closed(&mut self, token_id: &str) {
-        if let Some(count) = self.open_orders.get_mut(token_id) {
-            *count = count.saturating_sub(1);
+    /// Remove order tracking on fill/cancel.
+    pub fn order_closed(&mut self, order_id: &str) {
+        if let Some(order) = self.open_orders.remove(order_id) {
+            tracing::debug!(
+                order_id = order_id,
+                token_id = order.token_id,
+                notional = %order.notional,
+                "Untracking order"
+            );
         }
+    }
+
+    /// Get total notional value of open orders.
+    pub fn open_order_notional(&self) -> Decimal {
+        self.open_orders.values().map(|o| o.notional).sum()
     }
 
     /// Get total open order count.
     pub fn total_open_orders(&self) -> usize {
-        self.open_orders.values().sum()
+        self.open_orders.len()
+    }
+
+    /// Get current exposure (positions + open orders).
+    pub fn current_exposure(&self, positions: &PositionTracker) -> Decimal {
+        positions.total_notional() + self.open_order_notional()
+    }
+
+    /// Get remaining capacity before hitting exposure limit.
+    pub fn remaining_capacity(&self, positions: &PositionTracker) -> Decimal {
+        let exposure = self.current_exposure(positions);
+        (self.limits.max_total_exposure - exposure).max(Decimal::ZERO)
     }
 }
 

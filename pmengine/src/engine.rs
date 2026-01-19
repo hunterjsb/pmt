@@ -55,11 +55,22 @@ impl Engine {
         // Create risk manager with limits from config
         let risk_limits = RiskLimits {
             max_position_size: Decimal::from_f64_retain(config.max_position_size)
-                .unwrap_or(Decimal::from(1000)),
+                .unwrap_or(Decimal::from(50)),
             max_total_exposure: Decimal::from_f64_retain(config.max_total_exposure)
-                .unwrap_or(Decimal::from(5000)),
+                .unwrap_or(Decimal::from(50)),
+            max_order_size: Decimal::from_f64_retain(config.max_total_exposure / 2.0)
+                .unwrap_or(Decimal::from(25)),
             ..Default::default()
         };
+
+        tracing::info!(
+            max_position_size = %risk_limits.max_position_size,
+            max_total_exposure = %risk_limits.max_total_exposure,
+            max_order_size = %risk_limits.max_order_size,
+            max_loss = %risk_limits.max_loss,
+            "Risk limits configured"
+        );
+
         let risk_manager = RiskManager::new(risk_limits);
 
         // Create strategy runtime (empty, strategies added via register)
@@ -205,15 +216,28 @@ impl Engine {
                         }
 
                         match self.risk_manager.check_signal(&signal, &self.positions) {
-                            RiskCheckResult::Approved(s) => {
-                                if let Err(e) = self.order_manager.execute(s).await {
-                                    tracing::error!(error = %e, "Order execution failed");
+                            RiskCheckResult::Approved(ref s) | RiskCheckResult::Reduced(ref s, _) => {
+                                if let RiskCheckResult::Reduced(_, ref reason) = self.risk_manager.check_signal(&signal, &self.positions) {
+                                    tracing::warn!(reason = reason.as_str(), "Signal reduced by risk manager");
                                 }
-                            }
-                            RiskCheckResult::Reduced(s, reason) => {
-                                tracing::warn!(reason = reason, "Signal reduced by risk manager");
-                                if let Err(e) = self.order_manager.execute(s).await {
-                                    tracing::error!(error = %e, "Order execution failed");
+
+                                // Extract order details for tracking
+                                let (token_id, price, size) = match s {
+                                    Signal::Buy { token_id, price, size, .. } => (token_id.clone(), *price, *size),
+                                    Signal::Sell { token_id, price, size, .. } => (token_id.clone(), *price, *size),
+                                    _ => continue,
+                                };
+
+                                match self.order_manager.execute(s.clone()).await {
+                                    Ok(Some(order_id)) => {
+                                        // Track order notional in risk manager
+                                        let notional = price * size;
+                                        self.risk_manager.order_placed(&order_id, &token_id, notional);
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "Order execution failed");
+                                    }
                                 }
                             }
                             RiskCheckResult::Rejected(reason) => {
@@ -239,8 +263,17 @@ impl Engine {
                     // Notify strategies
                     self.strategy_runtime.on_fill(&fill);
 
-                    // Update risk manager
-                    self.risk_manager.order_closed(&fill.token_id);
+                    // Update risk manager - close tracked order
+                    self.risk_manager.order_closed(&fill.order_id);
+
+                    // Log current exposure
+                    let exposure = self.risk_manager.current_exposure(&self.positions);
+                    let remaining = self.risk_manager.remaining_capacity(&self.positions);
+                    tracing::info!(
+                        exposure = %exposure,
+                        remaining_capacity = %remaining,
+                        "Exposure after fill"
+                    );
                 }
 
                 // WebSocket market data
