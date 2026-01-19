@@ -1,0 +1,25 @@
+[project]
+name = "pmmcp"
+version = "0.1.0"
+description = "MCP server for PMT ecosystem - exposes market data, trading, and strategy tools"
+requires-python = ">=3.14"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "pmtrader",
+    "pmstrat",
+    "boto3>=1.35.0",  # For Cognito proxy auth
+]
+
+[project.scripts]
+pmmcp = "pmmcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pmmcp"]
+
+[tool.uv.sources]
+pmtrader = { path = "../pmtrader", editable = true }
+pmstrat = { path = "../pmstrat", editable = true }
