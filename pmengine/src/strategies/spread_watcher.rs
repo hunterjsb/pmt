@@ -3,6 +3,7 @@
 
 use crate::strategy::{Signal, Strategy, StrategyContext, Urgency};
 use crate::position::Fill;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 pub struct SpreadWatcher {
@@ -52,7 +53,7 @@ impl Strategy for SpreadWatcher {
         let spread = ask - bid;
         if spread > dec!(0.50) {
             let mid = (bid + ask) / dec!(2);
-            signals.push(Signal::Buy { token_id: token, price: mid, size: dec!(1), urgency: Urgency::Low });
+            signals.push(Signal::Buy { token_id: token.to_string(), price: mid, size: dec!(1), urgency: Urgency::Low });
         }
         return signals;
     }

@@ -66,17 +66,3 @@ ssh -i .infra/pmt-kp.pem ec2-user@34.250.56.199  # Manual
 
 Services: `pmproxy` (port 8080), `pmengine` (systemd units)
 Public URL: `https://pmt.xandaris.space`
-
-## Known Issues (pmengine v0.1.7)
-
-### CRITICAL: WebSocket Order Book Price Discrepancy
-- **Symptom**: Strategy sees `ask_price=0.99`, but orders fill at `0.93-0.94`
-- **Impact**: 5-6 cent price difference - getting better fills than expected prices
-- **Root Cause**: Unknown - WebSocket order book doesn't reflect true market depth
-- **Workaround**: None yet
-- **TODO**: Investigate REST order book vs WebSocket; add price sanity checks
-
-### MEDIUM: Sports Market Filtering
-- Expanded keyword filtering: "vs", "fc", "o/u X.5", "esports", etc.
-- May still miss some sports markets with unusual naming
-- **TODO**: Consider regex-based filtering or Gamma API category exclusion

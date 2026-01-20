@@ -47,6 +47,8 @@ pub enum Signal {
     Cancel { token_id: String },
     /// No action
     Hold,
+    /// Request graceful shutdown with a reason
+    Shutdown { reason: String },
 }
 
 /// Market metadata from Gamma API.

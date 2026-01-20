@@ -2,12 +2,312 @@
 
 import ast
 import inspect
+import re
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import Path
 from typing import Callable, List, Any
 
 from .dsl import get_strategy_meta, StrategyMeta
+
+
+class TranspileError(Exception):
+    """Error raised when transpilation fails due to unsupported patterns."""
+
+    def __init__(self, message: str, node: ast.AST | None = None, hint: str | None = None):
+        self.node = node
+        self.hint = hint
+        self.lineno = getattr(node, 'lineno', None) if node else None
+
+        full_message = message
+        if self.lineno:
+            full_message = f"Line {self.lineno}: {message}"
+        if hint:
+            full_message += f"\n  Hint: {hint}"
+
+        super().__init__(full_message)
+
+
+@dataclass
+class ValidationError:
+    """A single validation error."""
+    message: str
+    lineno: int | None
+    hint: str | None = None
+
+    def __str__(self) -> str:
+        prefix = f"Line {self.lineno}: " if self.lineno else ""
+        result = f"{prefix}{self.message}"
+        if self.hint:
+            result += f"\n    Hint: {self.hint}"
+        return result
+
+
+class StrategyValidator(ast.NodeVisitor):
+    """Validates Python strategy code for transpiler compatibility.
+
+    Catches unsupported patterns early with clear error messages.
+    """
+
+    # Patterns that are not supported
+    UNSUPPORTED_BUILTINS = {
+        'min', 'max', 'abs', 'sum', 'len', 'range', 'enumerate', 'zip',
+        'map', 'filter', 'sorted', 'reversed', 'list', 'dict', 'set',
+        'print', 'input', 'open', 'eval', 'exec',
+    }
+
+    def __init__(self, strategy_name: str):
+        self.strategy_name = strategy_name
+        self.errors: list[ValidationError] = []
+        self.warnings: list[ValidationError] = []
+        self._in_function = False
+        self._function_name: str | None = None
+
+    def validate(self, source: str) -> tuple[list[ValidationError], list[ValidationError]]:
+        """Validate source code and return (errors, warnings)."""
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as e:
+            self.errors.append(ValidationError(
+                f"Syntax error: {e.msg}",
+                e.lineno,
+            ))
+            return self.errors, self.warnings
+
+        self.visit(tree)
+        return self.errors, self.warnings
+
+    def visit_Global(self, node: ast.Global):
+        """global statements are not supported."""
+        self.errors.append(ValidationError(
+            f"'global' statement not supported: {', '.join(node.names)}",
+            node.lineno,
+            "Use strategy struct fields for state, not module-level variables. "
+            "Example: Add state to the @strategy decorator's params dict.",
+        ))
+        self.generic_visit(node)
+
+    def visit_Nonlocal(self, node: ast.Nonlocal):
+        """nonlocal statements are not supported."""
+        self.errors.append(ValidationError(
+            f"'nonlocal' statement not supported: {', '.join(node.names)}",
+            node.lineno,
+            "Avoid closures with mutable state. Use strategy params instead.",
+        ))
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        """Track function context and check for nested functions."""
+        if self._in_function:
+            self.errors.append(ValidationError(
+                f"Nested function '{node.name}' not supported",
+                node.lineno,
+                "Move helper functions to module level or inline the logic.",
+            ))
+        else:
+            old_in_function = self._in_function
+            old_function_name = self._function_name
+            self._in_function = True
+            self._function_name = node.name
+            self.generic_visit(node)
+            self._in_function = old_in_function
+            self._function_name = old_function_name
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        """async functions are not supported."""
+        self.errors.append(ValidationError(
+            f"Async function '{node.name}' not supported",
+            node.lineno,
+            "Strategies must be synchronous. The engine handles async I/O.",
+        ))
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        """Classes are not supported in strategy code."""
+        self.errors.append(ValidationError(
+            f"Class '{node.name}' not supported",
+            node.lineno,
+            "Use plain functions with the @strategy decorator.",
+        ))
+
+    def visit_Import(self, node: ast.Import):
+        """Check for unsupported imports."""
+        for alias in node.names:
+            if alias.name not in ('decimal', 'pmstrat', 'datetime'):
+                self.warnings.append(ValidationError(
+                    f"Import '{alias.name}' may not be supported",
+                    node.lineno,
+                    "Only 'decimal', 'datetime', and 'pmstrat' imports are fully supported.",
+                ))
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        """Check for unsupported imports."""
+        allowed_modules = {
+            'decimal', 'pmstrat', 'datetime',
+            '..dsl', '..signal', '..context', '.dsl', '.signal', '.context',
+        }
+        if node.module and not any(node.module.startswith(m.lstrip('.')) or node.module == m
+                                    for m in allowed_modules):
+            self.warnings.append(ValidationError(
+                f"Import from '{node.module}' may not be supported",
+                node.lineno,
+                "Only 'decimal', 'datetime', and 'pmstrat' imports are fully supported.",
+            ))
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call):
+        """Check for unsupported function calls."""
+        # Check for unsupported builtins
+        if isinstance(node.func, ast.Name):
+            if node.func.id in self.UNSUPPORTED_BUILTINS:
+                self.errors.append(ValidationError(
+                    f"Built-in '{node.func.id}()' not supported",
+                    node.lineno,
+                    self._get_builtin_hint(node.func.id),
+                ))
+
+        # Check for list comprehensions used as arguments (they're often problematic)
+        for arg in node.args:
+            if isinstance(arg, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                self.errors.append(ValidationError(
+                    "Comprehensions as function arguments not supported",
+                    node.lineno,
+                    "Use explicit loops instead of comprehensions.",
+                ))
+
+        self.generic_visit(node)
+
+    def visit_ListComp(self, node: ast.ListComp):
+        """List comprehensions are not supported."""
+        self.errors.append(ValidationError(
+            "List comprehension not supported",
+            node.lineno,
+            "Use explicit for loops: `for x in items: result.append(...)`",
+        ))
+
+    def visit_SetComp(self, node: ast.SetComp):
+        """Set comprehensions are not supported."""
+        self.errors.append(ValidationError(
+            "Set comprehension not supported",
+            node.lineno,
+            "Use explicit for loops instead.",
+        ))
+
+    def visit_DictComp(self, node: ast.DictComp):
+        """Dict comprehensions are not supported."""
+        self.errors.append(ValidationError(
+            "Dict comprehension not supported",
+            node.lineno,
+            "Use explicit for loops instead.",
+        ))
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp):
+        """Generator expressions are not supported."""
+        self.errors.append(ValidationError(
+            "Generator expression not supported",
+            node.lineno,
+            "Use explicit for loops instead.",
+        ))
+
+    def visit_Lambda(self, node: ast.Lambda):
+        """Lambda functions are not supported."""
+        self.errors.append(ValidationError(
+            "Lambda function not supported",
+            node.lineno,
+            "Define a named function instead or inline the logic.",
+        ))
+
+    def visit_With(self, node: ast.With):
+        """with statements are not supported."""
+        self.errors.append(ValidationError(
+            "'with' statement not supported",
+            node.lineno,
+            "Context managers don't translate to Rust. Use explicit setup/cleanup.",
+        ))
+
+    def visit_Try(self, node: ast.Try):
+        """try/except is not supported."""
+        self.errors.append(ValidationError(
+            "try/except not supported",
+            node.lineno,
+            "Use explicit None checks: `if value is None: return [Hold()]`",
+        ))
+
+    def visit_Raise(self, node: ast.Raise):
+        """raise is not supported."""
+        self.errors.append(ValidationError(
+            "'raise' not supported",
+            node.lineno,
+            "Return Hold() or Shutdown() signals instead of raising exceptions.",
+        ))
+
+    def visit_Assert(self, node: ast.Assert):
+        """assert is not supported."""
+        self.warnings.append(ValidationError(
+            "'assert' statement will be ignored",
+            node.lineno,
+            "Assertions are skipped during transpilation.",
+        ))
+
+    def visit_Yield(self, node: ast.Yield):
+        """yield is not supported."""
+        self.errors.append(ValidationError(
+            "'yield' not supported",
+            node.lineno,
+            "Return a list of signals instead of using generators.",
+        ))
+
+    def visit_YieldFrom(self, node: ast.YieldFrom):
+        """yield from is not supported."""
+        self.errors.append(ValidationError(
+            "'yield from' not supported",
+            node.lineno,
+            "Return a list of signals instead of using generators.",
+        ))
+
+    def visit_Match(self, node: ast.Match):
+        """match/case is not supported (Python 3.10+)."""
+        self.errors.append(ValidationError(
+            "'match' statement not supported",
+            node.lineno,
+            "Use if/elif/else chains instead.",
+        ))
+
+    def _get_builtin_hint(self, name: str) -> str:
+        """Get a helpful hint for replacing a builtin."""
+        hints = {
+            'min': "Use explicit comparison: `if a < b: result = a else: result = b`",
+            'max': "Use explicit comparison: `if a > b: result = a else: result = b`",
+            'abs': "Use explicit comparison: `if x < 0: x = -x`",
+            'sum': "Use a loop: `total = 0; for x in items: total = total + x`",
+            'len': "Track length manually or use a different approach",
+            'range': "Use while loops or iterate over collections directly",
+            'print': "Remove debug prints before transpiling",
+            'sorted': "Sorting is not supported; pre-sort data if needed",
+        }
+        return hints.get(name, "This builtin is not supported in the DSL")
+
+
+def validate_strategy(func: Callable) -> tuple[list[ValidationError], list[ValidationError]]:
+    """Validate a strategy function for transpiler compatibility.
+
+    Args:
+        func: The @strategy decorated function
+
+    Returns:
+        Tuple of (errors, warnings)
+    """
+    meta = get_strategy_meta(func)
+    if meta is None:
+        return [ValidationError("Function is not decorated with @strategy", None)], []
+
+    source = inspect.getsource(func)
+    # Dedent the source to handle nested functions
+    source = textwrap.dedent(source)
+
+    validator = StrategyValidator(meta.name)
+    return validator.validate(source)
 
 
 @dataclass
@@ -65,6 +365,12 @@ class RustCodeGen:
         self.mutable_vars: set[str] = set()
         # Track variables that have been declared (to avoid duplicate let)
         self.declared_vars: set[str] = set()
+        # Track variables that are String type (vs &str)
+        # Variables assigned with .to_string() are String
+        # Variables assigned from constants are &str
+        self.string_vars: set[str] = set()
+        # Get param names (these are &str constants)
+        self.param_names: set[str] = set(meta.params.keys()) if meta.params else set()
 
     def _to_pascal_case(self, name: str) -> str:
         """Convert snake_case to PascalCase."""
@@ -522,6 +828,12 @@ impl Strategy for {self.struct_name} {{
         # Check if this is a reassignment (variable already declared)
         if isinstance(target_node, ast.Name):
             var_name = target_node.id
+
+            # Track if this variable is a String type
+            # It's a String if the value is a string literal (generates .to_string())
+            if self._is_string_type(stmt.value):
+                self.string_vars.add(var_name)
+
             if var_name in self.declared_vars:
                 # Reassignment - no let keyword
                 return f"{self._indent()}{target} = {value};"
@@ -533,6 +845,24 @@ impl Strategy for {self.struct_name} {{
                 return f"{self._indent()}let {mut}{target} = {value};"
 
         return f"{self._indent()}let {target} = {value};"
+
+    def _is_string_type(self, expr: ast.expr) -> bool:
+        """Check if an expression results in a String type (vs &str).
+
+        Returns True for:
+        - String literals (we generate .to_string())
+
+        Returns False for:
+        - Name references to constants (they are &str)
+        - Attribute accesses
+        """
+        # String literal → generates .to_string() → String type
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return True
+        # Assignment from another variable - check if that's a String
+        if isinstance(expr, ast.Name):
+            return expr.id in self.string_vars
+        return False
 
     def _gen_ann_assign(self, stmt: ast.AnnAssign) -> str:
         """Generate Rust code for annotated assignment (e.g., signals: list[Signal] = [])."""
@@ -750,6 +1080,27 @@ impl Strategy for {self.struct_name} {{
             return "None"
         return str(expr.value)
 
+    def _borrow_string_args(self, args: list[ast.expr]) -> str:
+        """Generate borrowed string arguments for HashMap get() calls.
+
+        For local String variables, we need to borrow them with &.
+        For &str variables (constants, params), we pass them directly.
+        """
+        result = []
+        for arg in args:
+            if isinstance(arg, ast.Name):
+                var_name = arg.id
+                # Check if this variable is a String type (needs borrowing)
+                if var_name in self.string_vars:
+                    result.append(f"&{var_name}")
+                else:
+                    # &str type (constant, param) or iteration variable - pass directly
+                    result.append(var_name)
+            else:
+                # Not a name - generate normally (string literals, etc.)
+                result.append(self._gen_expr(arg))
+        return ", ".join(result)
+
     def _gen_call(self, expr: ast.Call) -> str:
         """Generate Rust code for a function call."""
         # Handle special cases
@@ -758,16 +1109,21 @@ impl Strategy for {self.struct_name} {{
             method = expr.func.attr
             args = ", ".join(self._gen_expr(a) for a in expr.args)
 
-            # ctx.book(token_id) -> ctx.order_books.get(token_id)
-            # Note: token_id from iteration is already &String, don't add &
+            # ctx.book(token_id) -> ctx.order_books.get(&token_id)
+            # When the argument is a local variable (Name), we need to borrow it
+            # When it comes from iteration (like `for token_id, market in ctx.markets.items()`),
+            # it's already &String so we don't add another &
             if obj == "ctx" and method == "book":
-                return f"ctx.order_books.get({args})"
-            # ctx.position(token_id) -> ctx.positions.get(token_id)
+                borrowed_args = self._borrow_string_args(expr.args)
+                return f"ctx.order_books.get({borrowed_args})"
+            # ctx.position(token_id) -> ctx.positions.get(&token_id)
             elif obj == "ctx" and method == "position":
-                return f"ctx.positions.get({args})"
-            # ctx.mid(token_id) -> ctx.order_books.get(token_id).and_then(|b| b.mid_price())
+                borrowed_args = self._borrow_string_args(expr.args)
+                return f"ctx.positions.get({borrowed_args})"
+            # ctx.mid(token_id) -> ctx.order_books.get(&token_id).and_then(|b| b.mid_price())
             elif obj == "ctx" and method == "mid":
-                return f"ctx.order_books.get({args}).and_then(|b| b.mid_price())"
+                borrowed_args = self._borrow_string_args(expr.args)
+                return f"ctx.order_books.get({borrowed_args}).and_then(|b| b.mid_price())"
             # vec.append(x) -> vec.push(x)
             elif method == "append":
                 return f"{obj}.push({args})"
@@ -795,6 +1151,8 @@ impl Strategy for {self.struct_name} {{
                 return self._gen_cancel_call(expr)
             elif func_name == "Hold":
                 return "Signal::Hold"
+            elif func_name == "Shutdown":
+                return self._gen_shutdown_call(expr)
             # Decimal("0.5") -> dec!(0.5)
             elif func_name == "Decimal":
                 arg = expr.args[0]
@@ -824,10 +1182,11 @@ impl Strategy for {self.struct_name} {{
         if "Urgency." in urgency:
             urgency = urgency.replace("Urgency.", "Urgency::")
 
-        # Clone token_id if it's a variable (likely borrowed from iteration)
-        # Don't clone if it's already a string literal
+        # Always convert token_id to String using .to_string()
+        # This works for both &str (constants/variables) and &String (iteration variables)
+        # since both implement ToString
         if not token_id.startswith('"'):
-            token_id = f"{token_id}.clone()"
+            token_id = f"{token_id}.to_string()"
 
         return f"Signal::{signal_type} {{ token_id: {token_id}, price: {price}, size: {size}, urgency: {urgency} }}"
 
@@ -835,7 +1194,18 @@ impl Strategy for {self.struct_name} {{
         """Generate Signal::Cancel."""
         kwargs = {kw.arg: self._gen_expr(kw.value) for kw in expr.keywords}
         token_id = kwargs.get("token_id", '""')
+
+        # Always use .to_string() for token_id (works for both &str and &String)
+        if not token_id.startswith('"'):
+            token_id = f"{token_id}.to_string()"
+
         return f"Signal::Cancel {{ token_id: {token_id} }}"
+
+    def _gen_shutdown_call(self, expr: ast.Call) -> str:
+        """Generate Signal::Shutdown."""
+        kwargs = {kw.arg: self._gen_expr(kw.value) for kw in expr.keywords}
+        reason = kwargs.get("reason", '""')
+        return f"Signal::Shutdown {{ reason: {reason}.to_string() }}"
 
     def _gen_attribute(self, expr: ast.Attribute) -> str:
         obj = self._gen_expr(expr.value)
@@ -989,18 +1359,44 @@ impl Strategy for {self.struct_name} {{
         return f"if {test} {{ {body} }} else {{ {orelse} }}"
 
 
-def transpile(strategy_func: Callable) -> TranspileResult:
+def transpile(strategy_func: Callable, validate: bool = True, strict: bool = True) -> TranspileResult:
     """Transpile a Python strategy function to Rust.
 
     Args:
         strategy_func: A function decorated with @strategy
+        validate: If True, validate the strategy before transpiling
+        strict: If True (default), raise TranspileError on validation errors.
+                If False, only print warnings and continue.
 
     Returns:
         TranspileResult with generated Rust code
+
+    Raises:
+        TranspileError: If validation fails and strict=True
+        ValueError: If function is not decorated with @strategy
     """
     meta = get_strategy_meta(strategy_func)
     if meta is None:
         raise ValueError("Function must be decorated with @strategy")
+
+    # Run validation
+    if validate:
+        errors, warnings = validate_strategy(strategy_func)
+
+        # Print warnings
+        for warning in warnings:
+            print(f"  Warning: {warning}")
+
+        # Handle errors
+        if errors:
+            error_msg = f"Strategy '{meta.name}' has {len(errors)} validation error(s):\n"
+            for error in errors:
+                error_msg += f"  - {error}\n"
+
+            if strict:
+                raise TranspileError(error_msg)
+            else:
+                print(f"  {error_msg}")
 
     codegen = RustCodeGen(meta)
     rust_code = codegen.generate()
@@ -1013,9 +1409,163 @@ def transpile(strategy_func: Callable) -> TranspileResult:
     )
 
 
-def transpile_to_file(strategy_func: Callable, output_path: str) -> TranspileResult:
-    """Transpile a strategy and write to a file."""
-    result = transpile(strategy_func)
+def transpile_to_file(strategy_func: Callable, output_path: str, validate: bool = True, strict: bool = True) -> TranspileResult:
+    """Transpile a strategy and write to a file.
+
+    Args:
+        strategy_func: A function decorated with @strategy
+        output_path: Path to write the generated Rust code
+        validate: If True, validate the strategy before transpiling
+        strict: If True (default), raise TranspileError on validation errors.
+
+    Returns:
+        TranspileResult with generated Rust code
+    """
+    result = transpile(strategy_func, validate=validate, strict=strict)
     with open(output_path, 'w') as f:
         f.write(result.rust_code)
     return result
+
+
+def to_pascal_case(name: str) -> str:
+    """Convert snake_case to PascalCase."""
+    return ''.join(word.capitalize() for word in name.split('_'))
+
+
+@dataclass
+class StrategyFileInfo:
+    """Information extracted from a strategy .rs file."""
+    module_name: str
+    struct_name: str
+    requires_market_discovery: bool
+
+
+def scan_strategy_file(path: Path) -> StrategyFileInfo | None:
+    """Extract strategy info from a Rust strategy file.
+
+    Returns None if the file doesn't look like a valid strategy.
+    """
+    content = path.read_text()
+    module_name = path.stem
+
+    # Look for struct definition pattern: pub struct StructName {
+    struct_match = re.search(r'pub struct (\w+)\s*\{', content)
+    if not struct_match:
+        return None
+
+    struct_name = struct_match.group(1)
+
+    # Detect if market discovery is needed:
+    # Look for "tokens: vec![]" (empty tokens) in new() function
+    # This indicates the strategy uses dynamic market discovery
+    requires_market_discovery = bool(re.search(r'tokens:\s*vec!\[\s*\]', content))
+
+    return StrategyFileInfo(
+        module_name=module_name,
+        struct_name=struct_name,
+        requires_market_discovery=requires_market_discovery,
+    )
+
+
+def generate_mod_rs(strategies_dir: Path) -> str:
+    """Generate mod.rs content with registry for all strategies in directory.
+
+    Args:
+        strategies_dir: Path to the pmengine/src/strategies directory
+
+    Returns:
+        Generated Rust code for mod.rs
+    """
+    # Scan for all .rs files (except mod.rs)
+    strategy_files = sorted(strategies_dir.glob("*.rs"))
+    strategy_files = [f for f in strategy_files if f.name != "mod.rs"]
+
+    # Extract info from each file
+    strategies: list[StrategyFileInfo] = []
+    for f in strategy_files:
+        info = scan_strategy_file(f)
+        if info:
+            strategies.append(info)
+
+    # Sort by module name
+    strategies.sort(key=lambda s: s.module_name)
+
+    # Generate mod declarations
+    mod_decls = "\n".join(f"mod {s.module_name};" for s in strategies)
+
+    # Generate pub use statements
+    pub_uses = "\n".join(f"pub use {s.module_name}::{s.struct_name};" for s in strategies)
+
+    # Generate registry entries
+    registry_entries = []
+    for s in strategies:
+        registry_entries.append(f'''    m.insert("{s.module_name}", StrategyInfo {{
+        factory: || Box::new({s.module_name}::{s.struct_name}::new()),
+        requires_market_discovery: {str(s.requires_market_discovery).lower()},
+    }});''')
+
+    registry_body = "\n\n".join(registry_entries)
+
+    return f'''//! Auto-generated strategy registry - DO NOT EDIT MANUALLY
+//! Regenerate with: pmstrat transpile --all
+
+{mod_decls}
+
+use std::collections::HashMap;
+use crate::strategy::Strategy;
+
+{pub_uses}
+
+/// Information about a strategy in the registry.
+pub struct StrategyInfo {{
+    /// Factory function to create a new instance of the strategy.
+    pub factory: fn() -> Box<dyn Strategy>,
+    /// Whether this strategy requires market discovery (empty tokens list).
+    pub requires_market_discovery: bool,
+}}
+
+/// Returns the strategy registry - a map of strategy names to their info.
+///
+/// This function is called by the engine to look up strategies by name.
+/// The registry is auto-generated by `pmstrat transpile --all`.
+pub fn registry() -> HashMap<&'static str, StrategyInfo> {{
+    let mut m = HashMap::new();
+
+{registry_body}
+
+    m
+}}
+'''
+
+
+def regenerate_mod_rs(strategies_dir: Path) -> None:
+    """Regenerate mod.rs in the given strategies directory.
+
+    Args:
+        strategies_dir: Path to the pmengine/src/strategies directory
+    """
+    mod_rs_path = strategies_dir / "mod.rs"
+    content = generate_mod_rs(strategies_dir)
+    mod_rs_path.write_text(content)
+
+
+def find_pmengine_strategies_dir() -> Path | None:
+    """Find the pmengine/src/strategies directory relative to the current path.
+
+    Searches in common locations relative to pmstrat.
+    """
+    # Common relative paths from pmstrat to pmengine
+    candidates = [
+        Path("../pmengine/src/strategies"),
+        Path("../../pmengine/src/strategies"),
+        Path("pmengine/src/strategies"),
+    ]
+
+    # Also try from cwd
+    cwd = Path.cwd()
+    for candidate in candidates:
+        path = (cwd / candidate).resolve()
+        if path.exists() and path.is_dir():
+            return path
+
+    return None

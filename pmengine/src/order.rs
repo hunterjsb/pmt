@@ -80,6 +80,9 @@ impl OrderManager {
             Signal::Sell { token_id, price, size, urgency } => {
                 self.place_order(&token_id, false, price, size, urgency).await
             }
+
+            // Shutdown is handled by the engine, not the order manager
+            Signal::Shutdown { .. } => Ok(None),
         }
     }
 

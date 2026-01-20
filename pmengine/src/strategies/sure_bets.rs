@@ -116,7 +116,7 @@ impl Strategy for SureBets {
             if size < MIN_ORDER_SIZE {
                 continue;
             }
-            signals.push(Signal::Buy { token_id: token_id.clone(), price: ask_price, size: size, urgency: Urgency::Medium });
+            signals.push(Signal::Buy { token_id: token_id.to_string(), price: ask_price, size: size, urgency: Urgency::Medium });
         }
         return if !signals.is_empty() { signals } else { vec![Signal::Hold] };
     }
