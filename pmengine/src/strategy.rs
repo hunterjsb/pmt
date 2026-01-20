@@ -59,10 +59,14 @@ pub struct MarketInfo {
     pub question: String,
     /// Which outcome this token represents (e.g., "Yes" or "No")
     pub outcome: String,
+    /// URL slug for the market
+    pub slug: String,
     /// When the market expires/resolves
     pub end_date: Option<DateTime<Utc>>,
     /// Hours until expiry (computed at context creation time)
     pub hours_until_expiry: Option<f64>,
+    /// Total liquidity in USDC (from Gamma API)
+    pub liquidity: Option<f64>,
 }
 
 impl MarketInfo {
@@ -70,7 +74,19 @@ impl MarketInfo {
     pub fn new(
         question: String,
         outcome: String,
+        slug: String,
         end_date: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self::with_liquidity(question, outcome, slug, end_date, None)
+    }
+
+    /// Create a new MarketInfo with liquidity data.
+    pub fn with_liquidity(
+        question: String,
+        outcome: String,
+        slug: String,
+        end_date: Option<DateTime<Utc>>,
+        liquidity: Option<f64>,
     ) -> Self {
         let hours_until_expiry = end_date.map(|end| {
             let now = Utc::now();
@@ -81,8 +97,10 @@ impl MarketInfo {
         Self {
             question,
             outcome,
+            slug,
             end_date,
             hours_until_expiry,
+            liquidity,
         }
     }
 }
@@ -102,6 +120,8 @@ pub struct StrategyContext {
     pub unrealized_pnl: Decimal,
     /// Total realized P&L
     pub realized_pnl: Decimal,
+    /// Available USDC balance for trading
+    pub usdc_balance: Decimal,
 }
 
 

@@ -101,8 +101,11 @@ impl PolymarketClient {
         // Determine if we're using a proxy
         let proxy_url = std::env::var("PMPROXY_URL").ok();
 
-        // Build and authenticate client
-        let mut auth_builder = Client::new(&config.clob_url, SdkConfig::default())
+        // Always authenticate directly with Polymarket (proxy doesn't support auth endpoints)
+        let direct_clob_url = "https://clob.polymarket.com";
+
+        // Build and authenticate client using direct URL
+        let mut auth_builder = Client::new(direct_clob_url, SdkConfig::default())
             .map_err(|e| ClientError::SdkError(e.to_string()))?
             .authentication_builder(&signer)
             .signature_type(sig_type);
@@ -119,7 +122,7 @@ impl PolymarketClient {
 
         // Get credentials by doing another L1 auth call (SDK doesn't expose credentials after auth)
         // We use the unauthenticated client for this since derive_api_key uses L1 auth
-        let unauth_client = Client::new(&config.clob_url, SdkConfig::default())
+        let unauth_client = Client::new(direct_clob_url, SdkConfig::default())
             .map_err(|e| ClientError::SdkError(e.to_string()))?;
         let credentials = unauth_client
             .derive_api_key(&signer, None)

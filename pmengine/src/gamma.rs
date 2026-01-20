@@ -9,10 +9,13 @@
 //! expiring soon. The /markets endpoint doesn't support date filtering.
 
 use chrono::{DateTime, Duration, Utc};
+use futures::future::join_all;
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::str::FromStr;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Gamma API client for fetching market metadata.
 pub struct GammaClient {
@@ -39,6 +42,10 @@ pub struct GammaMarket {
     pub active: bool,
     /// Whether market is closed
     pub closed: bool,
+    /// Total liquidity in USDC (from Gamma API)
+    pub liquidity: Option<f64>,
+    /// Market category (e.g., "politics", "crypto", "esports", "sports")
+    pub category: Option<String>,
 }
 
 impl GammaMarket {
@@ -74,6 +81,34 @@ struct RawGammaEvent {
     markets: Option<Vec<RawGammaMarket>>,
 }
 
+/// Raw series response from Gamma API /series endpoint.
+#[derive(Debug, Deserialize)]
+struct RawGammaSeries {
+    #[allow(dead_code)]
+    slug: Option<String>,
+    #[allow(dead_code)]
+    title: Option<String>,
+    recurrence: Option<String>,
+    #[allow(dead_code)]
+    liquidity: Option<f64>,
+    events: Option<Vec<RawSeriesEvent>>,
+}
+
+/// Raw event within a series.
+#[derive(Debug, Deserialize)]
+struct RawSeriesEvent {
+    slug: Option<String>,
+    #[allow(dead_code)]
+    title: Option<String>,
+    #[serde(rename = "endDate")]
+    end_date: Option<String>,
+    #[allow(dead_code)]
+    active: Option<bool>,
+    closed: Option<bool>,
+    #[allow(dead_code)]
+    liquidity: Option<f64>,
+}
+
 /// Raw market response from Gamma API.
 #[derive(Debug, Deserialize)]
 struct RawGammaMarket {
@@ -88,6 +123,10 @@ struct RawGammaMarket {
     clob_token_ids: Option<String>,  // JSON-encoded array
     active: Option<bool>,
     closed: Option<bool>,
+    /// Total liquidity in USDC (as string from API)
+    liquidity: Option<String>,
+    /// Market category
+    category: Option<String>,
 }
 
 /// Error type for Gamma API operations.
@@ -133,17 +172,14 @@ impl GammaClient {
     /// Fetch events with markets expiring in a time window.
     ///
     /// Uses the /events endpoint with end_date_min and end_date_max filtering.
-    /// This is the correct way to find markets expiring soon.
+    /// Fetches pages in parallel for better performance.
     async fn fetch_events_in_window(
         &self,
         end_date_min: DateTime<Utc>,
         end_date_max: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<RawGammaEvent>, GammaError> {
-        let mut all_events = Vec::new();
-        let mut offset = 0;
         let batch_size = 100;
-
         let min_str = end_date_min.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let max_str = end_date_max.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
@@ -153,42 +189,68 @@ impl GammaClient {
             "Fetching events in time window"
         );
 
-        while all_events.len() < limit {
+        // First request to get initial batch and estimate total
+        let first_url = format!(
+            "{}/events?closed=false&limit={}&offset=0&order=endDate&ascending=true&end_date_min={}&end_date_max={}",
+            self.base_url, batch_size, min_str, max_str
+        );
+
+        let response = self
+            .client
+            .get(&first_url)
+            .send()
+            .await
+            .map_err(|e| GammaError::RequestError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(GammaError::RequestError(format!(
+                "HTTP {}: {}",
+                response.status(),
+                response.status().canonical_reason().unwrap_or("Unknown")
+            )));
+        }
+
+        let first_batch: Vec<RawGammaEvent> = response
+            .json()
+            .await
+            .map_err(|e| GammaError::ParseError(e.to_string()))?;
+
+        if first_batch.is_empty() || first_batch.len() < batch_size {
+            return Ok(first_batch);
+        }
+
+        // Fetch remaining pages in parallel
+        let num_pages = (limit / batch_size).min(10); // Cap at 10 pages (1000 events)
+        let semaphore = Arc::new(Semaphore::new(5)); // 5 concurrent requests
+        let mut futures = Vec::new();
+
+        for page in 1..num_pages {
+            let offset = page * batch_size;
+            let sem = semaphore.clone();
+            let client = self.client.clone();
             let url = format!(
                 "{}/events?closed=false&limit={}&offset={}&order=endDate&ascending=true&end_date_min={}&end_date_max={}",
                 self.base_url, batch_size, offset, min_str, max_str
             );
 
-            let response = self
-                .client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| GammaError::RequestError(e.to_string()))?;
+            futures.push(async move {
+                let _permit = sem.acquire().await.ok()?;
+                let response = client.get(&url).send().await.ok()?;
+                if !response.status().is_success() {
+                    return None;
+                }
+                response.json::<Vec<RawGammaEvent>>().await.ok()
+            });
+        }
 
-            if !response.status().is_success() {
-                return Err(GammaError::RequestError(format!(
-                    "HTTP {}: {}",
-                    response.status(),
-                    response.status().canonical_reason().unwrap_or("Unknown")
-                )));
-            }
+        let results = join_all(futures).await;
 
-            let events: Vec<RawGammaEvent> = response
-                .json()
-                .await
-                .map_err(|e| GammaError::ParseError(e.to_string()))?;
-
-            if events.is_empty() {
+        // Combine all results
+        let mut all_events = first_batch;
+        for result in results.into_iter().flatten() {
+            all_events.extend(result);
+            if all_events.len() >= limit {
                 break;
-            }
-
-            let count = events.len();
-            all_events.extend(events);
-            offset += batch_size;
-
-            if count < batch_size {
-                break; // Last page
             }
         }
 
@@ -210,7 +272,7 @@ impl GammaClient {
         let end_date_min = now - Duration::hours(3);
         let end_date_max = now + Duration::hours(max_hours_to_expiry as i64 + 1);
 
-        let events = self.fetch_events_in_window(end_date_min, end_date_max, 2000).await?;
+        let events = self.fetch_events_in_window(end_date_min, end_date_max, 500).await?;
 
         tracing::info!(
             event_count = events.len(),
@@ -233,9 +295,9 @@ impl GammaClient {
                     let end_date_str = raw_market.end_date.clone().or_else(|| event_end_date.cloned());
 
                     if let Ok(market) = self.parse_market_with_end_date(raw_market, end_date_str.as_ref()) {
-                        // Check hours until expiry: -3h to +max_hours
+                        // Check hours until expiry: must be positive (not yet expired) and within max_hours
                         if let Some(hours) = market.hours_until_expiry() {
-                            if hours >= -3.0 && hours <= max_hours_to_expiry {
+                            if hours > 0.0 && hours <= max_hours_to_expiry {
                                 // Check for high certainty outcome
                                 if market.has_high_certainty_outcome(min_certainty) {
                                     candidates.push(market);
@@ -253,6 +315,217 @@ impl GammaClient {
         );
 
         Ok(candidates)
+    }
+
+    /// Fetch markets from recurring series (daily, hourly) expiring within the time window.
+    ///
+    /// This fetches from the /series endpoint to find recurring markets like BTC 4h,
+    /// SPX daily, etc. that always have something expiring soon.
+    ///
+    /// Uses concurrent HTTP requests with a semaphore to limit parallelism.
+    pub async fn fetch_recurring_markets(
+        &self,
+        max_hours_to_expiry: f64,
+        min_certainty: Decimal,
+    ) -> Result<Vec<GammaMarket>, GammaError> {
+        // Fetch all series
+        let url = format!("{}/series?limit=200", self.base_url);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| GammaError::RequestError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(GammaError::RequestError(format!(
+                "HTTP {}: {}",
+                response.status(),
+                response.status().canonical_reason().unwrap_or("Unknown")
+            )));
+        }
+
+        let series_list: Vec<RawGammaSeries> = response
+            .json()
+            .await
+            .map_err(|e| GammaError::ParseError(e.to_string()))?;
+
+        // Filter to recurring series (daily, hourly, etc.)
+        let recurring_series: Vec<_> = series_list
+            .into_iter()
+            .filter(|s| {
+                matches!(
+                    s.recurrence.as_deref(),
+                    Some("daily") | Some("hourly") | Some("weekly")
+                )
+            })
+            .collect();
+
+        tracing::info!(
+            series_count = recurring_series.len(),
+            "Found recurring series"
+        );
+
+        let now = Utc::now();
+        let max_end = now + Duration::hours(max_hours_to_expiry as i64 + 1);
+
+        // Collect all event slugs that need to be fetched
+        let mut event_slugs: Vec<String> = Vec::new();
+
+        for series in &recurring_series {
+            if let Some(events) = &series.events {
+                for event in events {
+                    // Skip closed events
+                    if event.closed.unwrap_or(true) {
+                        continue;
+                    }
+
+                    // Check end date
+                    let end_date = event.end_date.as_ref().and_then(|s| parse_datetime(s));
+                    if let Some(end) = end_date {
+                        // Must be in the future and within max_hours window
+                        if end <= now || end > max_end {
+                            continue;
+                        }
+
+                        // Collect event slug for fetching
+                        let event_slug = event.slug.clone().unwrap_or_default();
+                        if !event_slug.is_empty() {
+                            event_slugs.push(event_slug);
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            event_count = event_slugs.len(),
+            "Found active recurring events to fetch"
+        );
+
+        // Fetch all events concurrently with a semaphore to limit parallelism
+        let semaphore = Arc::new(Semaphore::new(10)); // Max 10 concurrent requests
+        let mut futures = Vec::new();
+
+        for slug in event_slugs {
+            let sem = semaphore.clone();
+            let client = self.client.clone();
+            let base_url = self.base_url.clone();
+
+            futures.push(async move {
+                let _permit = sem.acquire().await.ok()?;
+                let url = format!("{}/events?slug={}", base_url, slug);
+
+                let response = client.get(&url).send().await.ok()?;
+                if !response.status().is_success() {
+                    return None;
+                }
+
+                let events: Vec<RawGammaEvent> = response.json().await.ok()?;
+                Some((slug, events))
+            });
+        }
+
+        let results = join_all(futures).await;
+
+        // Process results and collect candidates
+        let mut candidates = Vec::new();
+
+        for result in results.into_iter().flatten() {
+            let (event_slug, events) = result;
+
+            for event in events {
+                let event_end_date = event.end_date.as_ref();
+
+                if let Some(raw_markets) = event.markets {
+                    for raw_market in raw_markets {
+                        if !raw_market.active.unwrap_or(false) || raw_market.closed.unwrap_or(true) {
+                            continue;
+                        }
+
+                        let end_date_str = raw_market.end_date.clone().or_else(|| event_end_date.cloned());
+
+                        if let Ok(market) = self.parse_market_with_end_date(raw_market, end_date_str.as_ref()) {
+                            // Check hours until expiry
+                            if let Some(hours) = market.hours_until_expiry() {
+                                if hours > 0.0 && hours <= max_hours_to_expiry {
+                                    if market.has_high_certainty_outcome(min_certainty) {
+                                        candidates.push(market);
+                                    } else {
+                                        tracing::debug!(
+                                            question = market.question.as_str(),
+                                            hours_left = format!("{:.2}", hours).as_str(),
+                                            "Recurring market (below certainty threshold)"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            tracing::debug!(
+                event = event_slug.as_str(),
+                "Processed recurring event"
+            );
+        }
+
+        tracing::info!(
+            candidate_count = candidates.len(),
+            "Found recurring market candidates"
+        );
+
+        Ok(candidates)
+    }
+
+    /// Fetch markets for a specific event by slug.
+    #[allow(dead_code)]
+    async fn fetch_event_markets(&self, event_slug: &str) -> Result<Vec<GammaMarket>, GammaError> {
+        let url = format!("{}/events?slug={}", self.base_url, event_slug);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| GammaError::RequestError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(GammaError::RequestError(format!(
+                "HTTP {}: {}",
+                response.status(),
+                response.status().canonical_reason().unwrap_or("Unknown")
+            )));
+        }
+
+        let events: Vec<RawGammaEvent> = response
+            .json()
+            .await
+            .map_err(|e| GammaError::ParseError(e.to_string()))?;
+
+        let mut markets = Vec::new();
+
+        for event in events {
+            let event_end_date = event.end_date.as_ref();
+
+            if let Some(raw_markets) = event.markets {
+                for raw_market in raw_markets {
+                    if !raw_market.active.unwrap_or(false) || raw_market.closed.unwrap_or(true) {
+                        continue;
+                    }
+
+                    let end_date_str = raw_market.end_date.clone().or_else(|| event_end_date.cloned());
+
+                    if let Ok(market) = self.parse_market_with_end_date(raw_market, end_date_str.as_ref()) {
+                        markets.push(market);
+                    }
+                }
+            }
+        }
+
+        Ok(markets)
     }
 
     /// Parse a raw market response into structured data.
@@ -302,6 +575,9 @@ impl GammaClient {
         let end_date_str = raw.end_date.as_ref().or(fallback_end_date);
         let end_date = end_date_str.and_then(|s| parse_datetime(s));
 
+        // Parse liquidity (comes as string, convert to f64)
+        let liquidity = raw.liquidity.as_ref().and_then(|s| s.parse::<f64>().ok());
+
         Ok(GammaMarket {
             question: raw.question.unwrap_or_default(),
             slug: raw.slug.unwrap_or_default(),
@@ -311,6 +587,8 @@ impl GammaClient {
             clob_token_ids,
             active: raw.active.unwrap_or(false),
             closed: raw.closed.unwrap_or(true),
+            liquidity,
+            category: raw.category,
         })
     }
 }
@@ -356,6 +634,8 @@ mod tests {
             clob_token_ids: vec!["123".to_string(), "456".to_string()],
             active: true,
             closed: false,
+            liquidity: Some(1000.0),
+            category: Some("politics".to_string()),
         };
 
         let hours = market.hours_until_expiry().unwrap();
@@ -373,6 +653,8 @@ mod tests {
             clob_token_ids: vec!["123".to_string(), "456".to_string()],
             active: true,
             closed: false,
+            liquidity: None,
+            category: None,
         };
 
         assert!(market.has_high_certainty_outcome(dec!(0.95)));
@@ -390,6 +672,8 @@ mod tests {
             clob_token_ids: vec!["123".to_string(), "456".to_string()],
             active: true,
             closed: false,
+            liquidity: Some(500.0),
+            category: Some("crypto".to_string()),
         };
 
         assert_eq!(market.highest_certainty_index(), Some(1));

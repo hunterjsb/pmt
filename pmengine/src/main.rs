@@ -1,6 +1,7 @@
 use clap::Parser;
-use pmengine::{Config, Engine};
+use pmengine::{Config, Engine, GammaClient};
 use pmengine::strategies::{OrderTest, SpreadWatcher, SureBets};
+use rust_decimal_macros::dec;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -29,6 +30,14 @@ struct Args {
     /// Run the sure bets strategy (high-certainty expiring markets)
     #[arg(long)]
     sure_bets: bool,
+
+    /// Test Gamma API only (no CLOB auth needed, prints discovered markets and exits)
+    #[arg(long)]
+    test_gamma: bool,
+
+    /// Scan-only mode - discover and print opportunities without trading
+    #[arg(long)]
+    scan_only: bool,
 }
 
 #[tokio::main]
@@ -53,6 +62,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     info!("pmengine starting...");
+
+    // Handle --test-gamma: Test Gamma API only (no CLOB auth needed)
+    if args.test_gamma {
+        info!("Running Gamma API test mode...");
+        let gamma = GammaClient::new();
+
+        // Fetch sure bet candidates: expiring within 2 hours, 95%+ certainty
+        match gamma.fetch_sure_bet_candidates(2.0, dec!(0.95)).await {
+            Ok(markets) => {
+                info!("Found {} sure bet candidates", markets.len());
+                for market in &markets {
+                    if let Some(hours) = market.hours_until_expiry() {
+                        if let Some(idx) = market.highest_certainty_index() {
+                            let price = market.outcome_prices.get(idx).copied().unwrap_or_default();
+                            let outcome = market.outcomes.get(idx).cloned().unwrap_or_default();
+                            info!(
+                                "  {} | {} @ {:.2}¢ | {:.1}h left | slug: {}",
+                                market.question,
+                                outcome,
+                                price * dec!(100),
+                                hours,
+                                market.slug
+                            );
+                        }
+                    }
+                }
+                info!("Gamma API test completed successfully");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::error!("Gamma API test failed: {}", e);
+                return Err(e.to_string().into());
+            }
+        }
+    }
 
     // Load configuration from environment
     let config = Config::from_env()?;

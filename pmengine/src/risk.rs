@@ -50,12 +50,23 @@ pub enum RiskCheckResult {
     Rejected(String),
 }
 
+/// Pending exposure reservation (before order is placed).
+#[derive(Debug, Clone)]
+pub struct PendingReservation {
+    pub token_id: String,
+    pub notional: Decimal,
+}
+
 /// Risk manager enforces trading limits.
 pub struct RiskManager {
     limits: RiskLimits,
     circuit_breaker_triggered: bool,
     /// Open orders tracked by order_id -> TrackedOrder
     open_orders: HashMap<String, TrackedOrder>,
+    /// Pending exposure reservations (reserved before order placed, keyed by temp ID)
+    pending_reservations: HashMap<String, PendingReservation>,
+    /// Counter for generating unique reservation IDs
+    reservation_counter: u64,
 }
 
 impl RiskManager {
@@ -64,6 +75,8 @@ impl RiskManager {
             limits,
             circuit_breaker_triggered: false,
             open_orders: HashMap::new(),
+            pending_reservations: HashMap::new(),
+            reservation_counter: 0,
         }
     }
 
@@ -271,9 +284,19 @@ impl RiskManager {
         }
     }
 
-    /// Get total notional value of open orders.
+    /// Get total notional value of open orders (excluding pending reservations).
     pub fn open_order_notional(&self) -> Decimal {
         self.open_orders.values().map(|o| o.notional).sum()
+    }
+
+    /// Get total notional value of pending reservations.
+    pub fn pending_reservation_notional(&self) -> Decimal {
+        self.pending_reservations.values().map(|r| r.notional).sum()
+    }
+
+    /// Get total reserved exposure (open orders + pending reservations).
+    pub fn total_reserved_notional(&self) -> Decimal {
+        self.open_order_notional() + self.pending_reservation_notional()
     }
 
     /// Get total open order count.
@@ -281,9 +304,108 @@ impl RiskManager {
         self.open_orders.len()
     }
 
-    /// Get current exposure (positions + open orders).
+    /// Reserve exposure BEFORE placing an order.
+    ///
+    /// Returns a reservation ID if successful, None if exposure limit would be exceeded.
+    /// This prevents race conditions where multiple signals pass risk checks before
+    /// any orders are tracked.
+    pub fn reserve_exposure(
+        &mut self,
+        token_id: &str,
+        notional: Decimal,
+        positions: &PositionTracker,
+    ) -> Option<String> {
+        // Calculate current exposure including pending reservations
+        let position_notional = positions.total_notional();
+        let reserved_notional = self.total_reserved_notional();
+        let current_exposure = position_notional + reserved_notional;
+
+        // Check if this reservation would exceed the limit
+        if current_exposure + notional > self.limits.max_total_exposure {
+            tracing::warn!(
+                token_id = token_id,
+                requested_notional = %notional,
+                position_notional = %position_notional,
+                reserved_notional = %reserved_notional,
+                current_exposure = %current_exposure,
+                limit = %self.limits.max_total_exposure,
+                "Exposure reservation rejected: would exceed limit"
+            );
+            return None;
+        }
+
+        // Generate unique reservation ID
+        self.reservation_counter += 1;
+        let reservation_id = format!("res_{}", self.reservation_counter);
+
+        tracing::debug!(
+            reservation_id = reservation_id.as_str(),
+            token_id = token_id,
+            notional = %notional,
+            new_total_exposure = %(current_exposure + notional),
+            "Exposure reserved"
+        );
+
+        self.pending_reservations.insert(
+            reservation_id.clone(),
+            PendingReservation {
+                token_id: token_id.to_string(),
+                notional,
+            },
+        );
+
+        Some(reservation_id)
+    }
+
+    /// Confirm a reservation after order is successfully placed.
+    ///
+    /// Converts the pending reservation into a tracked open order.
+    pub fn confirm_reservation(&mut self, reservation_id: &str, order_id: &str) {
+        if let Some(reservation) = self.pending_reservations.remove(reservation_id) {
+            tracing::debug!(
+                reservation_id = reservation_id,
+                order_id = order_id,
+                token_id = reservation.token_id.as_str(),
+                notional = %reservation.notional,
+                "Reservation confirmed as order"
+            );
+
+            self.open_orders.insert(
+                order_id.to_string(),
+                TrackedOrder {
+                    token_id: reservation.token_id,
+                    notional: reservation.notional,
+                },
+            );
+        } else {
+            tracing::warn!(
+                reservation_id = reservation_id,
+                order_id = order_id,
+                "Attempted to confirm unknown reservation"
+            );
+        }
+    }
+
+    /// Release a reservation if order placement fails.
+    pub fn release_reservation(&mut self, reservation_id: &str) {
+        if let Some(reservation) = self.pending_reservations.remove(reservation_id) {
+            tracing::debug!(
+                reservation_id = reservation_id,
+                token_id = reservation.token_id.as_str(),
+                notional = %reservation.notional,
+                "Reservation released (order failed)"
+            );
+        } else {
+            tracing::warn!(
+                reservation_id = reservation_id,
+                "Attempted to release unknown reservation"
+            );
+        }
+    }
+
+    /// Get current exposure (positions + open orders + pending reservations).
     pub fn current_exposure(&self, positions: &PositionTracker) -> Decimal {
-        positions.total_notional() + self.open_order_notional()
+        positions.total_notional() + self.total_reserved_notional()
     }
 
     /// Get remaining capacity before hitting exposure limit.
@@ -299,6 +421,8 @@ impl Clone for RiskManager {
             limits: self.limits.clone(),
             circuit_breaker_triggered: self.circuit_breaker_triggered,
             open_orders: self.open_orders.clone(),
+            pending_reservations: self.pending_reservations.clone(),
+            reservation_counter: self.reservation_counter,
         }
     }
 }

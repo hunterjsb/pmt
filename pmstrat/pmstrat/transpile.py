@@ -26,12 +26,13 @@ class MatchUnwrap:
     Represents the pattern:
         let var_name = match option_expr {
             Some(v) => v,
-            None => return return_value,
+            None => return return_value,  // or continue
         };
     """
     var_name: str
     option_expr: ast.expr
-    return_value: ast.expr
+    return_value: ast.expr | None  # None means 'continue' instead of return
+    is_continue: bool = False
 
 
 class RustCodeGen:
@@ -45,10 +46,12 @@ class RustCodeGen:
     OPTION_LEVEL_ATTRS = {"best_bid", "best_ask"}
     # Attributes on OrderBook that are Option<Decimal> (method calls)
     OPTION_DECIMAL_ATTRS = {"mid_price", "spread", "spread_bps", "imbalance"}
+    # Attributes on OrderBook that are Decimal (method calls, non-Option)
+    DECIMAL_METHOD_ATTRS = {"ask_size", "bid_size", "bid_depth", "ask_depth"}
     # Attributes on MarketInfo that are Option types
-    MARKET_OPTION_ATTRS = {"end_date", "hours_until_expiry"}
+    MARKET_OPTION_ATTRS = {"end_date", "hours_until_expiry", "liquidity"}
     # Attributes on MarketInfo that are String types (need .clone())
-    MARKET_STRING_ATTRS = {"question", "outcome"}
+    MARKET_STRING_ATTRS = {"question", "outcome", "slug"}
 
     def __init__(self, meta: StrategyMeta):
         self.meta = meta
@@ -60,6 +63,8 @@ class RustCodeGen:
         self.unwrapped_vars: set[str] = set()
         # Track variables that need to be mutable
         self.mutable_vars: set[str] = set()
+        # Track variables that have been declared (to avoid duplicate let)
+        self.declared_vars: set[str] = set()
 
     def _to_pascal_case(self, name: str) -> str:
         """Convert snake_case to PascalCase."""
@@ -67,6 +72,58 @@ class RustCodeGen:
 
     def _indent(self) -> str:
         return "    " * self.indent_level
+
+    def _generate_constants(self) -> str:
+        """Generate Rust constants from strategy params."""
+        if not self.meta.params:
+            return ""
+
+        lines = ["// Strategy parameters (generated from Python params)"]
+
+        for name, value in self.meta.params.items():
+            rust_type, rust_value = self._param_to_rust(name, value)
+            lines.append(f"const {name}: {rust_type} = {rust_value};")
+
+        return "\n".join(lines) + "\n\n"
+
+    def _param_to_rust(self, name: str, value: Any) -> tuple[str, str]:
+        """Convert a Python parameter value to Rust type and literal.
+
+        Returns:
+            Tuple of (rust_type, rust_value)
+        """
+        if isinstance(value, Decimal):
+            return ("Decimal", f"dec!({value})")
+        elif isinstance(value, bool):
+            return ("bool", "true" if value else "false")
+        elif isinstance(value, int):
+            return ("i64", str(value))
+        elif isinstance(value, float):
+            return ("f64", str(value))
+        elif isinstance(value, str):
+            return ("&str", f'"{value}"')
+        elif isinstance(value, (list, tuple)):
+            if not value:
+                return ("&[&str]", "&[]")
+            # Infer type from first element
+            first = value[0]
+            if isinstance(first, str):
+                items = ", ".join(f'"{v}"' for v in value)
+                return ("&[&str]", f"&[{items}]")
+            elif isinstance(first, Decimal):
+                items = ", ".join(f"dec!({v})" for v in value)
+                return ("&[Decimal]", f"&[{items}]")
+            elif isinstance(first, (int, float)):
+                items = ", ".join(str(v) for v in value)
+                elem_type = "i64" if isinstance(first, int) else "f64"
+                return (f"&[{elem_type}]", f"&[{items}]")
+            else:
+                # Fallback: treat as strings
+                items = ", ".join(f'"{v}"' for v in value)
+                return ("&[&str]", f"&[{items}]")
+        else:
+            # Fallback: convert to string
+            return ("&str", f'"{value}"')
 
     def generate(self) -> str:
         """Generate complete Rust module for the strategy."""
@@ -83,14 +140,18 @@ class RustCodeGen:
         # Build the complete Rust code
         tokens_array = ", ".join(f'"{t}".to_string()' for t in self.meta.tokens)
 
+        # Generate constants from params
+        constants = self._generate_constants()
+
         return f'''//! Auto-generated from Python strategy: {self.meta.name}
 //! DO NOT EDIT - regenerate with `pmstrat transpile`
 
 use crate::strategy::{{Signal, Strategy, StrategyContext, Urgency}};
 use crate::position::Fill;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-pub struct {self.struct_name} {{
+{constants}pub struct {self.struct_name} {{
     id: String,
     tokens: Vec<String>,
 }}
@@ -159,11 +220,14 @@ impl Strategy for {self.struct_name} {{
         A variable needs `mut` if:
         - It has .push()/.append()/.pop() called on it
         - It's used with augmented assignment (+=, -=, etc.)
+        - It's assigned multiple times (reassigned)
         """
+        # Track first assignments to detect reassignment
+        assigned_vars: set[str] = set()
         for stmt in stmts:
-            self._scan_stmt_mutability(stmt)
+            self._scan_stmt_mutability(stmt, assigned_vars)
 
-    def _scan_stmt_mutability(self, stmt: ast.stmt) -> None:
+    def _scan_stmt_mutability(self, stmt: ast.stmt, assigned_vars: set[str]) -> None:
         """Recursively scan a statement for mutability requirements."""
         if isinstance(stmt, ast.Expr):
             # Check for method calls like x.push(), x.append()
@@ -180,15 +244,34 @@ impl Strategy for {self.struct_name} {{
             if isinstance(stmt.target, ast.Name):
                 self.mutable_vars.add(stmt.target.id)
 
+        elif isinstance(stmt, ast.Assign):
+            # Check for reassignment
+            if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                var_name = stmt.targets[0].id
+                if var_name in assigned_vars:
+                    # This is a reassignment - needs mut
+                    self.mutable_vars.add(var_name)
+                else:
+                    assigned_vars.add(var_name)
+
+        elif isinstance(stmt, ast.AnnAssign):
+            # Annotated assignment - check for reassignment
+            if isinstance(stmt.target, ast.Name) and stmt.value is not None:
+                var_name = stmt.target.id
+                if var_name in assigned_vars:
+                    self.mutable_vars.add(var_name)
+                else:
+                    assigned_vars.add(var_name)
+
         elif isinstance(stmt, ast.If):
             for s in stmt.body:
-                self._scan_stmt_mutability(s)
+                self._scan_stmt_mutability(s, assigned_vars)
             for s in stmt.orelse:
-                self._scan_stmt_mutability(s)
+                self._scan_stmt_mutability(s, assigned_vars)
 
         elif isinstance(stmt, ast.For):
             for s in stmt.body:
-                self._scan_stmt_mutability(s)
+                self._scan_stmt_mutability(s, assigned_vars)
 
     def _preprocess_option_patterns(self, stmts: List[ast.stmt]) -> List[ast.stmt]:
         """Detect and mark Option unwrapping patterns.
@@ -209,7 +292,7 @@ impl Strategy for {self.struct_name} {{
 
             next_stmt = stmts[i + 1] if i + 1 < len(stmts) else None
 
-            # Pattern 1: x = option_expr; if x is None: return
+            # Pattern 1a: x = option_expr; if x is None: return
             if (isinstance(stmt, ast.Assign) and
                 len(stmt.targets) == 1 and
                 isinstance(stmt.targets[0], ast.Name) and
@@ -221,7 +304,23 @@ impl Strategy for {self.struct_name} {{
                 return_value = next_stmt.body[0].value  # The return value
 
                 # Create a synthetic node to represent match unwrap
-                result.append(MatchUnwrap(var_name, option_expr, return_value))
+                result.append(MatchUnwrap(var_name, option_expr, return_value, is_continue=False))
+                self.unwrapped_vars.add(var_name)
+                skip_indices.add(i + 1)
+                continue
+
+            # Pattern 1b: x = option_expr; if x is None: continue
+            if (isinstance(stmt, ast.Assign) and
+                len(stmt.targets) == 1 and
+                isinstance(stmt.targets[0], ast.Name) and
+                next_stmt is not None and
+                self._is_none_check_continue(next_stmt, stmt.targets[0].id)):
+
+                var_name = stmt.targets[0].id
+                option_expr = stmt.value
+
+                # Create a synthetic node to represent match unwrap with continue
+                result.append(MatchUnwrap(var_name, option_expr, None, is_continue=True))
                 self.unwrapped_vars.add(var_name)
                 skip_indices.add(i + 1)
                 continue
@@ -265,6 +364,29 @@ impl Strategy for {self.struct_name} {{
         if not isinstance(stmt, ast.If):
             return False
         if len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.Return):
+            return False
+        if stmt.orelse:  # No else clause
+            return False
+
+        test = stmt.test
+        if not isinstance(test, ast.Compare):
+            return False
+        if len(test.ops) != 1 or len(test.comparators) != 1:
+            return False
+        if not isinstance(test.ops[0], (ast.Is, ast.Eq)):
+            return False
+        if not isinstance(test.comparators[0], ast.Constant) or test.comparators[0].value is not None:
+            return False
+        if not isinstance(test.left, ast.Name) or test.left.id != var_name:
+            return False
+
+        return True
+
+    def _is_none_check_continue(self, stmt: ast.stmt, var_name: str) -> bool:
+        """Check if stmt is 'if var_name is None: continue'"""
+        if not isinstance(stmt, ast.If):
+            return False
+        if len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.Continue):
             return False
         if stmt.orelse:  # No else clause
             return False
@@ -348,13 +470,17 @@ impl Strategy for {self.struct_name} {{
             return f"{self._indent()}{self._gen_expr(stmt.value)};"
         elif isinstance(stmt, ast.AugAssign):
             return self._gen_aug_assign(stmt)
+        elif isinstance(stmt, ast.Continue):
+            return f"{self._indent()}continue;"
+        elif isinstance(stmt, ast.Break):
+            return f"{self._indent()}break;"
+        elif isinstance(stmt, ast.AnnAssign):
+            return self._gen_ann_assign(stmt)
         else:
             return f"{self._indent()}// TODO: unsupported stmt {type(stmt).__name__}"
 
     def _gen_match_unwrap(self, node: MatchUnwrap) -> str:
-        """Generate a match expression that unwraps an Option or returns early."""
-        return_expr = self._gen_expr(node.return_value)
-
+        """Generate a match expression that unwraps an Option or returns early/continues."""
         # Check if this is a Level attribute (best_bid, best_ask) that needs .price extraction
         is_level_attr = False
         if isinstance(node.option_expr, ast.Attribute):
@@ -367,9 +493,16 @@ impl Strategy for {self.struct_name} {{
         # For Level attributes, extract .price; otherwise just use v
         unwrap_expr = "v.price" if is_level_attr else "v"
 
+        # Generate the None arm - either continue or return
+        if node.is_continue:
+            none_arm = "continue"
+        else:
+            return_expr = self._gen_expr(node.return_value)
+            none_arm = f"return {return_expr}"
+
         return f"""{self._indent()}let {node.var_name} = match {option_expr} {{
 {self._indent()}    Some(v) => {unwrap_expr},
-{self._indent()}    None => return {return_expr},
+{self._indent()}    None => {none_arm},
 {self._indent()}}};"""
 
     def _gen_return(self, stmt: ast.Return) -> str:
@@ -386,12 +519,40 @@ impl Strategy for {self.struct_name} {{
         target = self._gen_expr(target_node)
         value = self._gen_expr(stmt.value)
 
-        # Check if this variable needs to be mutable
-        mut = ""
-        if isinstance(target_node, ast.Name) and target_node.id in self.mutable_vars:
-            mut = "mut "
+        # Check if this is a reassignment (variable already declared)
+        if isinstance(target_node, ast.Name):
+            var_name = target_node.id
+            if var_name in self.declared_vars:
+                # Reassignment - no let keyword
+                return f"{self._indent()}{target} = {value};"
+            else:
+                # First declaration
+                self.declared_vars.add(var_name)
+                # Check if this variable needs to be mutable
+                mut = "mut " if var_name in self.mutable_vars else ""
+                return f"{self._indent()}let {mut}{target} = {value};"
 
-        return f"{self._indent()}let {mut}{target} = {value};"
+        return f"{self._indent()}let {target} = {value};"
+
+    def _gen_ann_assign(self, stmt: ast.AnnAssign) -> str:
+        """Generate Rust code for annotated assignment (e.g., signals: list[Signal] = [])."""
+        if stmt.value is None:
+            # Declaration without value - skip
+            return f"{self._indent()}// (declaration only)"
+
+        target = self._gen_expr(stmt.target)
+        value = self._gen_expr(stmt.value)
+
+        # Track as declared
+        if isinstance(stmt.target, ast.Name):
+            var_name = stmt.target.id
+            if var_name in self.declared_vars:
+                return f"{self._indent()}{target} = {value};"
+            self.declared_vars.add(var_name)
+            mut = "mut " if var_name in self.mutable_vars else ""
+            return f"{self._indent()}let {mut}{target} = {value};"
+
+        return f"{self._indent()}let {target} = {value};"
 
     def _gen_aug_assign(self, stmt: ast.AugAssign) -> str:
         target = self._gen_expr(stmt.target)
@@ -400,6 +561,12 @@ impl Strategy for {self.struct_name} {{
         return f"{self._indent()}{target} {op}= {value};"
 
     def _gen_if(self, stmt: ast.If) -> str:
+        # Check for "if x is not None:" pattern where x is Option
+        # Generate "if let Some(x) = x {" instead
+        if_let_result = self._try_if_let_some(stmt)
+        if if_let_result:
+            return if_let_result
+
         cond = self._gen_expr(stmt.test)
         lines = [f"{self._indent()}if {cond} {{"]
         self.indent_level += 1
@@ -418,6 +585,52 @@ impl Strategy for {self.struct_name} {{
                 for s in stmt.orelse:
                     lines.append(self._gen_stmt(s))
                 self.indent_level -= 1
+
+        lines.append(f"{self._indent()}}}")
+        return "\n".join(lines)
+
+    def _try_if_let_some(self, stmt: ast.If) -> str | None:
+        """Try to convert 'if x is not None:' to 'if let Some(x) = x {'.
+
+        Returns generated code if pattern matches, None otherwise.
+        """
+        # Check for "x is not None" pattern
+        test = stmt.test
+        if not isinstance(test, ast.Compare):
+            return None
+        if len(test.ops) != 1 or len(test.comparators) != 1:
+            return None
+        if not isinstance(test.ops[0], ast.IsNot):
+            return None
+        if not isinstance(test.comparators[0], ast.Constant) or test.comparators[0].value is not None:
+            return None
+        if not isinstance(test.left, ast.Name):
+            return None
+
+        var_name = test.left.id
+
+        # Generate if let Some pattern
+        lines = [f"{self._indent()}if let Some({var_name}) = {var_name} {{"]
+        self.indent_level += 1
+
+        # Track that this variable is now unwrapped within this scope
+        old_unwrapped = self.unwrapped_vars.copy()
+        self.unwrapped_vars.add(var_name)
+
+        for s in stmt.body:
+            lines.append(self._gen_stmt(s))
+
+        # Restore unwrapped state
+        self.unwrapped_vars = old_unwrapped
+
+        self.indent_level -= 1
+
+        if stmt.orelse:
+            lines.append(f"{self._indent()}}} else {{")
+            self.indent_level += 1
+            for s in stmt.orelse:
+                lines.append(self._gen_stmt(s))
+            self.indent_level -= 1
 
         lines.append(f"{self._indent()}}}")
         return "\n".join(lines)
@@ -474,7 +687,11 @@ impl Strategy for {self.struct_name} {{
 
         lines = [f"{self._indent()}for ({token_var}, {market_var}) in ctx.markets.iter() {{"]
         self.indent_level += 1
-        for s in stmt.body:
+
+        # Preprocess the for loop body for Option patterns
+        processed_body = self._preprocess_option_patterns(stmt.body)
+
+        for s in processed_body:
             lines.append(self._gen_stmt(s))
         self.indent_level -= 1
         lines.append(f"{self._indent()}}}")
@@ -522,7 +739,12 @@ impl Strategy for {self.struct_name} {{
             return f'"{expr.value}".to_string()'
         elif isinstance(expr.value, bool):
             return "true" if expr.value else "false"
-        elif isinstance(expr.value, (int, float)):
+        elif isinstance(expr.value, float):
+            # Keep floats as floats (for f64 comparisons)
+            return str(expr.value)
+        elif isinstance(expr.value, int):
+            # Integers default to Decimal, but small ones used in comparisons
+            # might be intended as regular numbers. Use dec! for safety.
             return f"dec!({expr.value})"
         elif expr.value is None:
             return "None"
@@ -536,18 +758,28 @@ impl Strategy for {self.struct_name} {{
             method = expr.func.attr
             args = ", ".join(self._gen_expr(a) for a in expr.args)
 
-            # ctx.book(token_id) -> ctx.order_books.get(&token_id)
+            # ctx.book(token_id) -> ctx.order_books.get(token_id)
+            # Note: token_id from iteration is already &String, don't add &
             if obj == "ctx" and method == "book":
-                return f"ctx.order_books.get(&{args})"
-            # ctx.position(token_id) -> ctx.positions.get(&token_id)
+                return f"ctx.order_books.get({args})"
+            # ctx.position(token_id) -> ctx.positions.get(token_id)
             elif obj == "ctx" and method == "position":
-                return f"ctx.positions.get(&{args})"
-            # ctx.mid(token_id) -> ctx.order_books.get(&token_id).and_then(|b| b.mid_price())
+                return f"ctx.positions.get({args})"
+            # ctx.mid(token_id) -> ctx.order_books.get(token_id).and_then(|b| b.mid_price())
             elif obj == "ctx" and method == "mid":
-                return f"ctx.order_books.get(&{args}).and_then(|b| b.mid_price())"
+                return f"ctx.order_books.get({args}).and_then(|b| b.mid_price())"
             # vec.append(x) -> vec.push(x)
             elif method == "append":
                 return f"{obj}.push({args})"
+            # str.lower() -> str.to_lowercase()
+            elif method == "lower":
+                return f"{obj}.to_lowercase()"
+            # str.upper() -> str.to_uppercase()
+            elif method == "upper":
+                return f"{obj}.to_uppercase()"
+            # str.contains(x) -> str.contains(x) (same in Rust)
+            elif method == "contains":
+                return f"{obj}.contains({args})"
             else:
                 return f"{obj}.{method}({args})"
 
@@ -592,6 +824,11 @@ impl Strategy for {self.struct_name} {{
         if "Urgency." in urgency:
             urgency = urgency.replace("Urgency.", "Urgency::")
 
+        # Clone token_id if it's a variable (likely borrowed from iteration)
+        # Don't clone if it's already a string literal
+        if not token_id.startswith('"'):
+            token_id = f"{token_id}.clone()"
+
         return f"Signal::{signal_type} {{ token_id: {token_id}, price: {price}, size: {size}, urgency: {urgency} }}"
 
     def _gen_cancel_call(self, expr: ast.Call) -> str:
@@ -611,6 +848,7 @@ impl Strategy for {self.struct_name} {{
                 "total_pnl": "(ctx.realized_pnl + ctx.unrealized_pnl)",
                 "total_realized_pnl": "ctx.realized_pnl",
                 "total_unrealized_pnl": "ctx.unrealized_pnl",
+                "usdc_balance": "ctx.usdc_balance",
             }
             return attr_map.get(attr, f"ctx.{attr}")
 
@@ -625,7 +863,7 @@ impl Strategy for {self.struct_name} {{
             return f"Urgency::{urgency_map.get(attr, attr)}"
 
         # OrderBook method attributes - convert to method calls
-        if attr in self.OPTION_LEVEL_ATTRS or attr in self.OPTION_DECIMAL_ATTRS:
+        if attr in self.OPTION_LEVEL_ATTRS or attr in self.OPTION_DECIMAL_ATTRS or attr in self.DECIMAL_METHOD_ATTRS:
             return f"{obj}.{attr}()"
 
         # MarketInfo string attributes - need .clone()
@@ -656,6 +894,16 @@ impl Strategy for {self.struct_name} {{
                     return f"{left}.is_some()"
                 elif isinstance(op, ast.Eq):
                     return f"{left}.is_none()"
+
+            # Handle "x in y" -> y.contains(x) for substring checks
+            if isinstance(op, ast.In):
+                right = self._gen_expr(comp)
+                # Don't add & if left is already a reference (like loop variables)
+                return f"{right}.contains({left})"
+            # Handle "x not in y" -> !y.contains(x)
+            elif isinstance(op, ast.NotIn):
+                right = self._gen_expr(comp)
+                return f"!{right}.contains({left})"
 
         parts = [left]
         for op, comparator in zip(expr.ops, expr.comparators):
@@ -730,6 +978,14 @@ impl Strategy for {self.struct_name} {{
         test = self._gen_expr(expr.test)
         body = self._gen_expr(expr.body)
         orelse = self._gen_expr(expr.orelse)
+
+        # Handle "x if x else y" pattern for lists -> "if !x.is_empty() { x } else { y }"
+        # This is common for "signals if signals else [Hold()]"
+        if isinstance(expr.test, ast.Name) and isinstance(expr.body, ast.Name):
+            if expr.test.id == expr.body.id:
+                var_name = expr.test.id
+                return f"if !{var_name}.is_empty() {{ {body} }} else {{ {orelse} }}"
+
         return f"if {test} {{ {body} }} else {{ {orelse} }}"
 
 
