@@ -44,7 +44,9 @@ class MarketInfo:
     token_id: str
     question: str = ""
     outcome: str = ""
+    slug: str = ""
     end_date: Optional[datetime] = None
+    liquidity: Optional[float] = None
 
     @property
     def hours_until_expiry(self) -> Optional[float]:

@@ -15,6 +15,7 @@ _order_placed = False
     name="order_test",
     tokens=[TOKEN_ID],
     tick_interval_ms=5000,
+    transpilable=False,  # Uses global state - Python-only test strategy
 )
 def on_tick(ctx: Context) -> list[Signal]:
     """Place a small order once, then hold."""

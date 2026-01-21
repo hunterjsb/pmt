@@ -44,5 +44,11 @@ class Hold:
     pass
 
 
+@dataclass(frozen=True)
+class Shutdown:
+    """Request graceful engine shutdown."""
+    reason: str
+
+
 # Union type for all signals
-Signal = Union[Buy, Sell, Cancel, Hold]
+Signal = Union[Buy, Sell, Cancel, Hold, Shutdown]

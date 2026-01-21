@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from py_clob_client.client import ClobClient
@@ -404,10 +403,13 @@ class AuthenticatedClob:
             "id": 1,
         }
 
+        # Include auth headers if using proxy
+        headers = self._get_headers()
+
         last_error = None
         for attempt in range(retries):
             try:
-                response = requests.post(self._rpc, json=payload, timeout=10)
+                response = requests.post(self._rpc, json=payload, headers=headers, timeout=10)
                 response.raise_for_status()
                 result = response.json()
 
@@ -451,7 +453,7 @@ class AuthenticatedClob:
         balance = int(hex_result, 16)
         return balance / 1e6  # Polymarket outcome tokens use 6 decimals
 
-    def positions(self, max_tokens: int = 20) -> list[dict]:
+    def positions(self, max_tokens: int = 150) -> list[dict]:
         """Current positions by on-chain balances for tokens seen in trade history.
 
         Args:
@@ -491,6 +493,56 @@ class AuthenticatedClob:
                 continue  # Skip tokens we can't fetch
 
         return positions
+
+    # -----------------------------
+    # Resolution checking
+    # -----------------------------
+
+    def _normalize_condition_id(self, condition_id: str) -> str:
+        """Normalize condition ID to 64 hex chars (bytes32) without 0x prefix."""
+        # Remove 0x prefix if present
+        cid = condition_id[2:] if condition_id.startswith("0x") else condition_id
+        # Left-pad with zeros to 64 chars (bytes32)
+        return cid.lower().zfill(64)
+
+    def is_condition_resolved(self, condition_id: str) -> bool:
+        """Check if a condition has been resolved by querying payoutDenominator.
+
+        Args:
+            condition_id: The condition ID (hex string, with or without 0x prefix)
+
+        Returns:
+            True if resolved (payoutDenominator > 0), False otherwise
+        """
+        # payoutDenominator(bytes32) selector: 0xdd34de67
+        condition_padded = self._normalize_condition_id(condition_id)
+        data = "0xdd34de67" + condition_padded
+
+        hex_result = self._rpc_call(CTF_CONTRACT, data)
+        return int(hex_result, 16) > 0
+
+    def get_payout_numerators(self, condition_id: str) -> list[int]:
+        """Get payout numerators for a resolved condition.
+
+        Args:
+            condition_id: The condition ID (hex string, with or without 0x prefix)
+
+        Returns:
+            List of payout numerators [outcome0, outcome1] for binary markets.
+            e.g., [1, 0] means outcome 0 (Yes) won, [0, 1] means outcome 1 (No) won.
+        """
+        condition_padded = self._normalize_condition_id(condition_id)
+
+        # payoutNumerators(bytes32, uint256) selector: 0x0504c814
+        # Query for index 0 and 1 (binary market)
+        numerators = []
+        for idx in range(2):
+            idx_padded = hex(idx)[2:].zfill(64)
+            data = "0x0504c814" + condition_padded + idx_padded
+            hex_result = self._rpc_call(CTF_CONTRACT, data)
+            numerators.append(int(hex_result, 16))
+
+        return numerators
 
 
 def create_authenticated_clob(*, proxy: bool = False) -> AuthenticatedClob | None:

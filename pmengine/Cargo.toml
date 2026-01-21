@@ -1,6 +1,6 @@
 [package]
 name = "pmengine"
-version = "0.1.3"
+version = "0.1.8"
 edition = "2021"
 description = "Rust HFT engine for Polymarket trading"
 
@@ -18,6 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Config (EC2 only)
 clap = { version = "4", features = ["derive"], optional = true }
+dotenvy = "0.15"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -53,7 +54,7 @@ aws-sdk-cognitoidentityprovider = { version = "1", optional = true }
 
 [features]
 default = ["ec2"]
-ec2 = ["clap"]
+ec2 = ["clap", "cognito"]
 cognito = ["aws-config", "aws-sdk-cognitoidentityprovider"]
 
 [lib]

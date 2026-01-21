@@ -80,6 +80,9 @@ impl OrderManager {
             Signal::Sell { token_id, price, size, urgency } => {
                 self.place_order(&token_id, false, price, size, urgency).await
             }
+
+            // Shutdown is handled by the engine, not the order manager
+            Signal::Shutdown { .. } => Ok(None),
         }
     }
 
@@ -91,6 +94,16 @@ impl OrderManager {
         size: Decimal,
         _urgency: Urgency,
     ) -> Result<Option<String>, OrderError> {
+        // Round to 2 decimal places (Polymarket requirement)
+        let price = price.round_dp(2);
+        let size = size.round_dp(2);
+
+        // Skip if size rounds to zero
+        if size.is_zero() {
+            tracing::debug!(token_id = token_id, "Order size rounded to zero, skipping");
+            return Ok(None);
+        }
+
         let side = if is_buy { Side::Buy } else { Side::Sell };
 
         // Place order via SDK (handles dry-run internally)

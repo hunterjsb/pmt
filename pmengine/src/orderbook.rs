@@ -70,6 +70,18 @@ impl OrderBook {
         self.asks.first()
     }
 
+    /// Best bid size (for Python DSL compatibility).
+    /// Returns 0 if no bids exist.
+    pub fn bid_size(&self) -> Decimal {
+        self.best_bid().map(|l| l.size).unwrap_or(Decimal::ZERO)
+    }
+
+    /// Best ask size (for Python DSL compatibility).
+    /// Returns 0 if no asks exist.
+    pub fn ask_size(&self) -> Decimal {
+        self.best_ask().map(|l| l.size).unwrap_or(Decimal::ZERO)
+    }
+
     /// Mid price (average of best bid and ask).
     pub fn mid_price(&self) -> Option<Decimal> {
         match (self.best_bid(), self.best_ask()) {

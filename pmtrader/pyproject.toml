@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 cognito = ["boto3>=1.35.0"]
+redeem = ["polymarket-apis>=0.4.0"]
 
 [project.scripts]
 pmtrader-ui = "ui.app:main"

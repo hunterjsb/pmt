@@ -1,0 +1,67 @@
+{
+  "_comment": "Sample Gamma API /events response for testing. Used by both pmtrader (Python) and pmengine (Rust).",
+  "events": [
+    {
+      "id": "12345",
+      "title": "Will BTC reach $100k by end of day?",
+      "slug": "btc-100k-eod",
+      "endDate": "2024-01-15T23:59:59Z",
+      "markets": [
+        {
+          "question": "Will BTC reach $100k by end of day?",
+          "slug": "btc-100k-eod",
+          "endDate": "2024-01-15T23:59:59Z",
+          "outcomes": "[\"Yes\", \"No\"]",
+          "outcomePrices": "[\"0.95\", \"0.05\"]",
+          "clobTokenIds": "[\"1234567890123456789012345678901234567890\", \"0987654321098765432109876543210987654321\"]",
+          "active": true,
+          "closed": false
+        }
+      ]
+    },
+    {
+      "id": "12346",
+      "title": "Will ETH stay above $2k?",
+      "slug": "eth-above-2k",
+      "endDate": "2024-01-15T22:00:00Z",
+      "markets": [
+        {
+          "question": "Will ETH stay above $2k by market close?",
+          "slug": "eth-above-2k-market",
+          "endDate": "2024-01-15T22:00:00Z",
+          "outcomes": "[\"Yes\", \"No\"]",
+          "outcomePrices": "[\"0.97\", \"0.03\"]",
+          "clobTokenIds": "[\"1111111111111111111111111111111111111111\", \"2222222222222222222222222222222222222222\"]",
+          "active": true,
+          "closed": false
+        }
+      ]
+    },
+    {
+      "id": "12347",
+      "title": "Will the Fed raise rates?",
+      "slug": "fed-rates-decision",
+      "endDate": "2024-01-20T18:00:00Z",
+      "markets": [
+        {
+          "question": "Will the Fed raise rates at January meeting?",
+          "slug": "fed-rates-jan",
+          "endDate": "2024-01-20T18:00:00Z",
+          "outcomes": "[\"Yes\", \"No\"]",
+          "outcomePrices": "[\"0.15\", \"0.85\"]",
+          "clobTokenIds": "[\"3333333333333333333333333333333333333333\", \"4444444444444444444444444444444444444444\"]",
+          "active": true,
+          "closed": false
+        }
+      ]
+    }
+  ],
+  "_test_expectations": {
+    "total_events": 3,
+    "sure_bet_candidates_95pct": 2,
+    "sure_bet_candidates_tokens": [
+      "1234567890123456789012345678901234567890",
+      "1111111111111111111111111111111111111111"
+    ]
+  }
+}
