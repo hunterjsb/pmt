@@ -10,6 +10,10 @@ if [ -f /home/ec2-user/.pmengine.env ]; then
     set +a
 fi
 
-nohup /usr/local/bin/pmengine --log-level info > /home/ec2-user/pmengine.log 2>&1 &
+# Determine strategies to run (default: sure_bets)
+STRATEGIES="${PMENGINE_STRATEGIES:-sure_bets}"
+
+echo "Running strategies: $STRATEGIES"
+nohup /usr/local/bin/pmengine run $STRATEGIES --log-level info > /home/ec2-user/pmengine.log 2>&1 &
 disown
 echo "pmengine started with PID $!"
