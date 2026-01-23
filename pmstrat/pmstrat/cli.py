@@ -267,6 +267,8 @@ def run_transpile(args: list[str]):
         transpile_to_file,
         regenerate_mod_rs,
         find_pmengine_strategies_dir,
+        find_pmengine_tests_dir,
+        generate_tests_to_file,
     )
 
     # Parse args
@@ -288,6 +290,11 @@ def run_transpile(args: list[str]):
 
     console.print(f"[dim]Strategies dir: {strategies_dir}[/dim]")
 
+    # Find tests directory
+    tests_dir = find_pmengine_tests_dir()
+    if tests_dir:
+        console.print(f"[dim]Tests dir: {tests_dir}[/dim]")
+
     if transpile_all:
         # Transpile all strategies and regenerate mod.rs
         console.print("[bold]Transpiling all strategies...[/bold]")
@@ -303,12 +310,17 @@ def run_transpile(args: list[str]):
 
         transpiled = 0
         skipped = 0
+        tests_generated = 0
         for strategy_file in strategy_files:
             name = strategy_file.stem
             try:
-                result = transpile_single_strategy(name, strategies_dir)
-                if result:
-                    console.print(f"  [green]✓[/green] {name}")
+                strategy_path, test_path = transpile_single_strategy(name, strategies_dir, tests_dir)
+                if strategy_path:
+                    msg = f"  [green]✓[/green] {name}"
+                    if test_path:
+                        msg += " [dim](+ tests)[/dim]"
+                        tests_generated += 1
+                    console.print(msg)
                     transpiled += 1
             except SkippedStrategy:
                 console.print(f"  [dim]–[/dim] {name} [dim](skipped)[/dim]")
@@ -322,8 +334,10 @@ def run_transpile(args: list[str]):
         console.print(f"  [green]✓[/green] mod.rs updated")
 
         summary = f"\n[green]Done![/green] Transpiled {transpiled} strategies"
+        if tests_generated:
+            summary += f" ({tests_generated} with tests)"
         if skipped:
-            summary += f" ({skipped} skipped)"
+            summary += f", {skipped} skipped"
         console.print(summary)
         console.print(f"[dim]Now run: cd pmengine && cargo build --features ec2[/dim]")
 
@@ -332,9 +346,11 @@ def run_transpile(args: list[str]):
         console.print(f"[bold]Transpiling {strategy_name}...[/bold]")
 
         try:
-            result = transpile_single_strategy(strategy_name, strategies_dir)
-            if result:
-                console.print(f"  [green]✓[/green] {result}")
+            strategy_path, test_path = transpile_single_strategy(strategy_name, strategies_dir, tests_dir)
+            if strategy_path:
+                console.print(f"  [green]✓[/green] {strategy_path}")
+                if test_path:
+                    console.print(f"  [green]✓[/green] {test_path} [dim](tests)[/dim]")
 
                 # Regenerate mod.rs
                 console.print("[bold]Regenerating mod.rs registry...[/bold]")
@@ -360,13 +376,14 @@ class SkippedStrategy(Exception):
     pass
 
 
-def transpile_single_strategy(name: str, strategies_dir: Path) -> str | None:
+def transpile_single_strategy(name: str, strategies_dir: Path, tests_dir: Path | None = None) -> tuple[str, str | None]:
     """Transpile a single strategy by name.
 
-    Returns the output path on success, None on failure.
+    Returns tuple of (strategy_path, test_path) on success.
+    test_path is None if tests_dir is not provided.
     Raises SkippedStrategy if the strategy has transpilable=False.
     """
-    from .transpile import transpile_to_file
+    from .transpile import transpile_to_file, generate_tests_to_file
     from .dsl import get_strategy_meta
 
     # Find the Python strategy file
@@ -401,7 +418,13 @@ def transpile_single_strategy(name: str, strategies_dir: Path) -> str | None:
     output_path = strategies_dir / f"{name}.rs"
     transpile_to_file(strategy_fn, str(output_path))
 
-    return str(output_path)
+    # Generate tests if tests_dir is provided
+    test_path = None
+    if tests_dir is not None:
+        test_path = tests_dir / f"test_{name}.rs"
+        generate_tests_to_file(strategy_fn, str(test_path))
+
+    return str(output_path), str(test_path) if test_path else None
 
 
 def run_lint(args: list[str]):

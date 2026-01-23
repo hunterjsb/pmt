@@ -3,6 +3,7 @@
 
 use crate::strategy::{Signal, Strategy, StrategyContext, Urgency};
 use crate::position::Fill;
+#[allow(unused_imports)]
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 

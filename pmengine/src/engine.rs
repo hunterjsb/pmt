@@ -395,7 +395,6 @@ impl Engine {
 
         let mut last_tick = Instant::now();
         let mut tick_count: u64 = 0;
-        let mut ws_update_count: u64 = 0;
 
         // Market discovery timer (60 seconds)
         let mut market_refresh_timer = interval(Duration::from_secs(60));
@@ -415,7 +414,7 @@ impl Engine {
         // When new tokens are discovered, we break the inner loop and reconnect
         'reconnect: loop {
             // Reset WebSocket update count on each reconnection
-            ws_update_count = 0;
+            let mut ws_update_count: u64 = 0;
 
             // Connect to WebSocket for market data if we have subscriptions
             // Keep ws_client alive since the stream borrows from it

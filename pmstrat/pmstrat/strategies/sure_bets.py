@@ -12,10 +12,9 @@ Risk profile:
 """
 
 from decimal import Decimal
-from datetime import datetime, timezone
 
-from pmstrat import strategy, Context, Buy, Hold, Signal, Urgency
-
+# from datetime import datetime, timezone
+from pmstrat import Buy, Context, Hold, Signal, Urgency, strategy
 
 # Strategy parameters are defined in the decorator and transpiled to Rust constants
 # These module-level constants are used for Python-side testing/simulation
@@ -31,25 +30,93 @@ MIN_EXPECTED_RETURN = Decimal("0.01")
 # Keywords for excluded markets (esports, sports, etc.)
 EXCLUDE_KEYWORDS = [
     # Esports
-    "dota", "counter-strike", "valorant", "league of legends", "overwatch",
-    "csgo", "cs2", "lol", "pubg", "fortnite", "rocket league", "starcraft",
-    "kill handicap", "map handicap", "game handicap",
-    "games total", "bo3", "bo5", "esports", "e-sports",
+    "dota",
+    "counter-strike",
+    "valorant",
+    "league of legends",
+    "overwatch",
+    "csgo",
+    "cs2",
+    "lol",
+    "pubg",
+    "fortnite",
+    "rocket league",
+    "starcraft",
+    "kill handicap",
+    "map handicap",
+    "game handicap",
+    "games total",
+    "bo3",
+    "bo5",
+    "esports",
+    "e-sports",
     # Soccer/Football - generic patterns that catch most matches
-    " vs ", " vs. ", " fc", " afc", " cf", "united fc", "city fc",
-    "o/u 2.5", "o/u 3.5", "o/u 4.5", "o/u 1.5", "o/u 0.5",
-    "over/under", "over 0.5", "over 1.5", "over 2.5", "over 3.5", "over 4.5",
-    "under 0.5", "under 1.5", "under 2.5", "under 3.5", "under 4.5",
+    " vs ",
+    " vs. ",
+    " fc",
+    " afc",
+    " cf",
+    "united fc",
+    "city fc",
+    "o/u 2.5",
+    "o/u 3.5",
+    "o/u 4.5",
+    "o/u 1.5",
+    "o/u 0.5",
+    "over/under",
+    "over 0.5",
+    "over 1.5",
+    "over 2.5",
+    "over 3.5",
+    "over 4.5",
+    "under 0.5",
+    "under 1.5",
+    "under 2.5",
+    "under 3.5",
+    "under 4.5",
     # Leagues and competitions
-    "premier league", "epl", "champions league", "la liga", "bundesliga", "serie a",
-    "ligue 1", "eredivisie", "championship", "league one", "league two",
-    "copa america", "euros", "euro 2024", "euro 2025", "world cup",
+    "premier league",
+    "epl",
+    "champions league",
+    "la liga",
+    "bundesliga",
+    "serie a",
+    "ligue 1",
+    "eredivisie",
+    "championship",
+    "league one",
+    "league two",
+    "copa america",
+    "euros",
+    "euro 2024",
+    "euro 2025",
+    "world cup",
     # US Sports
-    "nfl", "nba", "mlb", "nhl", "mls", "ufc", "wwe", "ncaa",
-    "super bowl", "stanley cup", "world series",
+    "nfl",
+    "nba",
+    "mlb",
+    "nhl",
+    "mls",
+    "ufc",
+    "wwe",
+    "ncaa",
+    "super bowl",
+    "stanley cup",
+    "world series",
     # Other sports
-    "fifa", "olympics", "tennis", "golf", "boxing", "mma", "f1", "nascar",
-    "cricket", "rugby", "atp", "wta", "pga",
+    "fifa",
+    "olympics",
+    "tennis",
+    "golf",
+    "boxing",
+    "mma",
+    "f1",
+    "nascar",
+    "cricket",
+    "rugby",
+    "atp",
+    "wta",
+    "pga",
 ]
 
 
@@ -152,12 +219,14 @@ def on_tick(ctx: Context) -> list[Signal]:
             continue
 
         # Generate buy signal
-        signals.append(Buy(
-            token_id=token_id,
-            price=ask_price,
-            size=size,
-            urgency=Urgency.MEDIUM,
-        ))
+        signals.append(
+            Buy(
+                token_id=token_id,
+                price=ask_price,
+                size=size,
+                urgency=Urgency.MEDIUM,
+            )
+        )
 
     return signals if signals else [Hold()]
 
@@ -202,16 +271,18 @@ def scan_opportunities(ctx: Context) -> list[dict]:
         expected_return = (Decimal("1.00") - ask_price) / ask_price
         hourly_return = expected_return / Decimal(str(max(hours_left, 0.1)))
 
-        opportunities.append({
-            "token_id": token_id,
-            "question": market.question,
-            "outcome": market.outcome,
-            "ask_price": float(ask_price),
-            "ask_size": float(book.ask_size),
-            "hours_left": hours_left,
-            "expected_return_pct": float(expected_return * 100),
-            "hourly_return_pct": float(hourly_return * 100),
-        })
+        opportunities.append(
+            {
+                "token_id": token_id,
+                "question": market.question,
+                "outcome": market.outcome,
+                "ask_price": float(ask_price),
+                "ask_size": float(book.ask_size),
+                "hours_left": hours_left,
+                "expected_return_pct": float(expected_return * 100),
+                "hourly_return_pct": float(hourly_return * 100),
+            }
+        )
 
     # Sort by hourly return (best first)
     opportunities.sort(key=lambda x: x["hourly_return_pct"], reverse=True)
