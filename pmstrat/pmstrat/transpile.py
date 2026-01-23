@@ -12,6 +12,52 @@ from typing import Callable, List, Any
 from .dsl import get_strategy_meta, StrategyMeta
 
 
+def param_to_rust(name: str, value: Any) -> tuple[str, str]:
+    """Convert a Python parameter value to Rust type and literal.
+
+    This is a shared helper used by both RustCodeGen and RustTestGenerator.
+
+    Args:
+        name: Parameter name (unused, but kept for consistency)
+        value: Python value to convert
+
+    Returns:
+        Tuple of (rust_type, rust_value)
+    """
+    if isinstance(value, Decimal):
+        return ("Decimal", f"dec!({value})")
+    elif isinstance(value, bool):
+        return ("bool", "true" if value else "false")
+    elif isinstance(value, int):
+        return ("i64", str(value))
+    elif isinstance(value, float):
+        return ("f64", str(value))
+    elif isinstance(value, str):
+        return ("&str", f'"{value}"')
+    elif isinstance(value, (list, tuple)):
+        if not value:
+            return ("&[&str]", "&[]")
+        # Infer type from first element
+        first = value[0]
+        if isinstance(first, str):
+            items = ", ".join(f'"{v}"' for v in value)
+            return ("&[&str]", f"&[{items}]")
+        elif isinstance(first, Decimal):
+            items = ", ".join(f"dec!({v})" for v in value)
+            return ("&[Decimal]", f"&[{items}]")
+        elif isinstance(first, (int, float)):
+            items = ", ".join(str(v) for v in value)
+            elem_type = "i64" if isinstance(first, int) else "f64"
+            return (f"&[{elem_type}]", f"&[{items}]")
+        else:
+            # Fallback: treat as strings
+            items = ", ".join(f'"{v}"' for v in value)
+            return ("&[&str]", f"&[{items}]")
+    else:
+        # Fallback: convert to string
+        return ("&str", f'"{value}"')
+
+
 class TranspileError(Exception):
     """Error raised when transpilation fails due to unsupported patterns."""
 
@@ -371,6 +417,14 @@ class RustCodeGen:
         self.string_vars: set[str] = set()
         # Get param names (these are &str constants)
         self.param_names: set[str] = set(meta.params.keys()) if meta.params else set()
+        # Track integer params (for counter variable detection)
+        self.int_params: set[str] = set()
+        if meta.params:
+            for name, value in meta.params.items():
+                if isinstance(value, int) and not isinstance(value, bool):
+                    self.int_params.add(name)
+        # Track variables that should be integers (compared against int params)
+        self.int_vars: set[str] = set()
 
     def _to_pascal_case(self, name: str) -> str:
         """Convert snake_case to PascalCase."""
@@ -393,43 +447,8 @@ class RustCodeGen:
         return "\n".join(lines) + "\n\n"
 
     def _param_to_rust(self, name: str, value: Any) -> tuple[str, str]:
-        """Convert a Python parameter value to Rust type and literal.
-
-        Returns:
-            Tuple of (rust_type, rust_value)
-        """
-        if isinstance(value, Decimal):
-            return ("Decimal", f"dec!({value})")
-        elif isinstance(value, bool):
-            return ("bool", "true" if value else "false")
-        elif isinstance(value, int):
-            return ("i64", str(value))
-        elif isinstance(value, float):
-            return ("f64", str(value))
-        elif isinstance(value, str):
-            return ("&str", f'"{value}"')
-        elif isinstance(value, (list, tuple)):
-            if not value:
-                return ("&[&str]", "&[]")
-            # Infer type from first element
-            first = value[0]
-            if isinstance(first, str):
-                items = ", ".join(f'"{v}"' for v in value)
-                return ("&[&str]", f"&[{items}]")
-            elif isinstance(first, Decimal):
-                items = ", ".join(f"dec!({v})" for v in value)
-                return ("&[Decimal]", f"&[{items}]")
-            elif isinstance(first, (int, float)):
-                items = ", ".join(str(v) for v in value)
-                elem_type = "i64" if isinstance(first, int) else "f64"
-                return (f"&[{elem_type}]", f"&[{items}]")
-            else:
-                # Fallback: treat as strings
-                items = ", ".join(f'"{v}"' for v in value)
-                return ("&[&str]", f"&[{items}]")
-        else:
-            # Fallback: convert to string
-            return ("&str", f'"{value}"')
+        """Convert a Python parameter value to Rust type and literal."""
+        return param_to_rust(name, value)
 
     def generate(self) -> str:
         """Generate complete Rust module for the strategy."""
@@ -454,6 +473,7 @@ class RustCodeGen:
 
 use crate::strategy::{{Signal, Strategy, StrategyContext, Urgency}};
 use crate::position::Fill;
+#[allow(unused_imports)]
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -510,6 +530,9 @@ impl Strategy for {self.struct_name} {{
         # Scan for variables that need to be mutable
         self._scan_mutability(stmts)
 
+        # Scan for variables that should be integers (compared to int params)
+        self._scan_int_vars(stmts)
+
         # Pre-process to combine assign + None check patterns
         processed_stmts = self._preprocess_option_patterns(stmts)
 
@@ -519,6 +542,43 @@ impl Strategy for {self.struct_name} {{
                 continue
             lines.append(self._gen_stmt(stmt))
         return "\n".join(lines)
+
+    def _scan_int_vars(self, stmts: List[ast.stmt]) -> None:
+        """Scan for variables that should be integers based on comparisons with int params."""
+        for stmt in stmts:
+            self._scan_stmt_int_vars(stmt)
+
+    def _scan_stmt_int_vars(self, stmt: ast.stmt) -> None:
+        """Recursively scan a statement for integer variable patterns."""
+        if isinstance(stmt, ast.If):
+            # Check if condition compares a variable to an int param
+            self._check_compare_for_int_vars(stmt.test)
+            for s in stmt.body:
+                self._scan_stmt_int_vars(s)
+            for s in stmt.orelse:
+                self._scan_stmt_int_vars(s)
+        elif isinstance(stmt, ast.For):
+            for s in stmt.body:
+                self._scan_stmt_int_vars(s)
+        elif isinstance(stmt, ast.Expr):
+            if isinstance(stmt.value, ast.Compare):
+                self._check_compare_for_int_vars(stmt.value)
+
+    def _check_compare_for_int_vars(self, expr: ast.expr) -> None:
+        """Check a comparison expression for variables compared to int params."""
+        if not isinstance(expr, ast.Compare):
+            return
+        # Check left side against comparators
+        if isinstance(expr.left, ast.Name):
+            var_name = expr.left.id
+            for comp in expr.comparators:
+                if isinstance(comp, ast.Name) and comp.id in self.int_params:
+                    self.int_vars.add(var_name)
+        # Check comparators against left side
+        for comp in expr.comparators:
+            if isinstance(comp, ast.Name):
+                if isinstance(expr.left, ast.Name) and expr.left.id in self.int_params:
+                    self.int_vars.add(comp.id)
 
     def _scan_mutability(self, stmts: List[ast.stmt]) -> None:
         """Scan statements to find variables that need to be mutable.
@@ -638,7 +698,16 @@ impl Strategy for {self.struct_name} {{
                     obj_name = attr_expr.value.id
                     attr_name = attr_expr.attr
                     return_value = stmt.body[0].value
-                    pending_attr_checks[(obj_name, attr_name)] = (return_value, i)
+                    pending_attr_checks[(obj_name, attr_name)] = (return_value, i, False)  # False = not continue
+                    continue  # Don't add to result yet
+
+            # Pattern 2a': if x.attr is None: continue - record for later matching
+            if self._is_attr_none_check_continue(stmt):
+                attr_expr = stmt.test.left  # x.attr
+                if isinstance(attr_expr, ast.Attribute) and isinstance(attr_expr.value, ast.Name):
+                    obj_name = attr_expr.value.id
+                    attr_name = attr_expr.attr
+                    pending_attr_checks[(obj_name, attr_name)] = (None, i, True)  # True = is_continue
                     continue  # Don't add to result yet
 
             # Pattern 2b: z = x.attr - check if we have a pending None check for this
@@ -649,11 +718,11 @@ impl Strategy for {self.struct_name} {{
                     key = (obj_name, attr_name)
 
                     if key in pending_attr_checks:
-                        return_value, check_idx = pending_attr_checks.pop(key)
+                        return_value, check_idx, is_continue = pending_attr_checks.pop(key)
                         var_name = stmt.targets[0].id
                         attr_expr = stmt.value
 
-                        result.append(MatchUnwrap(var_name, attr_expr, return_value))
+                        result.append(MatchUnwrap(var_name, attr_expr, return_value, is_continue=is_continue))
                         self.unwrapped_vars.add(var_name)
                         # The None check was already skipped (not added to result)
                         continue
@@ -665,11 +734,20 @@ impl Strategy for {self.struct_name} {{
 
         return result
 
-    def _is_none_check_return(self, stmt: ast.stmt, var_name: str) -> bool:
-        """Check if stmt is 'if var_name is None: return ...'"""
+    def _is_none_check(self, stmt: ast.stmt, var_name: str | None, action: type) -> bool:
+        """Check 'if var is None: <action>' or 'if x.attr is None: <action>'.
+
+        Args:
+            stmt: Statement to check
+            var_name: Variable to check (None = check for attribute access to Option field)
+            action: ast.Return or ast.Continue
+
+        Returns:
+            True if the statement matches the pattern
+        """
         if not isinstance(stmt, ast.If):
             return False
-        if len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.Return):
+        if len(stmt.body) != 1 or not isinstance(stmt.body[0], action):
             return False
         if stmt.orelse:  # No else clause
             return False
@@ -683,60 +761,36 @@ impl Strategy for {self.struct_name} {{
             return False
         if not isinstance(test.comparators[0], ast.Constant) or test.comparators[0].value is not None:
             return False
-        if not isinstance(test.left, ast.Name) or test.left.id != var_name:
-            return False
+
+        if var_name is not None:
+            # Check for simple variable: `if var_name is None`
+            if not isinstance(test.left, ast.Name) or test.left.id != var_name:
+                return False
+        else:
+            # Check for attribute access: `if x.attr is None` where attr is an Option field
+            if not isinstance(test.left, ast.Attribute):
+                return False
+            if test.left.attr not in (self.OPTION_LEVEL_ATTRS | self.OPTION_DECIMAL_ATTRS):
+                return False
 
         return True
+
+    # Thin wrappers for backward compatibility in _preprocess_option_patterns
+    def _is_none_check_return(self, stmt: ast.stmt, var_name: str) -> bool:
+        """Check if stmt is 'if var_name is None: return ...'"""
+        return self._is_none_check(stmt, var_name, ast.Return)
 
     def _is_none_check_continue(self, stmt: ast.stmt, var_name: str) -> bool:
         """Check if stmt is 'if var_name is None: continue'"""
-        if not isinstance(stmt, ast.If):
-            return False
-        if len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.Continue):
-            return False
-        if stmt.orelse:  # No else clause
-            return False
-
-        test = stmt.test
-        if not isinstance(test, ast.Compare):
-            return False
-        if len(test.ops) != 1 or len(test.comparators) != 1:
-            return False
-        if not isinstance(test.ops[0], (ast.Is, ast.Eq)):
-            return False
-        if not isinstance(test.comparators[0], ast.Constant) or test.comparators[0].value is not None:
-            return False
-        if not isinstance(test.left, ast.Name) or test.left.id != var_name:
-            return False
-
-        return True
+        return self._is_none_check(stmt, var_name, ast.Continue)
 
     def _is_attr_none_check_return(self, stmt: ast.stmt) -> bool:
         """Check if stmt is 'if x.attr is None: return ...' where attr is an Option field."""
-        if not isinstance(stmt, ast.If):
-            return False
-        if len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.Return):
-            return False
-        if stmt.orelse:
-            return False
+        return self._is_none_check(stmt, None, ast.Return)
 
-        test = stmt.test
-        if not isinstance(test, ast.Compare):
-            return False
-        if len(test.ops) != 1 or len(test.comparators) != 1:
-            return False
-        if not isinstance(test.ops[0], (ast.Is, ast.Eq)):
-            return False
-        if not isinstance(test.comparators[0], ast.Constant) or test.comparators[0].value is not None:
-            return False
-
-        # Check that left side is an attribute access to an Option field
-        if not isinstance(test.left, ast.Attribute):
-            return False
-        if test.left.attr not in (self.OPTION_LEVEL_ATTRS | self.OPTION_DECIMAL_ATTRS):
-            return False
-
-        return True
+    def _is_attr_none_check_continue(self, stmt: ast.stmt) -> bool:
+        """Check if stmt is 'if x.attr is None: continue' where attr is an Option field."""
+        return self._is_none_check(stmt, None, ast.Continue)
 
     def _assigns_same_attr(self, assign_stmt: ast.Assign, if_stmt: ast.If) -> bool:
         """Check if assign_stmt assigns the same attribute that if_stmt checks."""
@@ -823,11 +877,16 @@ impl Strategy for {self.struct_name} {{
     def _gen_assign(self, stmt: ast.Assign) -> str:
         target_node = stmt.targets[0]
         target = self._gen_expr(target_node)
-        value = self._gen_expr(stmt.value)
 
         # Check if this is a reassignment (variable already declared)
         if isinstance(target_node, ast.Name):
             var_name = target_node.id
+
+            # Generate value, using integer literals for int_vars
+            if var_name in self.int_vars:
+                value = self._gen_int_expr(stmt.value)
+            else:
+                value = self._gen_expr(stmt.value)
 
             # Track if this variable is a String type
             # It's a String if the value is a string literal (generates .to_string())
@@ -844,7 +903,22 @@ impl Strategy for {self.struct_name} {{
                 mut = "mut " if var_name in self.mutable_vars else ""
                 return f"{self._indent()}let {mut}{target} = {value};"
 
+        value = self._gen_expr(stmt.value)
         return f"{self._indent()}let {target} = {value};"
+
+    def _gen_int_expr(self, expr: ast.expr) -> str:
+        """Generate Rust code for an expression that should be an integer."""
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
+            return str(expr.value)
+        elif isinstance(expr, ast.BinOp):
+            left = self._gen_int_expr(expr.left)
+            right = self._gen_int_expr(expr.right)
+            op = self._gen_binop(expr.op)
+            return f"{left} {op} {right}"
+        elif isinstance(expr, ast.Name):
+            return expr.id
+        else:
+            return self._gen_expr(expr)
 
     def _is_string_type(self, expr: ast.expr) -> bool:
         """Check if an expression results in a String type (vs &str).
@@ -1562,6 +1636,363 @@ def find_pmengine_strategies_dir() -> Path | None:
     ]
 
     # Also try from cwd
+    cwd = Path.cwd()
+    for candidate in candidates:
+        path = (cwd / candidate).resolve()
+        if path.exists() and path.is_dir():
+            return path
+
+    return None
+
+
+# =============================================================================
+# Test Generation
+# =============================================================================
+
+@dataclass
+class TestGeneratorConfig:
+    """Configuration for test generation."""
+    # Market discovery strategies need different test setup
+    is_market_discovery: bool
+    # Strategy params for filter tests
+    params: dict[str, Any]
+    # Strategy name and struct name
+    strategy_name: str
+    struct_name: str
+
+
+class RustTestGenerator:
+    """Generates Rust integration tests for transpiled strategies."""
+
+    def __init__(self, config: TestGeneratorConfig):
+        self.config = config
+        # Detect strategy type from params
+        self.is_market_maker = "SPREAD_BPS" in config.params or "MIN_SPREAD_PCT" in config.params
+        self.is_sure_bets = "MIN_CERTAINTY" in config.params or "MAX_CERTAINTY" in config.params
+
+    def generate(self) -> str:
+        """Generate complete Rust test file."""
+        parts = [
+            self._gen_header(),
+            self._gen_imports(),
+            self._gen_constants(),
+            self._gen_helpers(),
+            self._gen_filter_tests(),
+            self._gen_behavior_tests(),
+            self._gen_summary_test(),
+        ]
+        return "\n".join(parts)
+
+    def _gen_header(self) -> str:
+        return f'''//! Auto-generated integration tests for {self.config.strategy_name}
+//! DO NOT EDIT - regenerate with `pmstrat transpile`
+
+'''
+
+    def _gen_imports(self) -> str:
+        if self.config.is_market_discovery:
+            return f'''mod fixtures;
+
+use fixtures::*;
+use pmengine::strategies::{self.config.struct_name};
+use pmengine::strategy::Strategy;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+
+'''
+        else:
+            # Non-market-discovery: only need minimal imports for instantiation test
+            return f'''use pmengine::strategies::{self.config.struct_name};
+use pmengine::strategy::Strategy;
+
+'''
+
+    def _gen_constants(self) -> str:
+        """Generate test constants from strategy params."""
+        # Only generate constants for market discovery strategies
+        if not self.config.is_market_discovery:
+            return ""
+
+        lines = ["// Strategy constants (from transpiled strategy)"]
+        for name, value in self.config.params.items():
+            rust_type, rust_value = self._param_to_rust(name, value)
+            # Only include filter-related params
+            if name in ("MIN_LIQUIDITY", "MAX_LIQUIDITY", "MIN_PRICE", "MAX_PRICE",
+                        "MIN_SPREAD_PCT", "MAX_SPREAD_PCT", "MIN_HOURS_TO_EXPIRY",
+                        "MAX_HOURS_TO_EXPIRY", "ORDER_SIZE", "SKEW_FACTOR",
+                        "SPREAD_BPS", "MIN_EDGE", "MAX_TOKENS", "MAX_POSITION"):
+                lines.append(f"#[allow(dead_code)]")
+                lines.append(f"const {name}: {rust_type} = {rust_value};")
+        return "\n".join(lines) + "\n\n"
+
+    def _param_to_rust(self, name: str, value: Any) -> tuple[str, str]:
+        """Convert a Python parameter value to Rust type and literal."""
+        return param_to_rust(name, value)
+
+    def _gen_helpers(self) -> str:
+        """Generate test helper functions.
+
+        Returns empty string since helpers are now in fixtures/mod.rs.
+        """
+        return ""
+
+    def _gen_filter_tests(self) -> str:
+        """Generate filter tests based on strategy params."""
+        if not self.config.is_market_discovery:
+            return "// No filter tests for non-market-discovery strategies\n\n"
+
+        tests = []
+
+        if "MIN_LIQUIDITY" in self.config.params:
+            tests.append(self._gen_liquidity_filter_test())
+        if "MIN_PRICE" in self.config.params:
+            tests.append(self._gen_low_price_filter_test())
+        if "MAX_PRICE" in self.config.params:
+            tests.append(self._gen_high_price_filter_test())
+        if "MIN_HOURS_TO_EXPIRY" in self.config.params:
+            tests.append(self._gen_expiry_filter_test())
+
+        tests.append(self._gen_no_markets_test())
+        return "\n".join(tests)
+
+    def _gen_liquidity_filter_test(self) -> str:
+        struct = self.config.struct_name
+        # Use liquidity below MIN_LIQUIDITY param
+        min_liq = self.config.params.get("MIN_LIQUIDITY", 10000.0)
+        low_liq = min_liq / 2  # Half of minimum should fail
+        return f'''#[test]
+fn test_filters_out_low_liquidity() {{
+    let mut strategy = {struct}::new();
+    let ctx = create_context_with_markets(vec![
+        ("token1", dec!(0.68), dec!(0.72), 48.0, {low_liq}, dec!(0)),
+    ]);
+    let signals = strategy.on_tick(&ctx);
+    let (_, _, _, holds) = count_signal_types(&signals);
+    assert_eq!(holds, 1, "Should hold for low liquidity");
+}}
+
+'''
+
+    def _gen_low_price_filter_test(self) -> str:
+        struct = self.config.struct_name
+        return f'''#[test]
+fn test_filters_out_low_price() {{
+    let mut strategy = {struct}::new();
+    let ctx = create_context_with_markets(vec![
+        ("token1", dec!(0.10), dec!(0.15), 48.0, 50000.0, dec!(0)),
+    ]);
+    let signals = strategy.on_tick(&ctx);
+    let (_, _, _, holds) = count_signal_types(&signals);
+    assert_eq!(holds, 1, "Should hold for low price");
+}}
+
+'''
+
+    def _gen_high_price_filter_test(self) -> str:
+        struct = self.config.struct_name
+        return f'''#[test]
+fn test_filters_out_high_price() {{
+    let mut strategy = {struct}::new();
+    let ctx = create_context_with_markets(vec![
+        ("token1", dec!(0.85), dec!(0.90), 48.0, 50000.0, dec!(0)),
+    ]);
+    let signals = strategy.on_tick(&ctx);
+    let (_, _, _, holds) = count_signal_types(&signals);
+    assert_eq!(holds, 1, "Should hold for high price");
+}}
+
+'''
+
+    def _gen_expiry_filter_test(self) -> str:
+        struct = self.config.struct_name
+        return f'''#[test]
+fn test_filters_out_near_expiry() {{
+    let mut strategy = {struct}::new();
+    let ctx = create_context_with_markets(vec![
+        ("token1", dec!(0.68), dec!(0.72), 12.0, 50000.0, dec!(0)),
+    ]);
+    let signals = strategy.on_tick(&ctx);
+    let (_, _, _, holds) = count_signal_types(&signals);
+    assert_eq!(holds, 1, "Should hold for near expiry");
+}}
+
+'''
+
+    def _gen_no_markets_test(self) -> str:
+        struct = self.config.struct_name
+        return f'''#[test]
+fn test_no_markets() {{
+    let mut strategy = {struct}::new();
+    let ctx = create_context_with_markets(vec![]);
+    let signals = strategy.on_tick(&ctx);
+    let (_, _, _, holds) = count_signal_types(&signals);
+    assert_eq!(holds, 1, "Should hold when no markets");
+}}
+
+'''
+
+    def _gen_behavior_tests(self) -> str:
+        """Generate behavior tests."""
+        if not self.config.is_market_discovery:
+            return ""
+
+        tests = []
+        tests.append(self._gen_qualifying_market_test())
+        if "MAX_POSITION" in self.config.params:
+            tests.append(self._gen_max_position_tests())
+        tests.append(self._gen_multi_market_test())
+        return "\n".join(tests)
+
+    def _gen_qualifying_market_test(self) -> str:
+        struct = self.config.struct_name
+
+        if self.is_sure_bets:
+            # Sure bets needs high certainty (0.95-0.99 ask) and short expiry
+            return f'''#[test]
+fn test_quotes_qualifying_market() {{
+    let mut strategy = {struct}::new();
+    // High certainty market: ask=0.96, expiring in 24h
+    let ctx = create_context_with_markets(vec![
+        ("token1", dec!(0.94), dec!(0.96), 24.0, 1000.0, dec!(0)),
+    ]);
+    let signals = strategy.on_tick(&ctx);
+    let (_, buys, _, holds) = count_signal_types(&signals);
+    assert!(buys >= 1, "Should place buy order");
+    assert_eq!(holds, 0, "Should not hold");
+}}
+
+'''
+        else:
+            # Market maker style: needs mid in tradeable range
+            return f'''#[test]
+fn test_quotes_qualifying_market() {{
+    let mut strategy = {struct}::new();
+    let ctx = create_context_with_markets(vec![
+        ("token1", dec!(0.68), dec!(0.72), 48.0, 50000.0, dec!(0)),
+    ]);
+    let signals = strategy.on_tick(&ctx);
+    let (cancels, buys, sells, holds) = count_signal_types(&signals);
+    assert_eq!(cancels, 1, "Should cancel existing orders");
+    assert_eq!(buys, 1, "Should place buy order");
+    assert_eq!(sells, 1, "Should place sell order");
+    assert_eq!(holds, 0, "Should not hold");
+}}
+
+'''
+
+    def _gen_max_position_tests(self) -> str:
+        struct = self.config.struct_name
+        max_pos = self.config.params.get("MAX_POSITION", 75)
+        return f'''#[test]
+fn test_max_position_only_sells() {{
+    let mut strategy = {struct}::new();
+    let ctx = create_context_with_markets(vec![
+        ("token1", dec!(0.68), dec!(0.72), 48.0, 50000.0, dec!({max_pos})),
+    ]);
+    let signals = strategy.on_tick(&ctx);
+    let (cancels, buys, sells, _) = count_signal_types(&signals);
+    assert_eq!(cancels, 1, "Should cancel");
+    assert_eq!(buys, 0, "Should not buy at max position");
+    assert_eq!(sells, 1, "Should still sell");
+}}
+
+#[test]
+fn test_max_short_position_only_buys() {{
+    let mut strategy = {struct}::new();
+    let ctx = create_context_with_markets(vec![
+        ("token1", dec!(0.68), dec!(0.72), 48.0, 50000.0, dec!(-{max_pos})),
+    ]);
+    let signals = strategy.on_tick(&ctx);
+    let (cancels, buys, sells, _) = count_signal_types(&signals);
+    assert_eq!(cancels, 1, "Should cancel");
+    assert_eq!(buys, 1, "Should still buy");
+    assert_eq!(sells, 0, "Should not sell at max short");
+}}
+
+'''
+
+    def _gen_multi_market_test(self) -> str:
+        struct = self.config.struct_name
+
+        if self.is_sure_bets:
+            # Sure bets: multiple high certainty markets
+            return f'''#[test]
+fn test_quotes_multiple_markets() {{
+    let mut strategy = {struct}::new();
+    // Multiple high certainty markets
+    let ctx = create_context_with_markets(vec![
+        ("token1", dec!(0.94), dec!(0.96), 24.0, 1000.0, dec!(0)),
+        ("token2", dec!(0.95), dec!(0.97), 12.0, 2000.0, dec!(0)),
+        ("token3", dec!(0.93), dec!(0.95), 36.0, 1500.0, dec!(0)),
+    ]);
+    let signals = strategy.on_tick(&ctx);
+    let (_, buys, _, _) = count_signal_types(&signals);
+    assert!(buys >= 1, "Should buy for at least 1 market");
+}}
+
+'''
+        else:
+            # Market maker style
+            return f'''#[test]
+fn test_quotes_multiple_markets() {{
+    let mut strategy = {struct}::new();
+    let ctx = create_context_with_markets(vec![
+        ("token1", dec!(0.68), dec!(0.72), 48.0, 50000.0, dec!(0)),
+        ("token2", dec!(0.73), dec!(0.77), 72.0, 30000.0, dec!(0)),
+        ("token3", dec!(0.66), dec!(0.70), 96.0, 40000.0, dec!(0)),
+    ]);
+    let signals = strategy.on_tick(&ctx);
+    let (cancels, buys, sells, _) = count_signal_types(&signals);
+    assert!(cancels >= 1, "Should cancel for at least 1 market");
+    assert!(buys >= 1, "Should buy for at least 1 market");
+    assert!(sells >= 1, "Should sell for at least 1 market");
+}}
+
+'''
+
+    def _gen_summary_test(self) -> str:
+        name = self.config.strategy_name
+        struct = self.config.struct_name
+        return f'''#[test]
+fn test_strategy_instantiation() {{
+    let strategy = {struct}::new();
+    assert_eq!(strategy.id(), "{name}");
+}}
+'''
+
+
+def generate_tests(strategy_func: Callable) -> str:
+    """Generate Rust test code for a strategy."""
+    meta = get_strategy_meta(strategy_func)
+    if meta is None:
+        raise ValueError("Function must be decorated with @strategy")
+
+    config = TestGeneratorConfig(
+        is_market_discovery=len(meta.tokens) == 0,
+        params=meta.params or {},
+        strategy_name=meta.name,
+        struct_name=to_pascal_case(meta.name),
+    )
+
+    generator = RustTestGenerator(config)
+    return generator.generate()
+
+
+def generate_tests_to_file(strategy_func: Callable, output_path: str) -> None:
+    """Generate Rust tests and write to a file."""
+    test_code = generate_tests(strategy_func)
+    with open(output_path, 'w') as f:
+        f.write(test_code)
+
+
+def find_pmengine_tests_dir() -> Path | None:
+    """Find the pmengine/tests directory relative to the current path."""
+    candidates = [
+        Path("../pmengine/tests"),
+        Path("../../pmengine/tests"),
+        Path("pmengine/tests"),
+    ]
+
     cwd = Path.cwd()
     for candidate in candidates:
         path = (cwd / candidate).resolve()

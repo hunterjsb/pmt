@@ -1,8 +1,8 @@
-//! Auto-generated integration tests for market_maker
+//! Auto-generated integration tests for spread_watcher
 //! DO NOT EDIT - regenerate with `pmstrat transpile`
 
 
-use pmengine::strategies::MarketMaker;
+use pmengine::strategies::SpreadWatcher;
 use pmengine::strategy::Strategy;
 
 
@@ -14,6 +14,6 @@ use pmengine::strategy::Strategy;
 
 #[test]
 fn test_strategy_instantiation() {
-    let strategy = MarketMaker::new();
-    assert_eq!(strategy.id(), "market_maker");
+    let strategy = SpreadWatcher::new();
+    assert_eq!(strategy.id(), "spread_watcher");
 }

@@ -36,6 +36,7 @@ class Position:
     avg_entry_price: Decimal = Decimal(0)
     unrealized_pnl: Decimal = Decimal(0)
     realized_pnl: Decimal = Decimal(0)
+    last_price: Optional[Decimal] = None  # Matches Rust Position
 
 
 @dataclass
@@ -88,3 +89,7 @@ class Context:
     def total_pnl(self) -> Decimal:
         """Total P&L (realized + unrealized)."""
         return self.total_realized_pnl + self.total_unrealized_pnl
+
+
+# Alias for Rust naming compatibility
+StrategyContext = Context
