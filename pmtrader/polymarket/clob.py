@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -12,7 +13,10 @@ from py_clob_client.clob_types import (
     OpenOrderParams,
     OrderArgs,
     OrderType,
+    RequestArgs,
 )
+from py_clob_client.headers.headers import create_level_2_headers
+from py_clob_client.utilities import order_to_json
 
 from .models import Market, OrderBook, OrderBookLevel, Token
 
@@ -191,30 +195,55 @@ class Clob:
         Note: py_clob_client aggregates order book levels. For full depth,
         use get_order_book_depth() function instead.
         """
-        book = self._client.get_order_book(token_id)
+        response = requests.get(
+            f"{self.host}/book",
+            params={"token_id": token_id},
+            headers=self._get_headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
         bids = [
-            OrderBookLevel(float(b.price), float(b.size)) for b in (book.bids or [])
+            OrderBookLevel(float(b["price"]), float(b["size"]))
+            for b in data.get("bids", [])
         ]
         asks = [
-            OrderBookLevel(float(a.price), float(a.size)) for a in (book.asks or [])
+            OrderBookLevel(float(a["price"]), float(a["size"]))
+            for a in data.get("asks", [])
         ]
         return OrderBook(name=name, bids=bids, asks=asks)
 
-    def midpoint(self, token_id: str):
+    def midpoint(self, token_id: str) -> dict:
         """Returns {'mid': '0.123'}."""
-        return self._client.get_midpoint(token_id)
+        response = requests.get(
+            f"{self.host}/midpoint",
+            params={"token_id": token_id},
+            headers=self._get_headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
 
-    def price(self, token_id: str, side: str = "BUY"):
+    def price(self, token_id: str, side: str = "BUY") -> dict:
         """Returns {'price': '0.123'}."""
-        return self._client.get_price(token_id, side=side)
+        response = requests.get(
+            f"{self.host}/price",
+            params={"token_id": token_id, "side": side},
+            headers=self._get_headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
 
-    def spread(self, token_id: str):
+    def spread(self, token_id: str) -> tuple[dict, dict]:
         """Returns (best_bid_dict, best_ask_dict)."""
         return self.price(token_id, "SELL"), self.price(token_id, "BUY")
 
 
-class AuthenticatedClob:
+class AuthenticatedClob(Clob):
     """Authenticated CLOB client for orders/trades + on-chain balances/positions.
+
+    Inherits read-only methods from Clob, adds authenticated trading operations.
 
     Notes:
     - Uses funder address for on-chain balances (USDC + ERC-1155 outcome tokens).
@@ -233,14 +262,14 @@ class AuthenticatedClob:
         proxy: bool = False,
         cognito_auth: CognitoAuth | None = None,
     ) -> None:
-        self.host = host or get_clob_host(proxy)
+        super().__init__(host=host, proxy=proxy, cognito_auth=cognito_auth)
         self._funder = funder_address
         self._rpc = polygon_rpc or get_chain_host(proxy)
-        self._cognito_auth = cognito_auth
-        self._is_proxy = proxy or bool(get_proxy_url())
 
+        # Direct client for operations that need Polymarket API access
+        # (tick size lookups, order signing, etc.)
         self._client = ClobClient(
-            self.host,
+            CLOB_HOST,  # Always direct to Polymarket for signing
             key=private_key,
             chain_id=chain_id,
             signature_type=signature_type,
@@ -248,18 +277,65 @@ class AuthenticatedClob:
         )
         self._client.set_api_creds(self._client.create_or_derive_api_creds())
 
-    def _get_headers(self) -> dict[str, str]:
-        """Get headers for requests, including auth if using proxy."""
-        if self._is_proxy and self._cognito_auth:
-            return self._cognito_auth.get_auth_header()
-        return {}
+    def _create_l2_headers(self, method: str, path: str, body: dict | None = None) -> dict[str, str]:
+        """Create L2 auth headers for a request.
+
+        Args:
+            method: HTTP method (GET, POST, DELETE)
+            path: Request path (e.g., "/order")
+            body: Request body dict (will be serialized)
+
+        Returns:
+            Dict with POLY_* headers
+        """
+        serialized_body = ""
+        if body:
+            serialized_body = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+        request_args = RequestArgs(
+            method=method,
+            request_path=path,
+            body=body,
+            serialized_body=serialized_body,
+        )
+        return create_level_2_headers(self._client.signer, self._client.creds, request_args)
+
+    def _post_order_http(self, signed_order, order_type: str = "GTC") -> dict:
+        """Post a signed order via direct HTTP (supports proxy auth headers).
+
+        Args:
+            signed_order: Signed order from create_order/create_market_order
+            order_type: "GTC", "FOK", or "GTD"
+
+        Returns:
+            Order response from API
+        """
+        # Build the order payload
+        body = order_to_json(signed_order, self._client.creds.api_key, order_type)
+
+        # Serialize body exactly as the L2 signature expects (no spaces)
+        serialized_body = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+        # Create L2 headers (signature is computed on serialized_body)
+        l2_headers = self._create_l2_headers("POST", "/order", body)
+
+        # Add proxy auth if using proxy, and Content-Type
+        proxy_headers = self._get_headers()
+        headers = {**l2_headers, **proxy_headers, "Content-Type": "application/json"}
+
+        # Use data= with pre-serialized body to preserve exact formatting
+        response = requests.post(
+            f"{self.host}/order",
+            data=serialized_body,
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
 
     # -----------------------------
     # CLOB: orders & trades
     # -----------------------------
-    # Note: Order-related methods use py_clob_client which handles POLY_* headers
-    # for Polymarket authentication. For proxy authentication (Bearer token),
-    # the py_clob_client would need to be extended to support custom headers.
 
     def create_order(
         self,
@@ -315,14 +391,17 @@ class AuthenticatedClob:
             size=size,
             side=side,
         )
-        return self._client.create_and_post_order(order_args)
+        # Create signed order using py_clob_client
+        signed_order = self._client.create_order(order_args)
+        # Post via our HTTP helper (supports proxy auth headers)
+        return self._post_order_http(signed_order, order_type)
 
     def market_order(
         self,
         token_id: str,
         amount: float,
         side: str = "BUY",
-    ):
+    ) -> dict:
         """Place a market order (executes immediately at best available price).
 
         Args:
@@ -338,57 +417,71 @@ class AuthenticatedClob:
             amount=amount,
             side=side,
         )
-        # Create the signed order
+        # Create the signed order using py_clob_client
         signed_order = self._client.create_market_order(order_args)
-        # Post it to the exchange (FOK = Fill or Kill, executes immediately or cancels)
-        return self._client.post_order(signed_order, OrderType.FOK)
+        # Post via our HTTP helper (FOK = Fill or Kill, executes immediately or cancels)
+        return self._post_order_http(signed_order, "FOK")
 
-    def trades(self):
-        return self._client.get_trades()
+    def trades(self) -> dict:
+        l2_headers = self._create_l2_headers("GET", "/trades")
+        headers = {**l2_headers, **self._get_headers()}
+        response = requests.get(
+            f"{self.host}/trades",
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
 
-    def open_orders(self, market: str = "", asset_id: str = ""):
-        params = OpenOrderParams(market=market, asset_id=asset_id)
-        return self._client.get_orders(params)
+    def open_orders(self, market: str = "", asset_id: str = "") -> dict:
+        l2_headers = self._create_l2_headers("GET", "/orders")
+        headers = {**l2_headers, **self._get_headers()}
+        params = {}
+        if market:
+            params["market"] = market
+        if asset_id:
+            params["asset_id"] = asset_id
+        response = requests.get(
+            f"{self.host}/orders",
+            params=params,
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
 
-    def order(self, order_id: str):
-        return self._client.get_order(order_id)
+    def order(self, order_id: str) -> dict:
+        l2_headers = self._create_l2_headers("GET", f"/order/{order_id}")
+        headers = {**l2_headers, **self._get_headers()}
+        response = requests.get(
+            f"{self.host}/order/{order_id}",
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
 
-    def cancel(self, order_id: str):
-        return self._client.cancel(order_id)
+    def cancel(self, order_id: str) -> dict:
+        l2_headers = self._create_l2_headers("DELETE", f"/order/{order_id}")
+        headers = {**l2_headers, **self._get_headers()}
+        response = requests.delete(
+            f"{self.host}/order/{order_id}",
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
 
-    def cancel_all(self):
-        return self._client.cancel_all()
-
-    # -----------------------------
-    # Convenience read-only
-    # -----------------------------
-
-    def ok(self):
-        return self._client.get_ok()
-
-    def order_book(self, token_id: str, name: str = "Token") -> OrderBook:
-        """Get order book for a token.
-
-        Note: py_clob_client aggregates order book levels. For full depth,
-        use get_order_book_depth() function instead.
-        """
-        book = self._client.get_order_book(token_id)
-        bids = [
-            OrderBookLevel(float(b.price), float(b.size)) for b in (book.bids or [])
-        ]
-        asks = [
-            OrderBookLevel(float(a.price), float(a.size)) for a in (book.asks or [])
-        ]
-        return OrderBook(name=name, bids=bids, asks=asks)
-
-    def midpoint(self, token_id: str):
-        return self._client.get_midpoint(token_id)
-
-    def price(self, token_id: str, side: str = "BUY"):
-        return self._client.get_price(token_id, side=side)
-
-    def spread(self, token_id: str):
-        return self.price(token_id, "SELL"), self.price(token_id, "BUY")
+    def cancel_all(self) -> dict:
+        l2_headers = self._create_l2_headers("DELETE", "/orders")
+        headers = {**l2_headers, **self._get_headers()}
+        response = requests.delete(
+            f"{self.host}/orders",
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
 
     # -----------------------------
     # On-chain balances (funder)
@@ -462,7 +555,9 @@ class AuthenticatedClob:
         Returns list of:
           { token_id, outcome, market, shares }
         """
-        trades = self.trades()
+        trades_response = self.trades()
+        # Handle both list and dict response formats
+        trades = trades_response.get("data", trades_response) if isinstance(trades_response, dict) else trades_response
 
         # Build token metadata from most recent trades first
         token_meta: dict[str, dict] = {}
@@ -561,7 +656,9 @@ def create_authenticated_clob(*, proxy: bool = False) -> AuthenticatedClob | Non
     """
     from dotenv import load_dotenv
 
-    load_dotenv()
+    # Load from DOTENV_PATH if specified, otherwise default .env
+    dotenv_path = os.environ.get("DOTENV_PATH")
+    load_dotenv(dotenv_path)
 
     private_key = os.environ.get("PM_PRIVATE_KEY")
     funder_address = os.environ.get("PM_FUNDER_ADDRESS")
