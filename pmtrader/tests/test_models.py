@@ -3,8 +3,8 @@
 from datetime import datetime, timedelta, timezone
 
 from polymarket.models import Market, OrderBook, OrderBookLevel, Token
-from strategies.expiring import calculate_max_return, hours_until, parse_end_date
-from strategies.scanner import analyze_order_book
+from scanners.expiring import calculate_max_return, hours_until, parse_end_date
+from scanners.scanner import analyze_order_book
 
 
 def test_volume_cliff_detection():

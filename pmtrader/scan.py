@@ -104,7 +104,7 @@ def main() -> None:
 
     # Run volume cliff scanner
     if args.strategy == "cliff":
-        from strategies.scanner import (
+        from scanners.scanner import (
             create_opportunities_table,
             scan_continuous,
             scan_once,
@@ -143,7 +143,7 @@ def main() -> None:
 
     # Run expiring markets scanner
     elif args.strategy == "expiring":
-        from strategies.expiring import (
+        from scanners.expiring import (
             calculate_max_return,
             find_expiring_opportunities,
         )

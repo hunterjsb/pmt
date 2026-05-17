@@ -82,7 +82,7 @@ uv run python scan.py expiring --once --verbose
 ### Volume Cliff Scanner
 
 ```python
-from strategies.scanner import find_volume_cliff_opportunities, scan_once
+from scanners.scanner import find_volume_cliff_opportunities, scan_once
 from polymarket import clob
 
 # Get active markets
@@ -107,7 +107,7 @@ for opp in opportunities:
 ### Expiring Markets Scanner
 
 ```python
-from strategies.expiring import find_expiring_opportunities, calculate_max_return
+from scanners.expiring import find_expiring_opportunities, calculate_max_return
 
 # Find high-certainty expiring markets
 opportunities = find_expiring_opportunities(
