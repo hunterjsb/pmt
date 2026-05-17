@@ -50,19 +50,13 @@ pmstrat (Python DSL) → transpile → Rust code → pmengine (execution)
 
 Write strategies in Python, transpile to Rust for HFT performance.
 
-## CI/CD & Deployment
+## Infra & Deployment
 
-- Tags trigger deployment: `pmproxy-v*`, `pmengine-v*`, `pmtrader-v*`
-- Rust binaries deploy via CodeDeploy to EC2 (eu-west-1)
+All AWS infra is in `infra/pulumi/` (Python Pulumi, S3 backend, eu-west-1 pinned).
+Current live state and decisions are tracked in `.infra/INFRA.md` (gitignored).
 
-## EC2 Instance
+- **pmproxy** — Lambda + Function URL in eu-west-1, deployed via `pulumi up` after `cargo lambda build --release --features lambda --bin pmproxy-lambda --output-format zip`
+- **pmengine** — no live host. Releases via tag `pmengine-v*` produce GH artifacts only.
+- **pmtrader** — Python package, no AWS deployment.
 
-Production server in eu-west-1 (Ireland), near Polymarket infra.
-
-```bash
-.infra/ssh-connect.sh                    # Connect
-ssh -i .infra/pmt-kp.pem ec2-user@34.250.56.199  # Manual
-```
-
-Services: `pmproxy` (port 8080), `pmengine` (systemd units)
-Public URL: `https://pmt.xandaris.space`
+Tag-triggered workflows (`publish-pmproxy.yml`, `publish-pmengine.yml`, `publish-pmtrader.yml`) now only build + cut GitHub releases. Lambda deploys are done locally via Pulumi.
