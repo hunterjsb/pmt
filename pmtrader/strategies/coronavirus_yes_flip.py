@@ -1,4 +1,4 @@
-"""Vaccine YES flip — sweep 9¢ asks, sell at 10¢."""
+"""Coronavirus pandemic YES flip — sweep 6.2-6.4¢ asks, sell at 8.5¢."""
 
 import argparse
 import json
@@ -9,12 +9,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from _flip import submit_buy, submit_sell_with_settlement_retry
-from polymarket.markets import HANTAVIRUS_VACCINE
+from polymarket.markets import CORONAVIRUS_PANDEMIC
 from polymarket.clob_v2 import create_authenticated_clob_v2
 
-BUY_PRICE = 0.09
-BUY_SIZE = 850
-SELL_PRICE = 0.10
+BUY_PRICE = 0.064
+BUY_SIZE = 60
+SELL_PRICE = 0.085
 
 
 def main() -> int:
@@ -28,7 +28,7 @@ def main() -> int:
 
     client = create_authenticated_clob_v2()
 
-    buy_resp = submit_buy(client, HANTAVIRUS_VACCINE, BUY_PRICE, BUY_SIZE)
+    buy_resp = submit_buy(client, CORONAVIRUS_PANDEMIC, BUY_PRICE, BUY_SIZE)
     print(json.dumps(buy_resp, indent=2, default=str))
 
     filled = int(float(buy_resp.get("takingAmount") or 0))
@@ -36,7 +36,7 @@ def main() -> int:
         print("Buy did not fill; skipping sell.")
         return 1
 
-    sell_resp = submit_sell_with_settlement_retry(client, HANTAVIRUS_VACCINE, SELL_PRICE, filled)
+    sell_resp = submit_sell_with_settlement_retry(client, CORONAVIRUS_PANDEMIC, SELL_PRICE, filled)
     print(json.dumps(sell_resp, indent=2, default=str))
 
     spent = float(buy_resp.get("makingAmount") or 0)
