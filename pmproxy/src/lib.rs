@@ -206,9 +206,9 @@ pub async fn proxy_handler(
     } else if let Some(rest) = path.strip_prefix("/gamma/") {
         ("https://gamma-api.polymarket.com", rest)
     } else if path == "/chain" {
-        ("https://polygon-rpc.com", "")
+        ("https://polygon-bor-rpc.publicnode.com", "")
     } else if let Some(rest) = path.strip_prefix("/chain/") {
-        ("https://polygon-rpc.com", rest)
+        ("https://polygon-bor-rpc.publicnode.com", rest)
     } else {
         error!("Unknown path prefix: {}", path);
         return Response::builder()
