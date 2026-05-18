@@ -21,9 +21,11 @@ from py_clob_client_v2.exceptions import PolyApiException
 from polymarket.markets import Market
 
 
-def submit_buy(client, market: Market, price: float, size: int) -> dict:
+def submit_buy(client, market: Market, price: float, size: int, *, token: str | None = None) -> dict:
     return client.create_and_post_order(
-        order_args=OrderArgs(token_id=market.yes_token, price=price, side=Side.BUY, size=size),
+        order_args=OrderArgs(
+            token_id=token or market.yes_token, price=price, side=Side.BUY, size=size,
+        ),
         options=PartialCreateOrderOptions(tick_size=market.tick_size),
         order_type=OrderType.GTC,
     )

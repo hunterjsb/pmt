@@ -16,8 +16,8 @@ from polymarket.markets import HANTAVIRUS_PANDEMIC
 from polymarket.clob_v2 import create_authenticated_clob_v2
 from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
 
-PRICE = 0.9285
-SIZE = 216  # 216 × 0.9285 = $200.56, clears the $200 rewards-eligibility floor
+PRICE = 0.932
+SIZE = 217  # 217 × 0.932 = $202.24, clears the $200 rewards-eligibility floor
 
 
 def main() -> int:
