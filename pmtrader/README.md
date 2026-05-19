@@ -1,71 +1,91 @@
 # pmtrader
 
-Python SDK + CLI for Polymarket. Browse markets, place trades, monitor positions, and run scanners — all from the terminal. Optionally routes through `pmproxy` (Cognito-authed Lambda in eu-west-1) to bypass the US geoblock.
+Polymarket trading CLI + Python SDK. Routes through `pmproxy` (Cognito-authed Lambda in eu-west-1) to bypass the US geoblock.
 
-## CLI tools
+## `pmt` CLI
 
-All run from inside `pmtrader/` via `uv run python <name>.py`.
-
-| Script | Purpose |
-|---|---|
-| `main.py` | Quick market browser — top sampling markets + an example order book |
-| `scan.py` | Opportunity scanners (`scan.py cliff`, `scan.py expiring`) |
-| `trade.py` | Interactive trade prompt — balances, positions, place an order |
-| `redeem.py` | Redeem winning shares from resolved markets |
-| **`portfolio.py`** | **Positions + P&L + exposure by side + theme correlation; `--orders` adds open resting orders** |
-| **`rewards.py`** | **REWARD (maker liquidity) + YIELD (interest on cash) income history** |
-
-### portfolio.py
+Installed as a console script via `uv sync`. Run from inside `pmtrader/` (or anywhere if the venv is active):
 
 ```bash
-uv run python portfolio.py                              # positions + theme exposure
-uv run python portfolio.py --orders                     # also pull resting orders + locked capital
-uv run python portfolio.py --themes hantavirus,vaccine  # filter themes
+pmt --help                                        # list subcommands
+
+# Orders
+pmt buy   --token hantavirus-pandemic:no --price 0.93 --size 217
+pmt sell  --token hantavirus-vaccine:yes --price 0.10 --size 862
+pmt flip  --token hantavirus-vaccine:yes --buy-price 0.09 --sell-price 0.10 --size 850
+pmt cancel 0xeb78787c2c55...
+
+# Reads (no auth needed for these except `orders`)
+pmt orders                                        # open resting orders w/ market labels
+pmt positions --orders                            # full portfolio + open orders + theme exposure
+pmt positions --themes hantavirus,vaccine         # filter themes
+pmt rewards --days 7                              # REWARD + YIELD income (last N days)
+pmt rewards --all --type reward                   # full history, rewards only
+
+# Discovery
+pmt book   hantavirus-pandemic:no                 # depth chart
+pmt market hantavirus-pandemic-in-2026            # event metadata by slug or condition_id
+pmt search pandemic                               # free-text active-market search
 ```
 
-Themes are title-keyword regexes defined at the top of `portfolio.py` — edit `DEFAULT_THEMES` to add your own.
+The `--token` arg accepts either a raw numeric token ID or `market-name:yes|no`. Market names come from `polymarket/markets.py` — add new markets there.
 
-### rewards.py
+Every command has `--dry-run` (for orders) and `--help`.
 
-```bash
-uv run python rewards.py             # last 30 days
-uv run python rewards.py --all       # full history
-uv run python rewards.py --type yield
-uv run python rewards.py --days 1    # check if today's REWARDs landed
+## Python SDK
+
+The `PolymarketAPI` class is the main entry point:
+
+```python
+from polymarket import PolymarketAPI
+from polymarket.markets import HANTAVIRUS_PANDEMIC
+
+api = PolymarketAPI()
+
+# Orders
+api.place_buy(token=HANTAVIRUS_PANDEMIC.no_token, price=0.93, size=217)
+result = api.flip(
+    token=HANTAVIRUS_PANDEMIC.no_token,
+    buy_price=0.933, sell_price=0.934, size=215,
+)
+print(result.potential_profit)
+
+# Reads
+api.get_positions()       # data-api positions (no auth)
+api.get_orders()          # L2-authed open orders
+api.get_portfolio_value() # total $ value
+api.get_activity(kind="REWARD")
+api.get_rewards_config(condition_id)
+api.search_markets("pandemic")
+api.get_book(token_id)
 ```
 
 ## Package layout
 
 ```
 pmtrader/
-├── polymarket/           # SDK
-│   ├── clob.py           # v1 ClobClient + AuthenticatedClob (positions, balances, RPC)
-│   ├── clob_v2.py        # v2 authenticated client (orders) — used by strategies
-│   ├── cognito.py        # Cognito JWT auth for pmproxy
-│   ├── gamma.py          # gamma-api wrapper (events, market metadata, search)
-│   ├── markets.py        # token-ID ↔ market-name lookup
-│   └── models.py         # Market, Token, OrderBook, Event dataclasses
-├── strategies/           # Trade entry scripts (place orders)
-├── scanners/             # Opportunity scanners (read-only)
-├── ui/                   # Streamlit dashboard (`uv run pmtrader-ui`)
+├── cli.py                 # pmt CLI (click)
+├── scan.py                # opportunity scanners CLI (volume cliff, expiring)
+├── polymarket/            # SDK
+│   ├── api.py             # PolymarketAPI — high-level authenticated client
+│   ├── clob.py            # Clob — read-only CLOB wrapper
+│   ├── clob_v2.py         # v2 client setup + Cognito monkey-patch
+│   ├── cognito.py         # Cognito JWT auth
+│   ├── gamma.py           # Gamma API wrapper (events, search)
+│   ├── markets.py         # named market constants — add yours here
+│   └── models.py          # Market/Token/OrderBook dataclasses
+├── scanners/              # opportunity scanners (read-only)
 └── tests/
 ```
-
-## Routing through pmproxy
-
-Polymarket geoblocks US IPs. Set `PMPROXY_URL` in `.env` and the CLOB/Gamma/RPC calls route through the eu-west-1 Lambda. Cognito creds (`PMPROXY_USERNAME`, `PMPROXY_PASSWORD`, etc.) are auto-attached as Bearer tokens.
-
-See `../.infra/INFRA.md` (gitignored) for the live URL + current secrets.
 
 ## Required env (`.env` at repo root)
 
 ```bash
-# Trading identity
 PM_PRIVATE_KEY=0x...
 PM_FUNDER_ADDRESS=0x...
-PM_SIGNATURE_TYPE=1               # 1 = Polymarket Proxy wallet
+PM_SIGNATURE_TYPE=1                # 1 = Polymarket Proxy wallet
 
-# Proxy (optional but required for placing orders from US)
+# Proxy — required for placing orders from a geoblocked region
 PMPROXY_URL=https://<...>.lambda-url.eu-west-1.on.aws
 PMPROXY_USERNAME=...
 PMPROXY_PASSWORD=...

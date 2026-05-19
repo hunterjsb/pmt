@@ -1,7 +1,10 @@
-"""Polymarket market constants used by strategies.
+"""Polymarket market constants.
 
 Each Market pairs the token IDs with the tick size so callers can't mix tick
 and token incorrectly (a real footgun — pandemic uses 0.001 tick, vaccine 0.01).
+
+The `pmt` CLI's --token resolver looks these up by name:
+    pmt buy --token hantavirus-pandemic:no --price 0.93 --size 217
 """
 
 from dataclasses import dataclass
@@ -37,5 +40,13 @@ CORONAVIRUS_PANDEMIC = Market(
     condition_id="0x3dec83132c57c32848641f9fdf6e87687f7a5f7f4bdd8f33368bb5fdecb96b74",
     yes_token="27515921066882013223295256333819020556672789094219444894322459359838815569517",
     no_token="90702790936057338053502316835437449327217840723095157272143342998269881818958",
+    tick_size="0.001",
+)
+
+HANTAVIRUS_LAB_LEAK = Market(
+    name="Hantavirus lab leak confirmed by June 30?",
+    condition_id="0x4cd71e7b8c5c3f7cd1fc025002b2982aae1e5f70a65bf1faaae121299127537b",
+    yes_token="15464130699531603675372044350692986464780699477441200262642102173111827234544",
+    no_token="77911208241982327373495855644935587349201177208106713081551029073015187679590",
     tick_size="0.001",
 )

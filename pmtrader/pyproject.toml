@@ -3,26 +3,21 @@ index-url = "https://pypi.org/simple"
 
 [project]
 name = "pmtrader"
-version = "0.3.3"
-description = "Polymarket trading client with CLI and Streamlit UI"
+version = "0.4.0"
+description = "Polymarket trading CLI + Python SDK"
 requires-python = ">=3.14"
 dependencies = [
     "py-clob-client>=0.34.1",
+    "py-clob-client-v2>=1.0.1",
     "python-dotenv>=1.2.1",
     "rich>=14.2.0",
-    "streamlit>=1.45.0",
-    "plotly>=5.18.0",
-    "pandas>=2.0.0",
+    "click>=8.1.0",
     "boto3>=1.42.30",
-    "py-clob-client-v2>=1.0.1",
+    "requests>=2.31.0",
 ]
 
-[project.optional-dependencies]
-cognito = ["boto3>=1.35.0"]
-redeem = ["polymarket-apis>=0.4.0"]
-
 [project.scripts]
-pmtrader-ui = "ui.app:main"
+pmt = "cli:cli"
 
 [dependency-groups]
 dev = [
@@ -35,4 +30,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["polymarket*", "ui*"]
+include = ["polymarket*", "scanners*"]
+
+[tool.setuptools]
+py-modules = ["cli", "scan"]
