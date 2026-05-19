@@ -195,6 +195,22 @@ def _known_token_labels() -> dict[str, str]:
     return labels
 
 
+def _label_for_order(order: dict, known: dict[str, str]) -> str:
+    """Best-effort market label using static map, then dynamic CLOB lookup."""
+    asset = str(order.get("asset_id", ""))
+    if asset in known:
+        return known[asset]
+    cid = order.get("market")
+    if cid:
+        from polymarket.api import lookup_market_name
+
+        name = lookup_market_name(cid)
+        if name:
+            outcome = (order.get("outcome", "") or "").upper()
+            return f"{name[:30]} {outcome}"
+    return "…" + asset[-10:]
+
+
 @cli.command()
 def orders() -> None:
     """List open resting orders."""
@@ -214,8 +230,7 @@ def orders() -> None:
         notional = size * price
         if side == "BUY":
             locked_cash += notional
-        asset = str(d.get("asset_id", ""))
-        market = labels.get(asset, "…" + asset[-10:])
+        market = _label_for_order(d, labels)
         table.add_row(
             side,
             f"{size:.0f}",

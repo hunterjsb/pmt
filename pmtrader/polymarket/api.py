@@ -17,9 +17,11 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import requests
 
@@ -27,6 +29,33 @@ DATA_API = "https://data-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 UA = {"User-Agent": "pmtrader/1.0"}
+_MARKET_CACHE = Path.home() / ".cache" / "pmt" / "markets.json"
+
+
+def lookup_market_name(condition_id: str) -> str | None:
+    """Resolve condition_id → market question, with persistent disk cache.
+
+    Returns None on miss + network failure. Cache file is human-readable JSON,
+    safe to delete to force re-resolution.
+    """
+    _MARKET_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        cache: dict = json.loads(_MARKET_CACHE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        cache = {}
+    if condition_id in cache:
+        return cache[condition_id]
+    try:
+        r = requests.get(f"{CLOB_API}/markets/{condition_id}", headers=UA, timeout=5)
+        r.raise_for_status()
+        name = r.json().get("question")
+        if not name:
+            return None
+        cache[condition_id] = name
+        _MARKET_CACHE.write_text(json.dumps(cache, indent=2))
+        return name
+    except Exception:
+        return None
 
 
 @dataclass
