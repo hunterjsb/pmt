@@ -19,13 +19,12 @@ pmstrat/    Python strategy DSL + backtesting
 ```mermaid
 flowchart LR
     subgraph Clients
-        CLI["pmtrader CLI"]
-        UI["pmtrader-ui"]
+        CLI["pmt CLI"]
         BOT["Bots / Scripts"]
     end
 
     subgraph PMT["pmtrader (Python)"]
-        LIB["polymarket module"]
+        API["PolymarketAPI"]
         AUTH["Auth & Signing"]
     end
 
@@ -44,14 +43,12 @@ flowchart LR
     TRANS -->|"generates"| STRAT
 
     CLI --> PMT
-    UI --> PMT
     BOT --> PMT
 
     PMT --> DECIDE{"PMPROXY_URL?"}
 
     subgraph PROXY["pmproxy (Rust)"]
-        EC2["EC2"]
-        LAMBDA["Lambda"]
+        LAMBDA["Lambda (eu-west-1)"]
     end
 
     DECIDE -->|set| PROXY
@@ -74,12 +71,16 @@ cd pmtrader && uv sync
 ```
 
 ```bash
-uv run python main.py           # browse markets
-uv run python scan.py cliff     # order book cliffs
-uv run python scan.py expiring  # expiring opportunities
-uv run python trade.py          # interactive trading
-uv run pmtrader-ui              # streamlit UI
+pmt --help                                                  # list subcommands
+pmt buy   --token hantavirus-pandemic:no --price 0.93 --size 217
+pmt flip  --token hantavirus-vaccine:yes --buy-price 0.09 --sell-price 0.10 --size 850
+pmt positions --orders                                      # portfolio + open orders + exposure
+pmt rewards --days 7                                        # REWARD + YIELD income
+pmt search pandemic                                         # cross-market search
+pmt scan cliff                                              # opportunity scanners (separate CLI)
 ```
+
+See [pmtrader/README.md](pmtrader/README.md) for the full CLI reference.
 
 ### Config
 
@@ -89,19 +90,22 @@ PM_PRIVATE_KEY=0x...
 PM_FUNDER_ADDRESS=0x...
 PM_SIGNATURE_TYPE=1             # 0=EOA, 1=Poly Proxy, 2=EIP-1271
 
-# optional
-PMPROXY_URL=http://localhost:8080
+# pmproxy (required to trade from a geoblocked region)
+PMPROXY_URL=https://<...>.lambda-url.eu-west-1.on.aws
+PMPROXY_USERNAME=...
+PMPROXY_PASSWORD=...
 ```
 
-### API
+### Python SDK
 
 ```python
-from polymarket import clob, gamma
+from polymarket import PolymarketAPI
 
-clob.sampling_markets(limit=10)
-clob.order_book(token_id)
-gamma.events(limit=10)
-gamma.search(query)
+api = PolymarketAPI()
+api.place_buy(token=..., price=0.93, size=217)
+api.flip(token=..., buy_price=0.09, sell_price=0.10, size=850)
+api.get_positions()
+api.search_markets("pandemic")
 ```
 
 ## pmproxy
