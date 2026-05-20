@@ -405,6 +405,46 @@ impl RiskManager {
         }
     }
 
+    /// Release a tracked open order after it has been cancelled or filled.
+    ///
+    /// Without this the exposure tally grows monotonically with every order
+    /// placement and the engine eventually rejects all new orders once
+    /// `max_total_exposure` is reached.
+    pub fn release_order(&mut self, order_id: &str) {
+        if let Some(order) = self.open_orders.remove(order_id) {
+            tracing::debug!(
+                order_id = order_id,
+                token_id = order.token_id.as_str(),
+                notional = %order.notional,
+                "Open order released (cancelled or filled)"
+            );
+        }
+    }
+
+    /// Release all tracked open orders for a given token. Returns the count
+    /// of orders released. Called when a Cancel signal has cancelled every
+    /// order on a token.
+    pub fn release_orders_for_token(&mut self, token_id: &str) -> usize {
+        let to_remove: Vec<String> = self
+            .open_orders
+            .iter()
+            .filter(|(_, o)| o.token_id == token_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let count = to_remove.len();
+        for id in to_remove {
+            self.open_orders.remove(&id);
+        }
+        if count > 0 {
+            tracing::debug!(
+                token_id = token_id,
+                count = count,
+                "Released open-order tracking for token"
+            );
+        }
+        count
+    }
+
     /// Get current exposure (positions + open orders + pending reservations).
     pub fn current_exposure(&self, positions: &PositionTracker) -> Decimal {
         positions.total_notional() + self.total_reserved_notional()

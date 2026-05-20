@@ -606,10 +606,15 @@ impl Engine {
 
                             // Cancel signals don't have price/size and don't need the risk
                             // check or exposure reservation — pass them straight to the order
-                            // manager, which cancels any tracked orders on this token.
-                            if let Signal::Cancel { .. } = &signal {
+                            // manager, which cancels any tracked orders on this token. Then
+                            // release the risk manager's open-order tracking so cancelled
+                            // orders stop counting against the exposure limit.
+                            if let Signal::Cancel { token_id } = &signal {
+                                let token_id = token_id.clone();
                                 if let Err(e) = self.order_manager.execute(signal).await {
                                     tracing::warn!(error = %e, "Cancel signal failed");
+                                } else {
+                                    self.risk_manager.release_orders_for_token(&token_id);
                                 }
                                 continue;
                             }
