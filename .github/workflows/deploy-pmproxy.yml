@@ -8,7 +8,7 @@ on:
         description: "Git ref to deploy (default: master)"
         required: false
         default: "master"
-  # Auto-deploy when a pmproxy-v* release is published (after publish-pmproxy builds it).
+  # Auto-deploy when a pmproxy-v* release is published.
   release:
     types: [published]
 
@@ -19,7 +19,6 @@ concurrency:
 
 env:
   AWS_REGION: eu-west-1
-  PULUMI_BACKEND_URL: s3://pmt-pulumi-state-350985642081-euw1
 
 permissions:
   # Required to mint the OIDC token for AWS role assumption.
@@ -60,31 +59,31 @@ jobs:
           role-to-assume: arn:aws:iam::350985642081:role/pmproxy-ci-deploy
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install Pulumi CLI
-        uses: pulumi/actions@v5
-
-      - name: Install Pulumi Python deps
-        working-directory: infra/pulumi
+      # Push new code directly via the Lambda API. Infrastructure config changes
+      # (env vars, memory, role, etc.) still go through `pulumi up` locally —
+      # see infra/pulumi/lambda_proxy.py. CI only changes the running binary.
+      - name: Update Lambda function code
+        working-directory: pmproxy
         run: |
-          python -m venv venv
-          venv/bin/pip install -r requirements.txt
+          aws lambda update-function-code \
+            --function-name pmproxy \
+            --zip-file fileb://target/lambda/pmproxy-lambda/bootstrap.zip \
+            --publish \
+            --query '{Version:Version,LastModified:LastModified,CodeSha256:CodeSha256}' \
+            --output table
 
-      - name: Pulumi up
-        working-directory: infra/pulumi
-        env:
-          PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}
+      - name: Wait for update to settle
         run: |
-          pulumi login "$PULUMI_BACKEND_URL"
-          pulumi stack select prod
-          pulumi up --yes --skip-preview
+          aws lambda wait function-updated --function-name pmproxy
+          aws lambda get-function-configuration \
+            --function-name pmproxy \
+            --query '{State:State,LastUpdateStatus:LastUpdateStatus,CodeSha256:CodeSha256}' \
+            --output table
 
-      - name: Verify deploy
+      - name: Verify deployed function responds
         run: |
           URL=$(aws lambda get-function-url-config --function-name pmproxy --query 'FunctionUrl' --output text)
-          echo "Deployed Lambda URL: $URL"
+          echo "Lambda URL: $URL"
+          # /health is unauthenticated; expects JSON {"status":"healthy"}
           curl -sf "${URL}health" | tee /dev/stderr
+          echo ""

@@ -55,7 +55,7 @@ Write strategies in Python, transpile to Rust for HFT performance.
 All AWS infra is in `infra/pulumi/` (Python Pulumi, S3 backend, eu-west-1 pinned).
 Current live state and decisions are tracked in `.infra/INFRA.md` (gitignored).
 
-- **pmproxy** — Lambda + Function URL in eu-west-1. Deploys via GitHub Actions (`.github/workflows/deploy-pmproxy.yml`) using OIDC-federated role `pmproxy-ci-deploy`. Trigger: `workflow_dispatch` or auto on `pmproxy-v*` release publish. Local fallback: `cd pmproxy && cargo lambda build --release --no-default-features --features lambda --bin pmproxy-lambda --output-format zip && cd ../infra/pulumi && pulumi up`.
+- **pmproxy** — Lambda + Function URL in eu-west-1. Code deploys via GitHub Actions (`.github/workflows/deploy-pmproxy.yml`) using OIDC-federated role `pmproxy-ci-deploy`: builds the Lambda zip, then `aws lambda update-function-code` to push the new binary. Trigger: `workflow_dispatch` or auto on `pmproxy-v*` release publish. **Config changes** (env vars, memory, role, etc.) still go through `pulumi up` locally — CI only swaps the binary, not the infra.
 - **pmengine** — no live host. Releases via tag `pmengine-v*` produce GH artifacts only.
 - **pmtrader** — Python package, no AWS deployment.
 
