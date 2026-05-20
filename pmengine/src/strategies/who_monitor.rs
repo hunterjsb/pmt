@@ -3,7 +3,7 @@ use crate::strategy::{Signal, Strategy, StrategyContext, Urgency};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU8, Ordering},
     Arc,
 };
 use tokio::time::{interval, Duration};
@@ -13,21 +13,109 @@ const HANTAVIRUS_PANDEMIC_NO: &str =
 
 // WHO removed RSS in 2024. The JSON API is the current equivalent.
 const WHO_DON_API: &str = "https://www.who.int/api/news/diseaseoutbreaknews?sf_culture=en&$top=20&$orderby=PublicationDateAndTime+desc";
-const ALERT_KEYWORDS: &[&str] = &["hantavirus"];
 const POLL_INTERVAL_SECS: u64 = 60;
+
+// Must appear in the title for ANY action (gate check before severity classification).
+const HANTAVIRUS_KW: &str = "hantavirus";
+
+// Alarm: WHO has actually declared something — this is what resolves the market YES.
+const ALARM_KEYWORDS: &[&str] = &[
+    "pandemic",
+    "pheic",
+    "public health emergency",
+    "emergency of international concern",
+];
+
+// Warning: active multi-country or community spread — risk elevated but not resolved.
+const WARNING_KEYWORDS: &[&str] = &[
+    "multi-country",
+    "multiple countries",
+    "community transmission",
+    "widespread",
+    "rapid increase",
+    "global spread",
+];
+
+/// Severity of a WHO hantavirus alert.
+///
+/// Ordering matters: Alarm > Warning > Watch > None.
+/// The engine escalates through levels but never de-escalates within a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AlertLevel {
+    None    = 0,
+    Watch   = 1, // any DON entry → log, no trade action
+    Warning = 2, // multi-country / community spread → cancel maker bid
+    Alarm   = 3, // PHEIC / pandemic declaration → exit position + shutdown
+}
+
+impl AlertLevel {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Watch,
+            2 => Self::Warning,
+            3 => Self::Alarm,
+            _ => Self::None,
+        }
+    }
+    pub fn as_u8(self) -> u8 { self as u8 }
+}
+
+/// Classify a single DON entry title into a severity level.
+/// Returns `None` if the title isn't hantavirus-related.
+pub fn classify(title: &str) -> Option<AlertLevel> {
+    let lower = title.to_lowercase();
+    if !lower.contains(HANTAVIRUS_KW) {
+        return None;
+    }
+    if ALARM_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        Some(AlertLevel::Alarm)
+    } else if WARNING_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        Some(AlertLevel::Warning)
+    } else {
+        Some(AlertLevel::Watch)
+    }
+}
+
+/// Scan a WHO DON JSON response and return the highest severity entry found,
+/// along with its title.
+pub fn assess_don(json: &Value) -> (AlertLevel, Option<String>) {
+    let items = match json.get("value").and_then(|v| v.as_array()) {
+        Some(a) => a,
+        None => return (AlertLevel::None, None),
+    };
+
+    let mut max_level = AlertLevel::None;
+    let mut max_title: Option<String> = None;
+
+    for item in items {
+        let title = item.get("Title").and_then(|t| t.as_str()).unwrap_or("");
+        if let Some(level) = classify(title) {
+            if level > max_level {
+                max_level = level;
+                max_title = Some(title.to_string());
+            }
+        }
+    }
+
+    (max_level, max_title)
+}
 
 pub struct WhoMonitor {
     id: String,
-    triggered: Arc<AtomicBool>,
+    /// Shared with background poller. Stores the highest AlertLevel seen as u8.
+    severity: Arc<AtomicU8>,
     alert_title: Arc<std::sync::Mutex<Option<String>>>,
+    /// The highest level we've already acted on. Signals are emitted once per
+    /// escalation, not on every tick, so this tracks what we've handled.
+    last_acted: AlertLevel,
 }
 
 impl WhoMonitor {
     pub fn new() -> Self {
-        let triggered = Arc::new(AtomicBool::new(false));
+        let severity = Arc::new(AtomicU8::new(AlertLevel::None.as_u8()));
         let alert_title = Arc::new(std::sync::Mutex::new(None::<String>));
 
-        let triggered_bg = triggered.clone();
+        let severity_bg = severity.clone();
         let title_bg = alert_title.clone();
 
         tokio::spawn(async move {
@@ -42,24 +130,31 @@ impl WhoMonitor {
             loop {
                 timer.tick().await;
 
-                if triggered_bg.load(Ordering::Relaxed) {
+                // Stop polling once we've hit Alarm — nothing higher to detect.
+                if AlertLevel::from_u8(severity_bg.load(Ordering::Relaxed)) == AlertLevel::Alarm {
                     break;
                 }
 
                 match client.get(WHO_DON_API).send().await {
                     Err(e) => tracing::warn!(error = %e, "WHO DON fetch failed"),
-                    Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(resp) => match resp.json::<Value>().await {
                         Err(e) => tracing::warn!(error = %e, "WHO DON JSON parse failed"),
                         Ok(json) => {
-                            if let Some(title) = first_matching_don_title(&json) {
+                            let (new_level, new_title) = assess_don(&json);
+                            let prev = AlertLevel::from_u8(severity_bg.load(Ordering::Relaxed));
+
+                            if new_level > prev {
                                 tracing::warn!(
-                                    title = %title,
-                                    "WHO ALERT — hantavirus mention in Disease Outbreak News"
+                                    level = ?new_level,
+                                    title = %new_title.as_deref().unwrap_or("?"),
+                                    "WHO DON severity escalated"
                                 );
-                                *title_bg.lock().unwrap() = Some(title);
-                                triggered_bg.store(true, Ordering::Relaxed);
+                                if let Some(t) = new_title {
+                                    *title_bg.lock().unwrap() = Some(t);
+                                }
+                                severity_bg.store(new_level.as_u8(), Ordering::Relaxed);
                             } else {
-                                tracing::debug!("WHO DON polled — no hantavirus mention");
+                                tracing::debug!(level = ?new_level, "WHO DON polled — no escalation");
                             }
                         }
                     },
@@ -69,32 +164,22 @@ impl WhoMonitor {
 
         Self {
             id: "who_monitor".to_string(),
-            triggered,
+            severity,
             alert_title,
+            last_acted: AlertLevel::None,
         }
     }
-}
 
-/// Search the WHO DON JSON response (`{ "value": [ { "Title": "...", ... } ] }`)
-/// for the first entry whose title contains any ALERT_KEYWORD.
-fn first_matching_don_title(json: &Value) -> Option<String> {
-    let items = json.get("value")?.as_array()?;
-    for item in items {
-        let title = item.get("Title")?.as_str().unwrap_or("");
-        if ALERT_KEYWORDS.iter().any(|kw| title.to_lowercase().contains(kw)) {
-            return Some(title.to_string());
-        }
-    }
-    None
-}
-
-impl WhoMonitor {
-    /// Test constructor: pre-triggered state, no background task.
-    /// Use in tests to exercise the `on_tick` signal path without a live engine.
-    pub fn new_triggered(title: &str) -> Self {
-        let triggered = Arc::new(AtomicBool::new(true));
+    /// Test constructor: inject a specific alert level without a background task.
+    pub fn new_at_level(level: AlertLevel, title: &str) -> Self {
+        let severity = Arc::new(AtomicU8::new(level.as_u8()));
         let alert_title = Arc::new(std::sync::Mutex::new(Some(title.to_string())));
-        Self { id: "who_monitor".to_string(), triggered, alert_title }
+        Self {
+            id: "who_monitor".to_string(),
+            severity,
+            alert_title,
+            last_acted: AlertLevel::None,
+        }
     }
 }
 
@@ -114,9 +199,13 @@ impl Strategy for WhoMonitor {
     }
 
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
-        if !self.triggered.load(Ordering::Relaxed) {
+        let current = AlertLevel::from_u8(self.severity.load(Ordering::Relaxed));
+
+        // Only act on escalation — emit signals once per level, not every tick.
+        if current <= self.last_acted {
             return vec![Signal::Hold];
         }
+        self.last_acted = current;
 
         let title = self
             .alert_title
@@ -125,36 +214,65 @@ impl Strategy for WhoMonitor {
             .and_then(|g| g.clone())
             .unwrap_or_else(|| "WHO hantavirus alert".to_string());
 
-        tracing::warn!(title = %title, "WhoMonitor: emitting emergency exit + shutdown");
+        match current {
+            AlertLevel::None => vec![Signal::Hold],
 
-        let mut signals = vec![Signal::Cancel {
-            token_id: HANTAVIRUS_PANDEMIC_NO.to_string(),
-        }];
+            AlertLevel::Watch => {
+                // Active DON entry but no spread indicators — log, don't trade.
+                tracing::warn!(
+                    title = %title,
+                    "WhoMonitor WATCH — hantavirus DON entry, no trading action"
+                );
+                vec![Signal::Hold]
+            }
 
-        // Size the sell from actual position; exit at best bid or 1¢ floor
-        if let Some(pos) = ctx.positions.get(HANTAVIRUS_PANDEMIC_NO) {
-            if pos.size > Decimal::ZERO {
-                let exit_price = ctx
-                    .order_books
-                    .get(HANTAVIRUS_PANDEMIC_NO)
-                    .and_then(|b| b.best_bid())
-                    .map(|l| l.price)
-                    .unwrap_or(Decimal::new(1, 2)); // 0.01 floor
-
-                signals.push(Signal::Sell {
+            AlertLevel::Warning => {
+                // Multi-country or community spread — cancel the resting maker
+                // bid to stop accumulating more NO exposure, but hold the position.
+                tracing::warn!(
+                    title = %title,
+                    "WhoMonitor WARNING — cancelling pandemic NO maker bid"
+                );
+                vec![Signal::Cancel {
                     token_id: HANTAVIRUS_PANDEMIC_NO.to_string(),
-                    price: exit_price,
-                    size: pos.size,
-                    urgency: Urgency::Immediate,
+                }]
+            }
+
+            AlertLevel::Alarm => {
+                // PHEIC or pandemic declaration — this likely resolves the market
+                // YES. Exit position immediately and shutdown.
+                tracing::error!(
+                    title = %title,
+                    "WhoMonitor ALARM — emergency exit + shutdown"
+                );
+                let mut signals = vec![Signal::Cancel {
+                    token_id: HANTAVIRUS_PANDEMIC_NO.to_string(),
+                }];
+
+                if let Some(pos) = ctx.positions.get(HANTAVIRUS_PANDEMIC_NO) {
+                    if pos.size > Decimal::ZERO {
+                        let exit_price = ctx
+                            .order_books
+                            .get(HANTAVIRUS_PANDEMIC_NO)
+                            .and_then(|b| b.best_bid())
+                            .map(|l| l.price)
+                            .unwrap_or(Decimal::new(1, 2)); // 0.01 floor
+
+                        signals.push(Signal::Sell {
+                            token_id: HANTAVIRUS_PANDEMIC_NO.to_string(),
+                            price: exit_price,
+                            size: pos.size,
+                            urgency: Urgency::Immediate,
+                        });
+                    }
+                }
+
+                signals.push(Signal::Shutdown {
+                    reason: format!("WHO alarm: {}", title),
                 });
+                signals
             }
         }
-
-        signals.push(Signal::Shutdown {
-            reason: format!("WHO alert: {}", title),
-        });
-
-        signals
     }
 
     fn on_fill(&mut self, _fill: &Fill) {}
@@ -169,52 +287,91 @@ mod tests {
     fn don_response(titles: &[&str]) -> Value {
         let items: Vec<Value> = titles
             .iter()
-            .map(|t| json!({ "Title": t, "PublicationDateAndTime": "2026-05-01T00:00:00Z" }))
+            .map(|t| json!({ "Title": t }))
             .collect();
         json!({ "value": items })
     }
 
+    // --- classify ---
+
     #[test]
-    fn matches_hantavirus_in_title() {
-        let resp = don_response(&["Hantavirus outbreak update — China"]);
+    fn classify_watch_plain_cluster() {
+        assert_eq!(classify("Hantavirus — Republic of Korea"), Some(AlertLevel::Watch));
+    }
+
+    #[test]
+    fn classify_warning_multi_country() {
         assert_eq!(
-            first_matching_don_title(&resp),
-            Some("Hantavirus outbreak update — China".into())
+            classify("Hantavirus cluster linked to cruise ship travel, Multi-country"),
+            Some(AlertLevel::Warning)
         );
     }
 
     #[test]
-    fn no_match_for_unrelated_outbreak() {
-        let resp = don_response(&["Ebola update — DRC"]);
-        assert_eq!(first_matching_don_title(&resp), None);
+    fn classify_alarm_pandemic() {
+        assert_eq!(
+            classify("Hantavirus pandemic declared — WHO"),
+            Some(AlertLevel::Alarm)
+        );
     }
 
     #[test]
-    fn returns_first_matching_item() {
+    fn classify_alarm_pheic() {
+        assert_eq!(
+            classify("Hantavirus: Public Health Emergency of International Concern"),
+            Some(AlertLevel::Alarm)
+        );
+    }
+
+    #[test]
+    fn classify_none_for_unrelated() {
+        assert_eq!(classify("Ebola update — DRC"), None);
+    }
+
+    #[test]
+    fn classify_case_insensitive() {
+        assert_eq!(classify("HANTAVIRUS PANDEMIC"), Some(AlertLevel::Alarm));
+    }
+
+    // --- assess_don ---
+
+    #[test]
+    fn assess_returns_highest_severity() {
         let resp = don_response(&[
-            "Influenza surveillance",
-            "Hantavirus — Republic of Korea",
-            "Hantavirus follow-up",
+            "Hantavirus — Republic of Korea",               // Watch
+            "Hantavirus cluster, Multi-country",            // Warning
         ]);
-        assert_eq!(
-            first_matching_don_title(&resp),
-            Some("Hantavirus — Republic of Korea".into())
-        );
+        let (level, title) = assess_don(&resp);
+        assert_eq!(level, AlertLevel::Warning);
+        assert!(title.unwrap().contains("Multi-country"));
     }
 
     #[test]
-    fn case_insensitive_match() {
-        let resp = don_response(&["HANTAVIRUS PANDEMIC DECLARED"]);
-        assert!(first_matching_don_title(&resp).is_some());
+    fn assess_alarm_takes_priority_over_warning() {
+        let resp = don_response(&[
+            "Hantavirus cluster, Multi-country",
+            "Hantavirus pandemic declared",
+        ]);
+        let (level, _) = assess_don(&resp);
+        assert_eq!(level, AlertLevel::Alarm);
     }
 
     #[test]
-    fn empty_value_array_returns_none() {
-        let resp = json!({ "value": [] });
-        assert_eq!(first_matching_don_title(&resp), None);
+    fn assess_no_hantavirus_returns_none() {
+        let resp = don_response(&["Ebola — DRC", "Measles — Bangladesh"]);
+        let (level, _) = assess_don(&resp);
+        assert_eq!(level, AlertLevel::None);
     }
 
-    /// Fetch the real WHO DON JSON API and print any hantavirus entries found.
+    #[test]
+    fn assess_empty_returns_none() {
+        let (level, _) = assess_don(&json!({ "value": [] }));
+        assert_eq!(level, AlertLevel::None);
+    }
+
+    // --- live WHO DON API ---
+
+    /// Fetch the real WHO DON API and show what severity we'd assign.
     /// Run with: cargo test -- --ignored live_who
     #[tokio::test]
     #[ignore]
@@ -235,13 +392,14 @@ mod tests {
             .expect("JSON parse failed");
 
         let items = json.get("value").and_then(|v| v.as_array()).expect("expected value array");
-        assert!(!items.is_empty(), "expected DON items");
         println!("Latest {} DON items:", items.len());
         for item in items.iter().take(10) {
-            println!("  {}", item.get("Title").and_then(|t| t.as_str()).unwrap_or("?"));
+            let title = item.get("Title").and_then(|t| t.as_str()).unwrap_or("?");
+            let level = classify(title);
+            println!("  [{:?}] {}", level, title);
         }
 
-        let hit = first_matching_don_title(&json);
-        println!("\nHantavirus match: {:?}", hit);
+        let (level, title) = assess_don(&json);
+        println!("\nMax severity: {:?} — {:?}", level, title);
     }
 }
