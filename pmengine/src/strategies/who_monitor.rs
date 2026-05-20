@@ -1,6 +1,7 @@
 use crate::position::Fill;
 use crate::strategy::{Signal, Strategy, StrategyContext, Urgency};
 use rust_decimal::Decimal;
+use serde_json::Value;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -10,7 +11,8 @@ use tokio::time::{interval, Duration};
 const HANTAVIRUS_PANDEMIC_NO: &str =
     "95212449865986159112377413335252801281670333750637442556685159781445406848396";
 
-const WHO_DON_RSS: &str = "https://www.who.int/feeds/entity/csr/don/en/rss.xml";
+// WHO removed RSS in 2024. The JSON API is the current equivalent.
+const WHO_DON_API: &str = "https://www.who.int/api/news/diseaseoutbreaknews?sf_culture=en&$top=20&$orderby=PublicationDateAndTime+desc";
 const ALERT_KEYWORDS: &[&str] = &["hantavirus"];
 const POLL_INTERVAL_SECS: u64 = 60;
 
@@ -41,15 +43,15 @@ impl WhoMonitor {
                 timer.tick().await;
 
                 if triggered_bg.load(Ordering::Relaxed) {
-                    break; // already fired, stop polling
+                    break;
                 }
 
-                match client.get(WHO_DON_RSS).send().await {
+                match client.get(WHO_DON_API).send().await {
                     Err(e) => tracing::warn!(error = %e, "WHO DON fetch failed"),
-                    Ok(resp) => match resp.text().await {
-                        Err(e) => tracing::warn!(error = %e, "WHO DON body read failed"),
-                        Ok(body) => {
-                            if let Some(title) = first_matching_item_title(&body) {
+                    Ok(resp) => match resp.json::<serde_json::Value>().await {
+                        Err(e) => tracing::warn!(error = %e, "WHO DON JSON parse failed"),
+                        Ok(json) => {
+                            if let Some(title) = first_matching_don_title(&json) {
                                 tracing::warn!(
                                     title = %title,
                                     "WHO ALERT — hantavirus mention in Disease Outbreak News"
@@ -73,34 +75,27 @@ impl WhoMonitor {
     }
 }
 
-/// Scan RSS XML for the first <item> whose text matches any ALERT_KEYWORD.
-/// Uses simple substring search — avoids a full XML parser dependency.
-fn first_matching_item_title(body: &str) -> Option<String> {
-    let lower = body.to_lowercase();
-    let mut pos = 0;
-
-    while let Some(rel) = lower[pos..].find("<item>") {
-        let start = pos + rel;
-        let end = lower[start..].find("</item>").map(|r| start + r).unwrap_or(lower.len());
-
-        let item_lower = &lower[start..end];
-        if ALERT_KEYWORDS.iter().any(|kw| item_lower.contains(kw)) {
-            let item_orig = &body[start..end];
-            return Some(extract_tag(item_orig, "title").unwrap_or_else(|| "(unknown)".into()));
+/// Search the WHO DON JSON response (`{ "value": [ { "Title": "...", ... } ] }`)
+/// for the first entry whose title contains any ALERT_KEYWORD.
+fn first_matching_don_title(json: &Value) -> Option<String> {
+    let items = json.get("value")?.as_array()?;
+    for item in items {
+        let title = item.get("Title")?.as_str().unwrap_or("");
+        if ALERT_KEYWORDS.iter().any(|kw| title.to_lowercase().contains(kw)) {
+            return Some(title.to_string());
         }
-
-        pos = end + 7; // step past </item>
     }
     None
 }
 
-/// Pull the text content of the first `<tag>…</tag>` in `text`.
-fn extract_tag(text: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    let start = text.find(&open)? + open.len();
-    let end = text[start..].find(&close)? + start;
-    Some(text[start..end].trim().to_string())
+impl WhoMonitor {
+    /// Test constructor: pre-triggered state, no background task.
+    /// Use in tests to exercise the `on_tick` signal path without a live engine.
+    pub fn new_triggered(title: &str) -> Self {
+        let triggered = Arc::new(AtomicBool::new(true));
+        let alert_title = Arc::new(std::sync::Mutex::new(Some(title.to_string())));
+        Self { id: "who_monitor".to_string(), triggered, alert_title }
+    }
 }
 
 impl Default for WhoMonitor {
@@ -169,70 +164,84 @@ impl Strategy for WhoMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    fn rss(items: &[(&str, &str)]) -> String {
-        let items_xml: String = items
+    fn don_response(titles: &[&str]) -> Value {
+        let items: Vec<Value> = titles
             .iter()
-            .map(|(title, desc)| {
-                format!(
-                    "<item><title>{}</title><description>{}</description></item>",
-                    title, desc
-                )
-            })
+            .map(|t| json!({ "Title": t, "PublicationDateAndTime": "2026-05-01T00:00:00Z" }))
             .collect();
-        format!("<rss><channel>{}</channel></rss>", items_xml)
+        json!({ "value": items })
     }
 
     #[test]
     fn matches_hantavirus_in_title() {
-        let body = rss(&[("Hantavirus outbreak update — China", "Several cases confirmed.")]);
+        let resp = don_response(&["Hantavirus outbreak update — China"]);
         assert_eq!(
-            first_matching_item_title(&body),
+            first_matching_don_title(&resp),
             Some("Hantavirus outbreak update — China".into())
         );
     }
 
     #[test]
-    fn matches_hantavirus_in_description() {
-        let body = rss(&[("Disease Outbreak News", "Hantavirus cases reported in three provinces.")]);
-        assert!(first_matching_item_title(&body).is_some());
-    }
-
-    #[test]
     fn no_match_for_unrelated_outbreak() {
-        let body = rss(&[("Ebola update — DRC", "Ongoing response in Équateur province.")]);
-        assert_eq!(first_matching_item_title(&body), None);
+        let resp = don_response(&["Ebola update — DRC"]);
+        assert_eq!(first_matching_don_title(&resp), None);
     }
 
     #[test]
     fn returns_first_matching_item() {
-        let body = rss(&[
-            ("Influenza surveillance", "Seasonal flu activity."),
-            ("Hantavirus — Republic of Korea", "Rodent-borne cases confirmed."),
-            ("Hantavirus follow-up", "Second report."),
+        let resp = don_response(&[
+            "Influenza surveillance",
+            "Hantavirus — Republic of Korea",
+            "Hantavirus follow-up",
         ]);
         assert_eq!(
-            first_matching_item_title(&body),
+            first_matching_don_title(&resp),
             Some("Hantavirus — Republic of Korea".into())
         );
     }
 
     #[test]
     fn case_insensitive_match() {
-        let body = rss(&[("HANTAVIRUS PANDEMIC DECLARED", "Global alert issued.")]);
-        assert!(first_matching_item_title(&body).is_some());
+        let resp = don_response(&["HANTAVIRUS PANDEMIC DECLARED"]);
+        assert!(first_matching_don_title(&resp).is_some());
     }
 
     #[test]
-    fn extract_tag_basic() {
-        assert_eq!(
-            extract_tag("<item><title>Hello</title></item>", "title"),
-            Some("Hello".into())
-        );
+    fn empty_value_array_returns_none() {
+        let resp = json!({ "value": [] });
+        assert_eq!(first_matching_don_title(&resp), None);
     }
 
-    #[test]
-    fn extract_tag_missing() {
-        assert_eq!(extract_tag("<item><desc>x</desc></item>", "title"), None);
+    /// Fetch the real WHO DON JSON API and print any hantavirus entries found.
+    /// Run with: cargo test -- --ignored live_who
+    #[tokio::test]
+    #[ignore]
+    async fn live_who_don_api() {
+        let client = reqwest::Client::builder()
+            .user_agent("pmengine-test/1.0")
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap();
+
+        let json: Value = client
+            .get(WHO_DON_API)
+            .send()
+            .await
+            .expect("WHO DON API fetch failed")
+            .json()
+            .await
+            .expect("JSON parse failed");
+
+        let items = json.get("value").and_then(|v| v.as_array()).expect("expected value array");
+        assert!(!items.is_empty(), "expected DON items");
+        println!("Latest {} DON items:", items.len());
+        for item in items.iter().take(10) {
+            println!("  {}", item.get("Title").and_then(|t| t.as_str()).unwrap_or("?"));
+        }
+
+        let hit = first_matching_don_title(&json);
+        println!("\nHantavirus match: {:?}", hit);
     }
 }
