@@ -6,10 +6,14 @@ description = "Simple HTTP reverse proxy for Polymarket APIs"
 
 [dependencies]
 # HTTP server
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# WebSocket client for upstream connections (EC2 only — Lambda doesn't support WS)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+futures-util = { version = "0.3", optional = true }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -43,7 +47,8 @@ lambda_runtime = { version = "0.14", optional = true }
 
 [features]
 default = ["ec2"]
-ec2 = ["clap"]
+ec2 = ["clap", "ws"]
+ws = ["tokio-tungstenite", "futures-util"]
 lambda = ["lambda_http", "lambda_runtime"]
 
 [lib]

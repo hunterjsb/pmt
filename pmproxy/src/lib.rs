@@ -15,6 +15,9 @@ pub mod config;
 pub mod error;
 pub mod ratelimit;
 
+#[cfg(feature = "ws")]
+pub mod ws;
+
 use std::sync::Arc;
 
 use axum::{
@@ -99,9 +102,14 @@ impl Default for ProxyState {
 
 /// Build the proxy router with shared state.
 pub fn build_router(state: Arc<ProxyState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health_handler))
-        .route("/badge", get(badge_handler))
+        .route("/badge", get(badge_handler));
+
+    #[cfg(feature = "ws")]
+    let router = router.route("/clob/ws/{channel}", get(ws::ws_handler));
+
+    router
         .fallback(proxy_handler)
         .with_state(state)
 }
@@ -127,7 +135,7 @@ pub async fn badge_handler() -> impl IntoResponse {
 }
 
 /// Authenticate request if auth is enabled.
-async fn authenticate(
+pub async fn authenticate(
     state: &ProxyState,
     auth_header: Option<&str>,
 ) -> Result<Option<AuthenticatedTenant>, AuthError> {

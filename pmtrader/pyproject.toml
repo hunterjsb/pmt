@@ -23,6 +23,7 @@ pmt = "cli:cli"
 dev = [
     "pynacl>=1.6.2",
     "pytest>=8.0.0",
+    "websockets>=16.0",
 ]
 
 [build-system]
