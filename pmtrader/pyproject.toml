@@ -33,4 +33,4 @@ build-backend = "setuptools.build_meta"
 include = ["polymarket*", "scanners*"]
 
 [tool.setuptools]
-py-modules = ["cli", "scan"]
+py-modules = ["cli"]

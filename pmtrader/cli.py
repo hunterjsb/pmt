@@ -429,6 +429,108 @@ def search(query: str, keyword: str | None) -> None:
     console.print(t)
 
 
+# ============================================================
+# Scanners
+# ============================================================
+
+
+@cli.group()
+def scan() -> None:
+    """Market opportunity scanners."""
+
+
+@scan.command("cliff")
+@click.option("--min", "min_pct", default=85.0, type=float, help="Min outcome price %% (default 85)")
+@click.option("--max", "max_pct", default=99.0, type=float, help="Max outcome price %% (default 99)")
+@click.option("--volume-jump", default=2000.0, type=float, help="Min $ jump to call it a cliff (default 2000)")
+@click.option("--price-gap", default=2.0, type=float, help="Min price gap in cents (default 2.0)")
+@click.option("--interval", default=30, type=int, help="Seconds between scans in continuous mode")
+@click.option("--once", is_flag=True, help="Run a single scan and exit")
+@click.option("--limit", default=None, type=int, help="Max scans in continuous mode")
+def scan_cliff(min_pct, max_pct, volume_jump, price_gap, interval, once, limit):
+    """Find ask-ladder gaps followed by a thick volume wall."""
+    from scanners.scanner import create_opportunities_table, scan_continuous, scan_once
+
+    console.print("[bold cyan]🔍 Volume Cliff Scanner[/bold cyan]")
+    console.print(f"  range {min_pct}%-{max_pct}%  min jump ${volume_jump:,.0f}  min gap {price_gap}¢")
+    if once:
+        opps = scan_once(min_pct=min_pct, max_pct=max_pct,
+                         min_volume_jump=volume_jump, min_price_gap_cents=price_gap)
+        console.print(create_opportunities_table(opps))
+        console.print(f"\n[dim]Found {len(opps)} opportunities[/dim]")
+    else:
+        console.print(f"  every {interval}s — Ctrl+C to stop\n")
+        scan_continuous(min_pct=min_pct, max_pct=max_pct,
+                        min_volume_jump=volume_jump, min_price_gap_cents=price_gap,
+                        interval=interval, max_iterations=limit)
+
+
+@scan.command("expiring")
+@click.option("--min-price", default=98.0, type=float, help="Min outcome price %% (default 98)")
+@click.option("--max-hours", default=2.0, type=float, help="Max hours until expiry (default 2)")
+@click.option("--interval", default=60, type=int, help="Seconds between scans in continuous mode")
+@click.option("--once", is_flag=True, help="Run a single scan and exit")
+@click.option("--verbose", "-v", is_flag=True, help="Show scanned-market counts")
+def scan_expiring(min_price, max_hours, interval, once, verbose):
+    """Find high-certainty markets resolving in the next few hours."""
+    from scanners.expiring import calculate_max_return, find_expiring_opportunities
+
+    def make_table(opps, label):
+        if not opps:
+            console.print("[yellow]No opportunities found.[/yellow]")
+            return None
+        t = Table(title=f"🕐 {label}", show_lines=True)
+        t.add_column("Market", style="cyan", max_width=35)
+        t.add_column("Outcome", style="yellow", justify="center")
+        t.add_column("Price", style="magenta", justify="right")
+        t.add_column("Expires", style="red", justify="right")
+        t.add_column("Max Return", style="green bold", justify="right")
+        t.add_column("Rate/hr", style="blue", justify="right")
+        for o in opps:
+            r = calculate_max_return(o.price_pct, o.hours_until_expiry)
+            q = o.question if len(o.question) <= 35 else o.question[:32] + "..."
+            t.add_row(q, o.outcome, f"{o.price_pct:.2f}%", f"{o.hours_until_expiry:.1f}h",
+                      f"{r['max_return_pct']:.2f}%", f"{r['hourly_rate_pct']:.2f}%")
+        return t
+
+    console.print("[bold cyan]🕐 Expiring Markets Scanner[/bold cyan]")
+    console.print(f"  min price {min_price}%  max expiry {max_hours}h")
+
+    if once:
+        opps = find_expiring_opportunities(min_price_pct=min_price, max_hours=max_hours)
+        if verbose:
+            from polymarket import clob, gamma
+
+            m1 = clob.sampling_markets(limit=500)
+            m2 = gamma.markets(limit=500, closed=False)
+            console.print(f"  [dim]scanned {len(m1)} CLOB + {len(m2)} Gamma markets[/dim]")
+        tbl = make_table(opps, f"{min_price}%+ certainty, <{max_hours}h")
+        if tbl:
+            console.print(tbl)
+            console.print(f"\n[dim]Found {len(opps)} opportunities[/dim]")
+    else:
+        import time as _time
+
+        from rich.live import Live
+
+        console.print(f"  every {interval}s — Ctrl+C to stop\n")
+        with Live(refresh_per_second=1) as live:
+            i = 0
+            while True:
+                try:
+                    opps = find_expiring_opportunities(min_price_pct=min_price, max_hours=max_hours)
+                    tbl = make_table(opps, f"{min_price}%+, <{max_hours}h  (scan #{i+1})")
+                    if tbl:
+                        live.update(tbl)
+                    i += 1
+                    _time.sleep(interval)
+                except KeyboardInterrupt:
+                    break
+                except Exception as e:
+                    console.print(f"\n[red]scan error: {e}[/red]")
+                    _time.sleep(interval)
+
+
 @cli.command()
 @click.argument("token")
 def book(token: str) -> None:

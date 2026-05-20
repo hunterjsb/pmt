@@ -26,6 +26,10 @@ pmt rewards --all --type reward                   # full history, rewards only
 pmt book   hantavirus-pandemic:no                 # depth chart
 pmt market hantavirus-pandemic-in-2026            # event metadata by slug or condition_id
 pmt search pandemic                               # free-text active-market search
+
+# Scanners
+pmt scan cliff --once                             # ask-ladder gaps + thick wall
+pmt scan expiring --once                          # high-certainty markets expiring soon
 ```
 
 The `--token` arg accepts either a raw numeric token ID or `market-name:yes|no`. Market names come from `polymarket/markets.py` — add new markets there.
