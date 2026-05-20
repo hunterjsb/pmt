@@ -66,7 +66,11 @@ lambda_function = aws.lambda_.Function(
             "RUST_LOG": "info",
         },
     ),
-    opts=pulumi.ResourceOptions(depends_on=[log_group]),
+    # CI deploys (.github/workflows/deploy-pmproxy.yml) own the function code via
+    # `aws lambda update-function-code`. Pulumi owns the configuration only — telling
+    # it to ignore "code" prevents `pulumi up` from clobbering a fresh CI deploy with
+    # whatever zip happens to be on the local disk.
+    opts=pulumi.ResourceOptions(depends_on=[log_group], ignore_changes=["code"]),
 )
 
 function_url = aws.lambda_.FunctionUrl(
