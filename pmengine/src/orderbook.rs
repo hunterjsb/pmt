@@ -53,9 +53,17 @@ impl OrderBook {
     }
 
     /// Update from a WebSocket book update.
+    ///
+    /// Polymarket's WS sends bids/asks unsorted (or in arbitrary order). We
+    /// sort here so `best_bid` / `best_ask` (which take `.first()`) return
+    /// the actual top of book.
     pub fn update_from_ws(&mut self, update: &BookUpdate) {
-        self.bids = update.bids.iter().map(Level::from).collect();
-        self.asks = update.asks.iter().map(Level::from).collect();
+        let mut bids: Vec<Level> = update.bids.iter().map(Level::from).collect();
+        bids.sort_by(|a, b| b.price.cmp(&a.price)); // descending: best bid first
+        let mut asks: Vec<Level> = update.asks.iter().map(Level::from).collect();
+        asks.sort_by(|a, b| a.price.cmp(&b.price)); // ascending: best ask first
+        self.bids = bids;
+        self.asks = asks;
         self.timestamp = update.timestamp;
         self.hash = update.hash.clone();
     }
@@ -284,6 +292,29 @@ impl MarketDataHub {
         books
             .entry(token_id.to_string())
             .or_insert_with(|| Arc::new(OrderBook::new(token_id.to_string())));
+    }
+
+    /// Replace a token's book wholesale, e.g. from a REST poll snapshot.
+    ///
+    /// Unlike `process_book_update` (which applies an incremental WS diff),
+    /// this overwrites bids/asks/timestamp/hash with the provided snapshot
+    /// and broadcasts a `BookUpdate` event so subscribers see the change.
+    pub async fn set_book(&self, book: OrderBook) {
+        let token_id = book.token_id.clone();
+        let arc = Arc::new(book);
+
+        {
+            let mut books = self.books.write().await;
+            books.insert(token_id.clone(), arc.clone());
+        }
+
+        let _ = self
+            .tx
+            .broadcast(MarketEvent::BookUpdate {
+                token_id,
+                book: arc,
+            })
+            .await;
     }
 
     /// Get number of tracked order books.

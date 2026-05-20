@@ -344,6 +344,130 @@ impl PolymarketClient {
     pub fn is_dry_run(&self) -> bool {
         self.dry_run
     }
+
+    /// Fetch a snapshot of the order book via REST.
+    ///
+    /// Routes through pmproxy when `PMPROXY_URL` is set (adding the Cognito
+    /// Bearer header), otherwise hits `clob.polymarket.com` directly. The
+    /// `/book` endpoint is unauthenticated from Polymarket's side, so we
+    /// don't compute L2 headers.
+    ///
+    /// Used by the engine's REST polling task as an alternative to the WS
+    /// orderbook subscription (which is geoblocked from US IPs without a
+    /// WS-capable proxy).
+    pub async fn get_book(
+        &self,
+        token_id: &str,
+    ) -> Result<crate::orderbook::OrderBook, ClientError> {
+        let url = if let Some(ref proxy) = self.proxy_url {
+            format!(
+                "{}/clob/book?token_id={}",
+                proxy.trim_end_matches('/'),
+                token_id
+            )
+        } else {
+            format!("https://clob.polymarket.com/book?token_id={}", token_id)
+        };
+
+        let mut req = self.http.get(&url);
+
+        #[cfg(feature = "cognito")]
+        if self.proxy_url.is_some() {
+            if let Some(ref cognito) = self.cognito_auth {
+                let auth_header = cognito
+                    .get_auth_header()
+                    .await
+                    .map_err(|e| ClientError::AuthError(format!("Cognito auth failed: {}", e)))?;
+                req = req.header("Authorization", auth_header);
+            }
+        }
+
+        let response = req
+            .send()
+            .await
+            .map_err(|e| ClientError::OrderError(format!("get_book request failed: {}", e)))?;
+
+        let status = response.status();
+        let body = response.text().await.map_err(|e| {
+            ClientError::OrderError(format!("get_book read failed: {}", e))
+        })?;
+
+        if !status.is_success() {
+            return Err(ClientError::OrderError(format!(
+                "get_book HTTP {}: {}",
+                status, body
+            )));
+        }
+
+        let snap: BookRestResponse = serde_json::from_str(&body).map_err(|e| {
+            ClientError::OrderError(format!("get_book JSON parse failed: {} (body: {})", e, body))
+        })?;
+
+        Ok(snap.into_orderbook(token_id))
+    }
+}
+
+/// REST `/book` response. Polymarket returns timestamp as a string of unix
+/// millis and bids/asks each as `[{price, size}]` arrays.
+#[derive(Debug, serde::Deserialize)]
+struct BookRestResponse {
+    #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    bids: Vec<BookRestLevel>,
+    #[serde(default)]
+    asks: Vec<BookRestLevel>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct BookRestLevel {
+    #[serde(with = "rust_decimal::serde::str")]
+    price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    size: Decimal,
+}
+
+impl BookRestResponse {
+    fn into_orderbook(self, token_id: &str) -> crate::orderbook::OrderBook {
+        use crate::orderbook::{Level, OrderBook};
+
+        // Polymarket REST returns bids ascending and asks descending. Both
+        // need flipping so best (bid: highest, ask: lowest) is at index 0.
+        let mut bids: Vec<Level> = self
+            .bids
+            .into_iter()
+            .map(|l| Level {
+                price: l.price,
+                size: l.size,
+            })
+            .collect();
+        bids.sort_by(|a, b| b.price.cmp(&a.price));
+
+        let mut asks: Vec<Level> = self
+            .asks
+            .into_iter()
+            .map(|l| Level {
+                price: l.price,
+                size: l.size,
+            })
+            .collect();
+        asks.sort_by(|a, b| a.price.cmp(&b.price));
+
+        let timestamp: i64 = self
+            .timestamp
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+        OrderBook {
+            token_id: token_id.to_string(),
+            bids,
+            asks,
+            timestamp,
+            hash: self.hash,
+        }
+    }
 }
 
 /// Response from posting an order.

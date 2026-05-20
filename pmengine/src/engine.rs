@@ -374,6 +374,18 @@ impl Engine {
         self.market_data.clone()
     }
 
+    /// True iff every subscribed token has both a best bid and best ask.
+    /// Used to short-circuit warmup when REST polling has filled the books.
+    async fn all_books_populated(&self) -> bool {
+        let books = self.market_data.get_all_books().await;
+        self.subscribed_tokens.iter().all(|t| {
+            books
+                .get(t)
+                .map(|b| b.best_bid().is_some() && b.best_ask().is_some())
+                .unwrap_or(false)
+        })
+    }
+
     /// Run the main event loop.
     ///
     /// # Arguments
@@ -392,6 +404,41 @@ impl Engine {
             tracing::info!("Received shutdown signal");
             shutdown_tx.send(()).await.ok();
         });
+
+        // Spawn the REST book poller. Runs alongside the WebSocket subscription
+        // so books stay current even when WS is unavailable (e.g. from a US IP
+        // without a WS-capable proxy). Polls every book currently tracked by
+        // the MarketDataHub.
+        let poller_handle = {
+            let client = self.client.clone();
+            let hub = self.market_data.clone();
+            let poll_interval = Duration::from_millis(
+                std::env::var("PMENGINE_BOOK_POLL_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2000),
+            );
+            tokio::spawn(async move {
+                let mut timer = tokio::time::interval(poll_interval);
+                // Skip immediate first tick
+                timer.tick().await;
+                loop {
+                    timer.tick().await;
+                    let tokens: Vec<String> =
+                        hub.get_all_books().await.keys().cloned().collect();
+                    for token in tokens {
+                        match client.get_book(&token).await {
+                            Ok(book) => hub.set_book(book).await,
+                            Err(e) => tracing::debug!(
+                                token = %token,
+                                error = %e,
+                                "REST book poll failed"
+                            ),
+                        }
+                    }
+                }
+            })
+        };
 
         let mut last_tick = Instant::now();
         let mut tick_count: u64 = 0;
@@ -490,7 +537,8 @@ impl Engine {
                             break 'reconnect;
                         }
 
-                        // Skip trading during warmup period (unless skip_warmup is set)
+                        // Skip trading during warmup period (unless skip_warmup is set
+                        // or REST polling has already populated every subscribed book).
                         if !warmup_complete {
                             if self.skip_warmup {
                                 warmup_complete = true;
@@ -499,7 +547,15 @@ impl Engine {
                                 warmup_complete = true;
                                 tracing::info!(
                                     ws_updates = ws_update_count,
-                                    "Warmup complete, trading enabled"
+                                    "Warmup complete via WS, trading enabled"
+                                );
+                            } else if !self.subscribed_tokens.is_empty()
+                                && self.all_books_populated().await
+                            {
+                                warmup_complete = true;
+                                tracing::info!(
+                                    book_count = self.subscribed_tokens.len(),
+                                    "Warmup complete via REST polling, trading enabled"
                                 );
                             } else {
                                 tracing::info!(
@@ -699,6 +755,9 @@ impl Engine {
                 }
             }
         }
+
+        poller_handle.abort();
+        tracing::debug!("REST book poller stopped");
 
         Ok(())
     }

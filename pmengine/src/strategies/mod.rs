@@ -2,6 +2,7 @@
 //! Regenerate with: pmstrat transpile --all
 
 mod dynamic_market_maker;
+mod hanta_maker;
 mod market_maker;
 mod order_test;
 mod spread_watcher;
@@ -11,6 +12,7 @@ use std::collections::HashMap;
 use crate::strategy::Strategy;
 
 pub use dynamic_market_maker::DynamicMarketMaker;
+pub use hanta_maker::HantaMaker;
 pub use market_maker::MarketMaker;
 pub use order_test::OrderTest;
 pub use spread_watcher::SpreadWatcher;
@@ -34,6 +36,11 @@ pub fn registry() -> HashMap<&'static str, StrategyInfo> {
     m.insert("dynamic_market_maker", StrategyInfo {
         factory: || Box::new(dynamic_market_maker::DynamicMarketMaker::new()),
         requires_market_discovery: true,
+    });
+
+    m.insert("hanta_maker", StrategyInfo {
+        factory: || Box::new(hanta_maker::HantaMaker::new()),
+        requires_market_discovery: false,
     });
 
     m.insert("market_maker", StrategyInfo {
