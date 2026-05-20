@@ -604,6 +604,16 @@ impl Engine {
                                 continue;
                             }
 
+                            // Cancel signals don't have price/size and don't need the risk
+                            // check or exposure reservation — pass them straight to the order
+                            // manager, which cancels any tracked orders on this token.
+                            if let Signal::Cancel { .. } = &signal {
+                                if let Err(e) = self.order_manager.execute(signal).await {
+                                    tracing::warn!(error = %e, "Cancel signal failed");
+                                }
+                                continue;
+                            }
+
                             match self.risk_manager.check_signal(&signal, &self.positions) {
                                 RiskCheckResult::Approved(ref s) | RiskCheckResult::Reduced(ref s, _) => {
                                     if let RiskCheckResult::Reduced(_, ref reason) = self.risk_manager.check_signal(&signal, &self.positions) {

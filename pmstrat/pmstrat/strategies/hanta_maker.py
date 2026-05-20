@@ -24,8 +24,10 @@ TOKEN_ID = "95212449865986159112377413335252801281670333750637442556685159781445
 
 # Quote ±0.9¢ around mid → 1.8¢ total spread, well under 5.5¢ rewards cap.
 HALF_SPREAD = Decimal("0.009")
-# Per-side quote size. 615 × $0.94 ≈ $578 notional, way above $200 min.
-ORDER_SIZE = Decimal("615")
+# Per-side quote size. 400 × $0.94 ≈ $376 notional, comfortably above the
+# $200 rewards minimum. Smaller than the full 1295 NO we hold so the engine
+# can run a real BID inside ~$480 free cash without a balance error.
+ORDER_SIZE = Decimal("400")
 # Hard cap on net long NO position from this strategy (we already hold ~1,295
 # NO outside the strategy). Setting wide so the strategy can extend the
 # position by ~600 before it stops bidding.
