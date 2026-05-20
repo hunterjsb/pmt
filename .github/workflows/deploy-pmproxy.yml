@@ -1,0 +1,90 @@
+name: Deploy pmproxy Lambda
+
+on:
+  # Manual trigger from the GitHub Actions UI.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to deploy (default: master)"
+        required: false
+        default: "master"
+  # Auto-deploy when a pmproxy-v* release is published (after publish-pmproxy builds it).
+  release:
+    types: [published]
+
+concurrency:
+  # Serialize Lambda deploys so two runs can't race the same resource.
+  group: deploy-pmproxy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-1
+  PULUMI_BACKEND_URL: s3://pmt-pulumi-state-350985642081-euw1
+
+permissions:
+  # Required to mint the OIDC token for AWS role assumption.
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    # Release-triggered runs only deploy pmproxy-v* tags; other releases are skipped.
+    if: ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'pmproxy-v') }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-lambda
+        run: pip install cargo-lambda
+
+      - name: Build Lambda zip
+        working-directory: pmproxy
+        run: |
+          cargo lambda build \
+            --release \
+            --no-default-features \
+            --features lambda \
+            --bin pmproxy-lambda \
+            --output-format zip
+          ls -lh target/lambda/pmproxy-lambda/bootstrap.zip
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::350985642081:role/pmproxy-ci-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Pulumi CLI
+        uses: pulumi/actions@v5
+
+      - name: Install Pulumi Python deps
+        working-directory: infra/pulumi
+        run: |
+          python -m venv venv
+          venv/bin/pip install -r requirements.txt
+
+      - name: Pulumi up
+        working-directory: infra/pulumi
+        env:
+          PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}
+        run: |
+          pulumi login "$PULUMI_BACKEND_URL"
+          pulumi stack select prod
+          pulumi up --yes --skip-preview
+
+      - name: Verify deploy
+        run: |
+          URL=$(aws lambda get-function-url-config --function-name pmproxy --query 'FunctionUrl' --output text)
+          echo "Deployed Lambda URL: $URL"
+          curl -sf "${URL}health" | tee /dev/stderr
