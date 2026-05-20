@@ -150,23 +150,13 @@ def on_tick(ctx: Context) -> list[Signal]:
         if excluded:
             continue
 
-        # Filter by liquidity (if available) - explicit Option handling
-        liquidity = market.liquidity
-        if liquidity is not None:
-            if liquidity < MIN_LIQUIDITY:
-                continue
-
-        # Skip if no end date
-        if market.end_date is None:
+        # Filter by liquidity (if available)
+        if market.liquidity is not None and market.liquidity < MIN_LIQUIDITY:
             continue
 
-        # Check if expiring soon - explicit Option unwrap
+        # Check if expiring soon
         hours_left = market.hours_until_expiry
-        if hours_left is None:
-            continue
-        if hours_left < 0.0:
-            continue
-        if hours_left > MAX_HOURS_TO_EXPIRY:
+        if hours_left is None or hours_left < 0.0 or hours_left > MAX_HOURS_TO_EXPIRY:
             continue
 
         # Get order book - explicit Option unwrap

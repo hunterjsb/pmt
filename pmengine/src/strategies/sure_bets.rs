@@ -60,23 +60,11 @@ impl Strategy for SureBets {
             if excluded {
                 continue;
             }
-            let liquidity = market.liquidity;
-            if let Some(liquidity) = liquidity {
-                if liquidity < MIN_LIQUIDITY {
-                    continue;
-                }
-            }
-            if market.end_date.is_none() {
+            if (market.liquidity.is_some() && market.liquidity.map(|v| v < MIN_LIQUIDITY).unwrap_or(false)) {
                 continue;
             }
-            let hours_left = match market.hours_until_expiry {
-                Some(v) => v,
-                None => continue,
-            };
-            if hours_left < 0.0 {
-                continue;
-            }
-            if hours_left > MAX_HOURS_TO_EXPIRY {
+            let hours_left = market.hours_until_expiry;
+            if (hours_left.is_none() || hours_left.map(|v| v < 0.0).unwrap_or(false) || hours_left.map(|v| v > MAX_HOURS_TO_EXPIRY).unwrap_or(false)) {
                 continue;
             }
             let book = match ctx.order_books.get(token_id) {

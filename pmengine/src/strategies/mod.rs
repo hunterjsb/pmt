@@ -3,6 +3,8 @@
 
 mod dynamic_market_maker;
 mod market_maker;
+mod naughty;
+mod naughty_var;
 mod order_test;
 mod spread_watcher;
 mod sure_bets;
@@ -12,6 +14,8 @@ use crate::strategy::Strategy;
 
 pub use dynamic_market_maker::DynamicMarketMaker;
 pub use market_maker::MarketMaker;
+pub use naughty::Naughty;
+pub use naughty_var::NaughtyVar;
 pub use order_test::OrderTest;
 pub use spread_watcher::SpreadWatcher;
 pub use sure_bets::SureBets;
@@ -39,6 +43,16 @@ pub fn registry() -> HashMap<&'static str, StrategyInfo> {
     m.insert("market_maker", StrategyInfo {
         factory: || Box::new(market_maker::MarketMaker::new()),
         requires_market_discovery: false,
+    });
+
+    m.insert("naughty", StrategyInfo {
+        factory: || Box::new(naughty::Naughty::new()),
+        requires_market_discovery: true,
+    });
+
+    m.insert("naughty_var", StrategyInfo {
+        factory: || Box::new(naughty_var::NaughtyVar::new()),
+        requires_market_discovery: true,
     });
 
     m.insert("order_test", StrategyInfo {

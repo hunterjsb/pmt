@@ -58,6 +58,59 @@ def param_to_rust(name: str, value: Any) -> tuple[str, str]:
         return ("&str", f'"{value}"')
 
 
+def _get_source(func: Callable) -> str:
+    """Robustly get source code for a function, handling test environments.
+
+    Args:
+        func: The function to get source for
+
+    Returns:
+        The source code as a string
+
+    Raises:
+        OSError: If source cannot be retrieved
+    """
+    try:
+        return inspect.getsource(func)
+    except (OSError, TypeError):
+        # Fallback for some test environments where inspect fails
+        import os
+        filename = getattr(func, "__code__", None).co_filename if hasattr(func, "__code__") else None
+        func_name = getattr(func, "__name__", None)
+
+        if filename and func_name:
+            # Try to resolve the filename
+            file_path = Path(filename)
+            content = None
+            
+            if not file_path.exists():
+                # Try relative to current working directory if it's a relative path
+                # Or try to fix the common 'Desktop/pmt' vs 'Desktop/code/pmt' mismatch
+                alt_path = Path(str(file_path).replace("Desktop/pmt", "Desktop/code/pmt"))
+                if alt_path.exists():
+                    file_path = alt_path
+
+            if file_path.exists():
+                content = file_path.read_text()
+
+            if content:
+                # Parse the whole file and find the specific function
+                tree = ast.parse(content)
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.FunctionDef) and node.name == func_name:
+                        # Found it! Extract lines
+                        lines = content.splitlines()
+                        # ast nodes have 1-based lineno
+                        # We also want to include decorators
+                        start_lineno = node.lineno
+                        if node.decorator_list:
+                            start_lineno = min(d.lineno for d in node.decorator_list)
+
+                        return "\n".join(lines[start_lineno-1:node.end_lineno])
+
+        raise OSError("Could not get source code for function")
+
+
 class TranspileError(Exception):
     """Error raised when transpilation fails due to unsupported patterns."""
 
@@ -348,7 +401,11 @@ def validate_strategy(func: Callable) -> tuple[list[ValidationError], list[Valid
     if meta is None:
         return [ValidationError("Function is not decorated with @strategy", None)], []
 
-    source = inspect.getsource(func)
+    try:
+        source = _get_source(meta.on_tick)
+    except OSError as e:
+        return [ValidationError(str(e), None)], []
+
     # Dedent the source to handle nested functions
     source = textwrap.dedent(source)
 
@@ -453,7 +510,7 @@ class RustCodeGen:
     def generate(self) -> str:
         """Generate complete Rust module for the strategy."""
         # Get source and parse
-        source = inspect.getsource(self.meta.on_tick)
+        source = _get_source(self.meta.on_tick)
         # Dedent to handle indented functions
         source = textwrap.dedent(source)
         tree = ast.parse(source)
@@ -893,6 +950,10 @@ impl Strategy for {self.struct_name} {{
             if self._is_string_type(stmt.value):
                 self.string_vars.add(var_name)
 
+            # Track if this variable is an Option type
+            if self._is_option_node(stmt.value):
+                self.option_vars.add(var_name)
+
             if var_name in self.declared_vars:
                 # Reassignment - no let keyword
                 return f"{self._indent()}{target} = {value};"
@@ -1320,7 +1381,18 @@ impl Strategy for {self.struct_name} {{
 
         return f"{obj}.{attr}"
 
+    def _is_option_node(self, node: ast.AST) -> bool:
+        """Check if an AST node represents an Option type that needs unwrapping."""
+        if isinstance(node, ast.Attribute):
+            return node.attr in (self.OPTION_LEVEL_ATTRS | self.OPTION_DECIMAL_ATTRS | self.MARKET_OPTION_ATTRS)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            return node.func.attr in (self.OPTION_LEVEL_ATTRS | self.OPTION_DECIMAL_ATTRS)
+        if isinstance(node, ast.Name):
+            return node.id in self.option_vars
+        return False
+
     def _gen_compare(self, expr: ast.Compare) -> str:
+        left_is_option = self._is_option_node(expr.left)
         left = self._gen_expr(expr.left)
 
         # Handle "x is None" / "x is not None" patterns
@@ -1348,6 +1420,24 @@ impl Strategy for {self.struct_name} {{
             elif isinstance(op, ast.NotIn):
                 right = self._gen_expr(comp)
                 return f"!{right}.contains({left})"
+
+        # If it's an Option being compared to a non-None value, automatically unwrap it
+        if left_is_option:
+            # We use unwrap_or() with a safe default.
+            # For LT/LTE: use a large value if None (so it's false)
+            # For GT/GTE: use a small value if None (so it's false)
+            # For EQ: unwrap normally and compare Some(v) == v (which Rust supports for some types)
+            # Actually, the most robust is: left.map(|v| v <op> right).unwrap_or(false)
+            op = expr.ops[0]
+            op_str = self._gen_cmpop(op)
+            right = self._gen_expr(expr.comparators[0])
+            
+            # If the attribute is a Level, we need .price
+            unwrap_val = "v"
+            if isinstance(expr.left, ast.Attribute) and expr.left.attr in self.OPTION_LEVEL_ATTRS:
+                unwrap_val = "v.price"
+                
+            return f"{left}.map(|v| {unwrap_val} {op_str} {right}).unwrap_or(false)"
 
         parts = [left]
         for op, comparator in zip(expr.ops, expr.comparators):
