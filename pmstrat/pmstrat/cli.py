@@ -174,60 +174,68 @@ def run_scan(args: list[str]):
             i += 1
 
     try:
-        # Fetch markets from Gamma API
+        # Fetch active events (events have the most up-to-date market data)
         response = httpx.get(
-            "https://gamma-api.polymarket.com/markets",
-            params={"closed": "false", "limit": 500},
+            "https://gamma-api.polymarket.com/events",
+            params={"closed": "false", "active": "true", "limit": 100},
             timeout=30,
         )
         response.raise_for_status()
-        markets = response.json()
+        events = response.json()
 
         now = datetime.now(timezone.utc)
         opportunities = []
 
-        for m in markets:
-            end_date = m.get("endDate")
-            if not end_date:
-                continue
-
-            # Parse end date
-            try:
-                if end_date.endswith("Z"):
-                    end_date = end_date[:-1] + "+00:00"
-                end_dt = datetime.fromisoformat(end_date)
-                hours_left = (end_dt - now).total_seconds() / 3600
-            except (ValueError, AttributeError):
-                continue
-
-            if hours_left < 0 or hours_left > max_hours:
-                continue
-
-            # Check outcome prices (these come as JSON strings from API)
-            outcomes_raw = m.get("outcomes", "[]")
-            prices_raw = m.get("outcomePrices", "[]")
-
-            try:
-                outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-                prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-            except json.JSONDecodeError:
-                continue
-
-            for i, price_str in enumerate(prices or []):
-                try:
-                    price_pct = float(price_str) * 100
-                except (ValueError, TypeError):
+        for e in events:
+            # Each event has a list of markets
+            for m in e.get("markets", []) or []:
+                if m.get("closed") or not m.get("active"):
                     continue
 
-                if price_pct >= min_price:
-                    exp_return = (100.0 - price_pct) / price_pct * 100
-                    opportunities.append({
-                        "question": m.get("question", "Unknown"),
-                        "outcome": outcomes[i] if i < len(outcomes) else "Unknown",
-                        "price_pct": price_pct,
-                        "hours_left": hours_left,
-                        "expected_return": exp_return,
-                    })
+                end_date = m.get("endDate")
+                if not end_date:
+                    continue
+
+                # Parse end date
+                try:
+                    if end_date.endswith("Z"):
+                        end_date = end_date[:-1] + "+00:00"
+                    end_dt = datetime.fromisoformat(end_date)
+                    hours_left = (end_dt - now).total_seconds() / 3600
+                except (ValueError, AttributeError):
+                    continue
+
+                if hours_left < -1 or hours_left > max_hours:
+                    continue
+
+                # Check outcome prices
+                outcomes_raw = m.get("outcomes", "[]")
+                prices_raw = m.get("outcomePrices", "[]")
+
+                try:
+                    outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+                    prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+                except json.JSONDecodeError:
+                    continue
+                
+                if not prices:
+                    continue
+
+                for i, price_str in enumerate(prices):
+                    try:
+                        price_pct = float(price_str) * 100
+                    except (ValueError, TypeError):
+                        continue
+
+                    if price_pct >= min_price and price_pct < 100.0:
+                        exp_return = (100.0 - price_pct) / price_pct * 100
+                        opportunities.append({
+                            "question": m.get("question", "Unknown"),
+                            "outcome": outcomes[i] if i < len(outcomes) else "Unknown",
+                            "price_pct": price_pct,
+                            "hours_left": hours_left,
+                            "expected_return": exp_return,
+                        })
 
         # Sort by expected return
         opportunities.sort(key=lambda x: x["expected_return"], reverse=True)
