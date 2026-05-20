@@ -165,3 +165,74 @@ impl Strategy for WhoMonitor {
     fn on_fill(&mut self, _fill: &Fill) {}
     fn on_shutdown(&mut self) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rss(items: &[(&str, &str)]) -> String {
+        let items_xml: String = items
+            .iter()
+            .map(|(title, desc)| {
+                format!(
+                    "<item><title>{}</title><description>{}</description></item>",
+                    title, desc
+                )
+            })
+            .collect();
+        format!("<rss><channel>{}</channel></rss>", items_xml)
+    }
+
+    #[test]
+    fn matches_hantavirus_in_title() {
+        let body = rss(&[("Hantavirus outbreak update — China", "Several cases confirmed.")]);
+        assert_eq!(
+            first_matching_item_title(&body),
+            Some("Hantavirus outbreak update — China".into())
+        );
+    }
+
+    #[test]
+    fn matches_hantavirus_in_description() {
+        let body = rss(&[("Disease Outbreak News", "Hantavirus cases reported in three provinces.")]);
+        assert!(first_matching_item_title(&body).is_some());
+    }
+
+    #[test]
+    fn no_match_for_unrelated_outbreak() {
+        let body = rss(&[("Ebola update — DRC", "Ongoing response in Équateur province.")]);
+        assert_eq!(first_matching_item_title(&body), None);
+    }
+
+    #[test]
+    fn returns_first_matching_item() {
+        let body = rss(&[
+            ("Influenza surveillance", "Seasonal flu activity."),
+            ("Hantavirus — Republic of Korea", "Rodent-borne cases confirmed."),
+            ("Hantavirus follow-up", "Second report."),
+        ]);
+        assert_eq!(
+            first_matching_item_title(&body),
+            Some("Hantavirus — Republic of Korea".into())
+        );
+    }
+
+    #[test]
+    fn case_insensitive_match() {
+        let body = rss(&[("HANTAVIRUS PANDEMIC DECLARED", "Global alert issued.")]);
+        assert!(first_matching_item_title(&body).is_some());
+    }
+
+    #[test]
+    fn extract_tag_basic() {
+        assert_eq!(
+            extract_tag("<item><title>Hello</title></item>", "title"),
+            Some("Hello".into())
+        );
+    }
+
+    #[test]
+    fn extract_tag_missing() {
+        assert_eq!(extract_tag("<item><desc>x</desc></item>", "title"), None);
+    }
+}
