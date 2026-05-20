@@ -6,6 +6,7 @@ mod market_maker;
 mod order_test;
 mod spread_watcher;
 mod sure_bets;
+pub mod who_monitor;
 
 use std::collections::HashMap;
 use crate::strategy::Strategy;
@@ -15,6 +16,7 @@ pub use market_maker::MarketMaker;
 pub use order_test::OrderTest;
 pub use spread_watcher::SpreadWatcher;
 pub use sure_bets::SureBets;
+pub use who_monitor::WhoMonitor;
 
 /// Information about a strategy in the registry.
 pub struct StrategyInfo {
@@ -54,6 +56,11 @@ pub fn registry() -> HashMap<&'static str, StrategyInfo> {
     m.insert("sure_bets", StrategyInfo {
         factory: || Box::new(sure_bets::SureBets::new()),
         requires_market_discovery: true,
+    });
+
+    m.insert("who_monitor", StrategyInfo {
+        factory: || Box::new(who_monitor::WhoMonitor::new()),
+        requires_market_discovery: false,
     });
 
     m
