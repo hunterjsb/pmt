@@ -1,10 +1,8 @@
 """GitHub Actions OIDC trust for CI-driven Lambda deploys.
 
 Creates an OIDC provider (one per AWS account) and a single IAM role that GitHub
-Actions can assume to:
-  - Update the pmproxy Lambda function code
-  - Read/write the Pulumi state bucket
-  - Read CloudWatch log groups
+Actions can assume to push new pmproxy Lambda code via
+`aws lambda update-function-code`. Pulumi-managed infra changes stay manual.
 
 Trust is scoped to this repo only, on master pushes and pmproxy-v* tags.
 """
@@ -15,7 +13,6 @@ import pulumi
 import pulumi_aws as aws
 
 REPO = "hunterjsb/pmt"
-PULUMI_STATE_BUCKET = "pmt-pulumi-state-350985642081-euw1"
 
 # OIDC provider for GitHub Actions. One per AWS account; safe to import if pre-existing.
 oidc_provider = aws.iam.OpenIdConnectProvider(
@@ -62,8 +59,9 @@ ci_role = aws.iam.Role(
     assume_role_policy=trust_policy,
 )
 
-# Permissions: Lambda update on the pmproxy function, S3 R/W on Pulumi state bucket,
-# IAM PassRole for the Lambda exec role, CloudWatch log read.
+# Permissions for code-only CI deploys via `aws lambda update-function-code`.
+# CI does NOT run Pulumi (config changes stay manual), so this role has no S3
+# state-bucket access, no IAM PassRole, no IAM/Logs/Budget reads.
 deploy_policy = aws.iam.RolePolicy(
     "pmproxy-ci-deploy-policy",
     role=ci_role.id,
@@ -72,94 +70,18 @@ deploy_policy = aws.iam.RolePolicy(
             "Version": "2012-10-17",
             "Statement": [
                 {
-                    "Sid": "LambdaManage",
+                    "Sid": "LambdaCodeDeploy",
                     "Effect": "Allow",
                     "Action": [
-                        # Reads (Pulumi provider performs these during refresh)
+                        # Read for the verify + wait steps
                         "lambda:GetFunction",
                         "lambda:GetFunctionConfiguration",
                         "lambda:GetFunctionUrlConfig",
-                        "lambda:GetFunctionCodeSigningConfig",
-                        "lambda:GetFunctionEventInvokeConfig",
-                        "lambda:GetFunctionConcurrency",
-                        "lambda:GetPolicy",
-                        "lambda:GetAlias",
-                        "lambda:ListVersionsByFunction",
-                        "lambda:ListAliases",
-                        "lambda:ListTags",
-                        "lambda:ListFunctionUrlConfigs",
-                        "lambda:ListFunctionEventInvokeConfigs",
-                        # Mutations
+                        # Mutate (only the code, plus publish a version)
                         "lambda:UpdateFunctionCode",
-                        "lambda:UpdateFunctionConfiguration",
-                        "lambda:UpdateFunctionUrlConfig",
                         "lambda:PublishVersion",
-                        "lambda:PutFunctionConcurrency",
-                        "lambda:AddPermission",
-                        "lambda:RemovePermission",
-                        "lambda:TagResource",
-                        "lambda:UntagResource",
                     ],
-                    "Resource": "arn:aws:lambda:eu-west-1:350985642081:function:pmproxy*",
-                },
-                {
-                    "Sid": "PulumiStateBucket",
-                    "Effect": "Allow",
-                    "Action": [
-                        "s3:GetObject",
-                        "s3:PutObject",
-                        "s3:DeleteObject",
-                        "s3:ListBucket",
-                        "s3:GetBucketLocation",
-                    ],
-                    "Resource": [
-                        f"arn:aws:s3:::{PULUMI_STATE_BUCKET}",
-                        f"arn:aws:s3:::{PULUMI_STATE_BUCKET}/*",
-                    ],
-                },
-                {
-                    "Sid": "PassLambdaExecRole",
-                    "Effect": "Allow",
-                    "Action": "iam:PassRole",
-                    "Resource": "arn:aws:iam::350985642081:role/pmproxy-lambda-role",
-                },
-                {
-                    "Sid": "ReadIamForPulumiRefresh",
-                    "Effect": "Allow",
-                    "Action": [
-                        "iam:GetRole",
-                        "iam:GetRolePolicy",
-                        "iam:ListAttachedRolePolicies",
-                        "iam:GetOpenIDConnectProvider",
-                    ],
-                    "Resource": "*",
-                },
-                {
-                    "Sid": "ReadLogGroup",
-                    "Effect": "Allow",
-                    "Action": [
-                        "logs:DescribeLogGroups",
-                        "logs:DescribeLogStreams",
-                    ],
-                    "Resource": "*",
-                },
-                {
-                    "Sid": "ReadCloudWatchAlarms",
-                    "Effect": "Allow",
-                    "Action": [
-                        "cloudwatch:DescribeAlarms",
-                        "cloudwatch:GetMetricStatistics",
-                    ],
-                    "Resource": "*",
-                },
-                {
-                    "Sid": "ReadBudgets",
-                    "Effect": "Allow",
-                    "Action": [
-                        "budgets:DescribeBudget",
-                        "budgets:ViewBudget",
-                    ],
-                    "Resource": "*",
+                    "Resource": "arn:aws:lambda:eu-west-1:350985642081:function:pmproxy",
                 },
             ],
         }
