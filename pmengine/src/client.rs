@@ -16,10 +16,10 @@ use alloy::signers::Signer;
 use base64::engine::general_purpose::URL_SAFE;
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use polymarket_client_sdk::auth::Credentials;
-use polymarket_client_sdk::clob::client::{Client, Config as SdkConfig};
-use polymarket_client_sdk::clob::types::{Side as SdkSide, SignatureType};
-use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk_v2::auth::Credentials;
+use polymarket_client_sdk_v2::clob::client::{Client, Config as SdkConfig};
+use polymarket_client_sdk_v2::clob::types::{Side as SdkSide, SignatureType};
+use polymarket_client_sdk_v2::POLYGON;
 use reqwest::header::{HeaderMap, HeaderValue};
 use rust_decimal::Decimal;
 use secrecy::ExposeSecret;
@@ -35,7 +35,7 @@ use crate::cognito::CognitoAuth;
 /// Authenticated Polymarket client.
 pub struct PolymarketClient {
     /// SDK client for order building/signing
-    inner: Client<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>,
+    inner: Client<polymarket_client_sdk_v2::auth::state::Authenticated<polymarket_client_sdk_v2::auth::Normal>>,
     /// Signer for order signatures
     signer: LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
     /// L2 credentials from derive-api-key

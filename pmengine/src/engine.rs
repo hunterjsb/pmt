@@ -13,8 +13,8 @@ use crate::strategy::{DummyStrategy, MarketInfo, Signal, StrategyContext, Strate
 use crate::cognito::create_cognito_auth;
 
 use futures::StreamExt;
-use polymarket_client_sdk::clob::ws::Client as WsClient;
-use polymarket_client_sdk::types::U256;
+use polymarket_client_sdk_v2::clob::ws::Client as WsClient;
+use polymarket_client_sdk_v2::types::U256;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::pin::Pin;

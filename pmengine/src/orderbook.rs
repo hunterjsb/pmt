@@ -4,7 +4,7 @@
 //! broadcast channels for market data distribution.
 
 use async_broadcast::{Receiver, Sender};
-use polymarket_client_sdk::clob::ws::types::response::{BookUpdate, OrderBookLevel};
+use polymarket_client_sdk_v2::clob::ws::types::response::{BookUpdate, OrderBookLevel};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;

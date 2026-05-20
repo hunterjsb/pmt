@@ -6,7 +6,7 @@ description = "Rust HFT engine for Polymarket trading"
 
 [dependencies]
 # Polymarket official SDK
-polymarket-client-sdk = { version = "0.4", features = ["clob", "ws", "data"] }
+polymarket_client_sdk_v2 = { version = "0.6.0-canary.1", features = ["clob", "data", "gamma", "ws"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
