@@ -36,6 +36,10 @@ impl Strategy for SpreadWatcher {
         self.tokens.clone()
     }
 
+    fn tick_interval_ms(&self) -> u64 {
+        1000
+    }
+
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
         let token = "41583919731714354912849507182398941127545694257513505398713274521520484370640".to_string();
         let mut signals = vec![];

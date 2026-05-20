@@ -135,6 +135,17 @@ pub trait Strategy: Send + Sync {
     /// Token IDs this strategy wants to subscribe to.
     fn subscriptions(&self) -> Vec<String>;
 
+    /// Minimum interval between `on_tick` calls for this strategy, in
+    /// milliseconds. The engine's global tick may fire more frequently;
+    /// `StrategyRuntime` skips calls that arrive sooner than this interval.
+    ///
+    /// Default is 1000ms — strategies declaring a larger interval (e.g.
+    /// market makers that re-quote every 10s) just override this and the
+    /// runtime won't waste API calls in between.
+    fn tick_interval_ms(&self) -> u64 {
+        1000
+    }
+
     /// Called on each tick with current market state.
     /// Returns signals for order management.
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal>;
@@ -149,19 +160,28 @@ pub trait Strategy: Send + Sync {
 /// Runtime for executing multiple strategies.
 pub struct StrategyRuntime {
     strategies: Vec<Box<dyn Strategy>>,
+    /// Last `on_tick` invocation time per strategy index. Used to gate calls
+    /// by each strategy's declared `tick_interval_ms`.
+    last_tick_at: Vec<Option<std::time::Instant>>,
 }
 
 impl StrategyRuntime {
     pub fn new() -> Self {
         Self {
             strategies: Vec::new(),
+            last_tick_at: Vec::new(),
         }
     }
 
     /// Register a strategy.
     pub fn register(&mut self, strategy: Box<dyn Strategy>) {
-        tracing::info!(strategy_id = strategy.id(), "Registering strategy");
+        tracing::info!(
+            strategy_id = strategy.id(),
+            tick_interval_ms = strategy.tick_interval_ms(),
+            "Registering strategy"
+        );
         self.strategies.push(strategy);
+        self.last_tick_at.push(None);
     }
 
     /// Get all token subscriptions from all strategies.
@@ -176,10 +196,25 @@ impl StrategyRuntime {
         subs
     }
 
-    /// Run all strategies and collect signals.
+    /// Run all strategies that are due for a tick and collect signals.
+    ///
+    /// Each strategy is only invoked if at least its declared
+    /// `tick_interval_ms` has elapsed since its last call. The engine's
+    /// global tick may fire faster — strategies declaring slower cadences
+    /// (e.g. market makers re-quoting every 10s) won't churn API calls.
     pub fn tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
         let mut all_signals = Vec::new();
-        for strategy in &mut self.strategies {
+        let now = std::time::Instant::now();
+        for (i, strategy) in self.strategies.iter_mut().enumerate() {
+            let interval = std::time::Duration::from_millis(strategy.tick_interval_ms());
+            let due = match self.last_tick_at[i] {
+                None => true,
+                Some(t) => now.duration_since(t) >= interval,
+            };
+            if !due {
+                continue;
+            }
+            self.last_tick_at[i] = Some(now);
             let signals = strategy.on_tick(ctx);
             for signal in signals {
                 tracing::debug!(strategy_id = strategy.id(), ?signal, "Strategy signal");

@@ -525,6 +525,9 @@ class RustCodeGen:
         # Generate constants from params
         constants = self._generate_constants()
 
+        # Per-strategy tick cadence pulled straight from the @strategy decorator.
+        tick_interval_ms = self.meta.tick_interval_ms
+
         return f'''//! Auto-generated from Python strategy: {self.meta.name}
 //! DO NOT EDIT - regenerate with `pmstrat transpile`
 
@@ -561,6 +564,10 @@ impl Strategy for {self.struct_name} {{
 
     fn subscriptions(&self) -> Vec<String> {{
         self.tokens.clone()
+    }}
+
+    fn tick_interval_ms(&self) -> u64 {{
+        {tick_interval_ms}
     }}
 
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {{

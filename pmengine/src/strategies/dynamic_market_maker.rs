@@ -50,6 +50,10 @@ impl Strategy for DynamicMarketMaker {
         self.tokens.clone()
     }
 
+    fn tick_interval_ms(&self) -> u64 {
+        10000
+    }
+
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
         let mut signals = vec![];
         let mut tokens_quoted = 0;

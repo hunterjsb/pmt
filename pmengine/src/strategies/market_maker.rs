@@ -44,6 +44,10 @@ impl Strategy for MarketMaker {
         self.tokens.clone()
     }
 
+    fn tick_interval_ms(&self) -> u64 {
+        5000
+    }
+
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
         let mut signals = vec![];
         let token_id = TOKEN_ID;

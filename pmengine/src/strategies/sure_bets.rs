@@ -47,6 +47,10 @@ impl Strategy for SureBets {
         self.tokens.clone()
     }
 
+    fn tick_interval_ms(&self) -> u64 {
+        60000
+    }
+
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
         let mut signals = vec![];
         for (token_id, market) in ctx.markets.iter() {

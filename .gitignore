@@ -211,3 +211,4 @@ sandbox/
 
 # Infrastructure secrets (SSH keys, deploy scripts)
 .infra/
+logs/
