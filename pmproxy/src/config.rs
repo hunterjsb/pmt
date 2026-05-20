@@ -62,6 +62,10 @@ pub struct ProxyConfig {
 
     /// Default burst allowance for unknown tiers.
     pub rate_limit_burst: u32,
+
+    /// Shared secret for the /alerts/who webhook endpoint.
+    /// If None, the endpoint is unauthenticated (not recommended in production).
+    pub who_alert_token: Option<String>,
 }
 
 impl ProxyConfig {
@@ -83,6 +87,7 @@ impl ProxyConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20),
+            who_alert_token: env::var("WHO_ALERT_TOKEN").ok(),
         }
     }
 

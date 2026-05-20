@@ -22,8 +22,10 @@ import json
 import os
 import re
 import sys
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import click
 import requests
@@ -456,6 +458,77 @@ def book(token: str) -> None:
     for p, sz in bids:
         t.add_row("BID", f"${p:.4f}", f"{sz:.2f}", f"${p*sz:.2f}")
     console.print(t)
+
+
+_WHO_DON_RSS = "https://www.who.int/feeds/entity/csr/don/en/rss.xml"
+_DEFAULT_KEYWORDS = ["hantavirus", "pandemic", "pheic", "outbreak"]
+
+
+@cli.command()
+@click.option("--keywords", default=None, help="Comma-separated keywords to filter (default: hantavirus,pandemic,pheic,outbreak)")
+@click.option("--days", default=30, type=int, help="Only show items from last N days (default 30)")
+@click.option("--all", "show_all", is_flag=True, help="Show all items, no keyword filter")
+def who(keywords: str | None, days: int, show_all: bool) -> None:
+    """Check WHO Disease Outbreak News for hantavirus / pandemic alerts.
+
+    Fetches the WHO DON RSS feed and filters for relevant items. Run this
+    manually as a sanity check; for real-time alerts wire the feed to a
+    webhook service (Zapier, Make, etc.) pointed at POST /alerts/who on pmproxy.
+    """
+    kws = (
+        [k.strip().lower() for k in keywords.split(",")]
+        if keywords
+        else _DEFAULT_KEYWORDS
+    )
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+
+    try:
+        r = requests.get(_WHO_DON_RSS, headers=UA, timeout=10)
+        r.raise_for_status()
+    except Exception as exc:
+        console.print(f"[red]Failed to fetch WHO RSS: {exc}[/red]")
+        sys.exit(1)
+
+    try:
+        root = ET.fromstring(r.text)
+    except ET.ParseError as exc:
+        console.print(f"[red]Failed to parse WHO RSS: {exc}[/red]")
+        sys.exit(1)
+
+    items = root.findall(".//item")
+    hits = []
+    for item in items:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub_str = (item.findtext("pubDate") or "").strip()
+        desc = (item.findtext("description") or "").strip()
+
+        try:
+            pub = parsedate_to_datetime(pub_str).astimezone(timezone.utc) if pub_str else None
+        except Exception:
+            pub = None
+
+        if pub and pub < cutoff:
+            continue
+
+        text = f"{title} {desc}".lower()
+        matched = show_all or any(kw in text for kw in kws)
+        if matched:
+            hits.append({"title": title, "link": link, "pub": pub, "desc": desc[:120]})
+
+    if not hits:
+        console.print(f"[dim]No WHO DON items matching {kws} in the last {days} days.[/dim]")
+        return
+
+    t = Table(title=f"WHO Disease Outbreak News — last {days}d", show_lines=True)
+    for col in ("Date", "Title", "Link"):
+        t.add_column(col)
+    for h in hits:
+        date_str = h["pub"].strftime("%Y-%m-%d") if h["pub"] else "?"
+        t.add_row(date_str, h["title"], h["link"])
+    console.print(t)
+    if any("hantavirus" in h["title"].lower() for h in hits):
+        console.print("[bold red]HANTAVIRUS MENTION — review pandemic NO position immediately.[/bold red]")
 
 
 if __name__ == "__main__":

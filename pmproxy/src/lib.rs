@@ -20,11 +20,12 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
+use serde::Deserialize;
 use tracing::{debug, error, info};
 
 use auth::{extract_bearer_token, AuthenticatedTenant, JwksCache};
@@ -43,6 +44,8 @@ pub struct ProxyState {
     pub rate_limiter: Option<Arc<TenantRateLimiter>>,
     /// Whether authentication is enabled.
     pub auth_enabled: bool,
+    /// Shared secret for the /alerts/who webhook (None = unauthenticated).
+    pub who_alert_token: Option<String>,
 }
 
 impl ProxyState {
@@ -56,6 +59,7 @@ impl ProxyState {
             jwks_cache: None,
             rate_limiter: None,
             auth_enabled: false,
+            who_alert_token: None,
         })
     }
 
@@ -71,6 +75,7 @@ impl ProxyState {
                 jwks_cache: Some(Arc::new(JwksCache::new(config))),
                 rate_limiter: Some(Arc::new(TenantRateLimiter::new(config))),
                 auth_enabled: true,
+                who_alert_token: config.who_alert_token.clone(),
             })
         } else {
             Ok(Self {
@@ -78,6 +83,7 @@ impl ProxyState {
                 jwks_cache: None,
                 rate_limiter: None,
                 auth_enabled: false,
+                who_alert_token: config.who_alert_token.clone(),
             })
         }
     }
@@ -102,6 +108,7 @@ pub fn build_router(state: Arc<ProxyState>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/badge", get(badge_handler))
+        .route("/alerts/who", post(who_alert_handler))
         .fallback(proxy_handler)
         .with_state(state)
 }
@@ -123,6 +130,53 @@ pub async fn badge_handler() -> impl IntoResponse {
         .body(Body::from(
             r#"{"schemaVersion":1,"label":"pmproxy","message":"online","color":"brightgreen"}"#,
         ))
+        .unwrap()
+}
+
+/// Incoming payload from a WHO RSS-to-webhook bridge (Zapier, Make, etc.)
+#[derive(Debug, Deserialize)]
+pub struct WhoAlertPayload {
+    pub title: String,
+    pub url: Option<String>,
+    pub summary: Option<String>,
+}
+
+/// Receive a WHO Disease Outbreak News alert via webhook.
+///
+/// Set WHO_ALERT_TOKEN in Lambda env and send `X-Alert-Token: <token>` in the
+/// webhook request to protect this endpoint. Without the env var, the endpoint
+/// accepts any POST (useful during initial setup/testing).
+pub async fn who_alert_handler(
+    State(state): State<Arc<ProxyState>>,
+    headers: HeaderMap,
+    Json(payload): Json<WhoAlertPayload>,
+) -> impl IntoResponse {
+    // Validate shared secret if configured.
+    if let Some(ref expected) = state.who_alert_token {
+        let provided = headers
+            .get("x-alert-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if provided != expected {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"error":"invalid token"}"#))
+                .unwrap();
+        }
+    }
+
+    tracing::warn!(
+        title = %payload.title,
+        url = %payload.url.as_deref().unwrap_or(""),
+        summary = %payload.summary.as_deref().unwrap_or(""),
+        "WHO ALERT RECEIVED — review hantavirus positions"
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"status":"received"}"#))
         .unwrap()
 }
 
@@ -343,6 +397,7 @@ mod tests {
             cognito_client_id: None,
             rate_limit_rpm: 100,
             rate_limit_burst: 20,
+            who_alert_token: None,
         };
 
         let state = ProxyState::with_auth(&config).unwrap();
@@ -360,6 +415,7 @@ mod tests {
             cognito_client_id: Some("client123".to_string()),
             rate_limit_rpm: 100,
             rate_limit_burst: 20,
+            who_alert_token: None,
         };
 
         let state = ProxyState::with_auth(&config).unwrap();
