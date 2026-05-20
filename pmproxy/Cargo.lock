@@ -84,17 +84,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-trait"
-version = "0.1.89"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -862,7 +851,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper",
- "lambda_runtime 0.13.0",
+ "lambda_runtime",
  "mime",
  "percent-encoding",
  "pin-project-lite",
@@ -889,7 +878,7 @@ dependencies = [
  "http-serde",
  "hyper",
  "hyper-util",
- "lambda_runtime_api_client 0.11.1",
+ "lambda_runtime_api_client",
  "pin-project",
  "serde",
  "serde_json",
@@ -898,31 +887,6 @@ dependencies = [
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",
- "tracing",
-]
-
-[[package]]
-name = "lambda_runtime"
-version = "0.14.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edb1a631df22d6d81314268a94fda06ab15b3fa1fcea660e7c5c162caa8fba6b"
-dependencies = [
- "async-stream",
- "base64",
- "bytes",
- "futures",
- "http",
- "http-body-util",
- "http-serde",
- "hyper",
- "lambda_runtime_api_client 0.12.4",
- "pin-project",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "tokio",
- "tokio-stream",
- "tower 0.5.2",
  "tracing",
 ]
 
@@ -943,25 +907,6 @@ dependencies = [
  "tokio",
  "tower 0.4.13",
  "tower-service",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "lambda_runtime_api_client"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd3ccfa59944d61c20b98892c84d9e0e8118d722a75beaebe68e69db36b4afe1"
-dependencies = [
- "bytes",
- "futures-channel",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "tower 0.5.2",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1185,7 +1130,6 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 name = "pmproxy"
 version = "0.4.0"
 dependencies = [
- "async-trait",
  "axum",
  "clap",
  "dashmap 6.1.0",
@@ -1193,14 +1137,11 @@ dependencies = [
  "governor",
  "jsonwebtoken",
  "lambda_http",
- "lambda_runtime 0.14.4",
  "reqwest",
  "serde",
- "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite 0.24.0",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1919,20 +1860,6 @@ dependencies = [
  "log",
  "tokio",
  "tungstenite 0.28.0",
-]
-
-[[package]]
-name = "tokio-util"
-version = "0.7.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
-dependencies = [
- "bytes",
- "futures-core",
- "futures-sink",
- "pin-project-lite",
- "slab",
- "tokio",
 ]
 
 [[package]]

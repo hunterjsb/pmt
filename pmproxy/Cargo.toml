@@ -25,7 +25,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # JWT authentication
 jsonwebtoken = "9"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
 # Rate limiting
 governor = "0.6"
@@ -34,22 +33,17 @@ dashmap = "6"
 # Error handling
 thiserror = "1"
 
-# Async utilities
-async-trait = "0.1"
-tokio-util = { version = "0.7", features = ["time"] }
-
 # Config (EC2 only)
 clap = { version = "4", features = ["derive"], optional = true }
 
 # Lambda runtime
 lambda_http = { version = "0.14", optional = true }
-lambda_runtime = { version = "0.14", optional = true }
 
 [features]
 default = ["ec2"]
 ec2 = ["clap", "ws"]
 ws = ["tokio-tungstenite", "futures-util"]
-lambda = ["lambda_http", "lambda_runtime"]
+lambda = ["lambda_http"]
 
 [lib]
 name = "pmproxy"
