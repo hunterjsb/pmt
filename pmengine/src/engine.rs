@@ -48,6 +48,9 @@ pub struct Engine {
     ws_needs_reconnect: bool,
     /// Skip warmup period (useful when WS connection is unavailable)
     skip_warmup: bool,
+    /// Cached free USDC collateral balance, refreshed periodically by the
+    /// balance poller task. Surfaced to strategies via StrategyContext.
+    usdc_balance: Arc<tokio::sync::RwLock<Decimal>>,
 }
 
 impl Engine {
@@ -125,6 +128,7 @@ impl Engine {
             market_discovery_enabled: false,
             ws_needs_reconnect: false,
             skip_warmup: false,
+            usdc_balance: Arc::new(tokio::sync::RwLock::new(Decimal::ZERO)),
         })
     }
 
@@ -435,6 +439,32 @@ impl Engine {
             shutdown_tx.send(()).await.ok();
         });
 
+        // Spawn the USDC balance poller. Polymarket caches balance server-side
+        // so polling every 30s is plenty. Strategies read this through
+        // StrategyContext.usdc_balance to size against real cash and avoid the
+        // "not enough balance" rejects you get from over-quoting.
+        let balance_handle = {
+            let client = self.client.clone();
+            let balance = self.usdc_balance.clone();
+            tokio::spawn(async move {
+                // Fire one immediate fetch so the first tick has a real value.
+                let mut timer = tokio::time::interval(Duration::from_secs(30));
+                loop {
+                    timer.tick().await;
+                    match client.get_collateral_balance().await {
+                        Ok(b) => {
+                            let mut w = balance.write().await;
+                            if *w != b {
+                                tracing::info!(usdc_balance = %b, prev = %*w, "Balance updated");
+                                *w = b;
+                            }
+                        }
+                        Err(e) => tracing::debug!(error = %e, "Balance poll failed"),
+                    }
+                }
+            })
+        };
+
         // Spawn the REST book poller. Runs alongside the WebSocket subscription
         // so books stay current even when WS is unavailable (e.g. from a US IP
         // without a WS-capable proxy). Polls every book currently tracked by
@@ -613,8 +643,7 @@ impl Engine {
                             markets: self.market_info.clone(),
                             unrealized_pnl: self.positions.total_unrealized_pnl(),
                             realized_pnl: self.positions.total_realized_pnl(),
-                            // TODO: Fetch actual USDC balance from CTF contract via RPC
-                            usdc_balance: Decimal::ZERO,
+                            usdc_balance: *self.usdc_balance.read().await,
                         };
 
                         // Run strategies
@@ -852,7 +881,8 @@ impl Engine {
         }
 
         poller_handle.abort();
-        tracing::debug!("REST book poller stopped");
+        balance_handle.abort();
+        tracing::debug!("REST book poller + balance poller stopped");
 
         Ok(())
     }

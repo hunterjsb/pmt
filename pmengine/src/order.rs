@@ -194,7 +194,19 @@ impl OrderManager {
     }
 
     /// Process a fill from the exchange.
-    pub async fn process_fill(&mut self, order_id: &str, price: Decimal, size: Decimal) -> Result<(), OrderError> {
+    /// Process a fill event from the user-trades stream.
+    ///
+    /// `fee` is the realized trading fee in USDC (not basis points). Compute
+    /// it from the Polymarket TradeMessage as
+    /// `price * size * fee_rate_bps / 10_000` before calling — the engine
+    /// doesn't recompute it here, so callers must pass the actual fee.
+    pub async fn process_fill(
+        &mut self,
+        order_id: &str,
+        price: Decimal,
+        size: Decimal,
+        fee: Decimal,
+    ) -> Result<(), OrderError> {
         if let Some(order) = self.orders.get_mut(order_id) {
             order.filled_size += size;
             if order.filled_size >= order.size {
@@ -210,7 +222,7 @@ impl OrderManager {
                 price,
                 size,
                 timestamp: chrono::Utc::now(),
-                fee: Decimal::ZERO, // TODO: Calculate actual fee
+                fee,
             };
 
             tracing::info!(

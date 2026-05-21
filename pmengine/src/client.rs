@@ -345,6 +345,27 @@ impl PolymarketClient {
         self.dry_run
     }
 
+    /// Fetch the authenticated user's free USDC collateral balance, in USD.
+    ///
+    /// Polymarket returns the balance in raw USDC base units (6 decimals);
+    /// we divide here so the value is on the same scale as trade notionals
+    /// (`size * price`). The returned value reflects free cash — server-side
+    /// already subtracts notional reserved by open orders.
+    pub async fn get_collateral_balance(&self) -> Result<Decimal, ClientError> {
+        use polymarket_client_sdk_v2::clob::types::AssetType;
+        use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+        let req = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Collateral)
+            .build();
+        let resp = self
+            .inner
+            .balance_allowance(req)
+            .await
+            .map_err(|e| ClientError::OrderError(format!("balance_allowance failed: {}", e)))?;
+        // 1 USDC = 10^6 base units.
+        Ok(resp.balance / Decimal::from(1_000_000u64))
+    }
+
     /// Cancel every open user-side order on a token (asset_id).
     ///
     /// Used by the engine at startup to clear orphans left from a previous
