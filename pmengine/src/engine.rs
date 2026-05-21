@@ -51,6 +51,24 @@ pub struct Engine {
     /// Cached free USDC collateral balance, refreshed periodically by the
     /// balance poller task. Surfaced to strategies via StrategyContext.
     usdc_balance: Arc<tokio::sync::RwLock<Decimal>>,
+    /// Receiver for fill events detected by the trades-poller task.
+    /// The poller emits one event per (order_id, price, size, fee) tuple
+    /// for trades involving our open orders. The main loop processes them
+    /// through `order_manager.process_fill`, which then propagates to
+    /// positions / strategies / risk via the existing `fill_receiver`.
+    fill_event_receiver: mpsc::Receiver<FillEvent>,
+    /// Sender half kept on Engine so the trades poller (spawned in `run`)
+    /// can clone it.
+    fill_event_sender: mpsc::Sender<FillEvent>,
+}
+
+/// Internal event emitted by the trades poller for the main loop to process.
+#[derive(Debug, Clone)]
+pub struct FillEvent {
+    pub order_id: String,
+    pub price: Decimal,
+    pub size: Decimal,
+    pub fee: Decimal,
 }
 
 impl Engine {
@@ -81,6 +99,7 @@ impl Engine {
 
         // Create fill channel
         let (fill_sender, fill_receiver) = mpsc::channel(1000);
+        let (fill_event_sender, fill_event_receiver) = mpsc::channel::<FillEvent>(100);
 
         // Create order manager with client
         let order_manager = OrderManager::new(client.clone(), fill_sender);
@@ -129,6 +148,8 @@ impl Engine {
             ws_needs_reconnect: false,
             skip_warmup: false,
             usdc_balance: Arc::new(tokio::sync::RwLock::new(Decimal::ZERO)),
+            fill_event_receiver,
+            fill_event_sender,
         })
     }
 
@@ -438,6 +459,77 @@ impl Engine {
             tracing::info!("Received shutdown signal");
             shutdown_tx.send(()).await.ok();
         });
+
+        // Spawn the trades poller. Watches the user-trades REST endpoint for
+        // fills against engine-placed orders and emits a FillEvent for each.
+        // Tracked-order IDs are read from order_manager via a cloned Arc; the
+        // poller never modifies engine state directly.
+        let trades_handle = {
+            let client = self.client.clone();
+            let tx = self.fill_event_sender.clone();
+            // Track which trade IDs we've already processed to dedupe across polls.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut last_ts: Option<i64> = None;
+            // We need to know which order_ids belong to the engine. Wrap the
+            // OrderManager's `orders` map behind a shared snapshot — but easier
+            // for now: have the poller query trades, and emit events for ALL
+            // user trades. The main loop filters by checking if order_id is
+            // tracked before calling process_fill.
+            tokio::spawn(async move {
+                let mut timer = tokio::time::interval(Duration::from_secs(15));
+                timer.tick().await; // skip immediate
+                loop {
+                    timer.tick().await;
+                    let trades = match client.get_user_trades_since(last_ts).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "Trades poll failed");
+                            continue;
+                        }
+                    };
+                    for t in trades {
+                        if !seen.insert(t.id.clone()) {
+                            continue; // already processed
+                        }
+                        let ts = t.match_time.timestamp();
+                        if last_ts.map(|prev| ts > prev).unwrap_or(true) {
+                            last_ts = Some(ts);
+                        }
+                        // Compute fee: price * size * fee_rate_bps / 10_000.
+                        let fee = t.price * t.size * t.fee_rate_bps / Decimal::from(10_000u32);
+                        use polymarket_client_sdk_v2::clob::types::TraderSide;
+                        // For our side of the trade we want the order id WE placed.
+                        // If we were the taker, that's taker_order_id and size = t.size.
+                        // If we were the maker, find our maker_orders entry (there
+                        // may be multiple makers per trade, but only one per user).
+                        let our_fills: Vec<(String, Decimal)> = match t.trader_side {
+                            TraderSide::Taker => vec![(t.taker_order_id.clone(), t.size)],
+                            TraderSide::Maker => t
+                                .maker_orders
+                                .iter()
+                                .map(|m| (m.order_id.clone(), m.matched_amount))
+                                .collect(),
+                            _ => {
+                                tracing::debug!(trade_id = %t.id, side = ?t.trader_side, "Unknown trader_side, skipping");
+                                continue;
+                            }
+                        };
+                        for (order_id, size) in our_fills {
+                            let ev = FillEvent {
+                                order_id,
+                                price: t.price,
+                                size,
+                                fee,
+                            };
+                            if tx.send(ev).await.is_err() {
+                                tracing::warn!("Fill event channel closed; trades poller exiting");
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+        };
 
         // Spawn the USDC balance poller. Polymarket caches balance server-side
         // so polling every 30s is plenty. Strategies read this through
@@ -821,6 +913,35 @@ impl Engine {
                         );
                     }
 
+                    // Fill events from the trades poller — feed them to the
+                    // order manager so it can update its tracked order state
+                    // and emit a downstream Fill event for the arm above.
+                    Some(ev) = self.fill_event_receiver.recv() => {
+                        // Skip trades not involving an engine-placed order.
+                        if self.order_manager.get_order(&ev.order_id).is_none() {
+                            tracing::debug!(
+                                order_id = %ev.order_id,
+                                "Fill for untracked order (manual or other session); ignoring"
+                            );
+                            continue;
+                        }
+                        if let Err(e) = self
+                            .order_manager
+                            .process_fill(&ev.order_id, ev.price, ev.size, ev.fee)
+                            .await
+                        {
+                            tracing::warn!(error = %e, order_id = %ev.order_id, "process_fill failed");
+                        } else {
+                            tracing::info!(
+                                order_id = %ev.order_id,
+                                price = %ev.price,
+                                size = %ev.size,
+                                fee = %ev.fee,
+                                "Fill detected via trades poll"
+                            );
+                        }
+                    }
+
                     // WebSocket market data
                     Some(book_result) = async {
                         match ws_stream.as_mut() {
@@ -882,7 +1003,8 @@ impl Engine {
 
         poller_handle.abort();
         balance_handle.abort();
-        tracing::debug!("REST book poller + balance poller stopped");
+        trades_handle.abort();
+        tracing::debug!("Background pollers stopped");
 
         Ok(())
     }

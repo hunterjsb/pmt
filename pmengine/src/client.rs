@@ -366,6 +366,34 @@ impl PolymarketClient {
         Ok(resp.balance / Decimal::from(1_000_000u64))
     }
 
+    /// Fetch the authenticated user's recent trades, newer than `after_ts`
+    /// (unix seconds). Polymarket scopes this endpoint to the
+    /// L2-authenticated user, so no maker/taker filter is needed.
+    ///
+    /// Used by the engine's trades-poller task to detect fills on
+    /// engine-placed orders. The returned `TradeResponse` carries the order
+    /// IDs (taker + maker side) and `fee_rate_bps` so the engine can compute
+    /// the actual realized fee per fill.
+    pub async fn get_user_trades_since(
+        &self,
+        after_ts: Option<i64>,
+    ) -> Result<
+        Vec<polymarket_client_sdk_v2::clob::types::response::TradeResponse>,
+        ClientError,
+    > {
+        use polymarket_client_sdk_v2::clob::types::request::TradesRequest;
+        let req = match after_ts {
+            Some(ts) => TradesRequest::builder().after(ts).build(),
+            None => TradesRequest::builder().build(),
+        };
+        let page = self
+            .inner
+            .trades(&req, None)
+            .await
+            .map_err(|e| ClientError::OrderError(format!("trades failed: {}", e)))?;
+        Ok(page.data)
+    }
+
     /// Cancel every open user-side order on a token (asset_id).
     ///
     /// Used by the engine at startup to clear orphans left from a previous
