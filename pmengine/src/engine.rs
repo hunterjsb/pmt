@@ -620,35 +620,85 @@ impl Engine {
                         // Run strategies
                         let signals = self.strategy_runtime.tick(&ctx);
 
-                        // Process signals through risk manager and execute
+                        // Bucket signals so we can do delta quoting. Strategies typically
+                        // emit Cancel + Buy + Sell every tick, but if the desired prices
+                        // haven't moved we want to LEAVE the existing orders alone — they
+                        // need to age before Polymarket counts them toward rewards
+                        // (`are_orders_scoring` returns false on orders <60s old, roughly).
                         let mut shutdown_requested = false;
+                        let mut cancel_tokens: Vec<String> = Vec::new();
+                        let mut desired: Vec<(Signal, String, Decimal, Decimal)> = Vec::new(); // (signal, token, price, size)
+
                         for signal in signals {
-                            if matches!(signal, Signal::Hold) {
-                                continue;
-                            }
-
-                            // Handle shutdown signal from strategies
-                            if let Signal::Shutdown { reason } = &signal {
-                                tracing::info!(reason = reason.as_str(), "Strategy requested shutdown");
-                                shutdown_requested = true;
-                                continue;
-                            }
-
-                            // Cancel signals don't have price/size and don't need the risk
-                            // check or exposure reservation — pass them straight to the order
-                            // manager, which cancels any tracked orders on this token. Then
-                            // release the risk manager's open-order tracking so cancelled
-                            // orders stop counting against the exposure limit.
-                            if let Signal::Cancel { token_id } = &signal {
-                                let token_id = token_id.clone();
-                                if let Err(e) = self.order_manager.execute(signal).await {
-                                    tracing::warn!(error = %e, "Cancel signal failed");
-                                } else {
-                                    self.risk_manager.release_orders_for_token(&token_id);
+                            match &signal {
+                                Signal::Hold => continue,
+                                Signal::Shutdown { reason } => {
+                                    tracing::info!(reason = reason.as_str(), "Strategy requested shutdown");
+                                    shutdown_requested = true;
                                 }
-                                continue;
+                                Signal::Cancel { token_id } => {
+                                    cancel_tokens.push(token_id.clone());
+                                }
+                                Signal::Buy { token_id, price, size, .. }
+                                | Signal::Sell { token_id, price, size, .. } => {
+                                    // Match the OrderManager's rounding so a "want $0.9301"
+                                    // can be detected as equal to an "open $0.93".
+                                    let price = price.round_dp(2);
+                                    let size = size.round_dp(2);
+                                    desired.push((signal.clone(), token_id.clone(), price, size));
+                                }
                             }
+                        }
 
+                        // For each token a Cancel signal touched: look at currently open
+                        // orders. If an open order matches one of the desired orders for
+                        // that token (same side + price + size), keep it alive and remove
+                        // it from the "to place" list — that order stays aged. Otherwise
+                        // cancel it.
+                        for token_id in &cancel_tokens {
+                            let active: Vec<(String, bool, Decimal, Decimal)> = self
+                                .order_manager
+                                .active_orders_for_token(token_id)
+                                .iter()
+                                .map(|o| (o.id.clone(), o.is_buy, o.price, o.size))
+                                .collect();
+                            for (id, is_buy, price, size) in active {
+                                // Find a desired order that matches this open order.
+                                let matched_idx = desired.iter().position(|(s, t, p, sz)| {
+                                    t == token_id
+                                        && *p == price
+                                        && *sz == size
+                                        && matches!(
+                                            (s, is_buy),
+                                            (Signal::Buy { .. }, true) | (Signal::Sell { .. }, false)
+                                        )
+                                });
+                                if let Some(i) = matched_idx {
+                                    // Already have this order — keep it, drop from desired.
+                                    desired.remove(i);
+                                    tracing::debug!(
+                                        order_id = %id,
+                                        token_id = %token_id,
+                                        price = %price,
+                                        size = %size,
+                                        "Keeping aged order (matches desired quote)"
+                                    );
+                                } else {
+                                    // No matching desired — cancel it.
+                                    if let Err(e) = self.order_manager.cancel_order(&id).await {
+                                        tracing::warn!(error = %e, "Cancel failed for stale order");
+                                    } else {
+                                        self.risk_manager.release_order(&id);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Drop the original `signals` iteration and place remaining desired.
+                        let signals_to_place: Vec<Signal> =
+                            desired.into_iter().map(|(s, _, _, _)| s).collect();
+
+                        for signal in signals_to_place {
                             match self.risk_manager.check_signal(&signal, &self.positions) {
                                 RiskCheckResult::Approved(ref s) | RiskCheckResult::Reduced(ref s, _) => {
                                     if let RiskCheckResult::Reduced(_, ref reason) = self.risk_manager.check_signal(&signal, &self.positions) {
