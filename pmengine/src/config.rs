@@ -23,6 +23,10 @@ pub struct Config {
     pub log_level: String,
     /// Signature type (0=EOA, 1=PolyProxy, 2=GnosisSafe)
     pub signature_type: u8,
+    /// On engine startup, cancel any pre-existing user orders on the
+    /// strategies' subscribed tokens. Treat the engine as the sole order
+    /// manager for those markets. Default true.
+    pub reconcile_on_startup: bool,
 }
 
 impl Config {
@@ -71,6 +75,10 @@ impl Config {
             .parse()
             .unwrap_or(0);
 
+        let reconcile_on_startup = env::var("PMENGINE_RECONCILE_ON_STARTUP")
+            .map(|v| !matches!(v.to_lowercase().as_str(), "false" | "0" | "no"))
+            .unwrap_or(true);
+
         Ok(Self {
             private_key,
             funder_address,
@@ -81,6 +89,7 @@ impl Config {
             tick_interval_ms,
             log_level,
             signature_type,
+            reconcile_on_startup,
         })
     }
 

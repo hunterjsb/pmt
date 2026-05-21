@@ -393,6 +393,36 @@ impl Engine {
     pub async fn run(&mut self, max_ticks: u64) -> Result<(), EngineError> {
         tracing::info!(max_ticks = max_ticks, "Starting engine event loop");
 
+        // Startup reconcile: clear any orphan orders left by a previous engine
+        // session on the strategies' subscribed tokens. The engine treats
+        // itself as the sole order manager for those markets — anything
+        // already on the book on these tokens would race against new
+        // engine-placed orders and trip the Polymarket balance check.
+        //
+        // Set PMENGINE_RECONCILE_ON_STARTUP=false to disable (e.g. if a
+        // human is also placing manual maker orders on the same tokens).
+        if self.config.reconcile_on_startup && !self.subscribed_tokens.is_empty() {
+            tracing::info!(
+                tokens = ?self.subscribed_tokens,
+                "Reconciling: cancelling pre-existing orders on subscribed tokens"
+            );
+            for token_id in self.subscribed_tokens.clone() {
+                match self.client.cancel_all_orders_on_token(&token_id).await {
+                    Ok(n) if n > 0 => tracing::info!(
+                        token_id = %token_id,
+                        cancelled = n,
+                        "Reconcile: cancelled orphans"
+                    ),
+                    Ok(_) => tracing::debug!(token_id = %token_id, "Reconcile: nothing to cancel"),
+                    Err(e) => tracing::warn!(
+                        token_id = %token_id,
+                        error = %e,
+                        "Reconcile cancel failed — engine will proceed but may hit balance errors"
+                    ),
+                }
+            }
+        }
+
         // Get tick interval
         let tick_duration = Duration::from_millis(self.config.tick_interval_ms);
         let mut tick_timer = interval(tick_duration);

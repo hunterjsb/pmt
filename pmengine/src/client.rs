@@ -345,6 +345,40 @@ impl PolymarketClient {
         self.dry_run
     }
 
+    /// Cancel every open user-side order on a token (asset_id).
+    ///
+    /// Used by the engine at startup to clear orphans left from a previous
+    /// session. Goes through the SDK's `cancel_market_orders` endpoint,
+    /// which Polymarket scopes to the authenticated user, so it cannot
+    /// touch other accounts' orders.
+    pub async fn cancel_all_orders_on_token(&self, token_id: &str) -> Result<usize, ClientError> {
+        if self.dry_run {
+            tracing::info!(token_id = token_id, "[DRY RUN] Would cancel all orders on token");
+            return Ok(0);
+        }
+
+        let token_u256 = U256::from_str(token_id)
+            .map_err(|e| ClientError::OrderError(format!("Invalid token_id: {}", e)))?;
+
+        let request = polymarket_client_sdk_v2::clob::types::request::CancelMarketOrderRequest::builder()
+            .asset_id(token_u256)
+            .build();
+
+        let response = self
+            .inner
+            .cancel_market_orders(&request)
+            .await
+            .map_err(|e| ClientError::OrderError(e.to_string()))?;
+
+        let count = response.canceled.len();
+        tracing::info!(
+            token_id = token_id,
+            cancelled = count,
+            "Cancelled all open orders on token"
+        );
+        Ok(count)
+    }
+
     /// Fetch a snapshot of the order book via REST.
     ///
     /// Routes through pmproxy when `PMPROXY_URL` is set (adding the Cognito
