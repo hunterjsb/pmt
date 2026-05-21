@@ -68,8 +68,8 @@ api.get_book(token_id)
 
 ```
 pmtrader/
-├── cli.py                 # pmt CLI (click)
-├── scan.py                # opportunity scanners CLI (volume cliff, expiring)
+├── cli.py                 # pmt CLI (click) — buy/sell/flip/cancel/orders/
+│                          #   positions/rewards/book/market/search/scan
 ├── polymarket/            # SDK
 │   ├── api.py             # PolymarketAPI — high-level authenticated client
 │   ├── clob.py            # Clob — read-only CLOB wrapper
@@ -79,6 +79,7 @@ pmtrader/
 │   ├── markets.py         # named market constants — add yours here
 │   └── models.py          # Market/Token/OrderBook dataclasses
 ├── scanners/              # opportunity scanners (read-only)
+│                          #   wired into `pmt scan cliff|expiring`
 └── tests/
 ```
 

@@ -8,10 +8,10 @@
 Polymarket trading toolkit.
 
 ```
-pmtrader/   Python SDK + CLI + Streamlit UI
-pmproxy/    Rust reverse proxy (EC2/Lambda)
+pmtrader/   Python SDK + CLI
+pmproxy/    Rust reverse proxy (Lambda live; EC2 binary as fallback)
 pmengine/   Rust HFT trading engine
-pmstrat/    Python strategy DSL + backtesting
+pmstrat/    Python strategy DSL + backtesting + transpiler to Rust
 ```
 
 ## Architecture

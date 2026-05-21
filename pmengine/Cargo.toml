@@ -4,6 +4,11 @@ version = "0.1.9"
 edition = "2021"
 description = "Rust HFT engine for Polymarket trading"
 
+[package.metadata.cargo-machete]
+# `openssl` looks unused to cargo-machete but is required for cross-compile
+# static linking on glibc targets (the `vendored` feature is the whole point).
+ignored = ["openssl"]
+
 [dependencies]
 # Polymarket official SDK
 polymarket_client_sdk_v2 = { version = "0.6.0-canary.1", features = ["clob", "data", "gamma", "ws"] }
