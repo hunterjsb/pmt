@@ -541,7 +541,7 @@ impl Engine {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| "127.0.0.1:7531".parse().expect("default bind addr is valid"));
-        let control_handle = control::spawn(control_bind, cmd_tx);
+        let control_handle = control::spawn(control_bind, cmd_tx.clone());
 
         // Startup reconcile: clear any orphan orders left by a previous engine
         // session on the strategies' subscribed tokens. The engine treats
@@ -680,6 +680,105 @@ impl Engine {
                     }
                 }
             })
+        };
+
+        // Spawn the market scanner, if any registered strategy declares a
+        // market_filter. Iterates all filters every PMENGINE_SCAN_INTERVAL_S
+        // seconds, queries gamma, and reconciles the watched token set:
+        // newcomers get SubscribeToken commands, drop-outs get
+        // UnsubscribeToken. Each filter contributes its share up to
+        // `max_subscriptions`; the union is the desired set.
+        let scanner_filters: Vec<crate::gamma::MarketFilter> = self
+            .strategy_runtime
+            .summaries()
+            .into_iter()
+            .filter_map(|_| None) // populated below — summaries doesn't carry filters
+            .collect();
+        // Actually pull filters off the trait — summaries() doesn't expose
+        // them. Iterate the live strategies via a helper accessor.
+        let scanner_filters: Vec<crate::gamma::MarketFilter> =
+            self.strategy_runtime.market_filters();
+        let scanner_handle = if !scanner_filters.is_empty() {
+            let cmd_tx = cmd_tx.clone();
+            let interval_s = std::env::var("PMENGINE_SCAN_INTERVAL_S")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60u64);
+            tracing::info!(
+                interval_s = interval_s,
+                filter_count = scanner_filters.len(),
+                "Market scanner enabled"
+            );
+            Some(tokio::spawn(async move {
+                use crate::gamma::GammaClient;
+                let gamma = GammaClient::new();
+                let mut timer = tokio::time::interval(Duration::from_secs(interval_s));
+                // Don't skip the first tick — we WANT an immediate
+                // scan-and-subscribe at startup so the strategy isn't
+                // running blind for interval_s seconds.
+                loop {
+                    timer.tick().await;
+                    // Build the desired token set by unioning each
+                    // strategy's matched markets. Choose the
+                    // highest-certainty token per market — that's what
+                    // existing discovery does and what strategies expect.
+                    let mut desired: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    for filter in &scanner_filters {
+                        let markets = match gamma.fetch_markets_matching(filter).await {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Scanner gamma query failed");
+                                continue;
+                            }
+                        };
+                        for m in markets {
+                            if let Some(idx) = m.highest_certainty_index() {
+                                if let Some(t) = m.clob_token_ids.get(idx) {
+                                    desired.insert(t.clone());
+                                }
+                            }
+                        }
+                    }
+                    // Read current subscriptions via the control plane.
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    if cmd_tx.send(EngineCommand::ListSubscriptions(tx)).await.is_err() {
+                        return;
+                    }
+                    let current: std::collections::HashSet<String> = match rx.await {
+                        Ok(v) => v.into_iter().collect(),
+                        Err(_) => return,
+                    };
+                    let to_add: Vec<String> = desired.difference(&current).cloned().collect();
+                    let to_drop: Vec<String> = current.difference(&desired).cloned().collect();
+                    tracing::info!(
+                        added = to_add.len(),
+                        dropped = to_drop.len(),
+                        watched = desired.len(),
+                        "Scanner reconciled"
+                    );
+                    for token_id in to_add {
+                        let (tx, _rx) = tokio::sync::oneshot::channel();
+                        let _ = cmd_tx
+                            .send(EngineCommand::SubscribeToken { token_id, reply: tx })
+                            .await;
+                    }
+                    // Be conservative about Unsubscribe: only drop tokens
+                    // we're sure no statically-declared strategy still
+                    // wants. For now we trust the scanner to be the sole
+                    // source — strategies with market_filter should not
+                    // also declare static tokens. Future: query strategies
+                    // for declared-static tokens and exclude those from
+                    // to_drop.
+                    for token_id in to_drop {
+                        let (tx, _rx) = tokio::sync::oneshot::channel();
+                        let _ = cmd_tx
+                            .send(EngineCommand::UnsubscribeToken { token_id, reply: tx })
+                            .await;
+                    }
+                }
+            }))
+        } else {
+            None
         };
 
         // Spawn the public-trade tape poller. Watches Polymarket's /trades
@@ -1421,6 +1520,14 @@ impl Engine {
                             EngineCommand::ListSubscriptions(reply) => {
                                 let _ = reply.send(self.subscribed_tokens.clone());
                             }
+                            EngineCommand::SubscribeToken { token_id, reply } => {
+                                self.subscribe_token(&token_id).await;
+                                let _ = reply.send(());
+                            }
+                            EngineCommand::UnsubscribeToken { token_id, reply } => {
+                                self.unsubscribe_token(&token_id).await;
+                                let _ = reply.send(());
+                            }
                             EngineCommand::ListTrades { token_id, since_ts, reply } => {
                                 let cutoff = since_ts.unwrap_or(i64::MIN);
                                 let trades: Vec<TradeInfo> = self
@@ -1457,6 +1564,9 @@ impl Engine {
         trades_handle.abort();
         trade_tape_handle.abort();
         control_handle.abort();
+        if let Some(h) = scanner_handle {
+            h.abort();
+        }
         tracing::debug!("Background pollers stopped");
 
         Ok(())

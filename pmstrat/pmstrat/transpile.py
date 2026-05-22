@@ -553,6 +553,32 @@ class RustCodeGen:
         """Convert a Python parameter value to Rust type and literal."""
         return param_to_rust(name, value)
 
+    def _generate_market_filter_impl(self) -> str:
+        """Emit `fn market_filter(&self) -> Option<MarketFilter>` if the
+        strategy declared one via `@strategy(market_filter=...)`."""
+        mf = getattr(self.meta, "market_filter", None)
+        if mf is None:
+            return ""
+        categories = ", ".join(f'"{c}".to_string()' for c in mf.categories)
+        max_hours = (
+            f"Some({mf.max_hours_to_expiry})"
+            if mf.max_hours_to_expiry is not None
+            else "None"
+        )
+        return f'''
+    fn market_filter(&self) -> Option<crate::gamma::MarketFilter> {{
+        Some(crate::gamma::MarketFilter {{
+            min_liquidity: {mf.min_liquidity},
+            max_hours_to_expiry: {max_hours},
+            min_mid: rust_decimal_macros::dec!({mf.min_mid}),
+            max_mid: rust_decimal_macros::dec!({mf.max_mid}),
+            categories: vec![{categories}],
+            exclude_recurring: {str(mf.exclude_recurring).lower()},
+            max_subscriptions: {mf.max_subscriptions},
+        }})
+    }}
+'''
+
     def generate(self) -> str:
         """Generate complete Rust module for the strategy."""
         # Get source and parse
@@ -573,6 +599,11 @@ class RustCodeGen:
 
         # Per-strategy tick cadence pulled straight from the @strategy decorator.
         tick_interval_ms = self.meta.tick_interval_ms
+
+        # Optional market_filter override — generates `fn market_filter()`
+        # if declared, otherwise falls back to the trait default (returns
+        # None, no scanner registration).
+        market_filter_impl = self._generate_market_filter_impl()
 
         return f'''//! Auto-generated from Python strategy: {self.meta.name}
 //! DO NOT EDIT - regenerate with `pmstrat transpile`
@@ -615,7 +646,7 @@ impl Strategy for {self.struct_name} {{
     fn tick_interval_ms(&self) -> u64 {{
         {tick_interval_ms}
     }}
-
+{market_filter_impl}
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {{
 {on_tick_body}
     }}
@@ -1177,6 +1208,17 @@ impl Strategy for {self.struct_name} {{
         lines.append(f"{self._indent()}}}")
         return "\n".join(lines)
 
+    # Methods on ctx that return Vec<String> at runtime. Iterating one of
+    # these means the loop target is a String, not a &str.
+    CTX_VEC_STRING_METHODS = {"subscribed_tokens"}
+
+    def _call_returns_vec_string(self, call: ast.Call) -> bool:
+        """True if this call returns a Vec<String> (so iterating it yields String)."""
+        if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+            if call.func.value.id == "ctx" and call.func.attr in self.CTX_VEC_STRING_METHODS:
+                return True
+        return False
+
     def _gen_for(self, stmt: ast.For) -> str:
         # Check for `for token_id, market in ctx.markets.items()` pattern
         if self._is_markets_iteration(stmt):
@@ -1192,6 +1234,17 @@ impl Strategy for {self.struct_name} {{
             and stmt.iter.id in self.module_list_consts
         ):
             target = f"&{target}"
+        # When iterating a call that returns Vec<String> (e.g.
+        # `ctx.subscribed_tokens()`), the loop variable IS a String —
+        # downstream uses need to be borrowed (`&token_id`) when passed
+        # to APIs expecting `&str`. Track the target in string_vars so
+        # _borrow_string_args does the right thing.
+        if (
+            isinstance(stmt.target, ast.Name)
+            and isinstance(stmt.iter, ast.Call)
+            and self._call_returns_vec_string(stmt.iter)
+        ):
+            self.string_vars.add(stmt.target.id)
         lines = [f"{self._indent()}for {target} in {iter_expr} {{"]
         self.indent_level += 1
         # Run the option-pattern preprocessor on the for-loop body too, so
@@ -1399,6 +1452,13 @@ impl Strategy for {self.struct_name} {{
             # str.contains(x) -> str.contains(x) (same in Rust)
             elif method == "contains":
                 return f"{obj}.contains({args})"
+            # Generic ctx.METHOD(...) — borrow any String args (e.g.
+            # ctx.volume_in_window(token_id, 60) where token_id is a
+            # String from a Vec<String> iteration). Rust method signatures
+            # on StrategyContext take &str.
+            elif obj == "ctx":
+                borrowed_args = self._borrow_string_args(expr.args)
+                return f"{obj}.{method}({borrowed_args})"
             else:
                 return f"{obj}.{method}({args})"
 
@@ -1881,10 +1941,17 @@ def scan_strategy_file(path: Path) -> StrategyFileInfo | None:
 
     struct_name = struct_match.group(1)
 
-    # Detect if market discovery is needed:
-    # Look for "tokens: vec![]" (empty tokens) in new() function
-    # This indicates the strategy uses dynamic market discovery
-    requires_market_discovery = bool(re.search(r'tokens:\s*vec!\[\s*\]', content))
+    # Detect if market discovery is needed.
+    # The OLD path: `tokens: vec![]` + no market_filter — strategy relies
+    # on the engine's legacy market_discovery_enabled flag to subscribe
+    # to every gamma-discovered market.
+    # The NEW path: strategy declares `fn market_filter()` → the engine's
+    # per-strategy scanner is responsible. Don't turn on the legacy
+    # flag too, or the engine will subscribe to all 400+ markets AND
+    # the scanner's 20 — they fight on every refresh cycle.
+    has_empty_tokens = bool(re.search(r'tokens:\s*vec!\[\s*\]', content))
+    has_market_filter = bool(re.search(r'fn market_filter\(', content))
+    requires_market_discovery = has_empty_tokens and not has_market_filter
 
     return StrategyFileInfo(
         module_name=module_name,

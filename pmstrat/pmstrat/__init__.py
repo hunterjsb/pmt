@@ -5,7 +5,7 @@ from .signal import (
     Subscribe, Unsubscribe, Alert,
 )
 from .context import Context, OrderBookSnapshot, Position, MarketInfo, TradeRecord
-from .dsl import strategy
+from .dsl import strategy, MarketFilter
 from .rewards import RewardsSimulator, MarketRewardConfig
 from .transpile import (
     transpile,
@@ -35,6 +35,7 @@ __all__ = [
     "MarketInfo",
     "TradeRecord",
     "strategy",
+    "MarketFilter",
     "RewardsSimulator",
     "MarketRewardConfig",
     "transpile",

@@ -105,6 +105,11 @@ class Context:
         """Total traded size for a token in the last `window_secs` seconds."""
         return sum((t.size for t in self.recent_trades(token_id, window_secs)), Decimal(0))
 
+    def subscribed_tokens(self) -> list[str]:
+        """Currently-subscribed token IDs. Used by scanner-driven strategies
+        that don't hardcode a watchlist."""
+        return list(self.books.keys())
+
     @property
     def total_pnl(self) -> Decimal:
         """Total P&L (realized + unrealized)."""

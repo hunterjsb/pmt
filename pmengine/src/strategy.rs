@@ -183,6 +183,13 @@ impl StrategyContext {
             .map(|t| t.size)
             .sum()
     }
+
+    /// Owned snapshot of currently-subscribed token ids the strategy can
+    /// reason about. Strategies driven by a market scanner (rather than a
+    /// hardcoded list) iterate this instead of a module-level constant.
+    pub fn subscribed_tokens(&self) -> Vec<String> {
+        self.order_books.keys().cloned().collect()
+    }
 }
 
 
@@ -208,6 +215,17 @@ pub trait Strategy: Send + Sync {
     /// Called on each tick with current market state.
     /// Returns signals for order management.
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal>;
+
+    /// Optional gamma-based market filter that the engine's scanner uses
+    /// to keep this strategy's subscription set current. Returning
+    /// `Some(filter)` tells the engine: every PMENGINE_SCAN_INTERVAL_S,
+    /// fetch markets matching `filter` from gamma and reconcile against
+    /// the currently-subscribed token set — Subscribe newcomers,
+    /// Unsubscribe drop-outs. `None` (the default) keeps the
+    /// statically-declared `subscriptions()` set.
+    fn market_filter(&self) -> Option<crate::gamma::MarketFilter> {
+        None
+    }
 
     /// Called when an order is filled.
     fn on_fill(&mut self, _fill: &Fill) {}
@@ -250,6 +268,16 @@ impl StrategyRuntime {
         );
         self.strategies.push(strategy);
         self.last_tick_at.push(None);
+    }
+
+    /// Owned snapshot of every registered strategy's `market_filter()`,
+    /// for the engine's scanner task to consume. Strategies returning
+    /// `None` (the default) are skipped — scanner only acts on opt-ins.
+    pub fn market_filters(&self) -> Vec<crate::gamma::MarketFilter> {
+        self.strategies
+            .iter()
+            .filter_map(|s| s.market_filter())
+            .collect()
     }
 
     /// Owned summary of a registered strategy, for introspection by the

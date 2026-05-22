@@ -55,6 +55,19 @@ pub enum EngineCommand {
         since_ts: Option<i64>,
         reply: oneshot::Sender<Vec<TradeInfo>>,
     },
+    /// Programmatic Subscribe — used by the engine's market scanner to
+    /// add tokens the matched filter produced. Idempotent on the engine
+    /// side; sender ignores the empty reply.
+    SubscribeToken {
+        token_id: String,
+        reply: oneshot::Sender<()>,
+    },
+    /// Programmatic Unsubscribe — scanner counterpart to SubscribeToken
+    /// for tokens that have dropped out of the filter set.
+    UnsubscribeToken {
+        token_id: String,
+        reply: oneshot::Sender<()>,
+    },
 }
 
 #[derive(Debug, Serialize)]

@@ -157,6 +157,95 @@ impl std::fmt::Display for GammaError {
 
 impl std::error::Error for GammaError {}
 
+/// Per-strategy filter used by the engine's market scanner to refresh
+/// the watched token set.
+///
+/// All fields are AND-combined. An empty `categories` vec matches any
+/// category. `exclude_recurring` drops series like `btc-updown-5m`,
+/// `spx-daily`, etc. that pollute the volume signal with mechanical
+/// flow rather than informed action.
+#[derive(Debug, Clone)]
+pub struct MarketFilter {
+    pub min_liquidity: f64,
+    pub max_hours_to_expiry: Option<f64>,
+    pub min_mid: Decimal,
+    pub max_mid: Decimal,
+    pub categories: Vec<String>,
+    pub exclude_recurring: bool,
+    /// Soft cap on how many tokens to subscribe at once. Defends against
+    /// runaway gamma matches eating REST poll budget. Default 30.
+    pub max_subscriptions: usize,
+}
+
+impl Default for MarketFilter {
+    fn default() -> Self {
+        Self {
+            min_liquidity: 20_000.0,
+            max_hours_to_expiry: None,
+            min_mid: Decimal::new(5, 2), // 0.05
+            max_mid: Decimal::new(95, 2), // 0.95
+            categories: Vec::new(),
+            exclude_recurring: true,
+            max_subscriptions: 30,
+        }
+    }
+}
+
+impl MarketFilter {
+    /// Apply the filter client-side to a market. The gamma endpoint
+    /// supports some server-side filters but not all of ours, so we do
+    /// the final cut here.
+    pub fn matches(&self, m: &GammaMarket) -> bool {
+        if !m.active || m.closed {
+            return false;
+        }
+        if let Some(liq) = m.liquidity {
+            if liq < self.min_liquidity {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        if let Some(max_h) = self.max_hours_to_expiry {
+            match m.hours_until_expiry() {
+                Some(h) if h > 0.0 && h <= max_h => {}
+                _ => return false,
+            }
+        }
+        // Mid filter — only meaningful if we have a numeric price for the
+        // canonical outcome.
+        if let Some(idx) = m.highest_certainty_index() {
+            if let Some(p) = m.outcome_prices.get(idx) {
+                if *p < self.min_mid || *p > self.max_mid {
+                    return false;
+                }
+            }
+        }
+        if !self.categories.is_empty() {
+            match &m.category {
+                Some(c) if self.categories.iter().any(|x| x.eq_ignore_ascii_case(c)) => {}
+                _ => return false,
+            }
+        }
+        if self.exclude_recurring && Self::looks_recurring(&m.slug) {
+            return false;
+        }
+        true
+    }
+
+    fn looks_recurring(slug: &str) -> bool {
+        // Recurring-series slugs from Polymarket follow a `<asset>-updown-<freq>-<epoch>`
+        // pattern (e.g. `btc-updown-5m-1779450300`). Conservative substring
+        // match — false positives just keep an extra series, false
+        // negatives leak a couple noise markets.
+        let s = slug.to_ascii_lowercase();
+        s.contains("-updown-")
+            || s.contains("-daily-")
+            || s.contains("-hourly-")
+            || s.contains("-weekly-")
+    }
+}
+
 impl GammaClient {
     /// Create a new Gamma client with default base URL.
     pub fn new() -> Self {
@@ -172,6 +261,66 @@ impl GammaClient {
             client: Client::new(),
             base_url: base_url.to_string(),
         }
+    }
+
+    /// Fetch the active gamma markets that match `filter`.
+    ///
+    /// Server-side, this issues a paged `/markets?active=true&closed=false&limit=N`
+    /// query. Client-side, each returned market is run through `filter.matches()`
+    /// and the surviving set is truncated to `filter.max_subscriptions`.
+    /// The result is the set of *markets* (not tokens) — callers pick the
+    /// highest-certainty token from each via `GammaMarket::highest_certainty_index`.
+    pub async fn fetch_markets_matching(
+        &self,
+        filter: &MarketFilter,
+    ) -> Result<Vec<GammaMarket>, GammaError> {
+        let batch_size = 100;
+        let mut all_markets: Vec<GammaMarket> = Vec::new();
+        let mut offset = 0usize;
+        // Cap at 500 markets scanned per refresh — beyond this we're
+        // basically full-table-scanning gamma every minute. The filter
+        // will trim to max_subscriptions anyway.
+        while offset < 500 {
+            let url = format!(
+                "{}/markets?active=true&closed=false&limit={}&offset={}",
+                self.base_url, batch_size, offset
+            );
+            let resp = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| GammaError::RequestError(e.to_string()))?;
+            if !resp.status().is_success() {
+                return Err(GammaError::RequestError(format!(
+                    "HTTP {}",
+                    resp.status()
+                )));
+            }
+            let page: Vec<RawGammaMarket> = resp
+                .json()
+                .await
+                .map_err(|e| GammaError::ParseError(e.to_string()))?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            for raw in page {
+                if let Ok(m) = self.parse_market_with_end_date(raw, None) {
+                    if filter.matches(&m) {
+                        all_markets.push(m);
+                    }
+                }
+                if all_markets.len() >= filter.max_subscriptions {
+                    return Ok(all_markets);
+                }
+            }
+            if page_len < batch_size {
+                break;
+            }
+            offset += batch_size;
+        }
+        Ok(all_markets)
     }
 
     /// Look up the GammaMarket that contains a given CLOB token id.

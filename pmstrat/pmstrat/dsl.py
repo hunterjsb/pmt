@@ -9,6 +9,28 @@ from .context import Context
 
 
 @dataclass
+class MarketFilter:
+    """Engine-side market scanner filter for a strategy.
+
+    Mirror of the Rust `pmengine::gamma::MarketFilter`. Set on a strategy
+    via `@strategy(market_filter=MarketFilter(...))` — the engine then
+    refreshes that strategy's watched-token set every PMENGINE_SCAN_INTERVAL_S
+    by querying gamma and matching against the filter, dispatching
+    Subscribe/Unsubscribe under the hood.
+
+    Defaults match the Rust defaults: $20k liquidity, mid in [0.05, 0.95],
+    any category, recurring series excluded.
+    """
+    min_liquidity: float = 20_000.0
+    max_hours_to_expiry: float | None = None
+    min_mid: str = "0.05"   # Decimal as string for clean transpile
+    max_mid: str = "0.95"
+    categories: List[str] = field(default_factory=list)
+    exclude_recurring: bool = True
+    max_subscriptions: int = 30
+
+
+@dataclass
 class StrategyMeta:
     """Metadata attached to a strategy function."""
     name: str
@@ -18,6 +40,7 @@ class StrategyMeta:
     on_fill: Callable[[Context, Any], None] | None = None
     params: dict[str, Any] = field(default_factory=dict)
     transpilable: bool = True
+    market_filter: MarketFilter | None = None
 
 
 def strategy(
@@ -26,6 +49,7 @@ def strategy(
     tick_interval_ms: int = 1000,
     params: dict[str, Any] | None = None,
     transpilable: bool = True,
+    market_filter: MarketFilter | None = None,
 ):
     """Decorator to define a strategy.
 
@@ -54,6 +78,7 @@ def strategy(
             on_tick=func,
             params=params or {},
             transpilable=transpilable,
+            market_filter=market_filter,
         )
 
         return wrapper

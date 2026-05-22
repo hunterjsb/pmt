@@ -1,37 +1,31 @@
 """Momentum-Fade Spike Detector.
 
-Watches a small set of tokens for volume spikes. When the last `SHORT_WINDOW`
-seconds of volume on a token exceeds `SPIKE_MULTIPLIER` × the recent baseline
-volume (computed from the prior `LONG_WINDOW` seconds), raise a `Signal::Alert`
-proposing a fade trade: a Sell at the current mid. The human reviews the
-alert (typically by checking whether @Polymarket / Trump / etc. just tweeted
-about the market) and approves or rejects via `pmt engine approve|reject`.
+Watches the live market set (selected by `market_filter` below) for
+volume spikes. When the last `SHORT_WINDOW` seconds of volume on a token
+exceeds `SPIKE_MULTIPLIER` × the recent baseline volume (computed from
+the prior `LONG_WINDOW - SHORT_WINDOW` seconds), raise a `Signal::Alert`
+proposing a fade trade: a Sell at the current mid.
 
-This strategy doesn't *itself* identify whether the move is informed or
-sheep-driven — that's the human-touch step. It just flags candidates where
-the volume profile looks like a coordinated pump worth a closer look.
+The human reviews the alert (typically by checking whether @Polymarket /
+Trump / etc. just tweeted about the market) and approves or rejects via
+`pmt engine approve|reject`. This strategy doesn't *itself* identify
+whether the move is informed or sheep-driven — that's the human-touch
+step. It just flags candidates where the volume profile looks like a
+coordinated pump worth a closer look.
 
-Designed for the engine's Phase 5 alert pipeline: the strategy never places
-a real order — every action is gated on human approval.
+Watchlist is dynamic — the engine's scanner queries gamma every
+PMENGINE_SCAN_INTERVAL_S (default 60s) for markets matching `market_filter`
+and Subscribe/Unsubscribe to keep this strategy's set current.
+
+Designed for the engine's Phase 5 alert pipeline: the strategy never
+places a real order — every action is gated on human approval.
 """
 
 from decimal import Decimal
 
-from ..dsl import strategy
+from ..dsl import MarketFilter, strategy
 from ..signal import Alert, Hold, Sell, Signal, Urgency
 
-
-# Tokens to watch. Start small with high-volume markets where pumps actually
-# happen. Polymarket's spike-prone markets tend to be politics, crypto, and
-# event-driven (election outcomes, court rulings, AI announcements, etc.).
-#
-# Hardcoded for now — Phase 6 ships an MVP that exercises the pipeline.
-# Future revisions could add Signal::Subscribe on startup based on a
-# scanner query against gamma.
-WATCH_TOKENS: list[str] = [
-    # Hantavirus pandemic NO — we have data for this already
-    "95212449865986159112377413335252801281670333750637442556685159781445406848396",
-]
 
 # Spike detection knobs.
 SHORT_WINDOW = 60     # seconds — the window we evaluate for "recent" volume
@@ -46,9 +40,22 @@ SUGGESTED_SIZE = Decimal("100")     # what to fade with — modest
 
 @strategy(
     name="momentum_fade",
-    tokens=WATCH_TOKENS,
-    tick_interval_ms=5000,   # 5s — fast enough to catch a 60s spike,
-                              # slow enough to not hammer
+    tokens=[],   # empty — the scanner provides them based on market_filter
+    tick_interval_ms=15000,   # 15s — scan many markets, don't hammer
+    market_filter=MarketFilter(
+        # Liquidity > $20k weeds out the long tail. Mid in [0.05, 0.95]
+        # avoids the resolution-imminent markets where moves are signal,
+        # not pump. Recurring series (BTC-updown-5m, SPX-daily, etc.) are
+        # mechanical flow — exclude them.
+        min_liquidity=20_000.0,
+        min_mid="0.05",
+        max_mid="0.95",
+        exclude_recurring=True,
+        # Cap subscriptions: 20 active markets per tick is plenty for a
+        # human-gated workflow. More than that and the alert stream gets
+        # noisier than the human can review.
+        max_subscriptions=20,
+    ),
     params={
         "SHORT_WINDOW": SHORT_WINDOW,
         "LONG_WINDOW": LONG_WINDOW,
@@ -61,7 +68,7 @@ SUGGESTED_SIZE = Decimal("100")     # what to fade with — modest
 def on_tick(ctx) -> list[Signal]:
     signals: list[Signal] = []
 
-    for token_id in WATCH_TOKENS:
+    for token_id in ctx.subscribed_tokens():
         book = ctx.book(token_id)
         if book is None:
             continue
@@ -91,8 +98,6 @@ def on_tick(ctx) -> list[Signal]:
 
         # Spike detected. Propose a fade.
         mid = (best_bid + best_ask) / Decimal("2")
-        # Round suggested sell price down to a tick we know is safe; the
-        # engine's per-market tick rounding will adjust if needed.
         suggested_price = mid - Decimal("0.005")
         if suggested_price <= Decimal("0.01"):
             suggested_price = Decimal("0.01")

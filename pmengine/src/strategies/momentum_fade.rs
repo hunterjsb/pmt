@@ -15,9 +15,6 @@ const MIN_SHORT_VOLUME: Decimal = dec!(100);
 const SUGGESTED_SIZE: Decimal = dec!(100);
 const ALERT_TTL_SECS: i64 = 600;
 
-// Module-level list[str] constants from the strategy file
-const WATCH_TOKENS: &[&str] = &["95212449865986159112377413335252801281670333750637442556685159781445406848396"];
-
 pub struct MomentumFade {
     id: String,
     tokens: Vec<String>,
@@ -27,7 +24,7 @@ impl MomentumFade {
     pub fn new() -> Self {
         Self {
             id: "momentum_fade".to_string(),
-            tokens: vec!["95212449865986159112377413335252801281670333750637442556685159781445406848396".to_string()],
+            tokens: vec![],
         }
     }
 }
@@ -48,13 +45,25 @@ impl Strategy for MomentumFade {
     }
 
     fn tick_interval_ms(&self) -> u64 {
-        5000
+        15000
+    }
+
+    fn market_filter(&self) -> Option<crate::gamma::MarketFilter> {
+        Some(crate::gamma::MarketFilter {
+            min_liquidity: 20000.0,
+            max_hours_to_expiry: None,
+            min_mid: rust_decimal_macros::dec!(0.05),
+            max_mid: rust_decimal_macros::dec!(0.95),
+            categories: vec![],
+            exclude_recurring: true,
+            max_subscriptions: 20,
+        })
     }
 
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
         let mut signals = vec![];
-        for &token_id in WATCH_TOKENS {
-            let book = match ctx.order_books.get(token_id) {
+        for token_id in ctx.subscribed_tokens() {
+            let book = match ctx.order_books.get(&token_id) {
                 Some(v) => v,
                 None => continue,
             };
@@ -66,11 +75,11 @@ impl Strategy for MomentumFade {
                 Some(v) => v.price,
                 None => continue,
             };
-            let short_vol = ctx.volume_in_window(token_id, SHORT_WINDOW);
+            let short_vol = ctx.volume_in_window(&token_id, SHORT_WINDOW);
             if short_vol < MIN_SHORT_VOLUME {
                 continue;
             }
-            let long_vol = ctx.volume_in_window(token_id, LONG_WINDOW);
+            let long_vol = ctx.volume_in_window(&token_id, LONG_WINDOW);
             let baseline_vol = long_vol - short_vol;
             if baseline_vol <= dec!(0) {
                 continue;
