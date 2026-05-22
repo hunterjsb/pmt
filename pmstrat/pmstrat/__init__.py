@@ -1,7 +1,10 @@
 """pmstrat - Strategy DSL and backtesting for Polymarket."""
 
-from .signal import Signal, Buy, Sell, Cancel, Hold, Shutdown, Urgency
-from .context import Context, OrderBookSnapshot, Position, MarketInfo
+from .signal import (
+    Signal, Buy, Sell, Cancel, Hold, Shutdown, Urgency,
+    Subscribe, Unsubscribe, Alert,
+)
+from .context import Context, OrderBookSnapshot, Position, MarketInfo, TradeRecord
 from .dsl import strategy
 from .rewards import RewardsSimulator, MarketRewardConfig
 from .transpile import (
@@ -23,10 +26,14 @@ __all__ = [
     "Hold",
     "Shutdown",
     "Urgency",
+    "Subscribe",
+    "Unsubscribe",
+    "Alert",
     "Context",
     "OrderBookSnapshot",
     "Position",
     "MarketInfo",
+    "TradeRecord",
     "strategy",
     "RewardsSimulator",
     "MarketRewardConfig",

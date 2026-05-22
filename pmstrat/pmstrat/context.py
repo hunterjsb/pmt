@@ -40,6 +40,16 @@ class Position:
 
 
 @dataclass
+class TradeRecord:
+    """One public market trade captured by the engine's trade-tape poller."""
+    token_id: str
+    price: Decimal
+    size: Decimal
+    side: str   # "BUY" or "SELL"
+    timestamp: int  # unix seconds
+
+
+@dataclass
 class MarketInfo:
     """Market metadata for a token."""
     token_id: str
@@ -62,6 +72,7 @@ class Context:
     """Read-only context passed to strategies on each tick."""
     timestamp: datetime
     books: dict[str, OrderBookSnapshot] = field(default_factory=dict)
+    trade_history: dict[str, list[TradeRecord]] = field(default_factory=dict)
     positions: dict[str, Position] = field(default_factory=dict)
     markets: dict[str, MarketInfo] = field(default_factory=dict)
     total_realized_pnl: Decimal = Decimal(0)
@@ -84,6 +95,15 @@ class Context:
         """Get mid price for a token."""
         book = self.book(token_id)
         return book.mid_price if book else None
+
+    def recent_trades(self, token_id: str, window_secs: int) -> list[TradeRecord]:
+        """Trades for a token in the last `window_secs` seconds."""
+        cutoff = int(self.timestamp.timestamp()) - window_secs
+        return [t for t in self.trade_history.get(token_id, []) if t.timestamp >= cutoff]
+
+    def volume_in_window(self, token_id: str, window_secs: int) -> Decimal:
+        """Total traded size for a token in the last `window_secs` seconds."""
+        return sum((t.size for t in self.recent_trades(token_id, window_secs)), Decimal(0))
 
     @property
     def total_pnl(self) -> Decimal:

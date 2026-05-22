@@ -5,6 +5,7 @@ mod alert_test;
 mod dynamic_market_maker;
 mod hanta_maker;
 mod market_maker;
+mod momentum_fade;
 mod order_test;
 mod spread_watcher;
 mod sure_bets;
@@ -16,6 +17,7 @@ pub use alert_test::AlertTest;
 pub use dynamic_market_maker::DynamicMarketMaker;
 pub use hanta_maker::HantaMaker;
 pub use market_maker::MarketMaker;
+pub use momentum_fade::MomentumFade;
 pub use order_test::OrderTest;
 pub use spread_watcher::SpreadWatcher;
 pub use sure_bets::SureBets;
@@ -52,6 +54,11 @@ pub fn registry() -> HashMap<&'static str, StrategyInfo> {
 
     m.insert("market_maker", StrategyInfo {
         factory: || Box::new(market_maker::MarketMaker::new()),
+        requires_market_discovery: false,
+    });
+
+    m.insert("momentum_fade", StrategyInfo {
+        factory: || Box::new(momentum_fade::MomentumFade::new()),
         requires_market_discovery: false,
     });
 
