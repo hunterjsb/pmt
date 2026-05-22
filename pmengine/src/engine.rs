@@ -61,6 +61,16 @@ pub struct Engine {
     /// Sender half kept on Engine so the trades poller (spawned in `run`)
     /// can clone it.
     fill_event_sender: mpsc::Sender<FillEvent>,
+    /// Maps subscribed token_id → on-chain condition_id (market id).
+    /// Populated on subscribe via gamma lookup; consumed by the public-
+    /// trade poller, which uses condition_id as the `market=` filter for
+    /// the data API. Shared via Arc so the spawned poller can read it
+    /// without holding a borrow on the engine.
+    token_to_condition: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
+    /// Always-on gamma client used to resolve token_id → condition_id on
+    /// subscription. Independent from the optional `gamma_client` above,
+    /// which is gated by market-discovery mode.
+    gamma_resolver: GammaClient,
 }
 
 /// Internal event emitted by the trades poller for the main loop to process.
@@ -151,6 +161,8 @@ impl Engine {
             usdc_balance: Arc::new(tokio::sync::RwLock::new(Decimal::ZERO)),
             fill_event_receiver,
             fill_event_sender,
+            token_to_condition: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            gamma_resolver: GammaClient::new(),
         })
     }
 
@@ -325,6 +337,40 @@ impl Engine {
         self.client.is_dry_run()
     }
 
+    /// Resolve a token_id to its parent market's condition_id via gamma,
+    /// caching the result. Best-effort: a failure is logged and the map
+    /// stays empty for that token, which only means the public-trade
+    /// poller won't watch that market — strategies still receive book
+    /// updates from the REST poller.
+    async fn ensure_condition_id(&self, token_id: &str) {
+        {
+            let map = self.token_to_condition.read().await;
+            if map.contains_key(token_id) {
+                return;
+            }
+        }
+        match self.gamma_resolver.fetch_market_by_token(token_id).await {
+            Ok(Some(m)) if !m.condition_id.is_empty() => {
+                let mut map = self.token_to_condition.write().await;
+                map.insert(token_id.to_string(), m.condition_id.clone());
+                tracing::info!(
+                    token_id = %token_id,
+                    condition_id = %m.condition_id,
+                    "Resolved condition_id for token"
+                );
+            }
+            Ok(_) => tracing::warn!(
+                token_id = %token_id,
+                "Gamma lookup returned no market — public trades disabled for this token"
+            ),
+            Err(e) => tracing::warn!(
+                token_id = %token_id,
+                error = %e,
+                "Gamma lookup failed — public trades disabled for this token"
+            ),
+        }
+    }
+
     /// Begin watching a token at runtime. Idempotent: a duplicate request is
     /// a no-op. Initialises an empty book in the MarketDataHub (the REST
     /// poller picks it up on its next tick) and flags the WebSocket for
@@ -336,6 +382,7 @@ impl Engine {
         self.market_data.init_book(token_id).await;
         self.subscribed_tokens.push(token_id.to_string());
         self.ws_needs_reconnect = true;
+        self.ensure_condition_id(token_id).await;
         tracing::info!(token_id = %token_id, "Subscribed to token");
     }
 
@@ -363,18 +410,27 @@ impl Engine {
         self.risk_manager.release_orders_for_token(token_id);
         self.market_data.remove_book(token_id).await;
         self.subscribed_tokens.retain(|t| t != token_id);
+        // Drop the condition_id mapping so the public-trade poller
+        // stops fetching for this market once no other watched token
+        // points to it (the poller iterates unique condition_ids each tick).
+        {
+            let mut map = self.token_to_condition.write().await;
+            map.remove(token_id);
+        }
         self.ws_needs_reconnect = true;
         tracing::info!(token_id = %token_id, "Unsubscribed from token");
     }
 
     /// Register a strategy.
     pub async fn register_strategy(&mut self, strategy: Box<dyn crate::strategy::Strategy>) {
-        // Initialize order books for subscriptions
+        // Initialize order books for subscriptions and resolve their
+        // condition_ids for the public-trade poller.
         for token_id in strategy.subscriptions() {
             if !self.subscribed_tokens.contains(&token_id) {
                 self.market_data.init_book(&token_id).await;
-                self.subscribed_tokens.push(token_id);
+                self.subscribed_tokens.push(token_id.clone());
             }
+            self.ensure_condition_id(&token_id).await;
         }
         self.strategy_runtime.register(strategy);
     }
@@ -412,13 +468,15 @@ impl Engine {
             // Create and register the strategy
             let strategy = (info.factory)();
 
-            // Initialize order books for subscriptions
+            // Initialize order books for subscriptions and resolve their
+            // condition_ids for the public-trade poller.
             for token_id in strategy.subscriptions() {
                 if !self.subscribed_tokens.contains(&token_id) {
                     // Use blocking approach for sync context
                     futures::executor::block_on(self.market_data.init_book(&token_id));
-                    self.subscribed_tokens.push(token_id);
+                    self.subscribed_tokens.push(token_id.clone());
                 }
+                futures::executor::block_on(self.ensure_condition_id(&token_id));
             }
             self.strategy_runtime.register(strategy);
 
@@ -610,6 +668,95 @@ impl Engine {
                             }
                         }
                         Err(e) => tracing::debug!(error = %e, "Balance poll failed"),
+                    }
+                }
+            })
+        };
+
+        // Spawn the public-trade tape poller. Watches Polymarket's /trades
+        // data API for every market we're subscribed to and broadcasts each
+        // new trade through the MarketDataHub. Independent from the
+        // user-trades poller above, which is filtered to our orders only.
+        //
+        // Per-condition cursor (last_ts_per_cond) narrows each poll to new
+        // trades. A composite dedup key catches the boundary case where two
+        // trades share a timestamp and the API's strict-greater-than cursor
+        // would drop one. Both maps are local to the task; nothing escapes.
+        let trade_tape_handle = {
+            let client = self.client.clone();
+            let hub = self.market_data.clone();
+            let token_to_condition = self.token_to_condition.clone();
+            let interval = Duration::from_millis(
+                std::env::var("PMENGINE_TRADE_POLL_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3000),
+            );
+            let limit: usize = std::env::var("PMENGINE_TRADE_POLL_LIMIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100);
+            tokio::spawn(async move {
+                let mut timer = tokio::time::interval(interval);
+                timer.tick().await; // skip immediate first
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut last_ts_per_cond: HashMap<String, i64> = HashMap::new();
+                loop {
+                    timer.tick().await;
+                    let conditions: std::collections::HashSet<String> = {
+                        let map = token_to_condition.read().await;
+                        map.values().cloned().collect()
+                    };
+                    if conditions.is_empty() {
+                        continue;
+                    }
+                    for cid in conditions {
+                        let after = last_ts_per_cond.get(&cid).copied();
+                        let trades = match client
+                            .get_market_trades_since(&cid, after, limit)
+                            .await
+                        {
+                            Ok(t) => t,
+                            Err(e) => {
+                                tracing::debug!(
+                                    condition_id = %cid,
+                                    error = %e,
+                                    "Public trade poll failed"
+                                );
+                                continue;
+                            }
+                        };
+                        for t in trades {
+                            if !seen.insert(t.dedup_key()) {
+                                continue;
+                            }
+                            let entry =
+                                last_ts_per_cond.entry(cid.clone()).or_insert(t.timestamp);
+                            if t.timestamp > *entry {
+                                *entry = t.timestamp;
+                            }
+                            hub.broadcast_trade(
+                                t.asset.clone(),
+                                t.price,
+                                t.size,
+                                t.side.clone(),
+                                t.timestamp,
+                            )
+                            .await;
+                            tracing::debug!(
+                                token_id = %t.asset,
+                                price = %t.price,
+                                size = %t.size,
+                                side = %t.side,
+                                "Public trade observed"
+                            );
+                        }
+                    }
+                    // Prune the dedup set if it grows large. The cursor does
+                    // most of the work; this is a safety net.
+                    if seen.len() > 10_000 {
+                        seen.clear();
+                        tracing::debug!("Trade dedup set reset (>10k entries)");
                     }
                 }
             })
@@ -1167,6 +1314,7 @@ impl Engine {
         poller_handle.abort();
         balance_handle.abort();
         trades_handle.abort();
+        trade_tape_handle.abort();
         control_handle.abort();
         tracing::debug!("Background pollers stopped");
 

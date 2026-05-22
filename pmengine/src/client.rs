@@ -428,6 +428,47 @@ impl PolymarketClient {
         Ok(page.data)
     }
 
+    /// Fetch public market trades from Polymarket's data API.
+    ///
+    /// Returns trades on either token of the market (both YES and NO sides);
+    /// callers filter by `MarketTrade.asset` to demultiplex back to the
+    /// specific token they care about. Goes direct to `data-api.polymarket.com`
+    /// — this endpoint is unauthenticated and not proxied through pmproxy.
+    ///
+    /// `after_ts` is a unix-seconds cursor: only trades strictly newer than
+    /// it are returned. `None` returns the most recent batch.
+    pub async fn get_market_trades_since(
+        &self,
+        condition_id: &str,
+        after_ts: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<MarketTrade>, ClientError> {
+        let mut url = format!(
+            "https://data-api.polymarket.com/trades?market={}&limit={}",
+            condition_id, limit
+        );
+        if let Some(ts) = after_ts {
+            url.push_str(&format!("&after={}", ts));
+        }
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ClientError::OrderError(format!("public trades request failed: {}", e)))?;
+        if !resp.status().is_success() {
+            return Err(ClientError::OrderError(format!(
+                "public trades HTTP {}",
+                resp.status()
+            )));
+        }
+        let trades: Vec<MarketTrade> = resp
+            .json()
+            .await
+            .map_err(|e| ClientError::OrderError(format!("public trades parse: {}", e)))?;
+        Ok(trades)
+    }
+
     /// Cancel every open user-side order on a token (asset_id).
     ///
     /// Used by the engine at startup to clear orphans left from a previous
@@ -600,6 +641,47 @@ struct PostOrderResponse {
 pub enum Side {
     Buy,
     Sell,
+}
+
+/// One trade row from Polymarket's public `/trades` data API.
+///
+/// Field names mirror the wire shape; only the fields the engine actually
+/// uses are deserialized. `side` is the trader's side ("BUY"/"SELL");
+/// `asset` is the CLOB token id; `condition_id` (alias for the wire's
+/// `conditionId`) is the market id.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MarketTrade {
+    pub asset: String,
+    #[serde(rename = "conditionId")]
+    pub condition_id: String,
+    pub side: String,
+    #[serde(with = "rust_decimal::serde::float")]
+    pub size: Decimal,
+    #[serde(with = "rust_decimal::serde::float")]
+    pub price: Decimal,
+    pub timestamp: i64,
+    #[serde(rename = "transactionHash")]
+    pub transaction_hash: String,
+    #[serde(rename = "proxyWallet")]
+    pub proxy_wallet: String,
+}
+
+impl MarketTrade {
+    /// Stable dedup key. Polymarket doesn't return a trade id, but the
+    /// (tx hash, asset, side, price, size, wallet) tuple uniquely
+    /// identifies a fill within a tx (one tx may settle multiple
+    /// maker/taker pairs).
+    pub fn dedup_key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            self.transaction_hash,
+            self.asset,
+            self.side,
+            self.price,
+            self.size,
+            self.proxy_wallet
+        )
+    }
 }
 
 #[derive(Debug)]

@@ -303,6 +303,32 @@ impl MarketDataHub {
         books.remove(token_id).is_some()
     }
 
+    /// Broadcast a public market trade to subscribers.
+    ///
+    /// Trades arrive from the engine's public-trades REST poller (Polymarket's
+    /// /trades data API). Unlike book updates the hub does not retain trade
+    /// state directly — that lives in the strategy layer's rolling buffers.
+    /// Returning quickly on a closed channel is fine; receivers may not exist.
+    pub async fn broadcast_trade(
+        &self,
+        token_id: String,
+        price: Decimal,
+        size: Decimal,
+        side: String,
+        timestamp: i64,
+    ) {
+        let _ = self
+            .tx
+            .broadcast(MarketEvent::Trade {
+                token_id,
+                price,
+                size,
+                side,
+                timestamp,
+            })
+            .await;
+    }
+
     /// Replace a token's book wholesale, e.g. from a REST poll snapshot.
     ///
     /// Unlike `process_book_update` (which applies an incremental WS diff),

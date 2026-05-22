@@ -38,6 +38,9 @@ pub struct GammaMarket {
     pub outcome_prices: Vec<Decimal>,
     /// CLOB token IDs for each outcome
     pub clob_token_ids: Vec<String>,
+    /// On-chain conditionId for the market (used as the `market=` filter
+    /// for Polymarket's public /trades data API).
+    pub condition_id: String,
     /// Whether market is active for trading
     pub active: bool,
     /// Whether market is closed
@@ -121,6 +124,8 @@ struct RawGammaMarket {
     outcome_prices: Option<String>,  // JSON-encoded array
     #[serde(rename = "clobTokenIds")]
     clob_token_ids: Option<String>,  // JSON-encoded array
+    #[serde(rename = "conditionId")]
+    condition_id: Option<String>,
     active: Option<bool>,
     closed: Option<bool>,
     /// Total liquidity in USDC (as string from API)
@@ -167,6 +172,47 @@ impl GammaClient {
             client: Client::new(),
             base_url: base_url.to_string(),
         }
+    }
+
+    /// Look up the GammaMarket that contains a given CLOB token id.
+    ///
+    /// Used by the engine when a strategy subscribes to a token at runtime
+    /// — we need the parent market's `condition_id` to drive the public
+    /// trade-tape poller, since the data API's `/trades` endpoint filters
+    /// by condition_id (market) rather than token_id (single outcome).
+    /// Returns `Ok(None)` if the token isn't found in any market.
+    pub async fn fetch_market_by_token(
+        &self,
+        token_id: &str,
+    ) -> Result<Option<GammaMarket>, GammaError> {
+        let url = format!(
+            "{}/markets?clob_token_ids={}",
+            self.base_url, token_id
+        );
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| GammaError::RequestError(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(GammaError::RequestError(format!(
+                "HTTP {}",
+                response.status()
+            )));
+        }
+        let markets: Vec<RawGammaMarket> = response
+            .json()
+            .await
+            .map_err(|e| GammaError::ParseError(e.to_string()))?;
+        for raw in markets {
+            if let Ok(m) = self.parse_market_with_end_date(raw, None) {
+                if m.clob_token_ids.iter().any(|t| t == token_id) {
+                    return Ok(Some(m));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Fetch events with markets expiring in a time window.
@@ -585,6 +631,7 @@ impl GammaClient {
             outcomes,
             outcome_prices,
             clob_token_ids,
+            condition_id: raw.condition_id.unwrap_or_default(),
             active: raw.active.unwrap_or(false),
             closed: raw.closed.unwrap_or(true),
             liquidity,
@@ -632,6 +679,7 @@ mod tests {
             outcomes: vec!["Yes".to_string(), "No".to_string()],
             outcome_prices: vec![dec!(0.95), dec!(0.05)],
             clob_token_ids: vec!["123".to_string(), "456".to_string()],
+            condition_id: "0xtest".to_string(),
             active: true,
             closed: false,
             liquidity: Some(1000.0),
@@ -651,6 +699,7 @@ mod tests {
             outcomes: vec!["Yes".to_string(), "No".to_string()],
             outcome_prices: vec![dec!(0.95), dec!(0.05)],
             clob_token_ids: vec!["123".to_string(), "456".to_string()],
+            condition_id: "0xtest".to_string(),
             active: true,
             closed: false,
             liquidity: None,
@@ -670,6 +719,7 @@ mod tests {
             outcomes: vec!["Yes".to_string(), "No".to_string()],
             outcome_prices: vec![dec!(0.30), dec!(0.70)],
             clob_token_ids: vec!["123".to_string(), "456".to_string()],
+            condition_id: "0xtest".to_string(),
             active: true,
             closed: false,
             liquidity: Some(500.0),
