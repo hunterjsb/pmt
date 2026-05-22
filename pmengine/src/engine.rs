@@ -762,11 +762,13 @@ impl Engine {
                                 }
                                 Signal::Buy { token_id, price, size, .. }
                                 | Signal::Sell { token_id, price, size, .. } => {
-                                    // Match the OrderManager's rounding so a "want $0.9301"
-                                    // can be detected as equal to an "open $0.93".
-                                    let price = price.round_dp(2);
+                                    // Don't pre-round here. OrderManager rounds to the
+                                    // per-market tick when actually placing; the delta-quote
+                                    // matcher below uses a half-tick tolerance so any
+                                    // sub-tick wobble in the strategy's target still
+                                    // matches an existing aged order.
                                     let size = size.round_dp(2);
-                                    desired.push((signal.clone(), token_id.clone(), price, size));
+                                    desired.push((signal.clone(), token_id.clone(), *price, size));
                                 }
                             }
                         }
@@ -785,9 +787,16 @@ impl Engine {
                                 .collect();
                             for (id, is_buy, price, size) in active {
                                 // Find a desired order that matches this open order.
+                                // Tolerance: half a tick (0.0005) so a 0.1¢ mid wiggle
+                                // that shifts the target by 0.1¢ doesn't force a
+                                // cancel+replace and re-age. The reward score weight
+                                // changes very little inside ±0.5 tick anyway, but a
+                                // re-quote restarts the order-age timer from zero,
+                                // costing far more than the precision gained.
+                                let price_tol = rust_decimal::Decimal::new(5, 4); // 0.0005
                                 let matched_idx = desired.iter().position(|(s, t, p, sz)| {
                                     t == token_id
-                                        && *p == price
+                                        && (*p - price).abs() <= price_tol
                                         && *sz == size
                                         && matches!(
                                             (s, is_buy),
