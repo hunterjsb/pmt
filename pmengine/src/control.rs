@@ -1,0 +1,176 @@
+//! Local HTTP control plane for the running engine.
+//!
+//! Exposes read-only introspection (status, strategies, orders, alerts) and,
+//! in later phases, action endpoints (approve/reject alerts, cancel orders,
+//! pause strategies). All traffic is local: the server binds to a loopback
+//! address by default. Remote access, if ever wanted, should route through
+//! pmproxy with Cognito.
+//!
+//! ## Pattern
+//!
+//! The control plane is a thin axum HTTP server. Handlers do not touch
+//! engine state directly — they send a typed `EngineCommand` over an
+//! mpsc channel and wait on a oneshot reply. The engine's `tokio::select!`
+//! receives the command and builds the reply inline, with full access to
+//! its own state and no locking. This keeps the hot path lock-free while
+//! still allowing external introspection.
+
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::Json,
+    routing::get,
+    Router,
+};
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use serde::Serialize;
+use std::net::SocketAddr;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+
+/// Commands the control plane sends to the engine main loop.
+///
+/// Each variant carries a oneshot sender for the typed reply. Adding a new
+/// endpoint = one new variant + one inline arm in the engine's command
+/// handler + one handler function below.
+#[derive(Debug)]
+pub enum EngineCommand {
+    GetStatus(oneshot::Sender<StatusReport>),
+    ListStrategies(oneshot::Sender<Vec<StrategyInfo>>),
+    ListOrders(oneshot::Sender<Vec<OrderInfo>>),
+    ListAlerts(oneshot::Sender<Vec<AlertInfo>>),
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusReport {
+    pub uptime_secs: u64,
+    pub tick_count: u64,
+    pub dry_run: bool,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub balance_usdc: Decimal,
+    pub subscribed_tokens: usize,
+    pub strategies: usize,
+    pub open_orders: usize,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub total_exposure_usd: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub realized_pnl: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub unrealized_pnl: Decimal,
+    pub halted: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StrategyInfo {
+    pub id: String,
+    pub tick_interval_ms: u64,
+    pub subscribed_tokens: Vec<String>,
+    pub last_tick_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OrderInfo {
+    pub id: String,
+    pub token_id: String,
+    pub side: &'static str,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub size: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub filled: Decimal,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlertInfo {
+    pub id: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+    pub suggested_order: Option<OrderInfo>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Spawn the control plane HTTP server on a background task.
+///
+/// Returns the join handle so the engine can abort it on shutdown. The
+/// server runs forever until aborted; binding failures are logged and the
+/// task exits.
+pub fn spawn(bind: SocketAddr, cmd_tx: mpsc::Sender<EngineCommand>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let app = Router::new()
+            .route("/status", get(status_handler))
+            .route("/strategies", get(strategies_handler))
+            .route("/orders", get(orders_handler))
+            .route("/alerts", get(alerts_handler))
+            .with_state(cmd_tx);
+
+        let listener = match tokio::net::TcpListener::bind(bind).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(bind = %bind, error = %e, "Control plane bind failed");
+                return;
+            }
+        };
+
+        tracing::info!(bind = %bind, "Control plane listening");
+
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!(error = %e, "Control plane serve loop ended");
+        }
+    })
+}
+
+async fn status_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+) -> Result<Json<StatusReport>, StatusCode> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::GetStatus(tx))
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    rx.await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn strategies_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+) -> Result<Json<Vec<StrategyInfo>>, StatusCode> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::ListStrategies(tx))
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    rx.await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn orders_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+) -> Result<Json<Vec<OrderInfo>>, StatusCode> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::ListOrders(tx))
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    rx.await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn alerts_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+) -> Result<Json<Vec<AlertInfo>>, StatusCode> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::ListAlerts(tx))
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    rx.await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}

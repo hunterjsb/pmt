@@ -53,6 +53,9 @@ openssl = { version = "0.10", features = ["vendored"] }
 # Async utilities
 async-broadcast = "0.7"
 
+# Control plane HTTP server (local introspection + future alert approval)
+axum = "0.7"
+
 # AWS SDK for Cognito authentication (optional, for pmproxy multi-tenant auth)
 aws-config = { version = "1", optional = true }
 aws-sdk-cognitoidentityprovider = { version = "1", optional = true }

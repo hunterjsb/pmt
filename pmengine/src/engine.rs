@@ -2,6 +2,7 @@
 
 use crate::client::PolymarketClient;
 use crate::config::Config;
+use crate::control::{self, AlertInfo, EngineCommand, OrderInfo, StatusReport, StrategyInfo};
 use crate::gamma::{GammaClient, GammaMarket};
 use crate::order::OrderManager;
 use crate::orderbook::MarketDataHub;
@@ -417,6 +418,21 @@ impl Engine {
     /// * `max_ticks` - Maximum number of ticks before automatic shutdown (0 = unlimited)
     pub async fn run(&mut self, max_ticks: u64) -> Result<(), EngineError> {
         tracing::info!(max_ticks = max_ticks, "Starting engine event loop");
+
+        // Origin for uptime exposed via the control plane. std (not tokio)
+        // because StrategyRuntime tracks last-tick instants with std::time.
+        let start_instant = std::time::Instant::now();
+
+        // Spawn the local control plane HTTP server. Binds to loopback by
+        // default; override with PMENGINE_CONTROL_BIND. Commands flow back
+        // here via cmd_rx and are dispatched inline in the select! loop
+        // below so no engine state ever needs to be Arc-shared.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<EngineCommand>(64);
+        let control_bind: std::net::SocketAddr = std::env::var("PMENGINE_CONTROL_BIND")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| "127.0.0.1:7531".parse().expect("default bind addr is valid"));
+        let control_handle = control::spawn(control_bind, cmd_tx);
 
         // Startup reconcile: clear any orphan orders left by a previous engine
         // session on the strategies' subscribed tokens. The engine treats
@@ -1000,6 +1016,78 @@ impl Engine {
                         }
                     }
 
+                    // Control plane commands. Built inline against live
+                    // engine state so we never need to share the state via
+                    // Arc/RwLock — the select! is the synchronization point.
+                    Some(cmd) = cmd_rx.recv() => {
+                        match cmd {
+                            EngineCommand::GetStatus(reply) => {
+                                let report = StatusReport {
+                                    uptime_secs: start_instant.elapsed().as_secs(),
+                                    tick_count,
+                                    dry_run: self.is_dry_run(),
+                                    balance_usdc: *self.usdc_balance.read().await,
+                                    subscribed_tokens: self.subscribed_tokens.len(),
+                                    strategies: self.strategy_runtime.summaries().len(),
+                                    open_orders: self.risk_manager.total_open_orders(),
+                                    total_exposure_usd: self
+                                        .risk_manager
+                                        .current_exposure(&self.positions),
+                                    realized_pnl: self.positions.total_realized_pnl(),
+                                    unrealized_pnl: self.positions.total_unrealized_pnl(),
+                                    halted: self.risk_manager.is_halted(),
+                                };
+                                let _ = reply.send(report);
+                            }
+                            EngineCommand::ListStrategies(reply) => {
+                                let now_instant = std::time::Instant::now();
+                                let now_utc = chrono::Utc::now();
+                                let infos: Vec<StrategyInfo> = self
+                                    .strategy_runtime
+                                    .summaries()
+                                    .into_iter()
+                                    .map(|s| StrategyInfo {
+                                        id: s.id,
+                                        tick_interval_ms: s.tick_interval_ms,
+                                        subscribed_tokens: s.subscriptions,
+                                        last_tick_at: s.last_tick_at.map(|t| {
+                                            // Instant → wall-clock by aligning the
+                                            // monotonic delta against the observed
+                                            // wall-clock at the same moment.
+                                            let elapsed = now_instant.saturating_duration_since(t);
+                                            now_utc
+                                                - chrono::Duration::from_std(elapsed)
+                                                    .unwrap_or_else(|_| chrono::Duration::zero())
+                                        }),
+                                    })
+                                    .collect();
+                                let _ = reply.send(infos);
+                            }
+                            EngineCommand::ListOrders(reply) => {
+                                let orders: Vec<OrderInfo> = self
+                                    .order_manager
+                                    .active_orders_snapshot()
+                                    .into_iter()
+                                    .map(|o| OrderInfo {
+                                        id: o.id,
+                                        token_id: o.token_id,
+                                        side: if o.is_buy { "buy" } else { "sell" },
+                                        price: o.price,
+                                        size: o.size,
+                                        filled: o.filled_size,
+                                        status: format!("{:?}", o.status),
+                                        created_at: o.created_at,
+                                    })
+                                    .collect();
+                                let _ = reply.send(orders);
+                            }
+                            EngineCommand::ListAlerts(reply) => {
+                                // Stub: Alert queue lands in Phase 5.
+                                let _ = reply.send(Vec::<AlertInfo>::new());
+                            }
+                        }
+                    }
+
                     // Shutdown signal
                     _ = shutdown_rx.recv() => {
                         tracing::info!("Shutting down engine");
@@ -1013,6 +1101,7 @@ impl Engine {
         poller_handle.abort();
         balance_handle.abort();
         trades_handle.abort();
+        control_handle.abort();
         tracing::debug!("Background pollers stopped");
 
         Ok(())

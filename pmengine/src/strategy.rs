@@ -157,6 +157,15 @@ pub trait Strategy: Send + Sync {
     fn on_shutdown(&mut self) {}
 }
 
+/// Owned summary of a registered strategy.
+#[derive(Debug, Clone)]
+pub struct StrategySummary {
+    pub id: String,
+    pub tick_interval_ms: u64,
+    pub subscriptions: Vec<String>,
+    pub last_tick_at: Option<std::time::Instant>,
+}
+
 /// Runtime for executing multiple strategies.
 pub struct StrategyRuntime {
     strategies: Vec<Box<dyn Strategy>>,
@@ -182,6 +191,23 @@ impl StrategyRuntime {
         );
         self.strategies.push(strategy);
         self.last_tick_at.push(None);
+    }
+
+    /// Owned summary of a registered strategy, for introspection by the
+    /// control plane. The `last_tick_at` Instant is monotonic; callers that
+    /// need a wall-clock time should compute it from `Utc::now()` minus
+    /// `Instant::now().duration_since(t)` at the same observation point.
+    pub fn summaries(&self) -> Vec<StrategySummary> {
+        self.strategies
+            .iter()
+            .enumerate()
+            .map(|(i, s)| StrategySummary {
+                id: s.id().to_string(),
+                tick_interval_ms: s.tick_interval_ms(),
+                subscriptions: s.subscriptions(),
+                last_tick_at: self.last_tick_at[i],
+            })
+            .collect()
     }
 
     /// Get all token subscriptions from all strategies.

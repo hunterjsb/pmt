@@ -17,6 +17,7 @@
 
 pub mod client;
 pub mod config;
+pub mod control;
 pub mod engine;
 pub mod gamma;
 pub mod order;

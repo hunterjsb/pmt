@@ -560,5 +560,128 @@ def book(token: str) -> None:
     console.print(t)
 
 
+@cli.group()
+def engine() -> None:
+    """Talk to a locally-running pmengine via its control plane.
+
+    The engine binds its control plane to 127.0.0.1:7531 by default. Override
+    with PMENGINE_CONTROL_URL.
+    """
+    pass
+
+
+def _engine_get(path: str) -> dict | list:
+    base = os.environ.get("PMENGINE_CONTROL_URL", "http://127.0.0.1:7531").rstrip("/")
+    try:
+        r = requests.get(f"{base}{path}", timeout=5)
+        r.raise_for_status()
+    except requests.ConnectionError:
+        console.print(
+            f"[red]Cannot reach pmengine at {base}.[/red] "
+            "Is the engine running? Check `ps -ef | grep pmengine`."
+        )
+        sys.exit(1)
+    except requests.HTTPError as e:
+        console.print(f"[red]Engine returned {e.response.status_code}: {e.response.text}[/red]")
+        sys.exit(1)
+    return r.json()
+
+
+@engine.command("status")
+def engine_status() -> None:
+    """One-line health snapshot of the running engine."""
+    s = _engine_get("/status")
+    t = Table(title="pmengine status", show_header=False)
+    t.add_column("key", style="bold")
+    t.add_column("value")
+    uptime_h, rem = divmod(int(s["uptime_secs"]), 3600)
+    uptime_m, uptime_s = divmod(rem, 60)
+    t.add_row("uptime", f"{uptime_h}h {uptime_m}m {uptime_s}s")
+    t.add_row("ticks", str(s["tick_count"]))
+    t.add_row("dry_run", str(s["dry_run"]))
+    t.add_row("balance", f"${float(s['balance_usdc']):,.2f} USDC")
+    t.add_row("subscribed tokens", str(s["subscribed_tokens"]))
+    t.add_row("strategies", str(s["strategies"]))
+    t.add_row("open orders", str(s["open_orders"]))
+    t.add_row("exposure", f"${float(s['total_exposure_usd']):,.2f}")
+    pnl_r = float(s["realized_pnl"])
+    pnl_u = float(s["unrealized_pnl"])
+    t.add_row("realized P&L", f"[{_pnl_color(pnl_r)}]${pnl_r:,.2f}[/{_pnl_color(pnl_r)}]")
+    t.add_row("unrealized P&L", f"[{_pnl_color(pnl_u)}]${pnl_u:,.2f}[/{_pnl_color(pnl_u)}]")
+    t.add_row("status", "[red bold]HALTED[/red bold]" if s["halted"] else "[green]running[/green]")
+    console.print(t)
+
+
+@engine.command("strategies")
+def engine_strategies() -> None:
+    """List registered strategies with cadence + last-tick timestamps."""
+    rows = _engine_get("/strategies")
+    if not rows:
+        console.print("[yellow]No strategies registered.[/yellow]")
+        return
+    t = Table(title="strategies")
+    for col in ("id", "tick interval", "tokens", "last tick"):
+        t.add_column(col)
+    for r in rows:
+        last = r.get("last_tick_at")
+        if last:
+            try:
+                ts = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - ts).total_seconds()
+                last_disp = f"{age:.0f}s ago"
+            except ValueError:
+                last_disp = last
+        else:
+            last_disp = "never"
+        tokens = r["subscribed_tokens"]
+        token_disp = tokens[0][:12] + "…" if len(tokens) == 1 else f"{len(tokens)} tokens"
+        t.add_row(r["id"], f"{r['tick_interval_ms']}ms", token_disp, last_disp)
+    console.print(t)
+
+
+@engine.command("orders")
+def engine_orders() -> None:
+    """Open orders the engine is currently managing."""
+    rows = _engine_get("/orders")
+    if not rows:
+        console.print("[yellow]No active orders.[/yellow]")
+        return
+    t = Table(title="open orders")
+    for col in ("id", "token", "side", "price", "size", "filled", "status", "age"):
+        t.add_column(col, justify="right" if col not in ("id", "token", "side", "status") else "left")
+    now = datetime.now(timezone.utc)
+    for o in rows:
+        created = datetime.fromisoformat(o["created_at"].replace("Z", "+00:00"))
+        age_s = (now - created).total_seconds()
+        age_disp = f"{age_s:.0f}s" if age_s < 120 else f"{age_s/60:.1f}m"
+        side_col = "green" if o["side"] == "buy" else "red"
+        t.add_row(
+            o["id"][:10] + "…",
+            o["token_id"][:8] + "…",
+            f"[{side_col}]{o['side'].upper()}[/{side_col}]",
+            f"${float(o['price']):.4f}",
+            f"{float(o['size']):.2f}",
+            f"{float(o['filled']):.2f}",
+            o["status"],
+            age_disp,
+        )
+    console.print(t)
+
+
+@engine.command("alerts")
+def engine_alerts() -> None:
+    """Pending strategy alerts awaiting human approval (Phase 5 — empty for now)."""
+    rows = _engine_get("/alerts")
+    if not rows:
+        console.print("[dim]No pending alerts.[/dim]")
+        return
+    t = Table(title="pending alerts")
+    for col in ("id", "reason", "created", "expires"):
+        t.add_column(col)
+    for a in rows:
+        t.add_row(a["id"][:10], a["reason"], a["created_at"], a.get("expires_at", ""))
+    console.print(t)
+
+
 if __name__ == "__main__":
     cli()

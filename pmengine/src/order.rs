@@ -253,6 +253,17 @@ impl OrderManager {
     }
 
     /// Get all active orders.
+    /// Owned snapshot of currently-active orders, for introspection by the
+    /// control plane. Cloned so the caller can serialize without holding a
+    /// reference into the manager.
+    pub fn active_orders_snapshot(&self) -> Vec<Order> {
+        self.orders
+            .values()
+            .filter(|o| o.is_active())
+            .cloned()
+            .collect()
+    }
+
     pub fn active_orders(&self) -> Vec<&Order> {
         self.orders.values().filter(|o| o.is_active()).collect()
     }
