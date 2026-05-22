@@ -726,17 +726,70 @@ def engine_trades(token: str, since: int | None, window: int | None, limit: int)
 
 @engine.command("alerts")
 def engine_alerts() -> None:
-    """Pending strategy alerts awaiting human approval (Phase 5 — empty for now)."""
+    """Pending strategy alerts awaiting human approval."""
     rows = _engine_get("/alerts")
     if not rows:
         console.print("[dim]No pending alerts.[/dim]")
         return
     t = Table(title="pending alerts")
-    for col in ("id", "reason", "created", "expires"):
-        t.add_column(col)
+    for col in ("id", "side", "token", "price", "size", "reason", "expires in"):
+        t.add_column(col, justify="right" if col in ("price", "size") else "left")
+    now = datetime.now(timezone.utc)
     for a in rows:
-        t.add_row(a["id"][:10], a["reason"], a["created_at"], a.get("expires_at", ""))
+        sug = a["suggested"]
+        side_col = "green" if sug["side"] == "buy" else "red"
+        try:
+            expires = datetime.fromisoformat(a["expires_at"].replace("Z", "+00:00"))
+            rem = (expires - now).total_seconds()
+            exp_disp = f"{rem:.0f}s" if rem < 120 else f"{rem/60:.1f}m"
+        except (KeyError, ValueError):
+            exp_disp = "?"
+        t.add_row(
+            a["id"],
+            f"[{side_col}]{sug['side'].upper()}[/{side_col}]",
+            sug["token_id"][:10] + "…",
+            f"${float(sug['price']):.4f}",
+            f"{float(sug['size']):.2f}",
+            a["reason"][:60],
+            exp_disp,
+        )
     console.print(t)
+    console.print(
+        "\n[dim]approve: `pmt engine approve <id>`   reject: `pmt engine reject <id>`[/dim]"
+    )
+
+
+def _engine_post(path: str) -> dict:
+    base = os.environ.get("PMENGINE_CONTROL_URL", "http://127.0.0.1:7531").rstrip("/")
+    try:
+        r = requests.post(f"{base}{path}", timeout=10)
+    except requests.ConnectionError:
+        console.print(f"[red]Cannot reach pmengine at {base}.[/red]")
+        sys.exit(1)
+    if r.status_code >= 400:
+        try:
+            msg = r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
+        except Exception:
+            msg = r.text
+        console.print(f"[red]HTTP {r.status_code}: {msg}[/red]")
+        sys.exit(1)
+    return r.json()
+
+
+@engine.command("approve")
+@click.argument("alert_id")
+def engine_approve(alert_id: str) -> None:
+    """Approve a pending alert; the engine executes the suggested order."""
+    res = _engine_post(f"/alerts/{alert_id}/approve")
+    console.print(f"[green]approved[/green] → order_id: {res.get('order_id')}")
+
+
+@engine.command("reject")
+@click.argument("alert_id")
+def engine_reject(alert_id: str) -> None:
+    """Reject a pending alert; the engine drops it without executing."""
+    _engine_post(f"/alerts/{alert_id}/reject")
+    console.print(f"[yellow]rejected[/yellow] alert {alert_id}")
 
 
 if __name__ == "__main__":

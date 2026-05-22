@@ -86,7 +86,8 @@ impl OrderManager {
             // for exhaustiveness.
             Signal::Shutdown { .. }
             | Signal::Subscribe { .. }
-            | Signal::Unsubscribe { .. } => Ok(None),
+            | Signal::Unsubscribe { .. }
+            | Signal::Alert { .. } => Ok(None),
         }
     }
 

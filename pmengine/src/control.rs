@@ -40,7 +40,15 @@ pub enum EngineCommand {
     GetStatus(oneshot::Sender<StatusReport>),
     ListStrategies(oneshot::Sender<Vec<StrategyInfo>>),
     ListOrders(oneshot::Sender<Vec<OrderInfo>>),
-    ListAlerts(oneshot::Sender<Vec<AlertInfo>>),
+    ListAlerts(oneshot::Sender<Vec<crate::alerts::PendingAlert>>),
+    ApproveAlert {
+        id: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    RejectAlert {
+        id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     ListSubscriptions(oneshot::Sender<Vec<String>>),
     ListTrades {
         token_id: String,
@@ -107,15 +115,6 @@ pub struct OrderInfo {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct AlertInfo {
-    pub id: String,
-    pub reason: String,
-    pub created_at: DateTime<Utc>,
-    pub suggested_order: Option<OrderInfo>,
-    pub expires_at: Option<DateTime<Utc>>,
-}
-
 /// Spawn the control plane HTTP server on a background task.
 ///
 /// Returns the join handle so the engine can abort it on shutdown. The
@@ -128,6 +127,14 @@ pub fn spawn(bind: SocketAddr, cmd_tx: mpsc::Sender<EngineCommand>) -> JoinHandl
             .route("/strategies", get(strategies_handler))
             .route("/orders", get(orders_handler))
             .route("/alerts", get(alerts_handler))
+            .route(
+                "/alerts/:id/approve",
+                axum::routing::post(approve_alert_handler),
+            )
+            .route(
+                "/alerts/:id/reject",
+                axum::routing::post(reject_alert_handler),
+            )
             .route("/subscriptions", get(subscriptions_handler))
             .route("/trades/:token_id", get(trades_handler))
             .with_state(cmd_tx);
@@ -189,7 +196,7 @@ async fn orders_handler(
 
 async fn alerts_handler(
     State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
-) -> Result<Json<Vec<AlertInfo>>, StatusCode> {
+) -> Result<Json<Vec<crate::alerts::PendingAlert>>, StatusCode> {
     let (tx, rx) = oneshot::channel();
     cmd_tx
         .send(EngineCommand::ListAlerts(tx))
@@ -198,6 +205,38 @@ async fn alerts_handler(
     rx.await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn approve_alert_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::ApproveAlert { id, reply: tx })
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "engine offline".to_string()))?;
+    match rx.await {
+        Ok(Ok(order_id)) => Ok(Json(serde_json::json!({"approved": true, "order_id": order_id}))),
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e)),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string())),
+    }
+}
+
+async fn reject_alert_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::RejectAlert { id, reply: tx })
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "engine offline".to_string()))?;
+    match rx.await {
+        Ok(Ok(())) => Ok(Json(serde_json::json!({"rejected": true}))),
+        Ok(Err(e)) => Err((StatusCode::NOT_FOUND, e)),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string())),
+    }
 }
 
 async fn subscriptions_handler(

@@ -73,5 +73,25 @@ class Unsubscribe:
     token_id: str
 
 
+@dataclass(frozen=True)
+class Alert:
+    """Propose an order pending human approval.
+
+    The engine queues a `PendingAlert` and fires a notification through
+    its configured Notifier (ntfy / Discord). The user approves via
+    `pmt engine approve <id>` (or by tapping the notification action
+    button), at which point the engine dispatches `suggested` through
+    the normal risk + order pipeline. Alerts expire after `ttl_secs`.
+
+    `dedupe_key` keeps a strategy from spamming the same alert each tick
+    — if an active alert with this key already exists, the new emission
+    is dropped.
+    """
+    reason: str
+    suggested: Union["Buy", "Sell"]
+    ttl_secs: int = 600
+    dedupe_key: str = ""
+
+
 # Union type for all signals
-Signal = Union[Buy, Sell, Cancel, Hold, Shutdown, Subscribe, Unsubscribe]
+Signal = Union[Buy, Sell, Cancel, Hold, Shutdown, Subscribe, Unsubscribe, Alert]

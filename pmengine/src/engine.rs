@@ -1,9 +1,10 @@
 //! Main event loop for the trading engine.
 
+use crate::alerts::{AlertQueue, Notifier};
 use crate::client::PolymarketClient;
 use crate::config::Config;
 use crate::control::{
-    self, AlertInfo, EngineCommand, OrderInfo, StatusReport, StrategyInfo, TradeInfo,
+    self, EngineCommand, OrderInfo, StatusReport, StrategyInfo, TradeInfo,
 };
 use crate::gamma::{GammaClient, GammaMarket};
 use crate::order::OrderManager;
@@ -73,6 +74,10 @@ pub struct Engine {
     /// subscription. Independent from the optional `gamma_client` above,
     /// which is gated by market-discovery mode.
     gamma_resolver: GammaClient,
+    /// Queue of `PendingAlert` awaiting human approval.
+    alert_queue: AlertQueue,
+    /// Notifier for outbound push notifications (ntfy / Discord / noop).
+    notifier: Arc<Notifier>,
 }
 
 /// Internal event emitted by the trades poller for the main loop to process.
@@ -165,6 +170,8 @@ impl Engine {
             fill_event_sender,
             token_to_condition: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             gamma_resolver: GammaClient::new(),
+            alert_queue: AlertQueue::new(),
+            notifier: Arc::new(Notifier::from_env()),
         })
     }
 
@@ -971,6 +978,47 @@ impl Engine {
                                 Signal::Unsubscribe { token_id } => {
                                     self.unsubscribe_token(&token_id).await;
                                 }
+                                Signal::Alert { reason, suggested, ttl_secs, dedupe_key } => {
+                                    // The Box<Signal> inside the variant carries
+                                    // the order to dispatch on approval. We push
+                                    // it onto the queue (dedup by key); if the
+                                    // queue accepts it, fire a notifier — spawned
+                                    // so a slow/down ntfy.sh doesn't stall the
+                                    // tick.
+                                    let suggested_signal = *suggested;
+                                    match self.alert_queue.push(
+                                        reason.clone(),
+                                        suggested_signal,
+                                        ttl_secs,
+                                        dedupe_key.clone(),
+                                    ) {
+                                        Some(_id) => {
+                                            // Notify on the freshly inserted alert.
+                                            let alert = self
+                                                .alert_queue
+                                                .list()
+                                                .into_iter()
+                                                .find(|a| a.dedupe_key == dedupe_key);
+                                            if let Some(alert) = alert {
+                                                tracing::info!(
+                                                    alert_id = %alert.id,
+                                                    reason = %reason,
+                                                    "Alert raised"
+                                                );
+                                                let notifier = self.notifier.clone();
+                                                tokio::spawn(async move {
+                                                    notifier.notify(&alert).await;
+                                                });
+                                            }
+                                        }
+                                        None => {
+                                            tracing::debug!(
+                                                dedupe_key = %dedupe_key,
+                                                "Alert deduped (active key already present)"
+                                            );
+                                        }
+                                    }
+                                }
                                 Signal::Cancel { token_id } => {
                                     cancel_tokens.push(token_id);
                                 }
@@ -1295,8 +1343,80 @@ impl Engine {
                                 let _ = reply.send(orders);
                             }
                             EngineCommand::ListAlerts(reply) => {
-                                // Stub: Alert queue lands in Phase 5.
-                                let _ = reply.send(Vec::<AlertInfo>::new());
+                                self.alert_queue.prune_expired();
+                                let _ = reply.send(self.alert_queue.list());
+                            }
+                            EngineCommand::ApproveAlert { id, reply } => {
+                                self.alert_queue.prune_expired();
+                                let res = match self.alert_queue.take(&id) {
+                                    None => Err(format!("alert {} not found", id)),
+                                    Some((_, sig)) => {
+                                        // Run the suggested signal through the
+                                        // normal risk + order pipeline, exactly
+                                        // as if the strategy had emitted it
+                                        // directly. Any rejection bubbles up
+                                        // to the HTTP response.
+                                        match self.risk_manager.check_signal(&sig, &self.positions) {
+                                            RiskCheckResult::Approved(ref s)
+                                            | RiskCheckResult::Reduced(ref s, _) => {
+                                                let (token_id, price, size) = match s {
+                                                    Signal::Buy { token_id, price, size, .. } => (token_id.clone(), *price, *size),
+                                                    Signal::Sell { token_id, price, size, .. } => (token_id.clone(), *price, *size),
+                                                    _ => {
+                                                        let _ = reply.send(Err("suggested is not Buy/Sell".to_string()));
+                                                        continue;
+                                                    }
+                                                };
+                                                let notional = price * size;
+                                                let reservation_id = match self
+                                                    .risk_manager
+                                                    .reserve_exposure(&token_id, notional, &self.positions)
+                                                {
+                                                    Some(id) => id,
+                                                    None => {
+                                                        let _ = reply.send(Err(
+                                                            "exposure reservation rejected".to_string(),
+                                                        ));
+                                                        continue;
+                                                    }
+                                                };
+                                                match self.order_manager.execute(s.clone()).await {
+                                                    Ok(Some(order_id)) => {
+                                                        self.risk_manager.confirm_reservation(
+                                                            &reservation_id,
+                                                            &order_id,
+                                                        );
+                                                        Ok(order_id)
+                                                    }
+                                                    Ok(None) => {
+                                                        self.risk_manager
+                                                            .release_reservation(&reservation_id);
+                                                        Ok("dry-run".to_string())
+                                                    }
+                                                    Err(e) => {
+                                                        self.risk_manager
+                                                            .release_reservation(&reservation_id);
+                                                        Err(format!("execute failed: {}", e))
+                                                    }
+                                                }
+                                            }
+                                            RiskCheckResult::Rejected(reason) => {
+                                                Err(format!("risk rejected: {}", reason))
+                                            }
+                                        }
+                                    }
+                                };
+                                let _ = reply.send(res);
+                            }
+                            EngineCommand::RejectAlert { id, reply } => {
+                                let res = match self.alert_queue.take(&id) {
+                                    None => Err(format!("alert {} not found", id)),
+                                    Some(_) => {
+                                        tracing::info!(alert_id = %id, "Alert rejected");
+                                        Ok(())
+                                    }
+                                };
+                                let _ = reply.send(res);
                             }
                             EngineCommand::ListSubscriptions(reply) => {
                                 let _ = reply.send(self.subscribed_tokens.clone());

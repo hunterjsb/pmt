@@ -1299,6 +1299,8 @@ impl Strategy for {self.struct_name} {{
                 return self._gen_token_only_signal("Subscribe", expr)
             elif func_name == "Unsubscribe":
                 return self._gen_token_only_signal("Unsubscribe", expr)
+            elif func_name == "Alert":
+                return self._gen_alert_call(expr)
             # Decimal("0.5") -> dec!(0.5)
             elif func_name == "Decimal":
                 arg = expr.args[0]
@@ -1352,6 +1354,30 @@ impl Strategy for {self.struct_name} {{
         kwargs = {kw.arg: self._gen_expr(kw.value) for kw in expr.keywords}
         reason = kwargs.get("reason", '""')
         return f"Signal::Shutdown {{ reason: {reason}.to_string() }}"
+
+    def _gen_alert_call(self, expr: ast.Call) -> str:
+        """Generate Signal::Alert { reason, suggested: Box::new(<Buy|Sell>), ttl_secs, dedupe_key }."""
+        kwargs = {kw.arg: kw.value for kw in expr.keywords}
+        reason = self._gen_expr(kwargs["reason"]) if "reason" in kwargs else '""'
+        ttl_secs = self._gen_expr(kwargs["ttl_secs"]) if "ttl_secs" in kwargs else "600"
+        dedupe_key = (
+            self._gen_expr(kwargs["dedupe_key"]) if "dedupe_key" in kwargs else '""'
+        )
+        # `suggested` must be a Buy() or Sell() expression — recurse into
+        # the nested call so it emits the right Signal variant.
+        if "suggested" not in kwargs:
+            raise ValueError("Alert(...) requires a `suggested=Buy(...)` or `Sell(...)`")
+        suggested = self._gen_expr(kwargs["suggested"])
+        if not reason.startswith('"'):
+            reason = f"{reason}.to_string()"
+        if not dedupe_key.startswith('"'):
+            dedupe_key = f"{dedupe_key}.to_string()"
+        return (
+            f"Signal::Alert {{ reason: {reason}, "
+            f"suggested: Box::new({suggested}), "
+            f"ttl_secs: {ttl_secs}, "
+            f"dedupe_key: {dedupe_key} }}"
+        )
 
     def _gen_token_only_signal(self, variant: str, expr: ast.Call) -> str:
         """Generate Signal::Subscribe or Signal::Unsubscribe (token-only).

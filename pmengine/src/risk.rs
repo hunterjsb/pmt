@@ -120,7 +120,8 @@ impl RiskManager {
             | Signal::Cancel { .. }
             | Signal::Shutdown { .. }
             | Signal::Subscribe { .. }
-            | Signal::Unsubscribe { .. } => RiskCheckResult::Approved(signal.clone()),
+            | Signal::Unsubscribe { .. }
+            | Signal::Alert { .. } => RiskCheckResult::Approved(signal.clone()),
 
             Signal::Buy { token_id, price, size, urgency } => {
                 self.check_order(token_id, *price, *size, true, *urgency, positions)

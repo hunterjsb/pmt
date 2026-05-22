@@ -59,6 +59,24 @@ pub enum Signal {
     /// the WebSocket to the remaining tokens. Order history and positions
     /// are preserved.
     Unsubscribe { token_id: String },
+    /// Propose an order that requires human approval before execution.
+    ///
+    /// The engine queues a PendingAlert and pushes a notification through
+    /// the configured Notifier (ntfy / Discord). The user calls
+    /// `pmt engine approve <id>` (or taps the notification action button)
+    /// to execute the suggested signal through the normal risk + order
+    /// pipeline, or `pmt engine reject <id>` to drop it. Alerts expire
+    /// after `ttl_secs`.
+    ///
+    /// `dedupe_key` lets a strategy emit the same alert across many ticks
+    /// without spamming notifications — if an active alert with the same
+    /// key already exists, the new emission is dropped silently.
+    Alert {
+        reason: String,
+        suggested: Box<Signal>,
+        ttl_secs: i64,
+        dedupe_key: String,
+    },
     /// No action
     Hold,
     /// Request graceful shutdown with a reason
