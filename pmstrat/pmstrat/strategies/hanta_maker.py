@@ -22,8 +22,13 @@ from ..signal import Buy, Sell, Cancel, Hold, Signal, Urgency
 # Hantavirus pandemic in 2026? — NO token
 TOKEN_ID = "95212449865986159112377413335252801281670333750637442556685159781445406848396"
 
-# Quote ±0.9¢ around mid → 1.8¢ total spread, well under 5.5¢ rewards cap.
-HALF_SPREAD = Decimal("0.009")
+# Quote ±0.2¢ around mid → 0.4¢ total spread. The reward score weight is
+# quadratic in distance from mid (S = ((v-s)/v)^2) — moving from 0.9¢ to
+# 0.2¢ each side bumps weight from ~49% to ~93%, doubling effective score
+# at the same notional. Tick size on Hantavirus pandemic is 0.001, so the
+# quotes round cleanly to 3 decimals (pmengine now picks up the per-market
+# tick instead of forcing 2 decimals).
+HALF_SPREAD = Decimal("0.002")
 # Per-side quote size. 400 × $0.94 ≈ $376 notional, comfortably above the
 # $200 rewards minimum. Smaller than the full 1295 NO we hold so the engine
 # can run a real BID inside ~$480 free cash without a balance error.
@@ -32,8 +37,11 @@ ORDER_SIZE = Decimal("400")
 # NO outside the strategy). Setting wide so the strategy can extend the
 # position by ~600 before it stops bidding.
 MAX_POSITION = Decimal("2000")
-# Don't quote if computed spread collapses below this. Tiny insurance.
-MIN_EDGE = Decimal("0.003")
+# Don't quote if computed spread collapses below this. With HALF_SPREAD
+# at 0.2¢, total spread is 0.4¢ — set MIN_EDGE just under HALF_SPREAD so
+# the check stays defensive (catches collapses near 0) without vetoing
+# our intentionally-tight quotes.
+MIN_EDGE = Decimal("0.001")
 
 
 @strategy(

@@ -27,7 +27,6 @@ use sha2::Sha256;
 
 use crate::config::Config;
 
-#[cfg(feature = "cognito")]
 use std::sync::Arc;
 #[cfg(feature = "cognito")]
 use crate::cognito::CognitoAuth;
@@ -51,6 +50,11 @@ pub struct PolymarketClient {
     /// Optional Cognito auth for pmproxy multi-tenant auth
     #[cfg(feature = "cognito")]
     cognito_auth: Option<Arc<CognitoAuth>>,
+    /// Cached tick-size decimal places per token. Lets us round each
+    /// market's prices to its actual tick (0.001 vs 0.01 vs 0.0001)
+    /// instead of the previous hard-coded 2-decimal rounding that
+    /// silently snapped $0.9425 → $0.94 and killed quote precision.
+    tick_decimals: Arc<tokio::sync::RwLock<std::collections::HashMap<String, u32>>>,
 }
 
 impl PolymarketClient {
@@ -157,7 +161,37 @@ impl PolymarketClient {
             dry_run,
             #[cfg(feature = "cognito")]
             cognito_auth: None,
+            tick_decimals: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         })
+    }
+
+    /// Look up (and cache) how many decimal places this market's tick size
+    /// allows. Used by `place_limit_order` to round each price to the right
+    /// precision instead of the hard-coded 2-decimal default.
+    pub async fn tick_decimals_for(&self, token_id: &str) -> Result<u32, ClientError> {
+        if let Some(d) = self.tick_decimals.read().await.get(token_id).copied() {
+            return Ok(d);
+        }
+        let token_u256 = U256::from_str(token_id)
+            .map_err(|e| ClientError::OrderError(format!("Invalid token_id: {}", e)))?;
+        let resp = self
+            .inner
+            .tick_size(token_u256)
+            .await
+            .map_err(|e| ClientError::OrderError(format!("tick_size lookup failed: {}", e)))?;
+        use polymarket_client_sdk_v2::clob::types::TickSize;
+        let decimals = match resp.minimum_tick_size {
+            TickSize::Tenth => 1,
+            TickSize::Hundredth => 2,
+            TickSize::Thousandth => 3,
+            TickSize::TenThousandth => 4,
+            _ => 2, // unknown variant — default to coarsest commonly safe value
+        };
+        self.tick_decimals
+            .write()
+            .await
+            .insert(token_id.to_string(), decimals);
+        Ok(decimals)
     }
 
     /// Compute L2 HMAC signature for a request.

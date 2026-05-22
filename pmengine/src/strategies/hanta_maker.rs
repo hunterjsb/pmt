@@ -9,10 +9,10 @@ use rust_decimal_macros::dec;
 
 // Strategy parameters (generated from Python params)
 const TOKEN_ID: &str = "95212449865986159112377413335252801281670333750637442556685159781445406848396";
-const HALF_SPREAD: Decimal = dec!(0.009);
+const HALF_SPREAD: Decimal = dec!(0.002);
 const ORDER_SIZE: Decimal = dec!(400);
 const MAX_POSITION: Decimal = dec!(2000);
-const MIN_EDGE: Decimal = dec!(0.003);
+const MIN_EDGE: Decimal = dec!(0.001);
 
 pub struct HantaMaker {
     id: String,

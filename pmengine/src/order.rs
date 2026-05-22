@@ -94,8 +94,16 @@ impl OrderManager {
         size: Decimal,
         _urgency: Urgency,
     ) -> Result<Option<String>, OrderError> {
-        // Round to 2 decimal places (Polymarket requirement)
-        let price = price.round_dp(2);
+        // Round price to the market's actual tick size (Polymarket rejects
+        // orders that don't sit on a tick). Default to 2 dp if the tick
+        // lookup fails — better to attempt at coarser precision than to
+        // drop the order entirely.
+        let dp = self
+            .client
+            .tick_decimals_for(token_id)
+            .await
+            .unwrap_or(2);
+        let price = price.round_dp(dp);
         let size = size.round_dp(2);
 
         // Skip if size rounds to zero
