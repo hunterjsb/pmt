@@ -280,6 +280,16 @@ impl StrategyRuntime {
             .collect()
     }
 
+    /// Union of every registered strategy's `subscriptions()`. Captured
+    /// at engine startup and used by the scanner to guard against
+    /// unsubscribing a token a static-watch strategy still needs.
+    pub fn all_static_subscriptions(&self) -> std::collections::HashSet<String> {
+        self.strategies
+            .iter()
+            .flat_map(|s| s.subscriptions())
+            .collect()
+    }
+
     /// Owned summary of a registered strategy, for introspection by the
     /// control plane. The `last_tick_at` Instant is monotonic; callers that
     /// need a wall-clock time should compute it from `Utc::now()` minus

@@ -698,6 +698,11 @@ impl Engine {
         // them. Iterate the live strategies via a helper accessor.
         let scanner_filters: Vec<crate::gamma::MarketFilter> =
             self.strategy_runtime.market_filters();
+        // Tokens statically declared by ANY strategy. The scanner must
+        // never unsubscribe these — they belong to a sibling strategy
+        // that doesn't drive the scanner and would silently break.
+        let static_subscriptions: std::collections::HashSet<String> =
+            self.strategy_runtime.all_static_subscriptions();
         let scanner_handle = if !scanner_filters.is_empty() {
             let cmd_tx = cmd_tx.clone();
             let interval_s = std::env::var("PMENGINE_SCAN_INTERVAL_S")
@@ -707,6 +712,7 @@ impl Engine {
             tracing::info!(
                 interval_s = interval_s,
                 filter_count = scanner_filters.len(),
+                protected_tokens = static_subscriptions.len(),
                 "Market scanner enabled"
             );
             Some(tokio::spawn(async move {
@@ -749,7 +755,15 @@ impl Engine {
                         Err(_) => return,
                     };
                     let to_add: Vec<String> = desired.difference(&current).cloned().collect();
-                    let to_drop: Vec<String> = current.difference(&desired).cloned().collect();
+                    // Skip Unsubscribe for any token a sibling strategy
+                    // statically declared. Otherwise the scanner would
+                    // happily drop hanta_maker's Hantavirus token the
+                    // moment it doesn't match momentum_fade's filter.
+                    let to_drop: Vec<String> = current
+                        .difference(&desired)
+                        .filter(|t| !static_subscriptions.contains(*t))
+                        .cloned()
+                        .collect();
                     tracing::info!(
                         added = to_add.len(),
                         dropped = to_drop.len(),
@@ -762,13 +776,6 @@ impl Engine {
                             .send(EngineCommand::SubscribeToken { token_id, reply: tx })
                             .await;
                     }
-                    // Be conservative about Unsubscribe: only drop tokens
-                    // we're sure no statically-declared strategy still
-                    // wants. For now we trust the scanner to be the sole
-                    // source — strategies with market_filter should not
-                    // also declare static tokens. Future: query strategies
-                    // for declared-static tokens and exclude those from
-                    // to_drop.
                     for token_id in to_drop {
                         let (tx, _rx) = tokio::sync::oneshot::channel();
                         let _ = cmd_tx
@@ -962,9 +969,23 @@ impl Engine {
 
             tracing::info!("Entering event loop");
 
-            // Warmup: wait for order books to sync before trading
-            // Require at least 100 WebSocket updates before allowing trades
+            // Warmup: wait for order books to sync before trading.
+            //
+            // Three exit conditions, any one is sufficient:
+            //   1. `--skip-warmup` is set (operator override).
+            //   2. WebSocket has streamed `WARMUP_WS_UPDATES` book diffs —
+            //      proves the WS path is alive. Doesn't fire under US IPs
+            //      where Polymarket's WS is geoblocked.
+            //   3. Wall-clock timeout: at least `WARMUP_DEADLINE` has
+            //      elapsed since we entered the loop. The REST poller
+            //      will have populated whatever books it could; any
+            //      missing book is handled by the strategy's own
+            //      `if book is None: continue` guard. Without this,
+            //      a scanner that adds an illiquid market (no orders →
+            //      no book) would gate warmup forever.
             const WARMUP_WS_UPDATES: u64 = 100;
+            const WARMUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+            let warmup_started_at = std::time::Instant::now();
             let mut warmup_complete = false;
 
             loop {
@@ -1008,6 +1029,12 @@ impl Engine {
                             if self.skip_warmup {
                                 warmup_complete = true;
                                 tracing::info!("Warmup skipped (--skip-warmup flag)");
+                            } else if warmup_started_at.elapsed() >= WARMUP_DEADLINE {
+                                warmup_complete = true;
+                                tracing::info!(
+                                    elapsed_s = warmup_started_at.elapsed().as_secs(),
+                                    "Warmup deadline reached, trading enabled (strategies guard their own None books)"
+                                );
                             } else if ws_update_count >= WARMUP_WS_UPDATES {
                                 warmup_complete = true;
                                 tracing::info!(
