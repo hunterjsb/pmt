@@ -2,7 +2,9 @@
 
 use crate::client::PolymarketClient;
 use crate::config::Config;
-use crate::control::{self, AlertInfo, EngineCommand, OrderInfo, StatusReport, StrategyInfo};
+use crate::control::{
+    self, AlertInfo, EngineCommand, OrderInfo, StatusReport, StrategyInfo, TradeInfo,
+};
 use crate::gamma::{GammaClient, GammaMarket};
 use crate::order::OrderManager;
 use crate::orderbook::MarketDataHub;
@@ -936,6 +938,7 @@ impl Engine {
                         let ctx = StrategyContext {
                             timestamp: chrono::Utc::now(),
                             order_books: self.market_data.get_all_books().await,
+                            trade_history: self.market_data.get_all_trade_history().await,
                             positions: self.positions.clone(),
                             markets: self.market_info.clone(),
                             unrealized_pnl: self.positions.total_unrealized_pnl(),
@@ -1297,6 +1300,24 @@ impl Engine {
                             }
                             EngineCommand::ListSubscriptions(reply) => {
                                 let _ = reply.send(self.subscribed_tokens.clone());
+                            }
+                            EngineCommand::ListTrades { token_id, since_ts, reply } => {
+                                let cutoff = since_ts.unwrap_or(i64::MIN);
+                                let trades: Vec<TradeInfo> = self
+                                    .market_data
+                                    .recent_trades(&token_id)
+                                    .await
+                                    .into_iter()
+                                    .filter(|t| t.timestamp >= cutoff)
+                                    .map(|t| TradeInfo {
+                                        token_id: t.token_id,
+                                        price: t.price,
+                                        size: t.size,
+                                        side: t.side,
+                                        timestamp: t.timestamp,
+                                    })
+                                    .collect();
+                                let _ = reply.send(trades);
                             }
                         }
                     }

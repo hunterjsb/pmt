@@ -683,6 +683,47 @@ def engine_subscriptions() -> None:
     console.print(t)
 
 
+@engine.command("trades")
+@click.argument("token")
+@click.option("--since", type=int, default=None, help="Only trades with timestamp ≥ this unix-seconds value")
+@click.option("--window", type=int, default=None, help="Trades in the last N seconds (alternative to --since)")
+@click.option("--limit", type=int, default=30, help="Max rows to print (default 30)")
+def engine_trades(token: str, since: int | None, window: int | None, limit: int) -> None:
+    """Recent public trades for a token from the engine's rolling buffer."""
+    token = _resolve_token(token)
+    params = ""
+    if window is not None:
+        from time import time as _now
+        since = int(_now()) - window
+    if since is not None:
+        params = f"?since={since}"
+    rows = _engine_get(f"/trades/{token}{params}")
+    if not rows:
+        console.print("[dim]No trades in buffer for that token / window.[/dim]")
+        return
+    # Newest first
+    rows.sort(key=lambda r: r["timestamp"], reverse=True)
+    rows = rows[:limit]
+    t = Table(title=f"recent trades for {token[:12]}…")
+    for col in ("when", "side", "price", "size", "notional"):
+        t.add_column(col, justify="right" if col != "side" else "left")
+    now_ts = datetime.now(timezone.utc).timestamp()
+    for r in rows:
+        age = now_ts - r["timestamp"]
+        when = f"{age:.0f}s ago" if age < 120 else f"{age/60:.1f}m ago"
+        side_col = "green" if r["side"] == "BUY" else "red"
+        price = float(r["price"])
+        size = float(r["size"])
+        t.add_row(
+            when,
+            f"[{side_col}]{r['side']}[/{side_col}]",
+            f"${price:.4f}",
+            f"{size:.2f}",
+            f"${price*size:,.2f}",
+        )
+    console.print(t)
+
+
 @engine.command("alerts")
 def engine_alerts() -> None:
     """Pending strategy alerts awaiting human approval (Phase 5 — empty for now)."""

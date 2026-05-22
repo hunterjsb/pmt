@@ -6,8 +6,9 @@
 use async_broadcast::{Receiver, Sender};
 use polymarket_client_sdk_v2::clob::ws::types::response::{BookUpdate, OrderBookLevel};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// A single price level in the order book.
@@ -202,6 +203,21 @@ impl OrderBook {
     }
 }
 
+/// One public market trade, captured by the engine's trade-tape poller
+/// and retained in the rolling per-token buffer on MarketDataHub.
+///
+/// Strategies read these to compute Δvolume / Δprice over windows the
+/// orderbook alone can't reveal. The struct is owned-by-value (small
+/// enough not to need Arc) so callers can clone freely.
+#[derive(Debug, Clone)]
+pub struct TradeRecord {
+    pub token_id: String,
+    pub price: Decimal,
+    pub size: Decimal,
+    pub side: String,
+    pub timestamp: i64,
+}
+
 /// Market data event for broadcast.
 #[derive(Debug, Clone)]
 pub enum MarketEvent {
@@ -224,6 +240,14 @@ pub enum MarketEvent {
 pub struct MarketDataHub {
     /// Order books by token ID
     books: RwLock<HashMap<String, Arc<OrderBook>>>,
+    /// Rolling trade history per token. Bounded by `max_trade_age` —
+    /// inserts prune anything older than that. Strategies read this
+    /// (via StrategyContext) to compute volume / price-change signals
+    /// over windows the live book can't express.
+    trades: RwLock<HashMap<String, VecDeque<TradeRecord>>>,
+    /// Maximum age of trades retained in the rolling buffer. Defaults
+    /// to 1 hour; override with PMENGINE_TRADE_HISTORY_SECS.
+    max_trade_age: Duration,
     /// Broadcast sender for market events
     tx: Sender<MarketEvent>,
     /// Template receiver (clone this for new subscribers)
@@ -236,11 +260,40 @@ impl MarketDataHub {
         let (mut tx, rx) = async_broadcast::broadcast(capacity);
         // Don't wait for receivers, drop old messages if buffer full
         tx.set_overflow(true);
+        let max_trade_age = Duration::from_secs(
+            std::env::var("PMENGINE_TRADE_HISTORY_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3600),
+        );
         Self {
             books: RwLock::new(HashMap::new()),
+            trades: RwLock::new(HashMap::new()),
+            max_trade_age,
             tx,
             rx,
         }
+    }
+
+    /// Snapshot of recent trades for a token. Returns an empty vec if the
+    /// token is unknown or has no trades yet. The buffer is bounded by
+    /// `max_trade_age`; callers can apply tighter time windows themselves.
+    pub async fn recent_trades(&self, token_id: &str) -> Vec<TradeRecord> {
+        let trades = self.trades.read().await;
+        trades
+            .get(token_id)
+            .map(|q| q.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of all per-token trade buffers. Used by the engine each
+    /// tick to build StrategyContext.trade_history.
+    pub async fn get_all_trade_history(&self) -> HashMap<String, Vec<TradeRecord>> {
+        let trades = self.trades.read().await;
+        trades
+            .iter()
+            .map(|(k, q)| (k.clone(), q.iter().cloned().collect()))
+            .collect()
     }
 
     /// Subscribe to market events.
@@ -297,18 +350,24 @@ impl MarketDataHub {
     /// Drop a token's book from the hub. Used when a strategy emits
     /// `Signal::Unsubscribe` to stop watching a market — the REST poller
     /// keys off `get_all_books`, so removing the entry also takes it out
-    /// of the polling rotation.
+    /// of the polling rotation. Also clears the rolling trade buffer.
     pub async fn remove_book(&self, token_id: &str) -> bool {
         let mut books = self.books.write().await;
-        books.remove(token_id).is_some()
+        let existed = books.remove(token_id).is_some();
+        drop(books);
+        let mut trades = self.trades.write().await;
+        trades.remove(token_id);
+        existed
     }
 
-    /// Broadcast a public market trade to subscribers.
+    /// Record + broadcast a public market trade.
     ///
-    /// Trades arrive from the engine's public-trades REST poller (Polymarket's
-    /// /trades data API). Unlike book updates the hub does not retain trade
-    /// state directly — that lives in the strategy layer's rolling buffers.
-    /// Returning quickly on a closed channel is fine; receivers may not exist.
+    /// Pushes onto the per-token rolling buffer (pruning anything older
+    /// than `max_trade_age`) and fires a `MarketEvent::Trade` on the
+    /// broadcast channel. Trades arrive from the engine's public-trades
+    /// REST poller; the buffer is what strategies actually read when they
+    /// need volume / price-change signals — broadcast is for live
+    /// consumers like dashboards.
     pub async fn broadcast_trade(
         &self,
         token_id: String,
@@ -317,6 +376,27 @@ impl MarketDataHub {
         side: String,
         timestamp: i64,
     ) {
+        let record = TradeRecord {
+            token_id: token_id.clone(),
+            price,
+            size,
+            side: side.clone(),
+            timestamp,
+        };
+
+        // Push + prune in one lock acquisition. The cutoff is wall-clock
+        // (chrono::Utc::now()) compared against the trade's unix-seconds
+        // timestamp because that's how data-api emits them.
+        let cutoff = chrono::Utc::now().timestamp() - self.max_trade_age.as_secs() as i64;
+        {
+            let mut trades = self.trades.write().await;
+            let q = trades.entry(token_id.clone()).or_default();
+            q.push_back(record);
+            while q.front().map(|t| t.timestamp < cutoff).unwrap_or(false) {
+                q.pop_front();
+            }
+        }
+
         let _ = self
             .tx
             .broadcast(MarketEvent::Trade {

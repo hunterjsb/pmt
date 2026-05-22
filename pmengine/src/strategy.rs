@@ -1,6 +1,6 @@
 //! Strategy trait and runtime for trading strategies.
 
-use crate::orderbook::OrderBook;
+use crate::orderbook::{OrderBook, TradeRecord};
 use crate::position::{Fill, PositionTracker};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -128,6 +128,12 @@ pub struct StrategyContext {
     pub timestamp: DateTime<Utc>,
     /// Order books by token ID (full depth)
     pub order_books: HashMap<String, Arc<OrderBook>>,
+    /// Rolling public-trade history per token, bounded by the hub's
+    /// `max_trade_age` (1h by default). Strategies use this to compute
+    /// volume / price-change signals over windows the live book can't
+    /// reveal. Empty if the trade tape hasn't seen anything for a token
+    /// yet, or if it failed to resolve the condition_id.
+    pub trade_history: HashMap<String, Vec<TradeRecord>>,
     /// Current positions
     pub positions: PositionTracker,
     /// Market metadata by token ID (from Gamma API)
@@ -138,6 +144,27 @@ pub struct StrategyContext {
     pub realized_pnl: Decimal,
     /// Available USDC balance for trading
     pub usdc_balance: Decimal,
+}
+
+impl StrategyContext {
+    /// Trades for a token within the last `window_secs` seconds.
+    /// Convenience over filtering `trade_history` manually.
+    pub fn recent_trades(&self, token_id: &str, window_secs: i64) -> Vec<&TradeRecord> {
+        let cutoff = self.timestamp.timestamp() - window_secs;
+        self.trade_history
+            .get(token_id)
+            .map(|v| v.iter().filter(|t| t.timestamp >= cutoff).collect())
+            .unwrap_or_default()
+    }
+
+    /// Sum of size across trades for a token in the last `window_secs`
+    /// seconds. Useful for volume-spike detection.
+    pub fn volume_in_window(&self, token_id: &str, window_secs: i64) -> Decimal {
+        self.recent_trades(token_id, window_secs)
+            .iter()
+            .map(|t| t.size)
+            .sum()
+    }
 }
 
 

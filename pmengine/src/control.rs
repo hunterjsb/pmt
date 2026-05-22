@@ -16,12 +16,13 @@
 //! still allowing external introspection.
 
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
     routing::get,
     Router,
 };
+use serde::Deserialize;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -41,6 +42,27 @@ pub enum EngineCommand {
     ListOrders(oneshot::Sender<Vec<OrderInfo>>),
     ListAlerts(oneshot::Sender<Vec<AlertInfo>>),
     ListSubscriptions(oneshot::Sender<Vec<String>>),
+    ListTrades {
+        token_id: String,
+        since_ts: Option<i64>,
+        reply: oneshot::Sender<Vec<TradeInfo>>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct TradeInfo {
+    pub token_id: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub size: Decimal,
+    pub side: String,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TradesQuery {
+    pub since: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +129,7 @@ pub fn spawn(bind: SocketAddr, cmd_tx: mpsc::Sender<EngineCommand>) -> JoinHandl
             .route("/orders", get(orders_handler))
             .route("/alerts", get(alerts_handler))
             .route("/subscriptions", get(subscriptions_handler))
+            .route("/trades/:token_id", get(trades_handler))
             .with_state(cmd_tx);
 
         let listener = match tokio::net::TcpListener::bind(bind).await {
@@ -183,6 +206,25 @@ async fn subscriptions_handler(
     let (tx, rx) = oneshot::channel();
     cmd_tx
         .send(EngineCommand::ListSubscriptions(tx))
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    rx.await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn trades_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+    Path(token_id): Path<String>,
+    Query(q): Query<TradesQuery>,
+) -> Result<Json<Vec<TradeInfo>>, StatusCode> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::ListTrades {
+            token_id,
+            since_ts: q.since,
+            reply: tx,
+        })
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     rx.await
