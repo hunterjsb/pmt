@@ -482,25 +482,71 @@ class RustCodeGen:
                     self.int_params.add(name)
         # Track variables that should be integers (compared against int params)
         self.int_vars: set[str] = set()
+        # Track variables bound to a Python list (so `not x` emits `.is_empty()`)
+        # and the canonical signal accumulator is always a list.
+        self.list_vars: set[str] = {"signals"}
+        # Track Python module-level list[str] constants seen at the top of the
+        # strategy file. Emitted as Rust `const NAME: &[&str] = &[...]` so
+        # references inside `on_tick` (`for x in WATCH_TOKENS:`) compile.
+        self.module_list_consts: dict[str, list[str]] = {}
+        self._scan_module_list_consts()
 
     def _to_pascal_case(self, name: str) -> str:
         """Convert snake_case to PascalCase."""
         return ''.join(word.capitalize() for word in name.split('_'))
 
+    def _scan_module_list_consts(self) -> None:
+        """Read the strategy's source file and pluck top-level `NAME: list[str] = [...]`
+        assignments into `module_list_consts`. These get emitted as
+        Rust `const NAME: &[&str]` so on_tick can iterate them.
+        """
+        try:
+            src_path = Path(self.meta.on_tick.__code__.co_filename)
+            if not src_path.exists():
+                return
+            module_src = src_path.read_text()
+            module_tree = ast.parse(module_src)
+        except (OSError, AttributeError, SyntaxError):
+            return
+        for stmt in module_tree.body:
+            if not isinstance(stmt, ast.AnnAssign):
+                continue
+            if not isinstance(stmt.target, ast.Name):
+                continue
+            if stmt.value is None or not isinstance(stmt.value, ast.List):
+                continue
+            # Require list of string literals — anything else (function calls,
+            # variable refs) is out of scope for the simple const path.
+            items: list[str] = []
+            for e in stmt.value.elts:
+                if isinstance(e, ast.Constant) and isinstance(e.value, str):
+                    items.append(e.value)
+                else:
+                    items = []
+                    break
+            if items:
+                self.module_list_consts[stmt.target.id] = items
+
     def _indent(self) -> str:
         return "    " * self.indent_level
 
     def _generate_constants(self) -> str:
-        """Generate Rust constants from strategy params."""
-        if not self.meta.params:
+        """Generate Rust constants from strategy params + module-level list[str]."""
+        lines: list[str] = []
+        if self.meta.params:
+            lines.append("// Strategy parameters (generated from Python params)")
+            for name, value in self.meta.params.items():
+                rust_type, rust_value = self._param_to_rust(name, value)
+                lines.append(f"const {name}: {rust_type} = {rust_value};")
+        if self.module_list_consts:
+            if lines:
+                lines.append("")
+            lines.append("// Module-level list[str] constants from the strategy file")
+            for name, items in self.module_list_consts.items():
+                joined = ", ".join(f'"{x}"' for x in items)
+                lines.append(f"const {name}: &[&str] = &[{joined}];")
+        if not lines:
             return ""
-
-        lines = ["// Strategy parameters (generated from Python params)"]
-
-        for name, value in self.meta.params.items():
-            rust_type, rust_value = self._param_to_rust(name, value)
-            lines.append(f"const {name}: {rust_type} = {rust_value};")
-
         return "\n".join(lines) + "\n\n"
 
     def _param_to_rust(self, name: str, value: Any) -> tuple[str, str]:
@@ -627,6 +673,30 @@ impl Strategy for {self.struct_name} {{
         elif isinstance(stmt, ast.Expr):
             if isinstance(stmt.value, ast.Compare):
                 self._check_compare_for_int_vars(stmt.value)
+        elif isinstance(stmt, ast.Assign):
+            # An assignment whose RHS is purely int (int literal, int_param,
+            # int_var, or BinOp over those) makes the LHS an int_var too.
+            if (
+                len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and self._expr_is_int(stmt.value)
+            ):
+                self.int_vars.add(stmt.targets[0].id)
+
+    def _expr_is_int(self, expr: ast.expr) -> bool:
+        """True iff this expression is an integer (literal, int param, or
+        int-valued BinOp). Conservative; bails on anything unknown."""
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
+            return True
+        if isinstance(expr, ast.Name) and (
+            expr.id in self.int_params or expr.id in self.int_vars
+        ):
+            return True
+        if isinstance(expr, ast.BinOp):
+            return self._expr_is_int(expr.left) and self._expr_is_int(expr.right)
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+            return expr.func.id == "int"
+        return False
 
     def _check_compare_for_int_vars(self, expr: ast.expr) -> None:
         """Check a comparison expression for variables compared to int params."""
@@ -1114,9 +1184,21 @@ impl Strategy for {self.struct_name} {{
 
         target = self._gen_expr(stmt.target)
         iter_expr = self._gen_expr(stmt.iter)
+        # When iterating a module_list_const (`&[&str]`), the iterator
+        # yields `&&str`. Bind via `&target` so the loop variable is &str
+        # — that's what HashMap<String, _>::get expects via Borrow.
+        if (
+            isinstance(stmt.iter, ast.Name)
+            and stmt.iter.id in self.module_list_consts
+        ):
+            target = f"&{target}"
         lines = [f"{self._indent()}for {target} in {iter_expr} {{"]
         self.indent_level += 1
-        for s in stmt.body:
+        # Run the option-pattern preprocessor on the for-loop body too, so
+        # `book = ctx.book(t); if book is None: continue` collapses into a
+        # MatchUnwrap inside the loop just as it does at the top level.
+        processed = self._preprocess_option_patterns(stmt.body)
+        for s in processed:
             lines.append(self._gen_stmt(s))
         self.indent_level -= 1
         lines.append(f"{self._indent()}}}")
@@ -1193,8 +1275,47 @@ impl Strategy for {self.struct_name} {{
             return self._gen_subscript(expr)
         elif isinstance(expr, ast.IfExp):
             return self._gen_ifexp(expr)
+        elif isinstance(expr, ast.JoinedStr):
+            return self._gen_joined_str(expr)
         else:
             return f"/* TODO: {type(expr).__name__} */"
+
+    def _gen_joined_str(self, expr: ast.JoinedStr) -> str:
+        """Python f-string → Rust format!() macro.
+
+        Common format specs map cleanly: `:.2f` → `:.2`. Specs we don't
+        recognise (`:,`, `:>10`, `:>=`) get dropped and the value uses
+        Display's default. Caller is the f-string; if no interpolations
+        exist this collapses to a `.to_string()` literal.
+        """
+        import re
+        fmt_parts: list[str] = []
+        args: list[str] = []
+        for v in expr.values:
+            if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                escaped = (
+                    v.value.replace("\\", "\\\\")
+                    .replace("{", "{{")
+                    .replace("}", "}}")
+                    .replace('"', '\\"')
+                )
+                fmt_parts.append(escaped)
+            elif isinstance(v, ast.FormattedValue):
+                spec = ""
+                if v.format_spec is not None and isinstance(v.format_spec, ast.JoinedStr):
+                    spec_text = "".join(
+                        s.value for s in v.format_spec.values
+                        if isinstance(s, ast.Constant) and isinstance(s.value, str)
+                    )
+                    m = re.match(r"^[,]?\.(\d+)f?$", spec_text)
+                    if m:
+                        spec = f":.{m.group(1)}"
+                fmt_parts.append("{" + spec + "}")
+                args.append(self._gen_expr(v.value))
+        fmt_str = "".join(fmt_parts)
+        if not args:
+            return f'"{fmt_str}".to_string()'
+        return f'format!("{fmt_str}", {", ".join(args)})'
 
     def _gen_name(self, expr: ast.Name) -> str:
         # Map Python names to Rust
@@ -1302,11 +1423,38 @@ impl Strategy for {self.struct_name} {{
             elif func_name == "Alert":
                 return self._gen_alert_call(expr)
             # Decimal("0.5") -> dec!(0.5)
+            # Decimal(int_var) -> Decimal::from(int_var)
+            # Decimal(int_literal) -> dec!(int_literal)
             elif func_name == "Decimal":
                 arg = expr.args[0]
                 if isinstance(arg, ast.Constant):
                     return f"dec!({arg.value})"
+                # If the argument is an i64-typed variable (int param,
+                # tracked int_var, or an int-returning call like int(x)),
+                # the From<i64> impl is what we want — not from_str, which
+                # would try to parse it as a string.
+                if (
+                    isinstance(arg, ast.Name)
+                    and (arg.id in self.int_params or arg.id in self.int_vars)
+                ):
+                    return f"Decimal::from({self._gen_expr(arg)})"
+                if isinstance(arg, ast.BinOp) and (
+                    self._binop_is_int(arg)
+                ):
+                    return f"Decimal::from({self._gen_expr(arg)})"
                 return f"Decimal::from_str({self._gen_expr(arg)}).unwrap()"
+            # Python int(x) cast → Rust `(x as i64)`. Matters for
+            # `int(ctx.timestamp.timestamp())`-style use.
+            elif func_name == "int" and len(expr.args) == 1:
+                inner = self._gen_expr(expr.args[0])
+                return f"({inner} as i64)"
+            # Python float() in f-strings is a no-op for our purposes —
+            # rust_decimal's Display impl honours `{:.N}` precision specs
+            # natively, so we drop the conversion and pass the Decimal
+            # straight through. Any place that actually wants a real f64
+            # should use `.to_f64()` explicitly in the spec.
+            elif func_name == "float" and len(expr.args) == 1:
+                return self._gen_expr(expr.args[0])
             # vec![] equivalent
             elif func_name == "list":
                 return "vec![]"
@@ -1518,6 +1666,28 @@ impl Strategy for {self.struct_name} {{
         values = [self._gen_expr(v) for v in expr.values]
         return f"({op_str.join(values)})"
 
+    def _binop_is_int(self, expr: ast.BinOp) -> bool:
+        """Best-effort detection of whether a BinOp produces an i64.
+
+        Walks the operand tree looking for int leaves (literals, int
+        params, int_vars, int() calls, ctx.timestamp.timestamp()). One
+        non-int leaf disqualifies the whole expr.
+        """
+        def is_int_leaf(e: ast.expr) -> bool:
+            if isinstance(e, ast.Constant) and isinstance(e.value, int):
+                return True
+            if isinstance(e, ast.Name) and (
+                e.id in self.int_params or e.id in self.int_vars
+            ):
+                return True
+            if isinstance(e, ast.Call):
+                if isinstance(e.func, ast.Name) and e.func.id == "int":
+                    return True
+            if isinstance(e, ast.BinOp):
+                return is_int_leaf(e.left) and is_int_leaf(e.right)
+            return False
+        return is_int_leaf(expr)
+
     def _gen_binop_expr(self, expr: ast.BinOp) -> str:
         # For nested binops, wrap in parens for correct precedence
         left = self._gen_expr(expr.left)
@@ -1539,12 +1709,24 @@ impl Strategy for {self.struct_name} {{
             ast.Mult: "*",
             ast.Div: "/",
             ast.Mod: "%",
+            # Python `a // b` floor-divides; Rust integer `/` already does
+            # floor division for positive operands (truncates toward zero
+            # for negatives — close enough for our timestamp-bucket use).
+            ast.FloorDiv: "/",
         }
         return ops.get(type(op), "+")
 
     def _gen_unaryop(self, expr: ast.UnaryOp) -> str:
         operand = self._gen_expr(expr.operand)
         if isinstance(expr.op, ast.Not):
+            # Python `not lst` is truthy-test on a list; Rust Vec doesn't
+            # implement Not — emit .is_empty() when we know the operand is
+            # a list.
+            if (
+                isinstance(expr.operand, ast.Name)
+                and expr.operand.id in self.list_vars
+            ):
+                return f"{operand}.is_empty()"
             return f"!{operand}"
         elif isinstance(expr.op, ast.USub):
             return f"-{operand}"
@@ -1558,6 +1740,32 @@ impl Strategy for {self.struct_name} {{
 
     def _gen_subscript(self, expr: ast.Subscript) -> str:
         obj = self._gen_expr(expr.value)
+        # Python string slicing → Rust byte-slice / char-take. The dict-get
+        # path below is fine for HashMap[k] but a Slice would crash it.
+        if isinstance(expr.slice, ast.Slice):
+            lo = expr.slice.lower
+            hi = expr.slice.upper
+            # Only support `[..N]` and `[M..N]` with constant int bounds.
+            if (
+                lo is None
+                and isinstance(hi, ast.Constant)
+                and isinstance(hi.value, int)
+            ):
+                # Use .chars().take(N).collect() for Unicode safety. Token
+                # ids are numeric strings so byte-slice would work too but
+                # this is robust by default.
+                return f"{obj}.chars().take({hi.value}).collect::<String>()"
+            if (
+                isinstance(lo, ast.Constant)
+                and isinstance(lo.value, int)
+                and isinstance(hi, ast.Constant)
+                and isinstance(hi.value, int)
+            ):
+                return (
+                    f"{obj}.chars().skip({lo.value}).take({hi.value - lo.value})"
+                    f".collect::<String>()"
+                )
+            return f"/* TODO: slice {ast.dump(expr.slice)[:60]} */"
         idx = self._gen_expr(expr.slice)
         # Translate dict access to .get()
         return f"{obj}.get(&{idx})"

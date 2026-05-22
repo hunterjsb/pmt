@@ -65,9 +65,11 @@ def on_tick(ctx) -> list[Signal]:
         book = ctx.book(token_id)
         if book is None:
             continue
-        if book.best_bid is None:
+        best_bid = book.best_bid
+        if best_bid is None:
             continue
-        if book.best_ask is None:
+        best_ask = book.best_ask
+        if best_ask is None:
             continue
 
         short_vol = ctx.volume_in_window(token_id, SHORT_WINDOW)
@@ -88,7 +90,7 @@ def on_tick(ctx) -> list[Signal]:
             continue
 
         # Spike detected. Propose a fade.
-        mid = (book.best_bid + book.best_ask) / Decimal("2")
+        mid = (best_bid + best_ask) / Decimal("2")
         # Round suggested sell price down to a tick we know is safe; the
         # engine's per-market tick rounding will adjust if needed.
         suggested_price = mid - Decimal("0.005")
