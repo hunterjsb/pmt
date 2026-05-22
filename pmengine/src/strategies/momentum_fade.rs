@@ -56,7 +56,7 @@ impl Strategy for MomentumFade {
             max_mid: rust_decimal_macros::dec!(0.95),
             categories: vec![],
             exclude_recurring: true,
-            max_subscriptions: 20,
+            max_subscriptions: 5,
         })
     }
 

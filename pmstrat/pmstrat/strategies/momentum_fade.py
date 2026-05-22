@@ -51,10 +51,12 @@ SUGGESTED_SIZE = Decimal("100")     # what to fade with — modest
         min_mid="0.05",
         max_mid="0.95",
         exclude_recurring=True,
-        # Cap subscriptions: 20 active markets per tick is plenty for a
-        # human-gated workflow. More than that and the alert stream gets
-        # noisier than the human can review.
-        max_subscriptions=20,
+        # Cap subscriptions: 5 active markets keeps the REST poller well
+        # under Polymarket's account-level rate limit. The original 20
+        # was triggering 429s on order placement (account budget is
+        # shared across reads + writes). 5 markets * 10s book poll
+        # cadence ≈ 0.5 req/sec from this strategy.
+        max_subscriptions=5,
     ),
     params={
         "SHORT_WINDOW": SHORT_WINDOW,
