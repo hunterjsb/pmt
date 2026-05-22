@@ -668,6 +668,21 @@ def engine_orders() -> None:
     console.print(t)
 
 
+@engine.command("subscriptions")
+def engine_subscriptions() -> None:
+    """List token IDs the engine is currently watching."""
+    tokens = _engine_get("/subscriptions")
+    if not tokens:
+        console.print("[yellow]No tokens subscribed.[/yellow]")
+        return
+    t = Table(title="subscribed tokens")
+    t.add_column("#", justify="right")
+    t.add_column("token id")
+    for i, tid in enumerate(tokens, 1):
+        t.add_row(str(i), tid)
+    console.print(t)
+
+
 @engine.command("alerts")
 def engine_alerts() -> None:
     """Pending strategy alerts awaiting human approval (Phase 5 — empty for now)."""

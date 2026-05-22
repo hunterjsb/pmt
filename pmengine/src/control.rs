@@ -40,6 +40,7 @@ pub enum EngineCommand {
     ListStrategies(oneshot::Sender<Vec<StrategyInfo>>),
     ListOrders(oneshot::Sender<Vec<OrderInfo>>),
     ListAlerts(oneshot::Sender<Vec<AlertInfo>>),
+    ListSubscriptions(oneshot::Sender<Vec<String>>),
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +106,7 @@ pub fn spawn(bind: SocketAddr, cmd_tx: mpsc::Sender<EngineCommand>) -> JoinHandl
             .route("/strategies", get(strategies_handler))
             .route("/orders", get(orders_handler))
             .route("/alerts", get(alerts_handler))
+            .route("/subscriptions", get(subscriptions_handler))
             .with_state(cmd_tx);
 
         let listener = match tokio::net::TcpListener::bind(bind).await {
@@ -168,6 +170,19 @@ async fn alerts_handler(
     let (tx, rx) = oneshot::channel();
     cmd_tx
         .send(EngineCommand::ListAlerts(tx))
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    rx.await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn subscriptions_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::ListSubscriptions(tx))
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     rx.await

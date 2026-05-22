@@ -325,6 +325,48 @@ impl Engine {
         self.client.is_dry_run()
     }
 
+    /// Begin watching a token at runtime. Idempotent: a duplicate request is
+    /// a no-op. Initialises an empty book in the MarketDataHub (the REST
+    /// poller picks it up on its next tick) and flags the WebSocket for
+    /// reconnect so the new asset id is included in the subscription.
+    pub async fn subscribe_token(&mut self, token_id: &str) {
+        if self.subscribed_tokens.iter().any(|t| t == token_id) {
+            return;
+        }
+        self.market_data.init_book(token_id).await;
+        self.subscribed_tokens.push(token_id.to_string());
+        self.ws_needs_reconnect = true;
+        tracing::info!(token_id = %token_id, "Subscribed to token");
+    }
+
+    /// Stop watching a token at runtime. Cancels any open orders on the
+    /// token first (locally + on Polymarket), releases their risk-manager
+    /// reservations, removes the book from the hub, and flags the
+    /// WebSocket for reconnect. Positions and order history are preserved.
+    pub async fn unsubscribe_token(&mut self, token_id: &str) {
+        if !self.subscribed_tokens.iter().any(|t| t == token_id) {
+            return;
+        }
+        match self.order_manager.cancel_all(token_id).await {
+            Ok(n) if n > 0 => tracing::info!(
+                token_id = %token_id,
+                cancelled = n,
+                "Unsubscribe: cancelled open orders"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                token_id = %token_id,
+                error = %e,
+                "Unsubscribe: cancel-all failed; proceeding anyway"
+            ),
+        }
+        self.risk_manager.release_orders_for_token(token_id);
+        self.market_data.remove_book(token_id).await;
+        self.subscribed_tokens.retain(|t| t != token_id);
+        self.ws_needs_reconnect = true;
+        tracing::info!(token_id = %token_id, "Unsubscribed from token");
+    }
+
     /// Register a strategy.
     pub async fn register_strategy(&mut self, strategy: Box<dyn crate::strategy::Strategy>) {
         // Initialize order books for subscriptions
@@ -767,24 +809,45 @@ impl Engine {
                         let mut desired: Vec<(Signal, String, Decimal, Decimal)> = Vec::new(); // (signal, token, price, size)
 
                         for signal in signals {
-                            match &signal {
+                            match signal {
                                 Signal::Hold => continue,
                                 Signal::Shutdown { reason } => {
                                     tracing::info!(reason = reason.as_str(), "Strategy requested shutdown");
                                     shutdown_requested = true;
                                 }
-                                Signal::Cancel { token_id } => {
-                                    cancel_tokens.push(token_id.clone());
+                                Signal::Subscribe { token_id } => {
+                                    self.subscribe_token(&token_id).await;
                                 }
-                                Signal::Buy { token_id, price, size, .. }
-                                | Signal::Sell { token_id, price, size, .. } => {
-                                    // Don't pre-round here. OrderManager rounds to the
+                                Signal::Unsubscribe { token_id } => {
+                                    self.unsubscribe_token(&token_id).await;
+                                }
+                                Signal::Cancel { token_id } => {
+                                    cancel_tokens.push(token_id);
+                                }
+                                Signal::Buy { token_id, price, size, urgency } => {
+                                    // Don't pre-round price here. OrderManager rounds to the
                                     // per-market tick when actually placing; the delta-quote
                                     // matcher below uses a half-tick tolerance so any
-                                    // sub-tick wobble in the strategy's target still
-                                    // matches an existing aged order.
+                                    // sub-tick wobble in the strategy's target still matches
+                                    // an existing aged order.
                                     let size = size.round_dp(2);
-                                    desired.push((signal.clone(), token_id.clone(), *price, size));
+                                    let sig = Signal::Buy {
+                                        token_id: token_id.clone(),
+                                        price,
+                                        size,
+                                        urgency,
+                                    };
+                                    desired.push((sig, token_id, price, size));
+                                }
+                                Signal::Sell { token_id, price, size, urgency } => {
+                                    let size = size.round_dp(2);
+                                    let sig = Signal::Sell {
+                                        token_id: token_id.clone(),
+                                        price,
+                                        size,
+                                        urgency,
+                                    };
+                                    desired.push((sig, token_id, price, size));
                                 }
                             }
                         }
@@ -1084,6 +1147,9 @@ impl Engine {
                             EngineCommand::ListAlerts(reply) => {
                                 // Stub: Alert queue lands in Phase 5.
                                 let _ = reply.send(Vec::<AlertInfo>::new());
+                            }
+                            EngineCommand::ListSubscriptions(reply) => {
+                                let _ = reply.send(self.subscribed_tokens.clone());
                             }
                         }
                     }

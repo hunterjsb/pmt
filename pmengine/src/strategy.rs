@@ -45,6 +45,20 @@ pub enum Signal {
     },
     /// Cancel existing orders for a token
     Cancel { token_id: String },
+    /// Subscribe to live market data for a token at runtime. The engine
+    /// initialises a fresh order book in the MarketDataHub, adds the token
+    /// to its REST poller rotation, and re-establishes the WebSocket
+    /// subscription so the new book stays current.
+    ///
+    /// No-op (and harmless) if the token is already subscribed. Strategies
+    /// that scan for new markets emit this when they want to start watching
+    /// a fresh token.
+    Subscribe { token_id: String },
+    /// Stop watching a token. The engine cancels any open orders on that
+    /// token, removes its book from the MarketDataHub, and re-subscribes
+    /// the WebSocket to the remaining tokens. Order history and positions
+    /// are preserved.
+    Unsubscribe { token_id: String },
     /// No action
     Hold,
     /// Request graceful shutdown with a reason

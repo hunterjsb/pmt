@@ -294,6 +294,15 @@ impl MarketDataHub {
             .or_insert_with(|| Arc::new(OrderBook::new(token_id.to_string())));
     }
 
+    /// Drop a token's book from the hub. Used when a strategy emits
+    /// `Signal::Unsubscribe` to stop watching a market — the REST poller
+    /// keys off `get_all_books`, so removing the entry also takes it out
+    /// of the polling rotation.
+    pub async fn remove_book(&self, token_id: &str) -> bool {
+        let mut books = self.books.write().await;
+        books.remove(token_id).is_some()
+    }
+
     /// Replace a token's book wholesale, e.g. from a REST poll snapshot.
     ///
     /// Unlike `process_book_update` (which applies an incremental WS diff),

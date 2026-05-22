@@ -50,5 +50,28 @@ class Shutdown:
     reason: str
 
 
+@dataclass(frozen=True)
+class Subscribe:
+    """Begin watching a token at runtime.
+
+    The engine initialises a fresh order book, adds the token to its REST
+    poller rotation, and reconnects the WebSocket so the new asset id is
+    included. Idempotent — a duplicate Subscribe for an already-watched
+    token is a no-op.
+    """
+    token_id: str
+
+
+@dataclass(frozen=True)
+class Unsubscribe:
+    """Stop watching a token at runtime.
+
+    The engine cancels any open orders on the token first, releases their
+    risk reservations, removes the book from the hub, and reconnects the
+    WebSocket. Positions and order history are preserved.
+    """
+    token_id: str
+
+
 # Union type for all signals
-Signal = Union[Buy, Sell, Cancel, Hold, Shutdown]
+Signal = Union[Buy, Sell, Cancel, Hold, Shutdown, Subscribe, Unsubscribe]

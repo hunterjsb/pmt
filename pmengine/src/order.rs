@@ -81,8 +81,12 @@ impl OrderManager {
                 self.place_order(&token_id, false, price, size, urgency).await
             }
 
-            // Shutdown is handled by the engine, not the order manager
-            Signal::Shutdown { .. } => Ok(None),
+            // These are engine-level signals; the engine consumes them
+            // before the order pipeline ever sees them. Listed here only
+            // for exhaustiveness.
+            Signal::Shutdown { .. }
+            | Signal::Subscribe { .. }
+            | Signal::Unsubscribe { .. } => Ok(None),
         }
     }
 

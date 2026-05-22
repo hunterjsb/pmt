@@ -116,9 +116,11 @@ impl RiskManager {
         }
 
         match signal {
-            Signal::Hold | Signal::Cancel { .. } | Signal::Shutdown { .. } => {
-                RiskCheckResult::Approved(signal.clone())
-            }
+            Signal::Hold
+            | Signal::Cancel { .. }
+            | Signal::Shutdown { .. }
+            | Signal::Subscribe { .. }
+            | Signal::Unsubscribe { .. } => RiskCheckResult::Approved(signal.clone()),
 
             Signal::Buy { token_id, price, size, urgency } => {
                 self.check_order(token_id, *price, *size, true, *urgency, positions)

@@ -1295,6 +1295,10 @@ impl Strategy for {self.struct_name} {{
                 return "Signal::Hold"
             elif func_name == "Shutdown":
                 return self._gen_shutdown_call(expr)
+            elif func_name == "Subscribe":
+                return self._gen_token_only_signal("Subscribe", expr)
+            elif func_name == "Unsubscribe":
+                return self._gen_token_only_signal("Unsubscribe", expr)
             # Decimal("0.5") -> dec!(0.5)
             elif func_name == "Decimal":
                 arg = expr.args[0]
@@ -1348,6 +1352,23 @@ impl Strategy for {self.struct_name} {{
         kwargs = {kw.arg: self._gen_expr(kw.value) for kw in expr.keywords}
         reason = kwargs.get("reason", '""')
         return f"Signal::Shutdown {{ reason: {reason}.to_string() }}"
+
+    def _gen_token_only_signal(self, variant: str, expr: ast.Call) -> str:
+        """Generate Signal::Subscribe or Signal::Unsubscribe (token-only).
+
+        Both variants take a single `token_id` field; share the same emit
+        path. Positional or keyword-passed token_id is accepted.
+        """
+        kwargs = {kw.arg: self._gen_expr(kw.value) for kw in expr.keywords}
+        if "token_id" in kwargs:
+            token_id = kwargs["token_id"]
+        elif expr.args:
+            token_id = self._gen_expr(expr.args[0])
+        else:
+            token_id = '""'
+        if not token_id.startswith('"'):
+            token_id = f"{token_id}.to_string()"
+        return f"Signal::{variant} {{ token_id: {token_id} }}"
 
     def _gen_attribute(self, expr: ast.Attribute) -> str:
         obj = self._gen_expr(expr.value)
