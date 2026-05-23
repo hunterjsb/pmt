@@ -2106,9 +2106,21 @@ class RustTestGenerator:
 
     def __init__(self, config: TestGeneratorConfig):
         self.config = config
-        # Detect strategy type from params
+        # Detect strategy type from params. Heuristic — the right move
+        # would be AST-scanning to see which Signal variants the body
+        # actually emits, but param-name sniffing is consistent with the
+        # existing is_market_maker / is_sure_bets classifiers below.
         self.is_market_maker = "SPREAD_BPS" in config.params or "MIN_SPREAD_PCT" in config.params
         self.is_sure_bets = "MIN_CERTAINTY" in config.params or "MAX_CERTAINTY" in config.params
+        # Alert-based strategies emit Signal::Alert on edge conditions
+        # (e.g. volume spikes). They need trade_history populated to
+        # fire, and the default fixture leaves that empty — so default
+        # behavior is Hold. Tests must assert Hold rather than the
+        # market-maker cancel+buy+sell triad.
+        self.is_alert = (
+            "SPIKE_MULTIPLIER" in config.params
+            or "MIN_SHORT_VOLUME" in config.params
+        )
 
     def generate(self) -> str:
         """Generate complete Rust test file."""
@@ -2286,7 +2298,26 @@ fn test_no_markets() {{
     def _gen_qualifying_market_test(self) -> str:
         struct = self.config.struct_name
 
-        if self.is_sure_bets:
+        if self.is_alert:
+            # Alert-based strategies need trade_history populated to
+            # detect their trigger condition (e.g. a volume spike).
+            # The default fixture leaves trade_history empty, so the
+            # strategy must return Hold. Asserting Hold here proves the
+            # strategy doesn't fire spuriously on a quiet market — the
+            # actual alert path needs a richer fixture to test.
+            return f'''#[test]
+fn test_quotes_qualifying_market() {{
+    let mut strategy = {struct}::new();
+    let ctx = create_context_with_markets(vec![
+        ("token1", dec!(0.68), dec!(0.72), 48.0, 50000.0, dec!(0)),
+    ]);
+    let signals = strategy.on_tick(&ctx);
+    let (_, _, _, holds) = count_signal_types(&signals);
+    assert_eq!(holds, 1, "Alert strategy should hold with no trade history");
+}}
+
+'''
+        elif self.is_sure_bets:
             # Sure bets needs high certainty (0.95-0.99 ask) and short expiry
             return f'''#[test]
 fn test_quotes_qualifying_market() {{
@@ -2354,7 +2385,26 @@ fn test_max_short_position_only_buys() {{
     def _gen_multi_market_test(self) -> str:
         struct = self.config.struct_name
 
-        if self.is_sure_bets:
+        if self.is_alert:
+            # Same logic as the single-market test — no trade_history,
+            # no spike to detect, every token results in Hold.
+            return f'''#[test]
+fn test_quotes_multiple_markets() {{
+    let mut strategy = {struct}::new();
+    let ctx = create_context_with_markets(vec![
+        ("token1", dec!(0.68), dec!(0.72), 48.0, 50000.0, dec!(0)),
+        ("token2", dec!(0.73), dec!(0.77), 72.0, 30000.0, dec!(0)),
+        ("token3", dec!(0.66), dec!(0.70), 96.0, 40000.0, dec!(0)),
+    ]);
+    let signals = strategy.on_tick(&ctx);
+    let (cancels, buys, sells, _) = count_signal_types(&signals);
+    assert_eq!(cancels, 0, "Alert strategy should not cancel without history");
+    assert_eq!(buys, 0, "Alert strategy should not buy without history");
+    assert_eq!(sells, 0, "Alert strategy should not sell without history");
+}}
+
+'''
+        elif self.is_sure_bets:
             # Sure bets: multiple high certainty markets
             return f'''#[test]
 fn test_quotes_multiple_markets() {{

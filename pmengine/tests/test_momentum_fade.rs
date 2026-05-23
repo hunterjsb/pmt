@@ -32,11 +32,8 @@ fn test_quotes_qualifying_market() {
         ("token1", dec!(0.68), dec!(0.72), 48.0, 50000.0, dec!(0)),
     ]);
     let signals = strategy.on_tick(&ctx);
-    let (cancels, buys, sells, holds) = count_signal_types(&signals);
-    assert_eq!(cancels, 1, "Should cancel existing orders");
-    assert_eq!(buys, 1, "Should place buy order");
-    assert_eq!(sells, 1, "Should place sell order");
-    assert_eq!(holds, 0, "Should not hold");
+    let (_, _, _, holds) = count_signal_types(&signals);
+    assert_eq!(holds, 1, "Alert strategy should hold with no trade history");
 }
 
 
@@ -50,9 +47,9 @@ fn test_quotes_multiple_markets() {
     ]);
     let signals = strategy.on_tick(&ctx);
     let (cancels, buys, sells, _) = count_signal_types(&signals);
-    assert!(cancels >= 1, "Should cancel for at least 1 market");
-    assert!(buys >= 1, "Should buy for at least 1 market");
-    assert!(sells >= 1, "Should sell for at least 1 market");
+    assert_eq!(cancels, 0, "Alert strategy should not cancel without history");
+    assert_eq!(buys, 0, "Alert strategy should not buy without history");
+    assert_eq!(sells, 0, "Alert strategy should not sell without history");
 }
 
 

@@ -58,6 +58,7 @@ pub fn create_context_with_markets(
     StrategyContext {
         timestamp: Utc::now(),
         order_books,
+        trade_history: HashMap::new(),
         positions,
         markets,
         unrealized_pnl: dec!(0),
