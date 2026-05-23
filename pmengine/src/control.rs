@@ -93,6 +93,15 @@ pub enum EngineCommand {
         order_id: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Schedule a cancel for `order_id` to run at-or-after `at`. The
+    /// engine drains the queue on each tick and calls `cancel_order` on
+    /// every entry whose deadline has passed. Used by `pmt buy/sell --ttl`
+    /// to set a client-side expiry on otherwise-GTC orders.
+    ScheduleCancel {
+        order_id: String,
+        at: DateTime<Utc>,
+        reply: oneshot::Sender<()>,
+    },
 }
 
 /// An order placed outside the engine that the engine has been told to
@@ -223,6 +232,10 @@ pub fn spawn(bind: SocketAddr, cmd_tx: mpsc::Sender<EngineCommand>) -> JoinHandl
             .route(
                 "/orders/:id/cancel",
                 axum::routing::post(cancel_order_by_id_handler),
+            )
+            .route(
+                "/orders/:id/schedule-cancel",
+                axum::routing::post(schedule_cancel_handler),
             )
             .with_state(cmd_tx);
 
@@ -441,4 +454,39 @@ async fn cancel_order_by_id_handler(
         Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e)),
         Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string())),
     }
+}
+
+/// Body for `POST /orders/:id/schedule-cancel`. Either `at` (absolute
+/// RFC3339 deadline) or `after_seconds` (relative; engine computes
+/// `Utc::now() + after_seconds`). `after_seconds` is preferred since it's
+/// immune to clock skew between CLI and engine.
+#[derive(Debug, Deserialize)]
+pub struct ScheduleCancelBody {
+    pub at: Option<DateTime<Utc>>,
+    pub after_seconds: Option<u64>,
+}
+
+async fn schedule_cancel_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+    Path(order_id): Path<String>,
+    Json(body): Json<ScheduleCancelBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let at = match (body.at, body.after_seconds) {
+        (Some(t), _) => t,
+        (None, Some(secs)) => Utc::now() + chrono::Duration::seconds(secs as i64),
+        (None, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "must supply `at` (RFC3339) or `after_seconds`".to_string(),
+            ))
+        }
+    };
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::ScheduleCancel { order_id, at, reply: tx })
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "engine offline".to_string()))?;
+    rx.await
+        .map(|_| Json(serde_json::json!({"scheduled": true, "at": at})))
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string()))
 }

@@ -83,6 +83,10 @@ pub struct Engine {
     /// engine-placed orders for the unified `/orders/all` view, and
     /// available as cancel targets via `POST /orders/:id/cancel`.
     external_orders: HashMap<String, crate::control::ExternalOrder>,
+    /// (deadline, order_id) pairs scheduled via `POST /orders/:id/schedule-cancel`.
+    /// Drained at the top of every tick — entries whose deadline has passed
+    /// trigger a `cancel_order` call. Backs `pmt buy/sell --ttl`.
+    pending_cancellations: Vec<(chrono::DateTime<chrono::Utc>, String)>,
 }
 
 /// Internal event emitted by the trades poller for the main loop to process.
@@ -178,6 +182,7 @@ impl Engine {
             alert_queue: AlertQueue::new(),
             notifier: Arc::new(Notifier::from_env()),
             external_orders: HashMap::new(),
+            pending_cancellations: Vec::new(),
         })
     }
 
@@ -1060,6 +1065,35 @@ impl Engine {
 
                         tracing::info!(tick = tick_count, elapsed_ms = elapsed.as_millis(), "Tick");
 
+                        // Drain TTL-scheduled cancels whose deadline has passed.
+                        // Runs before warmup checks so externally-placed orders
+                        // with TTLs still expire even if the engine isn't trading.
+                        if !self.pending_cancellations.is_empty() {
+                            let now = chrono::Utc::now();
+                            let (due, remaining): (Vec<_>, Vec<_>) = self
+                                .pending_cancellations
+                                .drain(..)
+                                .partition(|(at, _)| *at <= now);
+                            self.pending_cancellations = remaining;
+                            for (_, order_id) in due {
+                                match self.client.cancel_order(&order_id).await {
+                                    Ok(_) => {
+                                        self.external_orders.remove(&order_id);
+                                        self.risk_manager.release_order(&order_id);
+                                        tracing::info!(
+                                            order_id = %order_id,
+                                            "TTL cancel: order cancelled"
+                                        );
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        error = %e,
+                                        order_id = %order_id,
+                                        "TTL cancel: cancel failed (order may already be filled or cancelled)"
+                                    ),
+                                }
+                            }
+                        }
+
                         // Check max_ticks limit
                         if max_ticks > 0 && tick_count >= max_ticks {
                             tracing::info!(tick_count = tick_count, max_ticks = max_ticks, "Max ticks reached, shutting down");
@@ -1711,6 +1745,15 @@ impl Engine {
                                     }
                                 };
                                 let _ = reply.send(res);
+                            }
+                            EngineCommand::ScheduleCancel { order_id, at, reply } => {
+                                tracing::info!(
+                                    order_id = %order_id,
+                                    at = %at,
+                                    "TTL cancel scheduled"
+                                );
+                                self.pending_cancellations.push((at, order_id));
+                                let _ = reply.send(());
                             }
                         }
                     }

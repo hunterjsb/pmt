@@ -99,17 +99,24 @@ def cli() -> None:
 @click.option("--price", required=True, type=float)
 @click.option("--size", required=True, type=int)
 @click.option("--tick", default=None, help="Tick size override (auto-detected if omitted)")
+@click.option("--ttl", default=None, help="Auto-cancel after this duration (e.g. '30m', '2h', '1h30m'). Requires running pmengine.")
 @click.option("--dry-run", is_flag=True, help="Print spec, don't submit")
-def buy(token: str, price: float, size: int, tick: str | None, dry_run: bool) -> None:
+def buy(token: str, price: float, size: int, tick: str | None, ttl: str | None, dry_run: bool) -> None:
     """Place a BUY order. At-or-above best ask → taker; below → maker."""
     token = _resolve_token(token)
+    ttl_seconds = _parse_ttl(ttl) if ttl else None
     notional = price * size
-    console.print(f"BUY {size} @ ${price}  notional ${notional:.4f}")
+    msg = f"BUY {size} @ ${price}  notional ${notional:.4f}"
+    if ttl_seconds:
+        msg += f"  ttl={ttl} ({ttl_seconds}s)"
+    console.print(msg)
     if dry_run:
         console.print("[dim]dry-run[/dim]")
         return
     resp = _api().place_buy(token=token, price=price, size=size, tick_size=tick)
     _register_with_engine_if_live(resp, token=token, side="buy", price=price, size=size)
+    if ttl_seconds:
+        _schedule_ttl_cancel_if_live(resp, ttl_seconds=ttl_seconds)
     click.echo(json.dumps(resp, indent=2, default=str))
 
 
@@ -118,17 +125,24 @@ def buy(token: str, price: float, size: int, tick: str | None, dry_run: bool) ->
 @click.option("--price", required=True, type=float)
 @click.option("--size", required=True, type=int)
 @click.option("--tick", default=None)
+@click.option("--ttl", default=None, help="Auto-cancel after this duration (e.g. '30m', '2h', '1h30m'). Requires running pmengine.")
 @click.option("--dry-run", is_flag=True)
-def sell(token: str, price: float, size: int, tick: str | None, dry_run: bool) -> None:
+def sell(token: str, price: float, size: int, tick: str | None, ttl: str | None, dry_run: bool) -> None:
     """Place a SELL order."""
     token = _resolve_token(token)
+    ttl_seconds = _parse_ttl(ttl) if ttl else None
     notional = price * size
-    console.print(f"SELL {size} @ ${price}  notional ${notional:.4f}")
+    msg = f"SELL {size} @ ${price}  notional ${notional:.4f}"
+    if ttl_seconds:
+        msg += f"  ttl={ttl} ({ttl_seconds}s)"
+    console.print(msg)
     if dry_run:
         console.print("[dim]dry-run[/dim]")
         return
     resp = _api().place_sell(token=token, price=price, size=size, tick_size=tick)
     _register_with_engine_if_live(resp, token=token, side="sell", price=price, size=size)
+    if ttl_seconds:
+        _schedule_ttl_cancel_if_live(resp, ttl_seconds=ttl_seconds)
     click.echo(json.dumps(resp, indent=2, default=str))
 
 
@@ -850,6 +864,49 @@ def _register_with_engine_if_live(
             "source": "pmt-cli",
         },
     )
+
+
+_TTL_TOKEN = re.compile(r"(\d+)([dhms])", re.IGNORECASE)
+_TTL_UNIT_SECS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+
+
+def _parse_ttl(value: str) -> int:
+    """Parse '30m', '2h', '1h30m', '2d' → seconds.
+
+    Polymarket orders are GTC, so TTL is enforced client-side by asking the
+    engine to schedule a cancel — see `_schedule_ttl_cancel_if_live`.
+    """
+    parts = _TTL_TOKEN.findall(value)
+    if not parts or "".join(f"{n}{u}" for n, u in parts).lower() != value.lower():
+        raise click.BadParameter(
+            f"--ttl: invalid duration '{value}' (use forms like '30m', '2h', '1h30m', '2d')"
+        )
+    return sum(int(n) * _TTL_UNIT_SECS[u.lower()] for n, u in parts)
+
+
+def _schedule_ttl_cancel_if_live(resp: dict, *, ttl_seconds: int) -> None:
+    """After a successful place, ask the engine to cancel after `ttl_seconds`.
+
+    The order itself is already on the book whether or not the engine is up;
+    if the engine is unreachable, warn loudly because the TTL will not be
+    honored and the order will rest until manually cancelled.
+    """
+    if not isinstance(resp, dict) or not resp.get("success"):
+        return
+    order_id = resp.get("orderID") or resp.get("order_id")
+    if not order_id:
+        return
+    result = _engine_notify(
+        f"/orders/{order_id}/schedule-cancel",
+        {"after_seconds": ttl_seconds},
+    )
+    if result is None:
+        console.print(
+            f"[red]WARNING: engine unreachable — TTL of {ttl_seconds}s NOT registered. "
+            f"Order is placed but will rest until manually cancelled.[/red]"
+        )
+    else:
+        console.print(f"[dim]TTL: cancel scheduled at {result.get('at')}[/dim]")
 
 
 @engine.command("approve")
