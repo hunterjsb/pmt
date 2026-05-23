@@ -120,6 +120,7 @@ impl RiskManager {
             | Signal::Cancel { .. }
             | Signal::CancelOrder { .. }
             | Signal::Shutdown { .. }
+            | Signal::StrategyComplete { .. }
             | Signal::Subscribe { .. }
             | Signal::Unsubscribe { .. }
             | Signal::Alert { .. } => RiskCheckResult::Approved(signal.clone()),

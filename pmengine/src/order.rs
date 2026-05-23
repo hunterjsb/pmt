@@ -85,6 +85,7 @@ impl OrderManager {
             // before the order pipeline ever sees them. Listed here only
             // for exhaustiveness.
             Signal::Shutdown { .. }
+            | Signal::StrategyComplete { .. }
             | Signal::Subscribe { .. }
             | Signal::Unsubscribe { .. }
             | Signal::Alert { .. }

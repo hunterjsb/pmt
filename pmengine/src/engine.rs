@@ -1104,6 +1104,13 @@ impl Engine {
                                     tracing::info!(reason = reason.as_str(), "Strategy requested shutdown");
                                     shutdown_requested = true;
                                 }
+                                // Defensive arm: StrategyRuntime::tick handles
+                                // and consumes StrategyComplete before signals
+                                // ever reach the engine main loop. If one
+                                // somehow leaks through, treat it as a no-op
+                                // rather than panicking — the retirement was
+                                // already logged inside tick().
+                                Signal::StrategyComplete { .. } => continue,
                                 Signal::Subscribe { token_id } => {
                                     self.subscribe_token(&token_id).await;
                                 }

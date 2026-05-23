@@ -59,7 +59,24 @@ class Hold:
 
 @dataclass(frozen=True)
 class Shutdown:
-    """Request graceful engine shutdown."""
+    """Request graceful **engine-wide** shutdown. Stops all strategies
+    and the engine itself. Use sparingly — usually a strategy that's
+    done with its work should emit `StrategyComplete` instead, which
+    only retires this one strategy and leaves siblings running.
+    """
+    reason: str
+
+
+@dataclass(frozen=True)
+class StrategyComplete:
+    """Retire this strategy from the run loop, leaving the engine and
+    sibling strategies untouched.
+
+    The engine removes the emitting strategy from its strategies vec
+    and stops ticking it. Open orders the strategy placed are NOT
+    automatically cancelled; emit `Cancel`/`CancelOrder` first in the
+    same `on_tick` return list if you want to clean up.
+    """
     reason: str
 
 
@@ -107,4 +124,4 @@ class Alert:
 
 
 # Union type for all signals
-Signal = Union[Buy, Sell, Cancel, CancelOrder, Hold, Shutdown, Subscribe, Unsubscribe, Alert]
+Signal = Union[Buy, Sell, Cancel, CancelOrder, Hold, Shutdown, StrategyComplete, Subscribe, Unsubscribe, Alert]

@@ -1478,6 +1478,8 @@ impl Strategy for {self.struct_name} {{
                 return "Signal::Hold"
             elif func_name == "Shutdown":
                 return self._gen_shutdown_call(expr)
+            elif func_name == "StrategyComplete":
+                return self._gen_strategy_complete_call(expr)
             elif func_name == "Subscribe":
                 return self._gen_token_only_signal("Subscribe", expr)
             elif func_name == "Unsubscribe":
@@ -1575,6 +1577,12 @@ impl Strategy for {self.struct_name} {{
         kwargs = {kw.arg: self._gen_expr(kw.value) for kw in expr.keywords}
         reason = kwargs.get("reason", '""')
         return f"Signal::Shutdown {{ reason: {reason}.to_string() }}"
+
+    def _gen_strategy_complete_call(self, expr: ast.Call) -> str:
+        """Generate Signal::StrategyComplete."""
+        kwargs = {kw.arg: self._gen_expr(kw.value) for kw in expr.keywords}
+        reason = kwargs.get("reason", '""')
+        return f"Signal::StrategyComplete {{ reason: {reason}.to_string() }}"
 
     def _gen_alert_call(self, expr: ast.Call) -> str:
         """Generate Signal::Alert { reason, suggested: Box::new(<Buy|Sell>), ttl_secs, dedupe_key }."""

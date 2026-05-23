@@ -87,8 +87,20 @@ pub enum Signal {
     },
     /// No action
     Hold,
-    /// Request graceful shutdown with a reason
+    /// Request graceful **engine-wide** shutdown — stops all strategies
+    /// and the engine itself. Use sparingly; a strategy that's done
+    /// with its own work should emit `StrategyComplete` instead.
     Shutdown { reason: String },
+    /// Retire the emitting strategy from the run loop. The engine
+    /// removes it from `StrategyRuntime::strategies`, stops calling
+    /// `on_tick`, and leaves sibling strategies + the engine itself
+    /// untouched. Handled inside `StrategyRuntime::tick`, so this
+    /// signal never reaches the engine main loop.
+    ///
+    /// Does NOT cancel orders the strategy placed — emit
+    /// `Cancel { token_id }` or `CancelOrder { order_id }` in the same
+    /// `on_tick` return list first if cleanup is needed.
+    StrategyComplete { reason: String },
 }
 
 /// Market metadata from Gamma API.
@@ -336,6 +348,11 @@ impl StrategyRuntime {
     pub fn tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
         let mut all_signals = Vec::new();
         let now = std::time::Instant::now();
+        // Indices of strategies that emitted StrategyComplete this tick.
+        // Collected during iteration, applied after — can't remove
+        // mid-iteration. Reverse-sorted before removal so earlier
+        // indices stay valid as later ones are spliced out.
+        let mut retired: Vec<usize> = Vec::new();
         for (i, strategy) in self.strategies.iter_mut().enumerate() {
             let interval = std::time::Duration::from_millis(strategy.tick_interval_ms());
             let due = match self.last_tick_at[i] {
@@ -349,8 +366,27 @@ impl StrategyRuntime {
             let signals = strategy.on_tick(ctx);
             for signal in signals {
                 tracing::debug!(strategy_id = strategy.id(), ?signal, "Strategy signal");
+                if let Signal::StrategyComplete { reason } = &signal {
+                    tracing::info!(
+                        strategy_id = strategy.id(),
+                        reason = %reason,
+                        "Strategy retired (StrategyComplete)"
+                    );
+                    retired.push(i);
+                    // Do NOT propagate — handled here. Other signals in
+                    // this same on_tick batch (e.g. CancelOrder before
+                    // self-retire) still flow through normally.
+                    continue;
+                }
                 all_signals.push(signal);
             }
+        }
+        // Remove retired strategies. on_shutdown gives them a chance to
+        // clean up any internal state, just like engine-wide shutdown.
+        for i in retired.into_iter().rev() {
+            self.strategies[i].on_shutdown();
+            self.strategies.remove(i);
+            self.last_tick_at.remove(i);
         }
         all_signals
     }
