@@ -24,9 +24,16 @@ def _get_auth_headers() -> dict[str, str]:
         return {}
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(not PROXY_URL, reason="PMPROXY_URL not set")
 class TestProxy:
-    """Test API calls through the proxy."""
+    """Test API calls through the proxy.
+
+    Marked `integration` because they hit the live deployed Lambda and the
+    real Polymarket APIs upstream — they verify the deployed system, not the
+    code in any given diff. Excluded from default CI; run after a Lambda
+    deploy with `uv run pytest tests/ -m integration`.
+    """
 
     @pytest.fixture(autouse=True)
     def auth_headers(self):

@@ -1,6 +1,12 @@
 name: Deploy pmproxy Lambda
 
 on:
+  # Auto-deploy when pmproxy/Cargo.toml version bumps on master.
+  # The detect-bump job is the gate; it skips deploys for non-version pushes.
+  push:
+    branches: [master, main]
+    paths:
+      - 'pmproxy/Cargo.toml'
   # Manual trigger from the GitHub Actions UI.
   workflow_dispatch:
     inputs:
@@ -8,7 +14,7 @@ on:
         description: "Git ref to deploy (default: master)"
         required: false
         default: "master"
-  # Auto-deploy when a pmproxy-v* release is published.
+  # Auto-deploy when a pmproxy-v* release is published (e.g. manual tag push).
   release:
     types: [published]
 
@@ -21,14 +27,51 @@ env:
   AWS_REGION: eu-west-1
 
 permissions:
-  # Required to mint the OIDC token for AWS role assumption.
-  id-token: write
-  contents: read
+  id-token: write     # OIDC for AWS role assumption
+  contents: write     # create tag + release on push-triggered deploys
 
 jobs:
+  detect-bump:
+    # Only runs on push events. Compares pmproxy/Cargo.toml version against
+    # the parent commit; if unchanged, deploy job is skipped.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      bumped: ${{ steps.check.outputs.bumped }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Compare version with parent commit
+        id: check
+        run: |
+          current=$(awk -F\" '/^version = / {print $2; exit}' pmproxy/Cargo.toml)
+          previous=$(git show HEAD^:pmproxy/Cargo.toml 2>/dev/null | awk -F\" '/^version = / {print $2; exit}' || echo "")
+          echo "version=$current" >> "$GITHUB_OUTPUT"
+          if [[ "$current" == "$previous" ]]; then
+            echo "::notice::pmproxy version unchanged ($current); skipping deploy"
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::pmproxy version bumped: ${previous:-<none>} -> $current"
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+          fi
+
   deploy:
-    # Release-triggered runs only deploy pmproxy-v* tags; other releases are skipped.
-    if: ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'pmproxy-v') }}
+    needs: [detect-bump]
+    # Run when:
+    #   - push to master that bumped pmproxy/Cargo.toml version, OR
+    #   - manual workflow_dispatch, OR
+    #   - pmproxy-v* release published.
+    # `always()` is needed so this job runs even when detect-bump was skipped
+    # (workflow_dispatch / release events don't run detect-bump).
+    if: |
+      always() && !cancelled() && (
+        (github.event_name == 'push' && needs.detect-bump.outputs.bumped == 'true') ||
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'pmproxy-v'))
+      )
     runs-on: ubuntu-latest
 
     steps:
@@ -81,9 +124,55 @@ jobs:
             --output table
 
       - name: Verify deployed function responds
+        id: verify
         run: |
           URL=$(aws lambda get-function-url-config --function-name pmproxy --query 'FunctionUrl' --output text)
           echo "Lambda URL: $URL"
           # /health is unauthenticated; expects JSON {"status":"healthy"}
           curl -sf "${URL}health" | tee /dev/stderr
           echo ""
+          echo "url=${URL%/}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python for integration tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Install pmtrader deps
+        working-directory: pmtrader
+        run: uv sync
+
+      - name: Run proxy integration tests against deployed Lambda
+        working-directory: pmtrader
+        env:
+          PMPROXY_URL: ${{ steps.verify.outputs.url }}
+          PMPROXY_COGNITO_CLIENT_ID: ${{ secrets.PMPROXY_COGNITO_CLIENT_ID }}
+          PMPROXY_COGNITO_REGION: ${{ secrets.PMPROXY_COGNITO_REGION }}
+          PMPROXY_USERNAME: ${{ secrets.PMPROXY_USERNAME }}
+          PMPROXY_PASSWORD: ${{ secrets.PMPROXY_PASSWORD }}
+        run: uv run pytest tests/test_proxy.py -v -m integration
+
+      # Tag the commit + create a GitHub release for traceability, but only for
+      # push-triggered deploys (workflow_dispatch and release events skip this —
+      # release events would create a duplicate; dispatch is ad-hoc).
+      - name: Tag commit & create release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ needs.detect-bump.outputs.version }}"
+          tag="pmproxy-v${version}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::Release $tag already exists; skipping creation."
+            exit 0
+          fi
+          gh release create "$tag" \
+            pmproxy/target/lambda/pmproxy-lambda/bootstrap.zip \
+            --title "pmproxy ${version}" \
+            --target "${{ github.sha }}" \
+            --generate-notes
