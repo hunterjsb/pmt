@@ -358,6 +358,39 @@ impl PolymarketClient {
         Ok(())
     }
 
+    /// Fetch all currently-open orders for the authenticated user.
+    ///
+    /// Pages through `/data/orders` until exhausted. Used at engine startup
+    /// to repopulate the external-orders map with any orders left behind by
+    /// a previous session (manual CLI placements, crashes, etc.) so they
+    /// appear in `/orders/all` and can be cancelled via `CancelOrderById`.
+    pub async fn get_open_orders(
+        &self,
+    ) -> Result<
+        Vec<polymarket_client_sdk_v2::clob::types::response::OpenOrderResponse>,
+        ClientError,
+    > {
+        use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
+        let req = OrdersRequest::default();
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .inner
+                .orders(&req, cursor.clone())
+                .await
+                .map_err(|e| ClientError::OrderError(format!("orders fetch failed: {}", e)))?;
+            all.extend(page.data);
+            // SDK convention: empty cursor means no more pages. Polymarket
+            // also uses "LTE=" as an end sentinel — treat both as terminal.
+            if page.next_cursor.is_empty() || page.next_cursor == "LTE=" {
+                break;
+            }
+            cursor = Some(page.next_cursor);
+        }
+        Ok(all)
+    }
+
     /// Cancel multiple orders.
     pub async fn cancel_orders(&self, order_ids: &[&str]) -> Result<(), ClientError> {
         if self.dry_run {

@@ -579,6 +579,44 @@ impl Engine {
             }
         }
 
+        // Repopulate external_orders from Polymarket so any orders left over
+        // from a previous engine session (manual CLI placements, prior crash)
+        // show up in /orders/all and can be cancelled via /orders/:id/cancel.
+        //
+        // Runs after the destructive reconcile above so we don't pick up
+        // orders that were just cancelled. Failure here is non-fatal — the
+        // engine still starts, the unified view just won't include legacy
+        // orders until the user touches them via the CLI (which re-registers).
+        match self.client.get_open_orders().await {
+            Ok(orders) => {
+                let mut loaded = 0;
+                for o in orders {
+                    let ext = crate::control::ExternalOrder {
+                        id: o.id.clone(),
+                        token_id: o.asset_id.to_string(),
+                        side: o.side.to_string().to_lowercase(),
+                        price: o.price,
+                        size: o.original_size,
+                        source: "reconciled".to_string(),
+                        created_at: o.created_at,
+                    };
+                    self.external_orders.insert(o.id, ext);
+                    loaded += 1;
+                }
+                tracing::info!(
+                    count = loaded,
+                    "Startup reconcile: loaded existing open orders into external_orders"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Startup reconcile: failed to fetch open orders; /orders/all will be \
+                     incomplete until CLI re-registers them"
+                );
+            }
+        }
+
         // Get tick interval
         let tick_duration = Duration::from_millis(self.config.tick_interval_ms);
         let mut tick_timer = interval(tick_duration);
