@@ -78,6 +78,11 @@ pub struct Engine {
     alert_queue: AlertQueue,
     /// Notifier for outbound push notifications (ntfy / Discord / noop).
     notifier: Arc<Notifier>,
+    /// Orders the engine knows about but didn't place itself — registered
+    /// via `POST /orders/external` after a CLI buy/sell. Combined with
+    /// engine-placed orders for the unified `/orders/all` view, and
+    /// available as cancel targets via `POST /orders/:id/cancel`.
+    external_orders: HashMap<String, crate::control::ExternalOrder>,
 }
 
 /// Internal event emitted by the trades poller for the main loop to process.
@@ -172,6 +177,7 @@ impl Engine {
             gamma_resolver: GammaClient::new(),
             alert_queue: AlertQueue::new(),
             notifier: Arc::new(Notifier::from_env()),
+            external_orders: HashMap::new(),
         })
     }
 
@@ -1148,6 +1154,17 @@ impl Engine {
                                 Signal::Cancel { token_id } => {
                                     cancel_tokens.push(token_id);
                                 }
+                                Signal::CancelOrder { order_id } => {
+                                    match self.client.cancel_order(&order_id).await {
+                                        Ok(_) => {
+                                            tracing::info!(order_id = %order_id, "CancelOrder signal: cancelled");
+                                            self.risk_manager.release_order(&order_id);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, order_id = %order_id, "CancelOrder signal: cancel failed");
+                                        }
+                                    }
+                                }
                                 Signal::Buy { token_id, price, size, urgency } => {
                                     // Don't pre-round price here. OrderManager rounds to the
                                     // per-market tick when actually placing; the delta-quote
@@ -1572,6 +1589,83 @@ impl Engine {
                                     })
                                     .collect();
                                 let _ = reply.send(trades);
+                            }
+                            EngineCommand::RegisterExternalOrder { order, reply } => {
+                                tracing::info!(
+                                    order_id = %order.id,
+                                    token_id = %order.token_id,
+                                    source = %order.source,
+                                    "External order registered"
+                                );
+                                self.external_orders.insert(order.id.clone(), order);
+                                let _ = reply.send(());
+                            }
+                            EngineCommand::MarkExternalCancelled { order_id, reply } => {
+                                let removed = self.external_orders.remove(&order_id).is_some();
+                                if removed {
+                                    tracing::info!(
+                                        order_id = %order_id,
+                                        "External order marked cancelled"
+                                    );
+                                }
+                                let _ = reply.send(());
+                            }
+                            EngineCommand::ListAllOrders(reply) => {
+                                let mut combined: Vec<crate::control::UnifiedOrderInfo> = self
+                                    .order_manager
+                                    .active_orders_snapshot()
+                                    .into_iter()
+                                    .map(|o| crate::control::UnifiedOrderInfo {
+                                        id: o.id,
+                                        token_id: o.token_id,
+                                        side: if o.is_buy { "buy" } else { "sell" }.to_string(),
+                                        price: o.price,
+                                        size: o.size,
+                                        filled: o.filled_size,
+                                        status: format!("{:?}", o.status),
+                                        created_at: o.created_at,
+                                        source: "engine".to_string(),
+                                    })
+                                    .collect();
+                                for (_, ext) in self.external_orders.iter() {
+                                    combined.push(crate::control::UnifiedOrderInfo {
+                                        id: ext.id.clone(),
+                                        token_id: ext.token_id.clone(),
+                                        side: ext.side.clone(),
+                                        price: ext.price,
+                                        size: ext.size,
+                                        filled: Decimal::ZERO,
+                                        status: "external".to_string(),
+                                        created_at: ext.created_at,
+                                        source: ext.source.clone(),
+                                    });
+                                }
+                                let _ = reply.send(combined);
+                            }
+                            EngineCommand::CancelOrderById { order_id, reply } => {
+                                let res = match self.client.cancel_order(&order_id).await {
+                                    Ok(_) => {
+                                        // If it was tracked externally, clean up; if it was
+                                        // engine-placed, release the risk reservation. Both
+                                        // calls are no-ops if the id isn't present.
+                                        self.external_orders.remove(&order_id);
+                                        self.risk_manager.release_order(&order_id);
+                                        tracing::info!(
+                                            order_id = %order_id,
+                                            "CancelOrderById succeeded"
+                                        );
+                                        Ok(())
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            order_id = %order_id,
+                                            "CancelOrderById failed"
+                                        );
+                                        Err(format!("cancel failed: {}", e))
+                                    }
+                                };
+                                let _ = reply.send(res);
                             }
                         }
                     }

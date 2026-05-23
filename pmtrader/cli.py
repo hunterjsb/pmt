@@ -109,6 +109,7 @@ def buy(token: str, price: float, size: int, tick: str | None, dry_run: bool) ->
         console.print("[dim]dry-run[/dim]")
         return
     resp = _api().place_buy(token=token, price=price, size=size, tick_size=tick)
+    _register_with_engine_if_live(resp, token=token, side="buy", price=price, size=size)
     click.echo(json.dumps(resp, indent=2, default=str))
 
 
@@ -127,6 +128,7 @@ def sell(token: str, price: float, size: int, tick: str | None, dry_run: bool) -
         console.print("[dim]dry-run[/dim]")
         return
     resp = _api().place_sell(token=token, price=price, size=size, tick_size=tick)
+    _register_with_engine_if_live(resp, token=token, side="sell", price=price, size=size)
     click.echo(json.dumps(resp, indent=2, default=str))
 
 
@@ -171,8 +173,20 @@ def flip(
 @cli.command()
 @click.argument("order_id")
 def cancel(order_id: str) -> None:
-    """Cancel an open order by ID."""
+    """Cancel an open order by ID.
+
+    Tries the engine's `/orders/:id/cancel` endpoint first so the engine
+    stays authoritative for state. Falls back to a direct CLOB cancel if
+    the engine is unreachable; in that case it also notifies the engine
+    after the fact (no-op if still down).
+    """
+    via_engine = _engine_notify(f"/orders/{order_id}/cancel")
+    if via_engine is not None:
+        console.print(f"[green]cancelled[/green] via engine: {order_id}")
+        return
+    # Engine unreachable — direct CLOB cancel, then a best-effort notify.
     resp = _api().cancel(order_id)
+    _engine_notify(f"/orders/external/{order_id}/cancelled")
     click.echo(json.dumps(resp, indent=2, default=str))
 
 
@@ -640,22 +654,40 @@ def engine_strategies() -> None:
 
 
 @engine.command("orders")
-def engine_orders() -> None:
-    """Open orders the engine is currently managing."""
-    rows = _engine_get("/orders")
+@click.option(
+    "--all",
+    "show_all",
+    is_flag=True,
+    help="Include externally-registered orders (from pmt buy/sell, web, etc.)",
+)
+def engine_orders(show_all: bool) -> None:
+    """Open orders the engine is tracking.
+
+    Default view = orders the engine placed itself.
+    With --all = unified view incl. orders the CLI registered after placing.
+    """
+    rows = _engine_get("/orders/all" if show_all else "/orders")
     if not rows:
         console.print("[yellow]No active orders.[/yellow]")
         return
-    t = Table(title="open orders")
-    for col in ("id", "token", "side", "price", "size", "filled", "status", "age"):
-        t.add_column(col, justify="right" if col not in ("id", "token", "side", "status") else "left")
+    t = Table(title="open orders" + (" (all sources)" if show_all else ""))
+    cols = ("id", "token", "side", "price", "size", "filled", "status", "age")
+    if show_all:
+        cols = ("id", "token", "side", "price", "size", "filled", "status", "source", "age")
+    for col in cols:
+        t.add_column(
+            col,
+            justify="right"
+            if col not in ("id", "token", "side", "status", "source")
+            else "left",
+        )
     now = datetime.now(timezone.utc)
     for o in rows:
         created = datetime.fromisoformat(o["created_at"].replace("Z", "+00:00"))
         age_s = (now - created).total_seconds()
         age_disp = f"{age_s:.0f}s" if age_s < 120 else f"{age_s/60:.1f}m"
         side_col = "green" if o["side"] == "buy" else "red"
-        t.add_row(
+        row = [
             o["id"][:10] + "…",
             o["token_id"][:8] + "…",
             f"[{side_col}]{o['side'].upper()}[/{side_col}]",
@@ -663,8 +695,11 @@ def engine_orders() -> None:
             f"{float(o['size']):.2f}",
             f"{float(o['filled']):.2f}",
             o["status"],
-            age_disp,
-        )
+        ]
+        if show_all:
+            row.append(o.get("source", "engine"))
+        row.append(age_disp)
+        t.add_row(*row)
     console.print(t)
 
 
@@ -759,10 +794,10 @@ def engine_alerts() -> None:
     )
 
 
-def _engine_post(path: str) -> dict:
+def _engine_post(path: str, body: dict | None = None) -> dict:
     base = os.environ.get("PMENGINE_CONTROL_URL", "http://127.0.0.1:7531").rstrip("/")
     try:
-        r = requests.post(f"{base}{path}", timeout=10)
+        r = requests.post(f"{base}{path}", json=body, timeout=10)
     except requests.ConnectionError:
         console.print(f"[red]Cannot reach pmengine at {base}.[/red]")
         sys.exit(1)
@@ -774,6 +809,47 @@ def _engine_post(path: str) -> dict:
         console.print(f"[red]HTTP {r.status_code}: {msg}[/red]")
         sys.exit(1)
     return r.json()
+
+
+def _engine_notify(path: str, body: dict | None = None) -> dict | None:
+    """Fire-and-forget POST to the engine — does NOT exit on failure.
+
+    Returns the JSON response on success, or None if the engine is
+    unreachable / responds with an error. Use this for cooperative
+    notifications from CLI commands that must still succeed standalone.
+    """
+    base = os.environ.get("PMENGINE_CONTROL_URL", "http://127.0.0.1:7531").rstrip("/")
+    try:
+        r = requests.post(f"{base}{path}", json=body, timeout=3)
+        if r.status_code >= 400:
+            return None
+        return r.json()
+    except (requests.ConnectionError, requests.Timeout):
+        return None
+
+
+def _register_with_engine_if_live(
+    resp: dict, *, token: str, side: str, price: float, size: int
+) -> None:
+    """After a successful place_buy/place_sell, tell the engine about the
+    order so its `/orders/all` view stays unified. Silent on engine offline.
+    """
+    if not isinstance(resp, dict) or not resp.get("success"):
+        return
+    order_id = resp.get("orderID") or resp.get("order_id")
+    if not order_id:
+        return
+    _engine_notify(
+        "/orders/external",
+        {
+            "id": order_id,
+            "token_id": token,
+            "side": side,
+            "price": str(price),
+            "size": str(size),
+            "source": "pmt-cli",
+        },
+    )
 
 
 @engine.command("approve")

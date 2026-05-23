@@ -39,6 +39,19 @@ class Cancel:
 
 
 @dataclass(frozen=True)
+class CancelOrder:
+    """Cancel a single order by its exchange-assigned order ID.
+
+    Unlike `Cancel` (which only operates on orders the engine itself
+    placed for a given token), `CancelOrder` calls the CLOB cancel
+    endpoint directly with the order ID. This lets a strategy clean up
+    orders placed outside the engine — e.g. manual `pmt buy/sell` from
+    the CLI — as long as they belong to the same account.
+    """
+    order_id: str
+
+
+@dataclass(frozen=True)
 class Hold:
     """No action."""
     pass
@@ -94,4 +107,4 @@ class Alert:
 
 
 # Union type for all signals
-Signal = Union[Buy, Sell, Cancel, Hold, Shutdown, Subscribe, Unsubscribe, Alert]
+Signal = Union[Buy, Sell, Cancel, CancelOrder, Hold, Shutdown, Subscribe, Unsubscribe, Alert]

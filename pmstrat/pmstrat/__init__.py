@@ -1,7 +1,7 @@
 """pmstrat - Strategy DSL and backtesting for Polymarket."""
 
 from .signal import (
-    Signal, Buy, Sell, Cancel, Hold, Shutdown, Urgency,
+    Signal, Buy, Sell, Cancel, CancelOrder, Hold, Shutdown, Urgency,
     Subscribe, Unsubscribe, Alert,
 )
 from .context import Context, OrderBookSnapshot, Position, MarketInfo, TradeRecord
@@ -23,6 +23,7 @@ __all__ = [
     "Buy",
     "Sell",
     "Cancel",
+    "CancelOrder",
     "Hold",
     "Shutdown",
     "Urgency",

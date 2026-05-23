@@ -45,6 +45,14 @@ pub enum Signal {
     },
     /// Cancel existing orders for a token
     Cancel { token_id: String },
+    /// Cancel a single order by its exchange-assigned order ID.
+    ///
+    /// Unlike `Cancel` (which reconciles engine-tracked orders for a given
+    /// token), this calls the CLOB cancel endpoint directly with the order
+    /// ID. Use it to clean up orders the engine didn't place itself — e.g.
+    /// manual `pmt buy/sell` from the CLI — as long as they belong to the
+    /// same account.
+    CancelOrder { order_id: String },
     /// Subscribe to live market data for a token at runtime. The engine
     /// initialises a fresh order book in the MarketDataHub, adds the token
     /// to its REST poller rotation, and re-establishes the WebSocket

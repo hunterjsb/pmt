@@ -1472,6 +1472,8 @@ impl Strategy for {self.struct_name} {{
                 return self._gen_signal_call("Sell", expr)
             elif func_name == "Cancel":
                 return self._gen_cancel_call(expr)
+            elif func_name == "CancelOrder":
+                return self._gen_cancel_order_call(expr)
             elif func_name == "Hold":
                 return "Signal::Hold"
             elif func_name == "Shutdown":
@@ -1556,6 +1558,17 @@ impl Strategy for {self.struct_name} {{
             token_id = f"{token_id}.to_string()"
 
         return f"Signal::Cancel {{ token_id: {token_id} }}"
+
+    def _gen_cancel_order_call(self, expr: ast.Call) -> str:
+        """Generate Signal::CancelOrder.
+
+        order_id needs to be an owned String. Both string literals
+        ("0xabc") and &str variables (module-level consts) need
+        `.to_string()` applied.
+        """
+        kwargs = {kw.arg: self._gen_expr(kw.value) for kw in expr.keywords}
+        order_id = kwargs.get("order_id", '""')
+        return f"Signal::CancelOrder {{ order_id: {order_id}.to_string() }}"
 
     def _gen_shutdown_call(self, expr: ast.Call) -> str:
         """Generate Signal::Shutdown."""

@@ -118,6 +118,7 @@ impl RiskManager {
         match signal {
             Signal::Hold
             | Signal::Cancel { .. }
+            | Signal::CancelOrder { .. }
             | Signal::Shutdown { .. }
             | Signal::Subscribe { .. }
             | Signal::Unsubscribe { .. }

@@ -68,6 +68,67 @@ pub enum EngineCommand {
         token_id: String,
         reply: oneshot::Sender<()>,
     },
+    /// Register an order that was placed outside the engine (e.g. via
+    /// `pmt buy/sell` on the CLI). The engine adds it to its
+    /// external-orders map so /orders/all returns the unified view.
+    /// Idempotent — re-registering the same id overwrites.
+    RegisterExternalOrder {
+        order: ExternalOrder,
+        reply: oneshot::Sender<()>,
+    },
+    /// Mark an externally-registered order as cancelled (called by pmt
+    /// CLI after a successful direct-CLOB cancel, when engine wasn't
+    /// the one to do it). Removes from the engine's view.
+    MarkExternalCancelled {
+        order_id: String,
+        reply: oneshot::Sender<()>,
+    },
+    /// List the union of engine-placed and externally-registered orders.
+    /// Each row carries a `source` field so consumers can tell them apart.
+    ListAllOrders(oneshot::Sender<Vec<UnifiedOrderInfo>>),
+    /// Cancel any order on the account by ID — bypasses the engine's
+    /// own order_manager and hits the CLOB cancel endpoint directly.
+    /// Also clears the order from external_orders if present.
+    CancelOrderById {
+        order_id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+/// An order placed outside the engine that the engine has been told to
+/// track. Mirrors the fields the CLI registers; status is updated by
+/// engine-side events (cancel, fill notifications when those land).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalOrder {
+    pub id: String,
+    pub token_id: String,
+    pub side: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub size: Decimal,
+    /// Where the order came from — "pmt-cli", "web", etc. Free-form.
+    pub source: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Unified view of an order, regardless of whether the engine placed it
+/// itself or the CLI registered it after placing.
+#[derive(Debug, Serialize)]
+pub struct UnifiedOrderInfo {
+    pub id: String,
+    pub token_id: String,
+    pub side: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub size: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub filled: Decimal,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    /// "engine" or whatever the external registrar supplied.
+    pub source: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,6 +211,19 @@ pub fn spawn(bind: SocketAddr, cmd_tx: mpsc::Sender<EngineCommand>) -> JoinHandl
             )
             .route("/subscriptions", get(subscriptions_handler))
             .route("/trades/:token_id", get(trades_handler))
+            .route("/orders/all", get(orders_all_handler))
+            .route(
+                "/orders/external",
+                axum::routing::post(register_external_order_handler),
+            )
+            .route(
+                "/orders/external/:id/cancelled",
+                axum::routing::post(mark_external_cancelled_handler),
+            )
+            .route(
+                "/orders/:id/cancel",
+                axum::routing::post(cancel_order_by_id_handler),
+            )
             .with_state(cmd_tx);
 
         let listener = match tokio::net::TcpListener::bind(bind).await {
@@ -282,4 +356,89 @@ async fn trades_handler(
     rx.await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Body for `POST /orders/external`. Fields match `ExternalOrder` minus
+/// `created_at`, which the engine fills in on receipt.
+#[derive(Debug, Deserialize)]
+pub struct RegisterExternalOrderBody {
+    pub id: String,
+    pub token_id: String,
+    pub side: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub size: Decimal,
+    #[serde(default = "default_source")]
+    pub source: String,
+}
+
+fn default_source() -> String {
+    "external".to_string()
+}
+
+async fn orders_all_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+) -> Result<Json<Vec<UnifiedOrderInfo>>, StatusCode> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::ListAllOrders(tx))
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    rx.await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn register_external_order_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+    Json(body): Json<RegisterExternalOrderBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let order = ExternalOrder {
+        id: body.id,
+        token_id: body.token_id,
+        side: body.side,
+        price: body.price,
+        size: body.size,
+        source: body.source,
+        created_at: Utc::now(),
+    };
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::RegisterExternalOrder { order, reply: tx })
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "engine offline".to_string()))?;
+    rx.await
+        .map(|_| Json(serde_json::json!({"registered": true})))
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string()))
+}
+
+async fn mark_external_cancelled_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+    Path(order_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::MarkExternalCancelled { order_id, reply: tx })
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "engine offline".to_string()))?;
+    rx.await
+        .map(|_| Json(serde_json::json!({"marked": true})))
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string()))
+}
+
+async fn cancel_order_by_id_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+    Path(order_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::CancelOrderById { order_id, reply: tx })
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "engine offline".to_string()))?;
+    match rx.await {
+        Ok(Ok(())) => Ok(Json(serde_json::json!({"cancelled": true}))),
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e)),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string())),
+    }
 }
