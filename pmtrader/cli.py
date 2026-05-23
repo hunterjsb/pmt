@@ -113,8 +113,7 @@ def buy(token: str, price: float, size: int, tick: str | None, ttl: str | None, 
     if dry_run:
         console.print("[dim]dry-run[/dim]")
         return
-    resp = _api().place_buy(token=token, price=price, size=size, tick_size=tick)
-    _register_with_engine_if_live(resp, token=token, side="buy", price=price, size=size)
+    resp = _place_or_direct("buy", token=token, price=price, size=size, tick=tick)
     if ttl_seconds:
         _schedule_ttl_cancel_if_live(resp, ttl_seconds=ttl_seconds)
     click.echo(json.dumps(resp, indent=2, default=str))
@@ -139,8 +138,7 @@ def sell(token: str, price: float, size: int, tick: str | None, ttl: str | None,
     if dry_run:
         console.print("[dim]dry-run[/dim]")
         return
-    resp = _api().place_sell(token=token, price=price, size=size, tick_size=tick)
-    _register_with_engine_if_live(resp, token=token, side="sell", price=price, size=size)
+    resp = _place_or_direct("sell", token=token, price=price, size=size, tick=tick)
     if ttl_seconds:
         _schedule_ttl_cancel_if_live(resp, ttl_seconds=ttl_seconds)
     click.echo(json.dumps(resp, indent=2, default=str))
@@ -840,6 +838,67 @@ def _engine_notify(path: str, body: dict | None = None) -> dict | None:
         return r.json()
     except (requests.ConnectionError, requests.Timeout):
         return None
+
+
+def _place_via_engine(side: str, token: str, price: float, size: int) -> dict | None:
+    """Ask the running engine to place the order on our behalf.
+
+    Routing CLI writes through the engine puts every account-touching call
+    on a single queue, so the engine's pollers/strategies and the CLI no
+    longer race for the account-wide ~5 req/sec budget. The engine also
+    handles tick rounding (cached) so this path skips the CLI's separate
+    tick_size REST lookup.
+
+    Returns:
+        - dict shaped like place_buy/place_sell on success
+        - None if the engine is unreachable (caller falls back to direct)
+
+    On engine-side rejection (4xx, e.g. risk limit, validation error) this
+    prints the error and exits — a deliberate rejection is NOT a reason to
+    silently retry against direct CLOB and bypass whatever the engine was
+    enforcing.
+    """
+    base = os.environ.get("PMENGINE_CONTROL_URL", "http://127.0.0.1:7531").rstrip("/")
+    try:
+        r = requests.post(
+            f"{base}/trade/place",
+            json={"token_id": token, "side": side, "price": str(price), "size": str(size)},
+            timeout=20,
+        )
+    except (requests.ConnectionError, requests.Timeout):
+        return None
+    if r.status_code >= 400:
+        try:
+            msg = r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
+        except Exception:
+            msg = r.text
+        console.print(f"[red]engine rejected order: {msg}[/red]")
+        sys.exit(1)
+    body = r.json()
+    # Shape the response so downstream code (TTL scheduling, json echo) can
+    # pull order_id the same way it does from py-clob-client responses.
+    return {"success": True, "orderID": body.get("order_id"), "via_engine": True}
+
+
+def _place_or_direct(
+    side: str, *, token: str, price: float, size: int, tick: str | None
+) -> dict:
+    """Try the engine first; on engine unreachable fall back to direct CLOB.
+
+    The engine path serializes against the account-wide budget and skips the
+    CLI's tick_size lookup; the direct path keeps `pmt buy/sell` working when
+    the engine isn't running. `--tick` short-circuits to direct since the
+    engine ignores caller-supplied ticks (it always uses its cached lookup).
+    """
+    if tick is None:
+        resp = _place_via_engine(side, token, price, size)
+        if resp is not None:
+            return resp
+        console.print("[dim](engine unreachable; placing direct)[/dim]")
+    place_fn = _api().place_buy if side == "buy" else _api().place_sell
+    resp = place_fn(token=token, price=price, size=size, tick_size=tick)
+    _register_with_engine_if_live(resp, token=token, side=side, price=price, size=size)
+    return resp
 
 
 def _register_with_engine_if_live(

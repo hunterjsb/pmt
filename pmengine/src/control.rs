@@ -102,6 +102,19 @@ pub enum EngineCommand {
         at: DateTime<Utc>,
         reply: oneshot::Sender<()>,
     },
+    /// Place an order on behalf of an external caller (e.g. `pmt buy/sell`).
+    /// Routing CLI writes through the engine puts every account-touching
+    /// write on one queue, so the engine + CLI no longer compete for the
+    /// account-wide ~5 req/sec budget. The engine looks up tick decimals
+    /// (cached), rounds the price, places via its single PolymarketClient,
+    /// and auto-registers the result in `external_orders` for `/orders/all`.
+    PlaceOrder {
+        token_id: String,
+        side: String,    // "buy" or "sell"
+        price: Decimal,
+        size: Decimal,
+        reply: oneshot::Sender<Result<String, String>>, // order_id or error
+    },
 }
 
 /// An order placed outside the engine that the engine has been told to
@@ -236,6 +249,10 @@ pub fn spawn(bind: SocketAddr, cmd_tx: mpsc::Sender<EngineCommand>) -> JoinHandl
             .route(
                 "/orders/:id/schedule-cancel",
                 axum::routing::post(schedule_cancel_handler),
+            )
+            .route(
+                "/trade/place",
+                axum::routing::post(place_trade_handler),
             )
             .with_state(cmd_tx);
 
@@ -464,6 +481,45 @@ async fn cancel_order_by_id_handler(
 pub struct ScheduleCancelBody {
     pub at: Option<DateTime<Utc>>,
     pub after_seconds: Option<u64>,
+}
+
+/// Body for `POST /trade/place`. Side is "buy" or "sell" (case-insensitive).
+/// Price and size are strings (Decimal) to dodge float-precision surprises.
+/// The engine rounds price to the market's tick decimals before submitting.
+#[derive(Debug, Deserialize)]
+pub struct PlaceTradeBody {
+    pub token_id: String,
+    pub side: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub size: Decimal,
+}
+
+async fn place_trade_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+    Json(body): Json<PlaceTradeBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let side = body.side.to_lowercase();
+    if side != "buy" && side != "sell" {
+        return Err((StatusCode::BAD_REQUEST, format!("invalid side '{}'", body.side)));
+    }
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::PlaceOrder {
+            token_id: body.token_id,
+            side,
+            price: body.price,
+            size: body.size,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "engine offline".to_string()))?;
+    match rx.await {
+        Ok(Ok(order_id)) => Ok(Json(serde_json::json!({"order_id": order_id, "success": true}))),
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e)),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string())),
+    }
 }
 
 async fn schedule_cancel_handler(

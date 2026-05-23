@@ -1755,6 +1755,62 @@ impl Engine {
                                 self.pending_cancellations.push((at, order_id));
                                 let _ = reply.send(());
                             }
+                            EngineCommand::PlaceOrder { token_id, side, price, size, reply } => {
+                                let sdk_side = match side.as_str() {
+                                    "buy" => crate::client::Side::Buy,
+                                    "sell" => crate::client::Side::Sell,
+                                    _ => {
+                                        let _ = reply.send(Err(format!("invalid side '{}'", side)));
+                                        continue;
+                                    }
+                                };
+                                // Round price to the market's tick. Cached lookup
+                                // means this is free after first touch, eliminating
+                                // the CLI's separate tick_size REST call.
+                                let rounded_price = match self.client.tick_decimals_for(&token_id).await {
+                                    Ok(decimals) => price.round_dp(decimals),
+                                    Err(e) => {
+                                        let _ = reply.send(Err(format!("tick lookup failed: {}", e)));
+                                        continue;
+                                    }
+                                };
+                                let res = match self.client.place_limit_order(
+                                    &token_id, sdk_side, rounded_price, size,
+                                ).await {
+                                    Ok(order_id) => {
+                                        self.external_orders.insert(
+                                            order_id.clone(),
+                                            crate::control::ExternalOrder {
+                                                id: order_id.clone(),
+                                                token_id: token_id.clone(),
+                                                side: side.clone(),
+                                                price: rounded_price,
+                                                size,
+                                                source: "cli-via-engine".to_string(),
+                                                created_at: chrono::Utc::now(),
+                                            },
+                                        );
+                                        tracing::info!(
+                                            order_id = %order_id,
+                                            token_id = %token_id,
+                                            side = %side,
+                                            price = %rounded_price,
+                                            size = %size,
+                                            "PlaceOrder (CLI via engine) succeeded"
+                                        );
+                                        Ok(order_id)
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            token_id = %token_id,
+                                            "PlaceOrder (CLI via engine) failed"
+                                        );
+                                        Err(format!("place failed: {}", e))
+                                    }
+                                };
+                                let _ = reply.send(res);
+                            }
                         }
                     }
 
