@@ -33,14 +33,12 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import click
-import requests
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
