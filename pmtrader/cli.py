@@ -32,6 +32,16 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
+# Imported with aliases so the `pmt engine` CLI group below doesn't shadow it.
+from engine import (
+    get as _engine_get,
+    post as _engine_post,
+    notify as _engine_notify,
+    place_or_direct as _place_or_direct,
+    parse_ttl as _parse_ttl,
+    schedule_cancel as _schedule_ttl_cancel_if_live,
+)
+
 console = Console()
 
 # Theme keyword regexes for `pmt positions` — same set portfolio.py used.
@@ -843,23 +853,6 @@ def engine() -> None:
     pass
 
 
-def _engine_get(path: str) -> dict | list:
-    base = os.environ.get("PMENGINE_CONTROL_URL", "http://127.0.0.1:7531").rstrip("/")
-    try:
-        r = requests.get(f"{base}{path}", timeout=5)
-        r.raise_for_status()
-    except requests.ConnectionError:
-        console.print(
-            f"[red]Cannot reach pmengine at {base}.[/red] "
-            "Is the engine running? Check `ps -ef | grep pmengine`."
-        )
-        sys.exit(1)
-    except requests.HTTPError as e:
-        console.print(f"[red]Engine returned {e.response.status_code}: {e.response.text}[/red]")
-        sys.exit(1)
-    return r.json()
-
-
 @engine.command("status")
 def engine_status() -> None:
     """One-line health snapshot of the running engine."""
@@ -1051,168 +1044,6 @@ def engine_alerts() -> None:
     console.print(
         "\n[dim]approve: `pmt engine approve <id>`   reject: `pmt engine reject <id>`[/dim]"
     )
-
-
-def _engine_post(path: str, body: dict | None = None) -> dict:
-    base = os.environ.get("PMENGINE_CONTROL_URL", "http://127.0.0.1:7531").rstrip("/")
-    try:
-        r = requests.post(f"{base}{path}", json=body, timeout=10)
-    except requests.ConnectionError:
-        console.print(f"[red]Cannot reach pmengine at {base}.[/red]")
-        sys.exit(1)
-    if r.status_code >= 400:
-        try:
-            msg = r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
-        except Exception:
-            msg = r.text
-        console.print(f"[red]HTTP {r.status_code}: {msg}[/red]")
-        sys.exit(1)
-    return r.json()
-
-
-def _engine_notify(path: str, body: dict | None = None) -> dict | None:
-    """Fire-and-forget POST to the engine — does NOT exit on failure.
-
-    Returns the JSON response on success, or None if the engine is
-    unreachable / responds with an error. Use this for cooperative
-    notifications from CLI commands that must still succeed standalone.
-    """
-    base = os.environ.get("PMENGINE_CONTROL_URL", "http://127.0.0.1:7531").rstrip("/")
-    try:
-        r = requests.post(f"{base}{path}", json=body, timeout=3)
-        if r.status_code >= 400:
-            return None
-        return r.json()
-    except (requests.ConnectionError, requests.Timeout):
-        return None
-
-
-def _place_via_engine(side: str, token: str, price: float, size: int) -> dict | None:
-    """Ask the running engine to place the order on our behalf.
-
-    Routing CLI writes through the engine puts every account-touching call
-    on a single queue, so the engine's pollers/strategies and the CLI no
-    longer race for the account-wide ~5 req/sec budget. The engine also
-    handles tick rounding (cached) so this path skips the CLI's separate
-    tick_size REST lookup.
-
-    Returns:
-        - dict shaped like place_buy/place_sell on success
-        - None if the engine is unreachable (caller falls back to direct)
-
-    On engine-side rejection (4xx, e.g. risk limit, validation error) this
-    prints the error and exits — a deliberate rejection is NOT a reason to
-    silently retry against direct CLOB and bypass whatever the engine was
-    enforcing.
-    """
-    base = os.environ.get("PMENGINE_CONTROL_URL", "http://127.0.0.1:7531").rstrip("/")
-    try:
-        r = requests.post(
-            f"{base}/trade/place",
-            json={"token_id": token, "side": side, "price": str(price), "size": str(size)},
-            timeout=20,
-        )
-    except (requests.ConnectionError, requests.Timeout):
-        return None
-    if r.status_code >= 400:
-        try:
-            msg = r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
-        except Exception:
-            msg = r.text
-        console.print(f"[red]engine rejected order: {msg}[/red]")
-        sys.exit(1)
-    body = r.json()
-    # Shape the response so downstream code (TTL scheduling, json echo) can
-    # pull order_id the same way it does from py-clob-client responses.
-    return {"success": True, "orderID": body.get("order_id"), "via_engine": True}
-
-
-def _place_or_direct(
-    side: str, *, token: str, price: float, size: int, tick: str | None
-) -> dict:
-    """Try the engine first; on engine unreachable fall back to direct CLOB.
-
-    The engine path serializes against the account-wide budget and skips the
-    CLI's tick_size lookup; the direct path keeps `pmt buy/sell` working when
-    the engine isn't running. `--tick` short-circuits to direct since the
-    engine ignores caller-supplied ticks (it always uses its cached lookup).
-    """
-    if tick is None:
-        resp = _place_via_engine(side, token, price, size)
-        if resp is not None:
-            return resp
-        console.print("[dim](engine unreachable; placing direct)[/dim]")
-    place_fn = _api().place_buy if side == "buy" else _api().place_sell
-    resp = place_fn(token=token, price=price, size=size, tick_size=tick)
-    _register_with_engine_if_live(resp, token=token, side=side, price=price, size=size)
-    return resp
-
-
-def _register_with_engine_if_live(
-    resp: dict, *, token: str, side: str, price: float, size: int
-) -> None:
-    """After a successful place_buy/place_sell, tell the engine about the
-    order so its `/orders/all` view stays unified. Silent on engine offline.
-    """
-    if not isinstance(resp, dict) or not resp.get("success"):
-        return
-    order_id = resp.get("orderID") or resp.get("order_id")
-    if not order_id:
-        return
-    _engine_notify(
-        "/orders/external",
-        {
-            "id": order_id,
-            "token_id": token,
-            "side": side,
-            "price": str(price),
-            "size": str(size),
-            "source": "pmt-cli",
-        },
-    )
-
-
-_TTL_TOKEN = re.compile(r"(\d+)([dhms])", re.IGNORECASE)
-_TTL_UNIT_SECS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
-
-
-def _parse_ttl(value: str) -> int:
-    """Parse '30m', '2h', '1h30m', '2d' → seconds.
-
-    Polymarket orders are GTC, so TTL is enforced client-side by asking the
-    engine to schedule a cancel — see `_schedule_ttl_cancel_if_live`.
-    """
-    parts = _TTL_TOKEN.findall(value)
-    if not parts or "".join(f"{n}{u}" for n, u in parts).lower() != value.lower():
-        raise click.BadParameter(
-            f"--ttl: invalid duration '{value}' (use forms like '30m', '2h', '1h30m', '2d')"
-        )
-    return sum(int(n) * _TTL_UNIT_SECS[u.lower()] for n, u in parts)
-
-
-def _schedule_ttl_cancel_if_live(resp: dict, *, ttl_seconds: int) -> None:
-    """After a successful place, ask the engine to cancel after `ttl_seconds`.
-
-    The order itself is already on the book whether or not the engine is up;
-    if the engine is unreachable, warn loudly because the TTL will not be
-    honored and the order will rest until manually cancelled.
-    """
-    if not isinstance(resp, dict) or not resp.get("success"):
-        return
-    order_id = resp.get("orderID") or resp.get("order_id")
-    if not order_id:
-        return
-    result = _engine_notify(
-        f"/orders/{order_id}/schedule-cancel",
-        {"after_seconds": ttl_seconds},
-    )
-    if result is None:
-        console.print(
-            f"[red]WARNING: engine unreachable — TTL of {ttl_seconds}s NOT registered. "
-            f"Order is placed but will rest until manually cancelled.[/red]"
-        )
-    else:
-        console.print(f"[dim]TTL: cancel scheduled at {result.get('at')}[/dim]")
 
 
 @engine.command("approve")
