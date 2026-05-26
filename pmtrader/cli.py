@@ -772,10 +772,10 @@ def scan_expiring(min_price, max_hours, interval, once, verbose):
     if once:
         opps = find_expiring_opportunities(min_price_pct=min_price, max_hours=max_hours)
         if verbose:
-            from polymarket import clob, gamma
+            from polymarket import Gamma, sampling_markets
 
-            m1 = clob.sampling_markets(limit=500)
-            m2 = gamma.markets(limit=500, closed=False)
+            m1 = sampling_markets(limit=500)
+            m2 = Gamma().markets(limit=500, closed=False)
             console.print(f"  [dim]scanned {len(m1)} CLOB + {len(m2)} Gamma markets[/dim]")
         tbl = make_table(opps, f"{min_price}%+ certainty, <{max_hours}h")
         if tbl:

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from rich.live import Live
 from rich.table import Table
 
-from polymarket import Market, OrderBook, Token, clob
+from polymarket import Market, OrderBook, Token, get_order_book_depth, sampling_markets
 
 
 @dataclass
@@ -134,10 +134,8 @@ def find_volume_cliff_opportunities(
                 continue
 
             try:
-                # Fetch order book for this token
-                order_book = clob.order_book(token.token_id, token.outcome)
-
-                # Analyze for volume cliff opportunity
+                order_book = get_order_book_depth(token.token_id)
+                order_book.name = token.outcome
                 opp = analyze_order_book(market, token, order_book, **kwargs)
                 if opp:
                     opportunities.append(opp)
@@ -208,7 +206,7 @@ def scan_once(
     min_price_gap_cents: float = 2.0,
 ) -> list[VolumeCliffOpportunity]:
     """Perform a single scan of markets for volume cliff opportunities."""
-    markets = clob.sampling_markets(limit=100)
+    markets = sampling_markets(limit=100)
     opportunities = find_volume_cliff_opportunities(
         markets,
         min_pct=min_pct,

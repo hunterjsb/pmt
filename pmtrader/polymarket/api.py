@@ -1,18 +1,14 @@
-"""High-level authenticated Polymarket trading API.
+"""Authenticated Polymarket trading API.
 
-Wraps py_clob_client_v2 with friendlier methods and hides the Cognito Bearer
-monkey-patch + L1/L2 boilerplate.
+`PolymarketAPI` wraps py_clob_client_v2 with friendlier methods and hides
+the Cognito Bearer monkey-patch + L1/L2 derivation. Read endpoints that
+don't need auth (positions, value, activity, rewards config) call the
+public data-api or CLOB directly.
 
-Read endpoints (positions, value, activity, rewards config) hit the public
-data-api or CLOB directly so they don't need auth.
-
-Usage:
     from polymarket import PolymarketAPI
-
     api = PolymarketAPI()
-    api.place_buy(token=..., price=0.93, size=200)
-    result = api.flip(token=..., buy_price=0.09, sell_price=0.10, size=850)
-    orders = api.get_orders()
+    api.place(side="buy", token=..., price=0.93, size=200)
+    api.get_positions()
 """
 
 from __future__ import annotations
@@ -25,10 +21,8 @@ from pathlib import Path
 
 import requests
 
-DATA_API = "https://data-api.polymarket.com"
-CLOB_API = "https://clob.polymarket.com"
-GAMMA_API = "https://gamma-api.polymarket.com"
-UA = {"User-Agent": "pmtrader/1.0"}
+from . import hosts
+
 _MARKET_CACHE = Path.home() / ".cache" / "pmt" / "markets.json"
 
 
@@ -46,7 +40,7 @@ def lookup_market_name(condition_id: str) -> str | None:
     if condition_id in cache:
         return cache[condition_id]
     try:
-        r = requests.get(f"{CLOB_API}/markets/{condition_id}", headers=UA, timeout=5)
+        r = requests.get(f"{hosts.CLOB}/markets/{condition_id}", headers=hosts.UA, timeout=5)
         r.raise_for_status()
         name = r.json().get("question")
         if not name:
@@ -82,36 +76,32 @@ class PolymarketAPI:
 
     # --- order placement ---
 
-    def place_buy(
+    def place(
         self,
+        side: str,
         *,
         token: str,
         price: float,
         size: int,
         tick_size: str | None = None,
     ) -> dict:
-        return self._place(token=token, price=price, size=size, side="BUY", tick_size=tick_size)
-
-    def place_sell(
-        self,
-        *,
-        token: str,
-        price: float,
-        size: int,
-        tick_size: str | None = None,
-    ) -> dict:
-        return self._place(token=token, price=price, size=size, side="SELL", tick_size=tick_size)
-
-    def _place(self, *, token, price, size, side, tick_size=None) -> dict:
+        """Place a single GTC limit order. `side` is 'buy' or 'sell'."""
         from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
 
-        s = Side.BUY if side == "BUY" else Side.SELL
+        s = Side.BUY if side.lower() == "buy" else Side.SELL
         ts = tick_size or self.get_tick_size(token)
         return self.client.create_and_post_order(
             order_args=OrderArgs(token_id=token, price=price, side=s, size=size),
             options=PartialCreateOrderOptions(tick_size=ts),
             order_type=OrderType.GTC,
         )
+
+    # Thin wrappers used by `flip` and any caller that prefers the typed form.
+    def place_buy(self, *, token, price, size, tick_size=None) -> dict:
+        return self.place("buy", token=token, price=price, size=size, tick_size=tick_size)
+
+    def place_sell(self, *, token, price, size, tick_size=None) -> dict:
+        return self.place("sell", token=token, price=price, size=size, tick_size=tick_size)
 
     def flip(
         self,
@@ -190,9 +180,9 @@ class PolymarketAPI:
 
     def get_positions(self) -> list[dict]:
         r = requests.get(
-            f"{DATA_API}/positions",
+            f"{hosts.DATA}/positions",
             params={"user": self.funder, "limit": 200},
-            headers=UA,
+            headers=hosts.UA,
             timeout=10,
         )
         r.raise_for_status()
@@ -200,7 +190,7 @@ class PolymarketAPI:
 
     def get_portfolio_value(self) -> float:
         r = requests.get(
-            f"{DATA_API}/value", params={"user": self.funder}, headers=UA, timeout=10
+            f"{hosts.DATA}/value", params={"user": self.funder}, headers=hosts.UA, timeout=10
         )
         r.raise_for_status()
         data = r.json()
@@ -210,7 +200,7 @@ class PolymarketAPI:
         params: dict = {"user": self.funder, "limit": limit}
         if kind:
             params["type"] = kind
-        r = requests.get(f"{DATA_API}/activity", params=params, headers=UA, timeout=10)
+        r = requests.get(f"{hosts.DATA}/activity", params=params, headers=hosts.UA, timeout=10)
         r.raise_for_status()
         return r.json() or []
 
@@ -222,7 +212,7 @@ class PolymarketAPI:
             params: dict = {"user": self.funder, "limit": page, "offset": offset}
             if kind:
                 params["type"] = kind
-            r = requests.get(f"{DATA_API}/activity", params=params, headers=UA, timeout=15)
+            r = requests.get(f"{hosts.DATA}/activity", params=params, headers=hosts.UA, timeout=15)
             r.raise_for_status()
             batch = r.json() or []
             if not batch:
@@ -235,7 +225,7 @@ class PolymarketAPI:
 
     def get_rewards_config(self, condition_id: str) -> dict:
         r = requests.get(
-            f"{CLOB_API}/rewards/markets/{condition_id}", headers=UA, timeout=10
+            f"{hosts.CLOB}/rewards/markets/{condition_id}", headers=hosts.UA, timeout=10
         )
         r.raise_for_status()
         data = r.json().get("data", [])
@@ -247,12 +237,12 @@ class PolymarketAPI:
         """Look up a market or event by gamma slug or CLOB condition_id."""
         if slug_or_cid.startswith("0x"):
             r = requests.get(
-                f"{CLOB_API}/markets/{slug_or_cid}", headers=UA, timeout=10
+                f"{hosts.CLOB}/markets/{slug_or_cid}", headers=hosts.UA, timeout=10
             )
             r.raise_for_status()
             return r.json()
         r = requests.get(
-            f"{GAMMA_API}/events", params={"slug": slug_or_cid}, headers=UA, timeout=10
+            f"{hosts.GAMMA}/events", params={"slug": slug_or_cid}, headers=hosts.UA, timeout=10
         )
         r.raise_for_status()
         events = r.json() or []
@@ -261,9 +251,9 @@ class PolymarketAPI:
     def search_markets(self, query: str, *, limit: int = 20) -> list[dict]:
         """Free-text search across events. Returns event records with embedded markets."""
         r = requests.get(
-            f"{GAMMA_API}/public-search",
+            f"{hosts.GAMMA}/public-search",
             params={"q": query, "limit_per_type": limit},
-            headers=UA,
+            headers=hosts.UA,
             timeout=10,
         )
         r.raise_for_status()

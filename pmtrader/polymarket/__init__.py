@@ -1,40 +1,28 @@
-"""Polymarket API client.
+"""Polymarket API surface.
 
-- `Clob` — read-only CLOB wrapper (sampling_markets, order_book, midpoint, prices)
-- `Gamma` — Gamma API wrapper (events, search, market metadata)
-- `PolymarketAPI` — authenticated v2 client for placing orders, querying positions, etc.
-- Singleton convenience instances: `clob`, `gamma`
+- `PolymarketAPI` — authenticated v2 client (orders, positions, activity)
+- `Gamma`         — read-only Gamma client (events, markets)
+- `get_order_book_depth` — full-depth book fetch (no auth)
+- `hosts`         — single source of truth for API hosts + proxy override
+- `pnl`           — activity-ledger replay (realized + unrealized PnL)
 """
 
-from .api import FlipResult, PolymarketAPI
-from .clob import (
-    Clob,
-    get_chain_host,
-    get_clob_host,
-    get_gamma_host,
-    get_order_book_depth,
-    get_proxy_url,
-)
+from . import hosts
+from .api import FlipResult, PolymarketAPI, lookup_market_name
+from .clob import get_order_book_depth, sampling_markets
 from .gamma import Gamma
-from .models import Event, Market, OrderBook, OrderBookLevel, Token
+from .models import Market, OrderBook, OrderBookLevel, Token
 
 __all__ = [
-    "Token",
+    "FlipResult",
+    "Gamma",
     "Market",
     "OrderBook",
     "OrderBookLevel",
-    "Event",
-    "Clob",
-    "Gamma",
     "PolymarketAPI",
-    "FlipResult",
+    "Token",
     "get_order_book_depth",
-    "get_proxy_url",
-    "get_clob_host",
-    "get_gamma_host",
-    "get_chain_host",
+    "hosts",
+    "lookup_market_name",
+    "sampling_markets",
 ]
-
-# Singleton instances for convenience
-clob = Clob()
-gamma = Gamma()

@@ -6,7 +6,9 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from polymarket import clob, gamma
+from polymarket import Gamma
+
+gamma = Gamma()
 
 
 @dataclass

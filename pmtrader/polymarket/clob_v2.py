@@ -19,7 +19,7 @@ import os
 import stat
 from pathlib import Path
 
-from polymarket.cognito import create_cognito_auth
+from .cognito import create_cognito_auth
 
 CHAIN_ID = 137  # Polygon mainnet
 
@@ -100,7 +100,10 @@ def create_authenticated_clob_v2():
 
     _install_cognito_patch_once()
 
-    proxy_url = os.environ["PMPROXY_URL"].rstrip("/") + "/clob"
+    from . import hosts
+    proxy_url = hosts.proxy_url() + "/clob"
+    if proxy_url == "/clob":
+        raise RuntimeError("PMPROXY_URL not set")
     pk = os.environ["PM_PRIVATE_KEY"]
     funder = os.environ["PM_FUNDER_ADDRESS"]
     sig_type = int(os.environ.get("PM_SIGNATURE_TYPE", "1"))
