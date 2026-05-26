@@ -1,19 +1,32 @@
-"""pmt — unified CLI for placing trades, viewing positions, and tracking rewards.
+"""pmt — Polymarket trading CLI.
 
-Routes through the pmproxy Lambda (Cognito-authed) using PolymarketAPI under
-the hood.
+Routes through PolymarketAPI (and the pmproxy Lambda, when configured)
+for writes; falls through the local pmengine control plane when it's
+running so account-wide rate limits are shared with strategies.
 
-Subcommands:
-    pmt buy --token TOKEN --price PRICE --size SIZE [--tick TICK]
-    pmt sell --token TOKEN --price PRICE --size SIZE [--tick TICK]
-    pmt flip --token TOKEN --buy-price BP --sell-price SP --size SIZE [--tick TICK]
+Order primitives (symmetric):
+
+    pmt buy  REF [OUTCOME] [--amount $X | --size N] [--price P] ...
+    pmt sell REF [OUTCOME] [--amount $X | --size N] [--price P] ...
+
+REF is either a polymarket.com URL/slug OR a numeric token id. OUTCOME
+(yes/no/up/down/...) is required for URL/slug refs and ignored for token
+refs (the token already encodes the outcome).
+
+Pricing:
+    --amount $X          marketable sweep: walks book, sets limit so the
+                         intended notional is fully consumed
+    --size N             marketable sweep sized in shares
+    --price P + --size N explicit limit order at P
+    --price P + --amount explicit limit at P, size = ceil(amount/P)
+
+Other commands:
+    pmt flip   TOKEN --buy-price BP --sell-price SP --size N
     pmt cancel ORDER_ID
-    pmt orders                              # open orders
-    pmt positions [--orders] [--themes ...] # portfolio view
-    pmt rewards [--days N] [--all] [--type ...]
-    pmt market SLUG_OR_CONDITION_ID         # market lookup
-    pmt search QUERY                        # free-text search
-    pmt book TOKEN                          # order book
+    pmt orders | positions | pnl | rewards
+    pmt market | search | book
+    pmt engine status | strategies | orders | trades | alerts | approve | reject
+    pmt scan cliff | expiring
 """
 
 from __future__ import annotations
@@ -76,165 +89,43 @@ def _api():
 # ============================================================
 
 
-def _resolve_token(value: str) -> str:
-    """Accept either a numeric token ID, or 'market:side' (e.g. 'hantavirus-pandemic:no').
-
-    Markets are looked up in polymarket.markets (attributes like HANTAVIRUS_PANDEMIC).
-    """
-    if value.isdigit():
-        return value
-    if ":" in value:
-        market_name, side = value.split(":", 1)
-        from polymarket import markets as M
-
-        attr = market_name.upper().replace("-", "_")
-        m = getattr(M, attr, None)
-        if m is None:
-            available = [a for a in dir(M) if hasattr(getattr(M, a), "yes_token")]
-            raise click.BadParameter(
-                f"Unknown market '{market_name}'. Known: {', '.join(available)}"
-            )
-        return m.yes_token if side.lower().startswith("y") else m.no_token
-    raise click.BadParameter(
-        f"--token must be a numeric token ID or 'market:side' (e.g. hantavirus-pandemic:no)"
-    )
-
-
 @click.group()
 def cli() -> None:
     """pmtrader unified CLI."""
 
 
-@cli.command()
-@click.option("--token", required=True, help="Token ID OR 'market-name:yes|no' (e.g. hantavirus-pandemic:no)")
-@click.option("--price", required=True, type=float)
-@click.option("--size", required=True, type=int)
-@click.option("--tick", default=None, help="Tick size override (auto-detected if omitted)")
-@click.option("--ttl", default=None, help="Auto-cancel after this duration (e.g. '30m', '2h', '1h30m'). Requires running pmengine.")
-@click.option("--dry-run", is_flag=True, help="Print spec, don't submit")
-def buy(token: str, price: float, size: int, tick: str | None, ttl: str | None, dry_run: bool) -> None:
-    """Place a BUY order. At-or-above best ask → taker; below → maker."""
-    token = _resolve_token(token)
-    ttl_seconds = _parse_ttl(ttl) if ttl else None
-    notional = price * size
-    msg = f"BUY {size} @ ${price}  notional ${notional:.4f}"
-    if ttl_seconds:
-        msg += f"  ttl={ttl} ({ttl_seconds}s)"
-    console.print(msg)
-    if dry_run:
-        console.print("[dim]dry-run[/dim]")
-        return
-    resp = _place_or_direct("buy", token=token, price=price, size=size, tick=tick)
-    if ttl_seconds:
-        _schedule_ttl_cancel_if_live(resp, ttl_seconds=ttl_seconds)
-    click.echo(json.dumps(resp, indent=2, default=str))
-
-
-@cli.command()
-@click.option("--token", required=True)
-@click.option("--price", required=True, type=float)
-@click.option("--size", required=True, type=int)
-@click.option("--tick", default=None)
-@click.option("--ttl", default=None, help="Auto-cancel after this duration (e.g. '30m', '2h', '1h30m'). Requires running pmengine.")
-@click.option("--dry-run", is_flag=True)
-def sell(token: str, price: float, size: int, tick: str | None, ttl: str | None, dry_run: bool) -> None:
-    """Place a SELL order."""
-    token = _resolve_token(token)
-    ttl_seconds = _parse_ttl(ttl) if ttl else None
-    notional = price * size
-    msg = f"SELL {size} @ ${price}  notional ${notional:.4f}"
-    if ttl_seconds:
-        msg += f"  ttl={ttl} ({ttl_seconds}s)"
-    console.print(msg)
-    if dry_run:
-        console.print("[dim]dry-run[/dim]")
-        return
-    resp = _place_or_direct("sell", token=token, price=price, size=size, tick=tick)
-    if ttl_seconds:
-        _schedule_ttl_cancel_if_live(resp, ttl_seconds=ttl_seconds)
-    click.echo(json.dumps(resp, indent=2, default=str))
-
+# ---------- ref / book / amount helpers ----------
 
 def _slug_from_url(url_or_slug: str) -> str:
-    """Accept a polymarket.com event URL or bare slug and return the event slug."""
+    """Strip a polymarket.com URL down to the event slug; pass slugs through."""
     s = url_or_slug.strip()
     if "polymarket.com/event/" in s:
         s = s.split("/event/", 1)[1]
-    # Trim any trailing sub-market slug and query/fragment.
     return s.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
 
 
 def _parse_amount(raw: str) -> float:
+    """Parse '$200', '200', '$1,000' → float."""
     return float(raw.lstrip("$").replace(",", "").strip())
 
 
-def _pick_marketable_price(asks: list[dict], target_notional: float, tick: float) -> tuple[float | None, float, float]:
-    """Find the smallest tick-aligned limit price whose strictly-lower asks
-    cumulatively cover `target_notional`.
+def _resolve_ref(
+    api, ref: str, outcome: str | None, match: str | None,
+) -> tuple[str, dict | None, dict | None, str | None]:
+    """Resolve REF + OUTCOME → (token_id, event, market, outcome_name).
 
-    Same-priced orders on Polymarket don't cross, so a limit of P consumes
-    only asks priced < P. To take a level priced X, the limit must be ≥ X+tick.
-
-    Returns (limit_price, expected_consumed_size, expected_consumed_cost).
-    None price if the book is empty or too thin.
+    - Numeric REF → token-id passthrough; event/market are None.
+    - URL/slug REF → gamma event lookup, sub-market filter, outcome match.
     """
-    sorted_asks = sorted(asks, key=lambda a: float(a["price"]))
-    cum_cost = 0.0
-    cum_size = 0.0
-    for a in sorted_asks:
-        p = float(a["price"])
-        s = float(a["size"])
-        level_cost = p * s
-        if cum_cost + level_cost >= target_notional:
-            # Partial fill of this level finishes the order; limit = p + tick
-            # so this level (and everything below) is taken.
-            remaining_usd = target_notional - cum_cost
-            partial_size = remaining_usd / p
-            cum_size += partial_size
-            cum_cost += remaining_usd
-            limit = round(round((p + tick) / tick) * tick, 6)
-            return (limit, cum_size, cum_cost)
-        cum_cost += level_cost
-        cum_size += s
-    # Exhausted the book without filling — return whatever we found.
-    if not sorted_asks:
-        return (None, 0.0, 0.0)
-    top = float(sorted_asks[-1]["price"])
-    limit = round(round((top + tick) / tick) * tick, 6)
-    return (limit, cum_size, cum_cost)
+    if ref.isdigit():
+        return ref, None, None, None
 
-
-@cli.command()
-@click.argument("url_or_slug")
-@click.argument("side")
-@click.argument("amount")
-@click.option("--match", default=None, help="Filter sub-markets by keyword (e.g. '78,000', 'NVIDIA').")
-@click.option("--dry-run", is_flag=True, help="Resolve + plan, don't submit.")
-def bet(url_or_slug: str, side: str, amount: str, match: str | None, dry_run: bool) -> None:
-    """Place $AMOUNT on SIDE of a polymarket event by URL or slug.
-
-    \b
-    Examples:
-      pmt bet https://polymarket.com/event/btc-updown-4h-1779825600 down $910
-      pmt bet bitcoin-price-on-may-26-2026 no $80 --match '78,000'
-      pmt bet nobel-peace-prize-winner-2026 no $100 --match Trump
-
-    Walks the order book and prices the order to guarantee a sweep that
-    covers the notional. Routes through engine via existing `buy` flow.
-    """
-    slug = _slug_from_url(url_or_slug)
-    target = _parse_amount(amount)
-    if target <= 0:
-        console.print(f"[red]Bad amount: {amount!r}[/red]")
-        sys.exit(1)
-
-    api = _api()
+    slug = _slug_from_url(ref)
     ev = api.get_market(slug)
     markets = [m for m in (ev.get("markets") or [])
                if not m.get("closed") and not m.get("archived")]
     if not markets:
-        console.print(f"[red]No open sub-markets at slug '{slug}'[/red]")
-        sys.exit(1)
+        raise click.UsageError(f"No open sub-markets at slug '{slug}'")
 
     if match:
         m_low = match.lower()
@@ -242,66 +133,197 @@ def bet(url_or_slug: str, side: str, amount: str, match: str | None, dry_run: bo
                    if m_low in (m.get("question") or "").lower()
                    or m_low in (m.get("groupItemTitle") or "").lower()]
         if not matched:
-            console.print(f"[red]No sub-market matches '{match}'[/red]. Available:")
-            for m in markets:
-                console.print(f"  - {m.get('groupItemTitle') or m.get('question')}")
-            sys.exit(1)
+            avail = "\n  ".join(m.get("groupItemTitle") or m.get("question") or "(unnamed)" for m in markets)
+            raise click.UsageError(f"No sub-market matches '{match}'. Available:\n  {avail}")
         markets = matched
 
     if len(markets) > 1:
-        console.print(f"[yellow]{len(markets)} sub-markets — add --match KEYWORD to pick one:[/yellow]")
+        lines = [f"{len(markets)} sub-markets — add --match KEYWORD to pick one:"]
         for m in markets:
-            raw_o = m.get("outcomes") or "[]"
+            outs = json.loads(m["outcomes"]) if isinstance(m["outcomes"], str) else (m["outcomes"] or [])
             raw_p = m.get("outcomePrices") or "[]"
-            outcomes = json.loads(raw_o) if isinstance(raw_o, str) else raw_o
             prices = json.loads(raw_p) if isinstance(raw_p, str) else raw_p
             label = m.get("groupItemTitle") or m.get("question") or "(unnamed)"
-            px = "  ".join(f"{o}=${p}" for o, p in zip(outcomes, prices)) or "[no quotes]"
-            console.print(f"  • {label}   [dim]{px}[/dim]")
-        sys.exit(1)
+            px = "  ".join(f"{o}=${p}" for o, p in zip(outs, prices)) or "(no quotes)"
+            lines.append(f"  • {label}   {px}")
+        raise click.UsageError("\n".join(lines))
 
     m = markets[0]
-    outcomes = json.loads(m["outcomes"]) if isinstance(m["outcomes"], str) else m["outcomes"]
+    outs = json.loads(m["outcomes"]) if isinstance(m["outcomes"], str) else m["outcomes"]
     tokens = json.loads(m["clobTokenIds"]) if isinstance(m["clobTokenIds"], str) else m["clobTokenIds"]
 
-    side_low = side.lower()
-    idx = next((i for i, o in enumerate(outcomes) if o.lower() == side_low), None)
+    if not outcome:
+        raise click.UsageError(
+            f"OUTCOME required for URL/slug refs. Available: {', '.join(outs)}"
+        )
+    o_low = outcome.lower()
+    idx = next((i for i, o in enumerate(outs) if o.lower() == o_low), None)
     if idx is None:
-        idx = next((i for i, o in enumerate(outcomes) if o.lower().startswith(side_low)), None)
+        idx = next((i for i, o in enumerate(outs) if o.lower().startswith(o_low)), None)
     if idx is None:
-        console.print(f"[red]Side '{side}' not in outcomes {outcomes}[/red]")
-        sys.exit(1)
-    token = tokens[idx]
+        raise click.UsageError(f"OUTCOME '{outcome}' not in {outs}")
+    return tokens[idx], ev, m, outs[idx]
 
-    book = api.get_book(token)
-    tick = float(api.get_tick_size(token))
-    limit, exp_size, exp_cost = _pick_marketable_price(book.get("asks") or [], target, tick)
-    if limit is None:
-        console.print(f"[red]Empty {outcomes[idx]} ask book — nothing to take.[/red]")
-        sys.exit(1)
-    if exp_cost < target * 0.9:
-        console.print(
-            f"[yellow]warn:[/yellow] book only depths to ${exp_cost:.2f} of target ${target:.2f}. "
-            f"Order will partially fill and rest."
+
+def _sweep_book(
+    levels: list[dict], side: str, target_notional: float, tick: float,
+) -> tuple[float | None, float, float]:
+    """Walk the book in the direction the order takes liquidity.
+
+    BUY  → ascending asks; limit = highest_taken + tick.
+    SELL → descending bids; limit = lowest_taken  - tick.
+
+    Same-priced orders on Polymarket don't cross, so a limit at P only
+    consumes the opposite side strictly inside P. ±tick guarantees crossing.
+
+    Returns (limit_price, expected_size, expected_cost). limit is None on
+    empty book.
+    """
+    if side == "buy":
+        ordered = sorted(levels, key=lambda x: float(x["price"]))
+    else:
+        ordered = sorted(levels, key=lambda x: float(x["price"]), reverse=True)
+    if not ordered:
+        return (None, 0.0, 0.0)
+
+    cum_size = cum_cost = 0.0
+    for lvl in ordered:
+        p = float(lvl["price"])
+        s = float(lvl["size"])
+        level_cost = p * s
+        if cum_cost + level_cost >= target_notional:
+            remaining_usd = target_notional - cum_cost
+            cum_size += remaining_usd / p
+            cum_cost += remaining_usd
+            edge = p + tick if side == "buy" else p - tick
+            return (round(round(edge / tick) * tick, 6), cum_size, cum_cost)
+        cum_cost += level_cost
+        cum_size += s
+
+    worst = float(ordered[-1]["price"])
+    edge = worst + tick if side == "buy" else worst - tick
+    return (round(round(edge / tick) * tick, 6), cum_size, cum_cost)
+
+
+def _place(side, ref, outcome, *, match, amount, size, price, tick, ttl, dry_run):
+    """The order-placement flow shared by `buy` and `sell`."""
+    have_explicit = price is not None and size is not None
+    if amount is None and size is None and not have_explicit:
+        raise click.UsageError(
+            "Sizing required: --amount $X, --size N, or --price P --size N"
         )
 
-    size = max(int(math.ceil(target / limit)), 1)
+    ttl_seconds = _parse_ttl(ttl) if ttl else None
+    api = _api()
+    token, ev, market, outcome_name = _resolve_ref(api, ref, outcome, match)
 
-    label = m.get("groupItemTitle") or m.get("question")
-    console.print(f"Event:   [bold]{ev.get('title')}[/bold]")
-    console.print(f"Market:  {label}  →  BUY [bold]{outcomes[idx]}[/bold]")
-    console.print(
-        f"Sweep:   ~{exp_size:.1f} sh @ avg ${exp_cost/exp_size:.4f} "
-        f"= ${exp_cost:.2f}  (tick {tick})"
-    )
-    console.print(f"Order:   BUY {size} @ ${limit:.4f}  notional ${size*limit:.2f}")
+    swept: tuple[float | None, float, float] | None = None
+    actual_tick = None
+
+    if have_explicit and amount is None:
+        # Explicit limit; no book needed.
+        limit_price, order_size = price, size
+    else:
+        book = api.get_book(token)
+        actual_tick = float(api.get_tick_size(token))
+        levels = (book.get("asks") if side == "buy" else book.get("bids")) or []
+        if amount is not None:
+            target = _parse_amount(amount)
+        else:
+            # --size alone: estimate target from top-of-book.
+            if not levels:
+                raise click.UsageError("Empty book — can't sweep.")
+            target = float(levels[0]["price"]) * size
+        if target <= 0:
+            raise click.UsageError(f"Bad amount: {amount!r}")
+
+        swept = _sweep_book(levels, side, target, actual_tick)
+        sweep_limit, exp_size, exp_cost = swept
+        if sweep_limit is None:
+            raise click.UsageError(f"Empty {side} book.")
+        if amount is not None and exp_cost < target * 0.9:
+            console.print(
+                f"[yellow]warn:[/yellow] book only depths to ${exp_cost:.2f} "
+                f"of target ${target:.2f} — order will partially fill and rest."
+            )
+        limit_price = price if price is not None else sweep_limit
+        order_size = size if size is not None else max(int(math.ceil(target / limit_price)), 1)
+
+    # Display block
+    label = (market.get("groupItemTitle") or market.get("question")) if market else None
+    if ev:
+        console.print(f"Event:   [bold]{ev.get('title')}[/bold]")
+    if label:
+        console.print(f"Market:  {label}  →  {side.upper()} [bold]{outcome_name}[/bold]")
+    if swept and swept[1] > 0:
+        _, exp_size, exp_cost = swept
+        console.print(
+            f"Sweep:   ~{exp_size:.1f} sh @ avg ${exp_cost/exp_size:.4f} "
+            f"= ${exp_cost:.2f}  (tick {actual_tick})"
+        )
+    order_msg = f"Order:   {side.upper()} {order_size} @ ${limit_price:.4f}  notional ${order_size*limit_price:.2f}"
+    if ttl_seconds:
+        order_msg += f"  ttl={ttl} ({ttl_seconds}s)"
+    console.print(order_msg)
 
     if dry_run:
         console.print("[dim]dry-run[/dim]")
         return
 
-    ctx = click.get_current_context()
-    ctx.invoke(buy, token=token, price=limit, size=size, tick=None, ttl=None, dry_run=False)
+    resp = _place_or_direct(side, token=token, price=limit_price, size=order_size, tick=tick)
+    if ttl_seconds:
+        _schedule_ttl_cancel_if_live(resp, ttl_seconds=ttl_seconds)
+    click.echo(json.dumps(resp, indent=2, default=str))
+
+
+def _order_opts(f):
+    """Shared option surface for buy + sell. Decorators apply bottom-up."""
+    f = click.option("--dry-run", is_flag=True, help="Resolve + plan, don't submit")(f)
+    f = click.option("--ttl", default=None, help="Auto-cancel after duration (e.g. '30m', '1h30m'). Needs running pmengine.")(f)
+    f = click.option("--tick", default=None, help="Tick override; setting this skips engine routing.")(f)
+    f = click.option("--price", default=None, type=float, help="Explicit limit price (omit for marketable sweep).")(f)
+    f = click.option("--size", default=None, type=int, help="Order size in shares.")(f)
+    f = click.option("--amount", default=None, help="Order size in USD notional (e.g. '$200').")(f)
+    f = click.option("--match", default=None, help="Disambiguate sub-markets by keyword.")(f)
+    return f
+
+
+@cli.command()
+@click.argument("ref")
+@click.argument("outcome", required=False)
+@_order_opts
+def buy(ref, outcome, match, amount, size, price, tick, ttl, dry_run):
+    """Place a BUY order.
+
+    \b
+    REF      polymarket URL/slug OR numeric token id
+    OUTCOME  yes/no/up/down/... (required for URL/slug, ignored for tokens)
+
+    \b
+    Examples:
+      pmt buy https://polymarket.com/event/btc-updown-4h-1779825600 down --amount $910
+      pmt buy nobel-peace-prize-winner-2026 no --amount $100 --match Trump
+      pmt buy 14658893069672317885... --price 0.92 --size 217
+    """
+    _place("buy", ref, outcome, match=match, amount=amount, size=size,
+           price=price, tick=tick, ttl=ttl, dry_run=dry_run)
+
+
+@cli.command()
+@click.argument("ref")
+@click.argument("outcome", required=False)
+@_order_opts
+def sell(ref, outcome, match, amount, size, price, tick, ttl, dry_run):
+    """Place a SELL order. Same surface as buy; sweeps the BID side."""
+    _place("sell", ref, outcome, match=match, amount=amount, size=size,
+           price=price, tick=tick, ttl=ttl, dry_run=dry_run)
+
+
+def _resolve_token(value: str) -> str:
+    """Lightweight token validator used by `flip`, `book`, `engine trades`."""
+    if not value.isdigit():
+        raise click.BadParameter(f"Token must be numeric (got {value!r})")
+    return value
 
 
 @cli.command()
@@ -367,29 +389,13 @@ def cancel(order_id: str) -> None:
 # ============================================================
 
 
-def _known_token_labels() -> dict[str, str]:
-    """Map token_id → "Market name (YES|NO)" using polymarket.markets."""
-    from polymarket import markets as M
+def _label_for_order(order: dict) -> str:
+    """Resolve a market label for display via the cached CLOB lookup."""
+    from polymarket import lookup_market_name
 
-    labels: dict[str, str] = {}
-    for attr in dir(M):
-        obj = getattr(M, attr)
-        if not hasattr(obj, "yes_token"):
-            continue
-        labels[obj.yes_token] = f"{obj.name[:30]} YES"
-        labels[obj.no_token] = f"{obj.name[:30]} NO"
-    return labels
-
-
-def _label_for_order(order: dict, known: dict[str, str]) -> str:
-    """Best-effort market label using static map, then dynamic CLOB lookup."""
     asset = str(order.get("asset_id", ""))
-    if asset in known:
-        return known[asset]
     cid = order.get("market")
     if cid:
-        from polymarket.api import lookup_market_name
-
         name = lookup_market_name(cid)
         if name:
             outcome = (order.get("outcome", "") or "").upper()
@@ -401,7 +407,6 @@ def _label_for_order(order: dict, known: dict[str, str]) -> str:
 def orders() -> None:
     """List open resting orders."""
     rows = _api().get_orders()
-    labels = _known_token_labels()
     if not rows:
         console.print("[dim]No open orders.[/dim]")
         return
@@ -416,7 +421,7 @@ def orders() -> None:
         notional = size * price
         if side == "BUY":
             locked_cash += notional
-        market = _label_for_order(d, labels)
+        market = _label_for_order(d)
         table.add_row(
             side,
             f"{size:.0f}",
