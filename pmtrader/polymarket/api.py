@@ -214,6 +214,25 @@ class PolymarketAPI:
         r.raise_for_status()
         return r.json() or []
 
+    def get_full_activity(self, *, kind: str | None = None, page: int = 500) -> list[dict]:
+        """Paginate `/activity` via offset until empty. Returns newest-first."""
+        out: list[dict] = []
+        offset = 0
+        while True:
+            params: dict = {"user": self.funder, "limit": page, "offset": offset}
+            if kind:
+                params["type"] = kind
+            r = requests.get(f"{DATA_API}/activity", params=params, headers=UA, timeout=15)
+            r.raise_for_status()
+            batch = r.json() or []
+            if not batch:
+                break
+            out.extend(batch)
+            if len(batch) < page:
+                break
+            offset += page
+        return out
+
     def get_rewards_config(self, condition_id: str) -> dict:
         r = requests.get(
             f"{CLOB_API}/rewards/markets/{condition_id}", headers=UA, timeout=10

@@ -396,6 +396,103 @@ def rewards(days: int, all_history: bool, kind: str) -> None:
         console.print(t)
 
 
+@cli.command()
+@click.option("--top", default=10, type=int, help="Show top N realized winners and losers (all-time)")
+def pnl(top: int) -> None:
+    """Realized P&L over 1d/7d/30d/all-time + current unrealized.
+
+    Replays the full activity stream into a per-asset cost-basis ledger and
+    emits realized events on SELL/REDEEM disposals. Positions held in the
+    ledger but no longer in the current portfolio are written off as expired
+    (timestamp unknown → all-time bucket only)."""
+    import time
+    from polymarket.pnl import (
+        replay_activity, reconcile_expired, bucket_by_window,
+    )
+
+    api = _api()
+    with console.status("[dim]paginating /activity…[/dim]"):
+        acts = api.get_full_activity()
+    res = replay_activity(acts)
+    positions = api.get_positions()
+    reconcile_expired(res, positions)
+
+    now = int(time.time())
+    windows: dict[str, int | None] = {
+        "1d": 86400,
+        "7d": 7 * 86400,
+        "30d": 30 * 86400,
+        "all": None,
+    }
+
+    sells     = [e for e in res.realized if e.kind == "SELL"]
+    redeems   = [e for e in res.realized if e.kind == "REDEEM"]
+    expired   = [e for e in res.realized if e.kind == "EXPIRED"]
+    rewards   = [e for e in res.income   if e.kind == "REWARD"]
+    yields    = [e for e in res.income   if e.kind == "YIELD"]
+
+    rows = [
+        ("Trade SELL",  bucket_by_window(sells,   now, windows)),
+        ("Redemptions", bucket_by_window(redeems, now, windows)),
+        ("Expired (worthless)", bucket_by_window(expired, now, windows)),
+        ("Rewards",     bucket_by_window(rewards, now, windows)),
+        ("Yield",       bucket_by_window(yields,  now, windows)),
+    ]
+
+    unrealized = sum(
+        p.get("cashPnl", p.get("currentValue", 0) - p["size"] * p["avgPrice"])
+        for p in positions
+    )
+
+    t = Table(title=f"Realized P&L  ({len(acts)} activity events)")
+    t.add_column("Source", justify="left")
+    for w in windows:
+        t.add_column(w, justify="right")
+    for label, bucket in rows:
+        row = [label]
+        for w in windows:
+            v = bucket[w]
+            c = _pnl_color(v)
+            row.append(f"[{c}]${v:+.2f}[/]")
+        t.add_row(*row)
+    t.add_section()
+    subtotal_per_window = {w: sum(b[w] for _, b in rows) for w in windows}
+    sub_row = ["[bold]Realized subtotal[/bold]"]
+    for w in windows:
+        v = subtotal_per_window[w]
+        sub_row.append(f"[bold {_pnl_color(v)}]${v:+.2f}[/]")
+    t.add_row(*sub_row)
+    console.print(t)
+
+    console.print()
+    c = _pnl_color(unrealized)
+    console.print(f"Current [bold]unrealized[/bold] (mark - cost): [{c}]${unrealized:+.2f}[/]")
+    grand = subtotal_per_window["all"] + unrealized
+    c = _pnl_color(grand)
+    console.print(f"[bold]Grand total[/bold] (all-time realized + current unrealized): [{c}]${grand:+.2f}[/]")
+
+    console.print()
+    console.print("[dim]Note: window P&L is realized cash flow only. "
+                  "Polymarket UI also reflects mark-to-market changes within "
+                  "the window, which requires historical price snapshots we don't store.[/dim]")
+
+    # Top movers (all-time realized only — windowed views would need history)
+    if top > 0:
+        wins   = sorted(res.realized, key=lambda e: e.pnl, reverse=True)[:top]
+        losses = sorted(res.realized, key=lambda e: e.pnl)[:top]
+        for title, events in (("Top realized winners", wins), ("Top realized losers", losses)):
+            tt = Table(title=title)
+            tt.add_column("Market"); tt.add_column("Kind"); tt.add_column("PnL", justify="right")
+            for e in events:
+                tt.add_row(
+                    (e.title or e.condition_id)[:50],
+                    e.kind,
+                    f"[{_pnl_color(e.pnl)}]${e.pnl:+.2f}[/]",
+                )
+            console.print()
+            console.print(tt)
+
+
 # ============================================================
 # Market discovery
 # ============================================================
