@@ -104,3 +104,21 @@ jobs:
       - name: Run tests
         working-directory: ${{ matrix.crate }}
         run: cargo test
+
+  cargo-audit:
+    # RUSTSEC advisory check on Cargo.lock for both Rust crates. Fails CI on
+    # any vulnerability so we notice + refresh deps promptly. The binstall
+    # path skips a long source build of cargo-audit on every run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall --no-confirm cargo-audit
+      - name: Audit pmproxy
+        working-directory: pmproxy
+        run: cargo audit
+      - name: Audit pmengine
+        working-directory: pmengine
+        run: cargo audit
