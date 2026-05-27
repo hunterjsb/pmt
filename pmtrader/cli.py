@@ -287,7 +287,7 @@ def _order_opts(f):
     f = click.option("--ttl", default=None, help="Auto-cancel after duration (e.g. '30m', '1h30m'). Needs running pmengine.")(f)
     f = click.option("--tick", default=None, help="Tick override; setting this skips engine routing.")(f)
     f = click.option("--price", default=None, type=float, help="Explicit limit price (omit for marketable sweep).")(f)
-    f = click.option("--size", default=None, type=int, help="Order size in shares.")(f)
+    f = click.option("--size", default=None, type=float, help="Order size in shares.")(f)
     f = click.option("--amount", default=None, help="Order size in USD notional (e.g. '$200').")(f)
     f = click.option("--match", default=None, help="Disambiguate sub-markets by keyword.")(f)
     return f

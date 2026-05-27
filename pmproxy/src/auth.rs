@@ -12,6 +12,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{ProxyConfig, TenantTier};
 use crate::error::AuthError;
+use crate::metrics::Metrics;
+use std::sync::Arc;
 
 /// JWKS (JSON Web Key Set) response from Cognito.
 #[derive(Debug, Deserialize)]
@@ -47,11 +49,17 @@ pub struct JwksCache {
     http_client: reqwest::Client,
     /// Cache TTL (default: 1 hour).
     cache_ttl: Duration,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl JwksCache {
     /// Create a new JWKS cache.
     pub fn new(config: &ProxyConfig) -> Self {
+        Self::new_with_metrics(config, None)
+    }
+
+    /// Create with a metrics sink — refresh outcomes get recorded.
+    pub fn new_with_metrics(config: &ProxyConfig, metrics: Option<Arc<Metrics>>) -> Self {
         Self {
             jwks_url: config.jwks_url(),
             expected_issuer: config.expected_issuer(),
@@ -62,6 +70,13 @@ impl JwksCache {
                 .build()
                 .expect("Failed to create HTTP client"),
             cache_ttl: Duration::from_secs(3600), // 1 hour
+            metrics,
+        }
+    }
+
+    fn record_refresh(&self, ok: bool) {
+        if let Some(ref m) = self.metrics {
+            m.record_jwks_refresh(ok);
         }
     }
 
@@ -81,6 +96,7 @@ impl JwksCache {
             .await
             .map_err(|e| {
                 error!(error = %e, "Failed to fetch JWKS");
+                self.record_refresh(false);
                 AuthError::JwksFetchError(e.to_string())
             })?;
 
@@ -88,6 +104,7 @@ impl JwksCache {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             error!(status = %status, body = %body, "JWKS fetch failed");
+            self.record_refresh(false);
             return Err(AuthError::JwksFetchError(format!(
                 "HTTP {}: {}",
                 status, body
@@ -96,6 +113,7 @@ impl JwksCache {
 
         let jwks: JwksResponse = response.json().await.map_err(|e| {
             error!(error = %e, "Failed to parse JWKS");
+            self.record_refresh(false);
             AuthError::JwksFetchError(e.to_string())
         })?;
 
@@ -118,6 +136,7 @@ impl JwksCache {
         }
 
         if keys.is_empty() {
+            self.record_refresh(false);
             return Err(AuthError::JwksFetchError("No valid keys in JWKS".to_string()));
         }
 
@@ -128,6 +147,7 @@ impl JwksCache {
             keys,
             fetched_at: Instant::now(),
         });
+        self.record_refresh(true);
 
         Ok(())
     }

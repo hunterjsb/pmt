@@ -58,12 +58,18 @@ pub async fn ws_handler(
     }
 
     let upstream_url = format!("{}/{}", UPSTREAM_WS_BASE, channel);
+    let metrics = state.metrics.clone();
+    metrics.ws_connect();
 
-    ws.on_upgrade(move |socket| handle_socket(socket, upstream_url))
+    ws.on_upgrade(move |socket| handle_socket(socket, upstream_url, metrics))
 }
 
 /// Bidirectionally pipe frames between client `socket` and upstream Polymarket WS.
-async fn handle_socket(client_socket: WebSocket, upstream_url: String) {
+async fn handle_socket(
+    client_socket: WebSocket,
+    upstream_url: String,
+    metrics: std::sync::Arc<crate::metrics::Metrics>,
+) {
     debug!(upstream = %upstream_url, "Connecting to upstream WS");
 
     let upstream = match connect_async(&upstream_url).await {
@@ -126,6 +132,7 @@ async fn handle_socket(client_socket: WebSocket, upstream_url: String) {
         _ = c2u => debug!("Client side closed"),
         _ = u2c => debug!("Upstream side closed"),
     }
+    metrics.ws_disconnect();
 }
 
 fn axum_to_tungstenite(msg: AxumMessage) -> Option<TungMessage> {

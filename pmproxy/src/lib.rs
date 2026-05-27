@@ -14,6 +14,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod headers;
+pub mod metrics;
 pub mod ratelimit;
 pub mod upstream;
 
@@ -35,6 +36,7 @@ use tracing::{debug, error, info};
 use auth::{extract_bearer_token, AuthenticatedTenant, JwksCache};
 use config::ProxyConfig;
 use error::AuthError;
+use metrics::Metrics;
 use ratelimit::TenantRateLimiter;
 
 /// Shared proxy state.
@@ -48,6 +50,9 @@ pub struct ProxyState {
     pub rate_limiter: Option<Arc<TenantRateLimiter>>,
     /// Whether authentication is enabled.
     pub auth_enabled: bool,
+    /// Counter store exported at /metrics. Always present; auth + WS code
+    /// pokes it conditionally.
+    pub metrics: Arc<Metrics>,
 }
 
 impl ProxyState {
@@ -61,6 +66,7 @@ impl ProxyState {
             jwks_cache: None,
             rate_limiter: None,
             auth_enabled: false,
+            metrics: Arc::new(Metrics::new()),
         })
     }
 
@@ -70,12 +76,14 @@ impl ProxyState {
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
 
+        let metrics = Arc::new(Metrics::new());
         if config.auth_enabled {
             Ok(Self {
                 client,
-                jwks_cache: Some(Arc::new(JwksCache::new(config))),
+                jwks_cache: Some(Arc::new(JwksCache::new_with_metrics(config, Some(metrics.clone())))),
                 rate_limiter: Some(Arc::new(TenantRateLimiter::new(config))),
                 auth_enabled: true,
+                metrics,
             })
         } else {
             Ok(Self {
@@ -83,6 +91,7 @@ impl ProxyState {
                 jwks_cache: None,
                 rate_limiter: None,
                 auth_enabled: false,
+                metrics,
             })
         }
     }
@@ -106,7 +115,8 @@ impl Default for ProxyState {
 pub fn build_router(state: Arc<ProxyState>) -> Router {
     let router = Router::new()
         .route("/health", get(health_handler))
-        .route("/badge", get(badge_handler));
+        .route("/badge", get(badge_handler))
+        .route("/metrics", get(metrics_handler));
 
     #[cfg(feature = "ws")]
     let router = router.route("/clob/ws/{channel}", get(ws::ws_handler));
@@ -117,7 +127,8 @@ pub fn build_router(state: Arc<ProxyState>) -> Router {
 }
 
 /// Health check endpoint (no auth required).
-pub async fn health_handler() -> impl IntoResponse {
+pub async fn health_handler(State(state): State<Arc<ProxyState>>) -> impl IntoResponse {
+    state.metrics.record_request("health", 200);
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
@@ -126,13 +137,31 @@ pub async fn health_handler() -> impl IntoResponse {
 }
 
 /// Shields.io badge endpoint for server status.
-pub async fn badge_handler() -> impl IntoResponse {
+pub async fn badge_handler(State(state): State<Arc<ProxyState>>) -> impl IntoResponse {
+    state.metrics.record_request("badge", 200);
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .body(Body::from(
             r#"{"schemaVersion":1,"label":"pmproxy","message":"online","color":"brightgreen"}"#,
         ))
+        .unwrap()
+}
+
+/// Prometheus-format metrics endpoint (no auth — scrapers can't carry a JWT).
+pub async fn metrics_handler(State(state): State<Arc<ProxyState>>) -> impl IntoResponse {
+    let tenants = state
+        .rate_limiter
+        .as_ref()
+        .map(|r| r.tenant_count())
+        .unwrap_or(0);
+    let body = state.metrics.render(tenants);
+    state.metrics.record_request("metrics", 200);
+    Response::builder()
+        .status(StatusCode::OK)
+        // Prometheus exposition content type per the spec
+        .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(Body::from(body))
         .unwrap()
 }
 
@@ -146,19 +175,37 @@ pub async fn authenticate(
     }
 
     // Extract and validate token
-    let token = extract_bearer_token(auth_header)?;
+    let token = extract_bearer_token(auth_header).map_err(|e| {
+        state.metrics.record_auth_failure("missing_token");
+        e
+    })?;
 
     let jwks_cache = state
         .jwks_cache
         .as_ref()
-        .ok_or_else(|| AuthError::JwksFetchError("Auth enabled but JWKS cache not initialized".to_string()))?;
+        .ok_or_else(|| {
+            state.metrics.record_auth_failure("service_unavailable");
+            AuthError::JwksFetchError("Auth enabled but JWKS cache not initialized".to_string())
+        })?;
 
-    let claims = jwks_cache.validate_token(token).await?;
+    let claims = jwks_cache.validate_token(token).await.map_err(|e| {
+        let reason = match &e {
+            AuthError::ExpiredToken => "expired_token",
+            AuthError::InvalidToken(_) => "invalid_token",
+            AuthError::JwksFetchError(_) => "service_unavailable",
+            _ => "other",
+        };
+        state.metrics.record_auth_failure(reason);
+        e
+    })?;
     let tenant = AuthenticatedTenant::from(claims);
 
     // Check rate limit
     if let Some(ref limiter) = state.rate_limiter {
-        limiter.check(&tenant.tenant_id, tenant.tier)?;
+        limiter.check(&tenant.tenant_id, tenant.tier).map_err(|e| {
+            state.metrics.record_rate_limit_drop();
+            e
+        })?;
     }
 
     Ok(Some(tenant))
@@ -209,11 +256,13 @@ pub async fn proxy_handler(
     // Determine upstream based on path prefix
     let Some(route) = upstream::route(path) else {
         error!("Unknown path prefix: {}", path);
+        state.metrics.record_request("unknown", 404);
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Not found"))
             .unwrap();
     };
+    let route_label = route.label;
 
     let upstream_url = if query.is_empty() {
         format!("{}/{}", route.upstream_base, route.upstream_path)
@@ -221,12 +270,13 @@ pub async fn proxy_handler(
         format!("{}/{}?{}", route.upstream_base, route.upstream_path, query)
     };
 
-    debug!(upstream = %upstream_url, route = route.label, "Forwarding");
+    debug!(upstream = %upstream_url, route = route_label, "Forwarding");
 
     let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(b) => b,
         Err(e) => {
             error!("Failed to read request body: {}", e);
+            state.metrics.record_request(route_label, 400);
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(Body::from("Bad request"))
@@ -246,6 +296,7 @@ pub async fn proxy_handler(
         Ok(r) => r,
         Err(e) => {
             error!("Upstream request failed: {}", e);
+            state.metrics.record_request(route_label, 502);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from(format!("Upstream error: {}", e)))
@@ -255,6 +306,7 @@ pub async fn proxy_handler(
 
     let status = upstream_resp.status();
     debug!(status = %status, "Upstream responded");
+    state.metrics.record_request(route_label, status.as_u16());
 
     let response = headers::forward_response_headers(
         Response::builder().status(status),
@@ -281,7 +333,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_handler() {
-        let response = health_handler().await.into_response();
+        let state = Arc::new(ProxyState::default());
+        let response = health_handler(State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
