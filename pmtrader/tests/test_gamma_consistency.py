@@ -34,8 +34,14 @@ def sample_response():
     return None
 
 
+@pytest.mark.network
 class TestGammaApiConsistency:
-    """Tests verifying Gamma API consistency."""
+    """Tests verifying Gamma API consistency.
+
+    Marked `network` because they hit the live Polymarket Gamma API; an
+    upstream 5xx breaks CI through no fault of our code. Run locally
+    with `uv run pytest tests/test_gamma_consistency.py -m network`.
+    """
 
     def test_events_endpoint_supports_date_filtering(self, gamma_client):
         """Verify the /events endpoint supports end_date_min and end_date_max."""
@@ -132,8 +138,10 @@ class TestGammaApiConsistency:
         assert set(sure_bet_tokens) == expected_tokens
 
 
+@pytest.mark.network
 class TestGammaApiParameters:
-    """Tests for API parameter consistency."""
+    """Tests for API parameter consistency. Also hits live Gamma — see
+    TestGammaApiConsistency docstring."""
 
     def test_pagination_parameters(self, gamma_client):
         """Verify pagination works as expected."""

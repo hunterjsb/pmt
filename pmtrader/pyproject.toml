@@ -35,3 +35,9 @@ include = ["polymarket*", "scanners*"]
 [tool.setuptools]
 py-modules = ["cli"]
 
+[tool.pytest.ini_options]
+markers = [
+    "network: tests that depend on live Polymarket APIs. Excluded from CI default; run with `pytest -m network`.",
+]
+addopts = "-m 'not network'"
+
