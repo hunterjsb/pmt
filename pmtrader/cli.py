@@ -174,6 +174,10 @@ def _sweep_book(
     Same-priced orders on Polymarket don't cross, so a limit at P only
     consumes the opposite side strictly inside P. ±tick guarantees crossing.
 
+    Polymarket rejects limit prices outside [tick, 1 - tick], so the result
+    is clamped — if the book runs that thin, the order partial-fills at the
+    clamped edge and rests there.
+
     Returns (limit_price, expected_size, expected_cost). limit is None on
     empty book.
     """
@@ -183,6 +187,9 @@ def _sweep_book(
         ordered = sorted(levels, key=lambda x: float(x["price"]), reverse=True)
     if not ordered:
         return (None, 0.0, 0.0)
+
+    def clamp(p: float) -> float:
+        return max(tick, min(1.0 - tick, round(round(p / tick) * tick, 6)))
 
     cum_size = cum_cost = 0.0
     for lvl in ordered:
@@ -194,13 +201,13 @@ def _sweep_book(
             cum_size += remaining_usd / p
             cum_cost += remaining_usd
             edge = p + tick if side == "buy" else p - tick
-            return (round(round(edge / tick) * tick, 6), cum_size, cum_cost)
+            return (clamp(edge), cum_size, cum_cost)
         cum_cost += level_cost
         cum_size += s
 
     worst = float(ordered[-1]["price"])
     edge = worst + tick if side == "buy" else worst - tick
-    return (round(round(edge / tick) * tick, 6), cum_size, cum_cost)
+    return (clamp(edge), cum_size, cum_cost)
 
 
 def _place(side, ref, outcome, *, match, amount, size, price, tick, ttl, dry_run):
