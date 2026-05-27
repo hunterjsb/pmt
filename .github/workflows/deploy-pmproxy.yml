@@ -138,24 +138,19 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-        with:
-          version: "latest"
+      - name: Install test deps
+        working-directory: pmproxy/tests
+        run: pip install -r requirements.txt
 
-      - name: Install pmtrader deps
-        working-directory: pmtrader
-        run: uv sync
-
-      - name: Run proxy integration tests against deployed Lambda
-        working-directory: pmtrader
+      - name: Run post-deploy verification against live Lambda
+        working-directory: pmproxy/tests
         env:
           PMPROXY_URL: ${{ steps.verify.outputs.url }}
           PMPROXY_COGNITO_CLIENT_ID: ${{ secrets.PMPROXY_COGNITO_CLIENT_ID }}
           PMPROXY_COGNITO_REGION: ${{ secrets.PMPROXY_COGNITO_REGION }}
           PMPROXY_USERNAME: ${{ secrets.PMPROXY_USERNAME }}
           PMPROXY_PASSWORD: ${{ secrets.PMPROXY_PASSWORD }}
-        run: uv run pytest tests/test_proxy.py -v -m integration
+        run: pytest test_deployed.py -v
 
       # Tag the commit + create a GitHub release for traceability, but only for
       # push-triggered deploys (workflow_dispatch and release events skip this —

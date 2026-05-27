@@ -35,8 +35,3 @@ include = ["polymarket*", "scanners*"]
 [tool.setuptools]
 py-modules = ["cli"]
 
-[tool.pytest.ini_options]
-markers = [
-    "integration: tests that hit live external services (Polymarket, deployed Lambda). Excluded from default CI; run with `pytest -m integration`.",
-]
-addopts = "-m 'not integration'"
