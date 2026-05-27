@@ -2,6 +2,8 @@
 
 HTTP + WebSocket reverse proxy for Polymarket APIs. Deployed close to Polymarket servers (eu-west-1) to bypass US geoblocks and centralize per-tenant rate limiting.
 
+**Stability:** the 1.x route surface (`/clob/*`, `/gamma/*`, `/chain/*`, `/clob/ws/{channel}`, `/health`, `/badge`, `/metrics`) and the JWT claim model are frozen. Breaking changes require a major version bump. See [CHANGELOG.md](CHANGELOG.md).
+
 ```
 Python client → pmproxy → Polymarket APIs
 ```
