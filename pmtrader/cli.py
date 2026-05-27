@@ -697,7 +697,8 @@ def search(query: str, keyword: str | None) -> None:
             try:
                 outcomes = json.loads(m.get("outcomes", "[]"))
                 prices = json.loads(m.get("outcomePrices", "[]"))
-                yes_p = float(prices[outcomes.index("Yes")]) if "Yes" in outcomes else None
+                idx = outcomes.index("Yes") if "Yes" in outcomes else -1
+                yes_p = float(prices[idx]) if idx != -1 and idx < len(prices) else None
             except (ValueError, KeyError):
                 yes_p = None
             if yes_p is None:
