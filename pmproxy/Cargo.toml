@@ -1,6 +1,6 @@
 [package]
 name = "pmproxy"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Simple HTTP reverse proxy for Polymarket APIs"
 

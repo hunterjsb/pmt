@@ -1,84 +1,101 @@
 # pmproxy
 
-Dead-simple HTTP reverse proxy for Polymarket APIs. Deploy close to Polymarket servers for performance, rate control, and cost-effectiveness.
-
-## What It Does
-
-Forwards HTTP requests to Polymarket APIs transparently. Your Python client handles auth - the proxy just forwards everything.
+HTTP + WebSocket reverse proxy for Polymarket APIs. Deployed close to Polymarket servers (eu-west-1) to bypass US geoblocks and centralize per-tenant rate limiting.
 
 ```
 Python client → pmproxy → Polymarket APIs
 ```
 
-## Build & Run
-
-**EC2/Server (for performance)**:
-```bash
-cargo build --release --features ec2
-./target/release/pmproxy
-```
-
-Runs on `http://0.0.0.0:8080` by default.
-
-**Lambda (for cost-effective proxy)**:
-```bash
-# Cross-compile for Lambda (Amazon Linux 2023)
-cargo lambda build --release --features lambda --bin pmproxy-lambda
-
-# Deploy
-cargo lambda deploy pmproxy-lambda
-```
+The proxy forwards Polymarket auth headers unchanged — the upstream signing is handled client-side. Optional Cognito JWT validation adds a multi-tenant gate in front.
 
 ## Routes
 
-- `/clob/*` → `https://clob.polymarket.com/*`
-- `/gamma/*` → `https://gamma-api.polymarket.com/*`
-- `/chain/*` → `https://polygon-rpc.com`
+| Prefix | Upstream |
+| --- | --- |
+| `/clob/*`         | `https://clob.polymarket.com/*` |
+| `/clob/ws/{chan}` | `wss://ws-subscriptions-clob.polymarket.com/ws/{chan}` (EC2 only — Lambda can't WS) |
+| `/gamma/*`        | `https://gamma-api.polymarket.com/*` |
+| `/chain/*`        | `https://polygon-bor-rpc.publicnode.com` |
+| `/health`         | `{"status":"healthy"}` |
+| `/badge`          | shields.io schema for the README status badge |
 
-## CLI Options
+Only `market` and `user` are accepted as WS channels.
+
+## Deploy
+
+### Lambda (live, eu-west-1)
+
+The Lambda is deployed automatically by GitHub Actions
+(`.github/workflows/deploy-pmproxy.yml`) when `pmproxy/Cargo.toml` version is
+bumped on master. The workflow uses the OIDC-federated role
+`pmproxy-ci-deploy` to `aws lambda update-function-code` against the
+function URL, then runs integration tests and creates a `pmproxy-v<x.y.z>`
+GitHub release with the bootstrap zip attached.
+
+Manual trigger: `workflow_dispatch` from the Actions tab.
+
+**Config changes** (env vars, memory, role, etc.) go through `pulumi up`
+locally — CI only swaps the binary, not the infra.
+
+### EC2 / local
+
+Use this build for the WebSocket proxy or for local dev:
 
 ```bash
+cargo build --release --features ec2  # ec2 = clap + ws
+./target/release/pmproxy               # binds 0.0.0.0:8080 by default
+```
+
+## CLI options
+
+```
 pmproxy [OPTIONS]
 
-Options:
   -H, --host <HOST>       Host to bind [default: 0.0.0.0]
   -p, --port <PORT>       Port [default: 8080]
   -l, --log-level <LEVEL> Log level [default: info]
 ```
 
-## Environment Variables
+## Environment
 
-For multi-tenant authentication (optional):
+Optional multi-tenant authentication:
+
 ```
-PMPROXY_AUTH_ENABLED=true              # Enable JWT auth (default: false)
+PMPROXY_AUTH_ENABLED=true              # default: false
 PMPROXY_COGNITO_REGION=us-east-1       # AWS region
-PMPROXY_COGNITO_POOL_ID=us-east-1_xxx  # Cognito User Pool ID
-PMPROXY_COGNITO_APP_CLIENT_ID=xxx      # Optional: validate audience claim
-PMPROXY_RATE_LIMIT_RPM=60              # Requests per minute (default: 60)
-PMPROXY_RATE_LIMIT_BURST=10            # Burst allowance (default: 10)
+PMPROXY_COGNITO_POOL_ID=us-east-1_xxx  # User Pool ID
+PMPROXY_COGNITO_APP_CLIENT_ID=xxx      # optional: validate audience claim
+PMPROXY_RATE_LIMIT_RPM=60              # default per-tenant rpm
+PMPROXY_RATE_LIMIT_BURST=10            # default burst allowance
 ```
 
-## Architecture
+Tier-based limits (from the `custom:tenant_tier` JWT claim):
+- `free`       → 60 rpm / 10 burst
+- `pro`        → 300 rpm / 50 burst
+- `enterprise` → 1000 rpm / 100 burst
 
-Rust proxy with optional Cognito JWT authentication and per-tenant rate limiting.
+## Layout
 
 ```
 src/
-├── lib.rs       # Core proxy logic (shared)
-├── main.rs      # EC2 server binary (tokio)
-├── lambda.rs    # Lambda handler binary
-├── auth.rs      # Cognito JWT validation
-├── config.rs    # Environment configuration
-├── ratelimit.rs # Per-tenant rate limiting
-└── error.rs     # Error types
+├── lib.rs       core proxy + router (shared by both binaries)
+├── main.rs      EC2 server binary (tokio)
+├── lambda.rs    Lambda handler binary
+├── ws.rs        WebSocket bridge (ec2 only)
+├── auth.rs      Cognito JWKS fetch + JWT validation
+├── ratelimit.rs governor-based per-tenant rate limiting
+├── config.rs    ProxyConfig from env
+└── error.rs     AuthError + axum IntoResponse
 ```
 
-The Python client handles Polymarket auth signing. The proxy forwards those headers unchanged, but can optionally validate Cognito JWTs for multi-tenant access control.
-
-## Testing
+## Test
 
 ```bash
-# Public endpoints
+cargo test --lib                    # default features
+cargo test --lib --features lambda  # lambda binary feature set
+cargo test --lib --features ws      # WebSocket bridge
+
+# Live endpoints once running
+curl http://localhost:8080/health
 curl http://localhost:8080/gamma/events?limit=5
-curl http://localhost:8080/clob/sampling-markets
 ```
