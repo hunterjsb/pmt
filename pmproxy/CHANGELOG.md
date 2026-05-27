@@ -7,6 +7,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 from 1.0.0 onward; 0.x releases moved fast and may have broken between
 minors.
 
+## [1.0.1] — 2026-05-27
+
+### Fixed
+- `upstream::route` rejects any path containing a `..` segment.
+  Surfaced during deep e2e testing: `/clob/../gamma` was reaching
+  Polymarket's upstream gateway which normalizes `..` and routes
+  cross-host to Gamma. Our router faithfully forwarded; the upstream
+  did the unexpected. Defense in depth — we now 404 these before
+  forwarding. New `route_rejects_dotdot` unit test covers the matrix
+  (`..` as a path segment, with prefixes/suffixes, mixed with legit
+  paths). pmproxy/tests/test_deep.py `test_path_traversal_rejected`
+  asserts end-to-end against the deployed Lambda.
+
 ## [1.0.0] — 2026-05-27
 
 First stable release. The 1.x route surface (`/clob/*`, `/gamma/*`,

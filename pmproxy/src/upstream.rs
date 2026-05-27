@@ -20,7 +20,15 @@ pub struct Route {
 /// Strips the route prefix (with or without trailing slash) and returns the
 /// remaining path plus the upstream base URL. `/chain` (no path) collapses
 /// to root, so the JSON-RPC endpoint can be hit at `/chain/`.
+///
+/// Returns None if the path contains any `..` segment. Polymarket's upstream
+/// servers normalize path-traversal sequences server-side and may route
+/// cross-host (e.g. `clob.polymarket.com/../gamma` → Gamma), so we reject
+/// `..` before forwarding as defense in depth. Surfaced by deep e2e tests.
 pub fn route(path: &str) -> Option<Route> {
+    if path.split('/').any(|seg| seg == "..") {
+        return None;
+    }
     for (prefix, base, label) in [
         ("/clob", CLOB_BASE, "clob"),
         ("/gamma", GAMMA_BASE, "gamma"),
@@ -75,5 +83,19 @@ mod tests {
     fn route_no_prefix_leak() {
         // /clobbermuns shouldn't match /clob*
         assert!(route("/clobbermuns").is_none());
+    }
+
+    #[test]
+    fn route_rejects_dotdot() {
+        // Path traversal — even though our route() faithfully strips the
+        // prefix, Polymarket's upstream gateway can normalize `..` and
+        // serve content from a different host. We reject before forwarding.
+        assert!(route("/clob/../gamma").is_none());
+        assert!(route("/clob/foo/../bar").is_none());
+        assert!(route("/chain/..").is_none());
+        // Legitimate paths with `.` aren't blocked
+        assert!(route("/clob/markets/0x.deadbeef").is_some());
+        // Dot in segment-but-not-segment is fine ("..foo" is not a `..` segment)
+        assert!(route("/clob/..foo").is_some());
     }
 }
