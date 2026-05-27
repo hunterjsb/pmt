@@ -221,38 +221,25 @@ impl JwksCache {
 /// Claims from a Cognito JWT.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CognitoClaims {
-    /// Subject - unique user identifier (tenant ID).
+    /// Subject — unique user identifier (used as tenant ID).
     pub sub: String,
 
     /// Expiration time (Unix timestamp).
     pub exp: u64,
 
-    /// Issuer - Cognito User Pool URL.
+    /// Issuer — Cognito User Pool URL.
     pub iss: String,
 
-    /// Token use - "access" or "id".
+    /// "access" or "id".
     pub token_use: String,
 
-    /// Optional: Client ID.
-    #[serde(default)]
-    pub client_id: Option<String>,
-
-    /// Optional: Username.
-    #[serde(default)]
-    pub username: Option<String>,
-
-    /// Custom claim: Tenant tier for rate limiting.
+    /// Custom claim: tenant tier for rate limiting.
     #[serde(rename = "custom:tenant_tier", default)]
     pub tenant_tier: Option<String>,
 }
 
 impl CognitoClaims {
-    /// Get the tenant ID (sub claim).
-    pub fn tenant_id(&self) -> &str {
-        &self.sub
-    }
-
-    /// Get the tenant tier, defaulting to Free.
+    /// Tenant tier, defaulting to Free when absent.
     pub fn tier(&self) -> TenantTier {
         self.tenant_tier
             .as_ref()
@@ -323,20 +310,13 @@ mod tests {
             exp: 0,
             iss: "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_abc".to_string(),
             token_use: "access".to_string(),
-            client_id: None,
-            username: None,
             tenant_tier: Some("pro".to_string()),
         };
         assert_eq!(claims.tier(), TenantTier::Pro);
 
         let claims_no_tier = CognitoClaims {
-            sub: "user-123".to_string(),
-            exp: 0,
-            iss: "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_abc".to_string(),
-            token_use: "access".to_string(),
-            client_id: None,
-            username: None,
             tenant_tier: None,
+            ..claims
         };
         assert_eq!(claims_no_tier.tier(), TenantTier::Free);
     }

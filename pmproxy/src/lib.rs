@@ -13,7 +13,9 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod headers;
 pub mod ratelimit;
+pub mod upstream;
 
 #[cfg(feature = "ws")]
 pub mod ws;
@@ -205,19 +207,7 @@ pub async fn proxy_handler(
     }
 
     // Determine upstream based on path prefix
-    let (upstream_base, upstream_path) = if path == "/clob" {
-        ("https://clob.polymarket.com", "")
-    } else if let Some(rest) = path.strip_prefix("/clob/") {
-        ("https://clob.polymarket.com", rest)
-    } else if path == "/gamma" {
-        ("https://gamma-api.polymarket.com", "")
-    } else if let Some(rest) = path.strip_prefix("/gamma/") {
-        ("https://gamma-api.polymarket.com", rest)
-    } else if path == "/chain" {
-        ("https://polygon-bor-rpc.publicnode.com", "")
-    } else if let Some(rest) = path.strip_prefix("/chain/") {
-        ("https://polygon-bor-rpc.publicnode.com", rest)
-    } else {
+    let Some(route) = upstream::route(path) else {
         error!("Unknown path prefix: {}", path);
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -225,16 +215,14 @@ pub async fn proxy_handler(
             .unwrap();
     };
 
-    // Build upstream URL
     let upstream_url = if query.is_empty() {
-        format!("{}/{}", upstream_base, upstream_path)
+        format!("{}/{}", route.upstream_base, route.upstream_path)
     } else {
-        format!("{}/{}?{}", upstream_base, upstream_path, query)
+        format!("{}/{}?{}", route.upstream_base, route.upstream_path, query)
     };
 
-    debug!("Upstream URL: {}", upstream_url);
+    debug!(upstream = %upstream_url, route = route.label, "Forwarding");
 
-    // Read request body
     let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(b) => b,
         Err(e) => {
@@ -246,36 +234,14 @@ pub async fn proxy_handler(
         }
     };
 
-    let mut upstream_req = state.client.request(method.clone(), &upstream_url);
-
-    // Forward all headers except Host and Authorization (reqwest sets Host automatically,
-    // and we don't forward our auth to upstream)
-    for (name, value) in headers.iter() {
-        let name_str = name.as_str();
-        if name_str == "host" || name_str == "authorization" {
-            continue;
-        }
-
-        // Restore original casing for POLY_* headers
-        let header_name = match name_str {
-            "poly_address" => "POLY_ADDRESS",
-            "poly_signature" => "POLY_SIGNATURE",
-            "poly_timestamp" => "POLY_TIMESTAMP",
-            "poly_nonce" => "POLY_NONCE",
-            "poly_api_key" => "POLY_API_KEY",
-            "poly_passphrase" => "POLY_PASSPHRASE",
-            _ => name_str,
-        };
-
-        upstream_req = upstream_req.header(header_name, value);
-    }
-
-    // Forward body if present
+    let mut upstream_req = headers::forward_request_headers(
+        state.client.request(method.clone(), &upstream_url),
+        &headers,
+    );
     if !body.is_empty() {
         upstream_req = upstream_req.body(body);
     }
 
-    // Send request
     let upstream_resp = match upstream_req.send().await {
         Ok(r) => r,
         Err(e) => {
@@ -287,29 +253,14 @@ pub async fn proxy_handler(
         }
     };
 
-    // Build response
     let status = upstream_resp.status();
-    debug!("Upstream status: {}", status);
+    debug!(status = %status, "Upstream responded");
 
-    let mut response = Response::builder().status(status);
+    let response = headers::forward_response_headers(
+        Response::builder().status(status),
+        upstream_resp.headers(),
+    );
 
-    // Forward response headers (skip hop-by-hop headers)
-    for (name, value) in upstream_resp.headers().iter() {
-        let name_str = name.as_str();
-        // Skip hop-by-hop headers
-        if name_str != "connection"
-            && name_str != "transfer-encoding"
-            && name_str != "keep-alive"
-            && name_str != "proxy-authenticate"
-            && name_str != "proxy-authorization"
-            && name_str != "trailer"
-            && name_str != "upgrade"
-        {
-            response = response.header(name, value);
-        }
-    }
-
-    // Forward response body
     let body_bytes = match upstream_resp.bytes().await {
         Ok(b) => b,
         Err(e) => {

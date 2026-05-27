@@ -70,7 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("    /health   → Health check (no auth)");
     info!("    /clob/*   → https://clob.polymarket.com/*");
     info!("    /gamma/*  → https://gamma-api.polymarket.com/*");
-    info!("    /chain/*  → https://polygon-rpc.com");
+    info!("    /chain/*  → https://polygon-bor-rpc.publicnode.com");
+    #[cfg(feature = "ws")]
+    info!("    /clob/ws/{{channel}} → wss://ws-subscriptions-clob.polymarket.com/ws/{{channel}}");
     if config.auth_enabled {
         info!("  Authentication: ENABLED (Cognito JWT)");
         info!("    Region: {}", config.cognito_region);

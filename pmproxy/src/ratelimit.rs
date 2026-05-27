@@ -17,24 +17,15 @@ use crate::error::AuthError;
 /// Rate limiter state for a single tenant.
 type TenantLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
-/// Per-tenant rate limiter.
-///
-/// Each tenant gets their own token bucket based on their tier.
+/// Per-tenant rate limiter. Each tenant gets their own token bucket sized
+/// by their tier (see `TenantTier::requests_per_minute` / `burst_size`).
 pub struct TenantRateLimiter {
-    /// Map of tenant_id -> rate limiter.
     limiters: DashMap<String, Arc<TenantLimiter>>,
-    /// Default config for fallback limits.
-    #[allow(dead_code)]
-    config: ProxyConfig,
 }
 
 impl TenantRateLimiter {
-    /// Create a new per-tenant rate limiter.
-    pub fn new(config: &ProxyConfig) -> Self {
-        Self {
-            limiters: DashMap::new(),
-            config: config.clone(),
-        }
+    pub fn new(_config: &ProxyConfig) -> Self {
+        Self { limiters: DashMap::new() }
     }
 
     /// Get or create a rate limiter for a tenant.
@@ -88,35 +79,9 @@ impl TenantRateLimiter {
         }
     }
 
-    /// Get the number of active tenant limiters (for monitoring).
+    /// Active limiter count, exposed for /metrics.
     pub fn tenant_count(&self) -> usize {
         self.limiters.len()
-    }
-
-    /// Clean up stale limiters (tenants that haven't made requests in a while).
-    ///
-    /// This can be called periodically to prevent unbounded memory growth.
-    /// In practice, governor's internal state is very lightweight.
-    pub fn cleanup_stale(&self, max_tenants: usize) {
-        if self.limiters.len() > max_tenants {
-            // Simple strategy: remove half the entries
-            // A more sophisticated approach would track last-access time
-            let to_remove: Vec<String> = self
-                .limiters
-                .iter()
-                .take(self.limiters.len() / 2)
-                .map(|entry| entry.key().clone())
-                .collect();
-
-            for key in to_remove {
-                self.limiters.remove(&key);
-            }
-
-            debug!(
-                remaining = self.limiters.len(),
-                "Cleaned up stale rate limiters"
-            );
-        }
     }
 }
 
