@@ -72,12 +72,18 @@ cd pmtrader && uv sync
 
 ```bash
 pmt --help                                                  # list subcommands
-pmt buy   --token hantavirus-pandemic:no --price 0.93 --size 217
-pmt flip  --token hantavirus-vaccine:yes --buy-price 0.09 --sell-price 0.10 --size 850
+
+# Symmetric buy/sell: REF is a polymarket URL/slug OR numeric token id.
+pmt buy  https://polymarket.com/event/btc-updown-4h-1779825600 down --amount $910
+pmt sell URL no --amount $50 --match Trump                  # URL ref + outcome
+pmt buy  14658893069672317885... --price 0.92 --size 217    # token ref + explicit limit
+
 pmt positions --orders                                      # portfolio + open orders + exposure
+pmt pnl                                                     # realized 1d/7d/30d/all + unrealized
 pmt rewards --days 7                                        # REWARD + YIELD income
 pmt search pandemic                                         # cross-market search
-pmt scan cliff                                              # opportunity scanners (separate CLI)
+pmt engine status                                           # local engine snapshot
+pmt scan cliff                                              # opportunity scanners
 ```
 
 See [pmtrader/README.md](pmtrader/README.md) for the full CLI reference.
@@ -102,7 +108,7 @@ PMPROXY_PASSWORD=...
 from polymarket import PolymarketAPI
 
 api = PolymarketAPI()
-api.place_buy(token=..., price=0.93, size=217)
+api.place("buy", token=..., price=0.93, size=217)
 api.flip(token=..., buy_price=0.09, sell_price=0.10, size=850)
 api.get_positions()
 api.search_markets("pandemic")
