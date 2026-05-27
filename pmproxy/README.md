@@ -69,6 +69,18 @@ PMPROXY_RATE_LIMIT_RPM=60              # default per-tenant rpm
 PMPROXY_RATE_LIMIT_BURST=10            # default burst allowance
 ```
 
+Optional `/chain/*` JSON-RPC method allowlist (default: pass-through):
+
+```
+PMPROXY_CHAIN_METHOD_ALLOWLIST=eth_chainId,eth_blockNumber,eth_call,eth_getBalance
+```
+
+When unset, `/chain/*` forwards request bodies to the upstream RPC unchanged
+— correct for a single-tenant deployment where the JWT holder is the
+operator. When set, every request body is parsed as JSON-RPC and any method
+outside the list returns 403. Batched requests (`[{...}, {...}]`) are
+allowed only if every method in the batch is allowlisted.
+
 Tier-based limits (from the `custom:tenant_tier` JWT claim):
 - `free`       → 60 rpm / 10 burst
 - `pro`        → 300 rpm / 50 burst

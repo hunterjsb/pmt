@@ -420,6 +420,7 @@ H/RTRklk/NRqE60ISIcZCQ==
             cognito_client_id: client_id.map(String::from),
             rate_limit_rpm: 60,
             rate_limit_burst: 10,
+            chain_method_allowlist: None,
         };
         let cache = JwksCache::new(&config);
         let decoding_key = DecodingKey::from_rsa_components(TEST_PUB_N, TEST_PUB_E).unwrap();

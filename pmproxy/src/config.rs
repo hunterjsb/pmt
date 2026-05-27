@@ -62,6 +62,11 @@ pub struct ProxyConfig {
 
     /// Default burst allowance for unknown tiers.
     pub rate_limit_burst: u32,
+
+    /// Optional JSON-RPC method allowlist for `/chain/*`. When set, only
+    /// listed methods may pass; unset means pass-through (single-tenant
+    /// deployments treat the JWT holder as trusted with `eth_*` calls).
+    pub chain_method_allowlist: Option<std::collections::HashSet<String>>,
 }
 
 impl ProxyConfig {
@@ -83,6 +88,7 @@ impl ProxyConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20),
+            chain_method_allowlist: crate::chain::allowlist_from_env(),
         }
     }
 
@@ -143,6 +149,7 @@ mod tests {
             cognito_client_id: None,
             rate_limit_rpm: 100,
             rate_limit_burst: 20,
+            chain_method_allowlist: None,
         };
 
         assert_eq!(

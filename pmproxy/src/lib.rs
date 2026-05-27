@@ -11,6 +11,7 @@
 //! the tenant's tier, and then forwards the request to the upstream Polymarket API.
 
 pub mod auth;
+pub mod chain;
 pub mod config;
 pub mod error;
 pub mod headers;
@@ -53,6 +54,9 @@ pub struct ProxyState {
     /// Counter store exported at /metrics. Always present; auth + WS code
     /// pokes it conditionally.
     pub metrics: Arc<Metrics>,
+    /// Optional /chain/* JSON-RPC method allowlist (None = pass-through,
+    /// the single-tenant default — see chain.rs for the threat model).
+    pub chain_method_allowlist: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 impl ProxyState {
@@ -67,6 +71,7 @@ impl ProxyState {
             rate_limiter: None,
             auth_enabled: false,
             metrics: Arc::new(Metrics::new()),
+            chain_method_allowlist: None,
         })
     }
 
@@ -77,6 +82,7 @@ impl ProxyState {
             .build()?;
 
         let metrics = Arc::new(Metrics::new());
+        let chain_method_allowlist = config.chain_method_allowlist.clone().map(Arc::new);
         if config.auth_enabled {
             Ok(Self {
                 client,
@@ -84,6 +90,7 @@ impl ProxyState {
                 rate_limiter: Some(Arc::new(TenantRateLimiter::new(config))),
                 auth_enabled: true,
                 metrics,
+                chain_method_allowlist,
             })
         } else {
             Ok(Self {
@@ -92,6 +99,7 @@ impl ProxyState {
                 rate_limiter: None,
                 auth_enabled: false,
                 metrics,
+                chain_method_allowlist,
             })
         }
     }
@@ -284,6 +292,37 @@ pub async fn proxy_handler(
         }
     };
 
+    // /chain/* JSON-RPC method allowlist enforcement (opt-in via
+    // PMPROXY_CHAIN_METHOD_ALLOWLIST). When unset, this branch is skipped
+    // entirely — solo-tenant pass-through pays no overhead.
+    if route_label == "chain" {
+        if let Some(ref allowlist) = state.chain_method_allowlist {
+            match chain::validate(&body, allowlist) {
+                chain::AllowDecision::Allow => {}
+                chain::AllowDecision::Deny(method) => {
+                    info!(method = %method, "Chain method not in allowlist");
+                    state.metrics.record_request(route_label, 403);
+                    return Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"error":"method_not_allowed","method":"{}"}}"#,
+                            method
+                        )))
+                        .unwrap();
+                }
+                chain::AllowDecision::Malformed => {
+                    state.metrics.record_request(route_label, 400);
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(r#"{"error":"malformed_jsonrpc"}"#))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
     let mut upstream_req = headers::forward_request_headers(
         state.client.request(method.clone(), &upstream_url),
         &headers,
@@ -355,6 +394,7 @@ mod tests {
             cognito_client_id: None,
             rate_limit_rpm: 100,
             rate_limit_burst: 20,
+            chain_method_allowlist: None,
         };
 
         let state = ProxyState::with_auth(&config).unwrap();
@@ -372,6 +412,7 @@ mod tests {
             cognito_client_id: Some("client123".to_string()),
             rate_limit_rpm: 100,
             rate_limit_burst: 20,
+            chain_method_allowlist: None,
         };
 
         let state = ProxyState::with_auth(&config).unwrap();

@@ -98,6 +98,7 @@ mod tests {
             cognito_client_id: None,
             rate_limit_rpm: 100,
             rate_limit_burst: 20,
+            chain_method_allowlist: None,
         };
 
         let limiter = TenantRateLimiter::new(&config);
@@ -113,6 +114,7 @@ mod tests {
             cognito_client_id: None,
             rate_limit_rpm: 100,
             rate_limit_burst: 20,
+            chain_method_allowlist: None,
         };
 
         let limiter = TenantRateLimiter::new(&config);
@@ -135,6 +137,7 @@ mod tests {
             cognito_client_id: None,
             rate_limit_rpm: 60, // 1 per second
             rate_limit_burst: 5,
+            chain_method_allowlist: None,
         };
 
         let limiter = TenantRateLimiter::new(&config);
