@@ -95,4 +95,63 @@ the binary.
 | Current deployed version | `gh release view pmproxy-v$(grep '^version' pmproxy/Cargo.toml | head -1 | cut -d'"' -f2)` |
 | Recent invocations | CloudWatch Logs `/aws/lambda/pmproxy` |
 | Recent deploys | `gh run list --workflow=deploy-pmproxy.yml` |
-| Live metrics | (none yet — `/metrics` is on the 1.0 punch list) |
+| Live metrics | `curl $PMPROXY_URL/metrics` (Prometheus text; no auth) |
+
+## Deep testing
+
+`pmproxy/tests/test_deep.py` is the heavyweight verification suite — it
+exercises end-to-end JWT failure paths, latency percentiles, metric
+counter accuracy, concurrency-within-burst, failure injection, and an
+intentional rate-limit-tripping burst. **Not run in CI** (it intentionally
+trips the rate limiter and takes 2+ minutes).
+
+Run after any non-trivial change:
+
+```bash
+cd pmproxy/tests
+pip install -r requirements.txt
+PMPROXY_URL=$PMPROXY_URL \
+PMPROXY_COGNITO_CLIENT_ID=$PMPROXY_COGNITO_CLIENT_ID \
+PMPROXY_COGNITO_REGION=$PMPROXY_COGNITO_REGION \
+PMPROXY_USERNAME=$PMPROXY_USERNAME \
+PMPROXY_PASSWORD=$PMPROXY_PASSWORD \
+pytest test_deep.py -v
+```
+
+After running, the rate limiter is depleted — wait ~80 seconds before
+running normal client traffic.
+
+### Manual WS bridge verification
+
+The Lambda can't WebSocket. To verify the WS bridge end-to-end:
+
+```bash
+cd pmproxy
+cargo build --release --features ec2
+PMPROXY_AUTH_ENABLED=false ./target/release/pmproxy --port 18080 &
+
+# Connect through proxy to real Polymarket WS
+python -c "
+import asyncio, json, websockets
+async def main():
+    async with websockets.connect('ws://127.0.0.1:18080/clob/ws/market') as ws:
+        await ws.send(json.dumps({'type': 'Market', 'assets_ids': ['<token-id>']}))
+        async for msg in ws:
+            print(msg)
+            break
+asyncio.run(main())
+"
+```
+
+### Manual `/chain` allowlist verification
+
+```bash
+PMPROXY_AUTH_ENABLED=false \
+PMPROXY_CHAIN_METHOD_ALLOWLIST="eth_chainId,eth_blockNumber" \
+  ./target/release/pmproxy --port 18080 &
+
+curl -X POST http://127.0.0.1:18080/chain/ \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":[],"id":1}'
+# → 403 {"error":"method_not_allowed","method":"eth_sendRawTransaction"}
+```

@@ -9,16 +9,29 @@ minors.
 
 ## [1.0.1] — 2026-05-27
 
-### Fixed
-- `upstream::route` rejects any path containing a `..` segment.
-  Surfaced during deep e2e testing: `/clob/../gamma` was reaching
-  Polymarket's upstream gateway which normalizes `..` and routes
-  cross-host to Gamma. Our router faithfully forwarded; the upstream
-  did the unexpected. Defense in depth — we now 404 these before
-  forwarding. New `route_rejects_dotdot` unit test covers the matrix
-  (`..` as a path segment, with prefixes/suffixes, mixed with legit
-  paths). pmproxy/tests/test_deep.py `test_path_traversal_rejected`
-  asserts end-to-end against the deployed Lambda.
+### Defense in depth
+- `upstream::route` now returns None for any path containing a `..`
+  segment. Surfaced during deep e2e testing: `/clob/../gamma` was
+  returning Gamma's homepage with a 200. Investigation showed Lambda
+  Function URL (and most HTTP clients) normalize `..` BEFORE our
+  handler sees the request — so on Lambda, the path arrives at
+  pmproxy already resolved to `/gamma` and our `..` check never
+  triggers. The behavior is correct (legitimate gamma route), just
+  initially surprising.
+
+  The fix is still valuable: a future EC2 deployment may not benefit
+  from the same upstream path normalization, and rejecting `..` at
+  our boundary is cheap belt-and-suspenders. `route_rejects_dotdot`
+  unit test verifies the function-level rejection works.
+
+### Added
+- `pmproxy/tests/test_deep.py` — heavyweight verification suite (22
+  tests) covering end-to-end JWT failures, latency percentiles, metric
+  counter accuracy, concurrency-within-burst, failure injection, and
+  an intentional rate-limit-tripping burst. Run manually post-deploy.
+- `pmproxy/RUNBOOK.md` deep-testing section with reproducible recipes
+  for the deep suite, manual WS bridge verification, and `/chain`
+  allowlist verification.
 
 ## [1.0.0] — 2026-05-27
 
