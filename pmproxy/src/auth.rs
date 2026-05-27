@@ -80,6 +80,20 @@ impl JwksCache {
         }
     }
 
+    /// Test-only: pre-seed the cache with a (kid → DecodingKey) entry,
+    /// bypassing the JWKS fetch. Lets unit tests exercise validate_token
+    /// without standing up a fake Cognito.
+    #[cfg(test)]
+    pub(crate) async fn seed_for_test(&self, kid: &str, key: DecodingKey) {
+        let mut cache = self.cache.write().await;
+        let mut keys = HashMap::new();
+        keys.insert(kid.to_string(), key);
+        *cache = Some(CachedJwks {
+            keys,
+            fetched_at: Instant::now(),
+        });
+    }
+
     /// Pre-fetch JWKS at startup.
     pub async fn prefetch(&self) -> Result<(), AuthError> {
         self.refresh_cache().await
@@ -339,5 +353,242 @@ mod tests {
             ..claims
         };
         assert_eq!(claims_no_tier.tier(), TenantTier::Free);
+    }
+}
+
+#[cfg(test)]
+mod jwt_validation_tests {
+    //! End-to-end JWT validation tests using a baked-in test RSA keypair.
+    //!
+    //! Tests sign JWTs with the test private key, pre-seed the JwksCache
+    //! with the corresponding public key, then call validate_token and
+    //! assert on the AuthError variant. Covers the failure paths that
+    //! tripped over the original happy-path-only test coverage.
+    use super::*;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Test-only RSA-2048 keypair. NOT used in production — only for
+    // unit tests of validate_token's failure modes.
+    const TEST_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC4n+iatQBK3sei
+MXi821NMWVl5aMOYgiCNeUADliKNM3iAb7BRpeTHlzQg+OfhQBlgUhUpmKQSYCmT
+1WM/nWBfj5ZXJOL0kW6SX1vK0fPiNELNvLe3ckhRfNxriON2Ghqo9GLv6e31mJ3X
+Y8+86d25L/muoWaGRjMrk1/mCxUp4e0b4IYUxnMJZYutlHT2XtRTgOwzHXtssCPo
+NnFifKpvvdGASIteMU/OYTKg5rcBYUWw0hm51qQ8tNqBO8nQOCW55lRj75f6sKuK
+k9QbpojGRIeuzTPzFXRh/1R/rczVOfbSPf+6wpyuVz9TAMx6PjI/hUmoYJdLDwTP
+cJUSbMIhAgMBAAECggEAAJqfkTiZNkKvlXUUbpVjI7oenPlm7MxLReGrVW8/ugEX
+t5nikkIXOVKIUA5Rz0Bd9XKEoaB4H9IAnJvZmPlG9Dnr8TxyD3UMqOgjw6razWsw
+xYfIHqUUoTTPdEkiRcoGfpVbtSbxWJRclv2S+KwkGx3iw9coNjwjrmaNApcTScov
+19C2serKuFVLSgIYmRcXUENdaq2oA1S+V/lF1IRynbr/dBHpEAd7EEEeWhC0Te7y
+vxpPwMbi3WZP7iXiGSKUfuPUd5rN1n0GedTaF7g2vz2Zt/IWdjEmQ3np1WlSDifm
+xGtEhYb+zuwCdfnE9luXJ5455kp2RyW2MgK6t0Gm1QKBgQDoOr0cPkcg7BgM2/9h
+J2Hfklt1KrtXVlvd49OhUTP8VRS6vrKB8tpReXyN0pIkI8iQ44MhjkhB33sk++tE
+esDIO4hecd0FrualUCDcSS2HieKd8iexM0TFliWSVtkjslvy6sbqzQG9gAR37Xnj
+W0MyAs0ruassy1BEbCv8vQa1rwKBgQDLhb/z4hYoR47Xhteoddm41ytLKKj/fGzL
+JCkbJInAWJ+W7+K8LIopkceereY9z63OO/fKUKqGji2K6JklNGWvvPJTIAA3eXNd
+dRZ9z8K07QmFb/VbtEbJJ8RAm+vGL+1mFGs2atJMJOeoLm6vfTZ8yzCDSavK0kp1
+5QXurOXJLwKBgHk9iVOAdBQNDnVQOeDX9bIKL/NYrtvm+yk581fqFBDtvlfMjVdo
+mXAl09AbGi8B+4khLmnLZY/2g80INIjY6WLgKc7c9T4tVL8DuVQoZDu50fUR4oUR
+thrNy6m967lGOdj1l4ooI3typWKTOapoEAnBCqqEUYieULaYHtLhQOqDAoGAQU00
+/ee4/EuZhYX6hE7sAObpOUBemTsvHS8JEXBz0oedDS0DLyWLXzMrPbrGeWa9ecK8
+Cuo/DNVpv3xKRym8xtp1Vj6aUzJg1cfP46ZZ7vtvZqU5sKbzX2+nBKQCzqBqJ6q9
+i8RSnaPpwIjFcwFWDkyT0Ew/FuDKi3FkqeRIBnkCgYALdfVsqDc3qcNUhDgAGFlF
+EbTZBwWHu1zN/DOXyjFzZNwn57ZKJqNdtcePgRdqc7/K680CafJRDhuKIvXl7kmq
+DoDLEKf4julhkZ3tadHIlFJ4AE73WyQR6m/Of9IAsEDb00yb5AcnG9runyHiyQ/Q
+H/RTRklk/NRqE60ISIcZCQ==
+-----END PRIVATE KEY-----";
+
+    // Matching public key components for DecodingKey::from_rsa_components.
+    const TEST_PUB_N: &str = "uJ_omrUASt7HojF4vNtTTFlZeWjDmIIgjXlAA5YijTN4gG-wUaXkx5c0IPjn4UAZYFIVKZikEmApk9VjP51gX4-WVyTi9JFukl9bytHz4jRCzby3t3JIUXzca4jjdhoaqPRi7-nt9Zid12PPvOnduS_5rqFmhkYzK5Nf5gsVKeHtG-CGFMZzCWWLrZR09l7UU4DsMx17bLAj6DZxYnyqb73RgEiLXjFPzmEyoOa3AWFFsNIZudakPLTagTvJ0DglueZUY--X-rCripPUG6aIxkSHrs0z8xV0Yf9Uf63M1Tn20j3_usKcrlc_UwDMej4yP4VJqGCXSw8Ez3CVEmzCIQ";
+    const TEST_PUB_E: &str = "AQAB";
+    const TEST_KID: &str = "test-kid-1";
+    const TEST_ISSUER: &str = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_test";
+
+    fn now_secs() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    /// Build a JwksCache pre-seeded with the test public key. `client_id`
+    /// controls audience validation (None disables it).
+    async fn seeded_cache(client_id: Option<&str>) -> JwksCache {
+        let config = ProxyConfig {
+            auth_enabled: true,
+            cognito_region: "us-east-1".to_string(),
+            cognito_pool_id: "us-east-1_test".to_string(),
+            cognito_client_id: client_id.map(String::from),
+            rate_limit_rpm: 60,
+            rate_limit_burst: 10,
+        };
+        let cache = JwksCache::new(&config);
+        let decoding_key = DecodingKey::from_rsa_components(TEST_PUB_N, TEST_PUB_E).unwrap();
+        cache.seed_for_test(TEST_KID, decoding_key).await;
+        cache
+    }
+
+    fn sign(claims: serde_json::Value, kid: Option<&str>) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = kid.map(String::from);
+        let enc = EncodingKey::from_rsa_pem(TEST_PRIV_PEM.as_bytes()).unwrap();
+        encode(&header, &claims, &enc).unwrap()
+    }
+
+    #[tokio::test]
+    async fn happy_path_access_token() {
+        let cache = seeded_cache(None).await;
+        let token = sign(
+            json!({
+                "sub": "user-1", "exp": now_secs() + 3600,
+                "iss": TEST_ISSUER, "token_use": "access",
+            }),
+            Some(TEST_KID),
+        );
+        let claims = cache.validate_token(&token).await.unwrap();
+        assert_eq!(claims.sub, "user-1");
+    }
+
+    #[tokio::test]
+    async fn happy_path_id_token() {
+        let cache = seeded_cache(None).await;
+        let token = sign(
+            json!({
+                "sub": "user-1", "exp": now_secs() + 3600,
+                "iss": TEST_ISSUER, "token_use": "id",
+            }),
+            Some(TEST_KID),
+        );
+        assert!(cache.validate_token(&token).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_expired_token() {
+        let cache = seeded_cache(None).await;
+        // jsonwebtoken has a default 60s leeway, so "expired 60s ago" still
+        // passes. Use a clear margin so the assertion isn't flaky.
+        let token = sign(
+            json!({
+                "sub": "user-1", "exp": now_secs() - 3600,
+                "iss": TEST_ISSUER, "token_use": "access",
+            }),
+            Some(TEST_KID),
+        );
+        assert!(matches!(
+            cache.validate_token(&token).await,
+            Err(AuthError::ExpiredToken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_issuer() {
+        let cache = seeded_cache(None).await;
+        let token = sign(
+            json!({
+                "sub": "user-1", "exp": now_secs() + 3600,
+                "iss": "https://attacker.example.com/", "token_use": "access",
+            }),
+            Some(TEST_KID),
+        );
+        let err = cache.validate_token(&token).await.unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(ref m) if m.contains("issuer")), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_audience() {
+        let cache = seeded_cache(Some("expected-client-id")).await;
+        let token = sign(
+            json!({
+                "sub": "user-1", "exp": now_secs() + 3600,
+                "iss": TEST_ISSUER, "token_use": "access",
+                "aud": "different-client-id",
+            }),
+            Some(TEST_KID),
+        );
+        let err = cache.validate_token(&token).await.unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(ref m) if m.contains("audience")), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_kid() {
+        let cache = seeded_cache(None).await;
+        let token = sign(
+            json!({
+                "sub": "user-1", "exp": now_secs() + 3600,
+                "iss": TEST_ISSUER, "token_use": "access",
+            }),
+            None,
+        );
+        let err = cache.validate_token(&token).await.unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(ref m) if m.contains("key ID") || m.contains("kid")), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_kid() {
+        // Seeded with TEST_KID, ask for a token signed with a different kid.
+        // refresh_cache will try to network-fetch and fail (no upstream),
+        // bubbling up as JwksFetchError → caller renders 503.
+        let cache = seeded_cache(None).await;
+        let token = sign(
+            json!({
+                "sub": "user-1", "exp": now_secs() + 3600,
+                "iss": TEST_ISSUER, "token_use": "access",
+            }),
+            Some("totally-different-kid"),
+        );
+        let err = cache.validate_token(&token).await.unwrap_err();
+        assert!(matches!(err, AuthError::JwksFetchError(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_token_use() {
+        let cache = seeded_cache(None).await;
+        let token = sign(
+            json!({
+                "sub": "user-1", "exp": now_secs() + 3600,
+                "iss": TEST_ISSUER, "token_use": "refresh",
+            }),
+            Some(TEST_KID),
+        );
+        let err = cache.validate_token(&token).await.unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(ref m) if m.contains("token_use")), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_required_claim() {
+        let cache = seeded_cache(None).await;
+        // No `exp` claim — required spec claim per Validation::set_required_spec_claims
+        let token = sign(
+            json!({
+                "sub": "user-1", "iss": TEST_ISSUER, "token_use": "access",
+            }),
+            Some(TEST_KID),
+        );
+        assert!(cache.validate_token(&token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_signature_mismatch() {
+        // Sign with one private key, verify against a different public key.
+        let cache = seeded_cache(None).await;
+
+        // Construct a header + payload but craft an invalid signature by
+        // tampering with the JWT.
+        let token = sign(
+            json!({
+                "sub": "user-1", "exp": now_secs() + 3600,
+                "iss": TEST_ISSUER, "token_use": "access",
+            }),
+            Some(TEST_KID),
+        );
+        // Flip a byte in the signature segment.
+        let mut parts: Vec<&str> = token.split('.').collect();
+        let mut sig_bytes = parts[2].as_bytes().to_vec();
+        sig_bytes[0] = if sig_bytes[0] == b'a' { b'b' } else { b'a' };
+        let tampered_sig = std::str::from_utf8(&sig_bytes).unwrap().to_string();
+        parts[2] = &tampered_sig;
+        let tampered = parts.join(".");
+
+        let err = cache.validate_token(&tampered).await.unwrap_err();
+        assert!(matches!(err, AuthError::InvalidToken(_)), "got {err:?}");
     }
 }

@@ -39,6 +39,9 @@ clap = { version = "4", features = ["derive"], optional = true }
 # Lambda runtime
 lambda_http = { version = "0.14", optional = true }
 
+[dev-dependencies]
+serde_json = "1"
+
 [features]
 default = ["ec2"]
 ec2 = ["clap", "ws"]
