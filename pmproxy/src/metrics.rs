@@ -29,6 +29,8 @@ pub struct Metrics {
     ws_connections_total: AtomicU64,
     /// Currently-open WS connections.
     ws_connections_active: AtomicU64,
+    /// WS client→upstream frames dropped by per-session rate limit.
+    ws_frames_dropped: AtomicU64,
 }
 
 impl Metrics {
@@ -40,6 +42,7 @@ impl Metrics {
             jwks_refreshes: DashMap::new(),
             ws_connections_total: AtomicU64::new(0),
             ws_connections_active: AtomicU64::new(0),
+            ws_frames_dropped: AtomicU64::new(0),
         }
     }
 
@@ -76,6 +79,10 @@ impl Metrics {
 
     pub fn ws_disconnect(&self) {
         self.ws_connections_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn ws_frame_drop(&self) {
+        self.ws_frames_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Render as Prometheus text format 0.0.4.
@@ -126,6 +133,10 @@ impl Metrics {
         writeln!(out, "# HELP pmproxy_ws_connections_active Currently-open WebSocket connections").unwrap();
         writeln!(out, "# TYPE pmproxy_ws_connections_active gauge").unwrap();
         writeln!(out, "pmproxy_ws_connections_active {}", self.ws_connections_active.load(Ordering::Relaxed)).unwrap();
+
+        writeln!(out, "# HELP pmproxy_ws_frames_dropped_total WS client→upstream frames dropped by the per-session rate limiter").unwrap();
+        writeln!(out, "# TYPE pmproxy_ws_frames_dropped_total counter").unwrap();
+        writeln!(out, "pmproxy_ws_frames_dropped_total {}", self.ws_frames_dropped.load(Ordering::Relaxed)).unwrap();
 
         writeln!(out, "# HELP pmproxy_tenants_active Active per-tenant rate-limiter buckets").unwrap();
         writeln!(out, "# TYPE pmproxy_tenants_active gauge").unwrap();

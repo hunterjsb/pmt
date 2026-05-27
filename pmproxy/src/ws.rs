@@ -7,6 +7,7 @@
 //! Authentication is performed via the Authorization header on the upgrade request,
 //! same as HTTP routes.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use axum::{
@@ -18,12 +19,25 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
+use governor::{
+    clock::DefaultClock,
+    state::{InMemoryState, NotKeyed},
+    Quota, RateLimiter,
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungMessage};
 use tracing::{debug, error, info, warn};
 
 use crate::{authenticate, ProxyState};
 
 const UPSTREAM_WS_BASE: &str = "wss://ws-subscriptions-clob.polymarket.com/ws";
+
+/// Per-session client→upstream frame budget. Polymarket WS subscriptions
+/// are typically a few subscribe messages then read-mostly; this budget
+/// shouldn't bite legitimate clients but caps abuse if a JWT leaks.
+const WS_FRAMES_PER_SECOND: u32 = 10;
+const WS_FRAME_BURST: u32 = 50;
+
+type FrameLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 /// Axum handler for WS upgrade requests at `/clob/ws/{channel}`.
 pub async fn ws_handler(
@@ -83,11 +97,27 @@ async fn handle_socket(
     let (mut client_tx, mut client_rx) = client_socket.split();
     let (mut up_tx, mut up_rx) = upstream.split();
 
-    // client → upstream
+    // Per-session frame budget on the client→upstream direction. The
+    // upstream side is read-mostly for Polymarket WS, so we don't meter
+    // upstream→client — flooding from upstream is a Polymarket bug to fix.
+    let limiter: Arc<FrameLimiter> = Arc::new(RateLimiter::direct(
+        Quota::per_second(NonZeroU32::new(WS_FRAMES_PER_SECOND).unwrap())
+            .allow_burst(NonZeroU32::new(WS_FRAME_BURST).unwrap()),
+    ));
+    let limiter_metrics = metrics.clone();
+
+    // client → upstream (rate-limited)
     let c2u = async move {
         while let Some(result) = client_rx.next().await {
             match result {
                 Ok(msg) => {
+                    if limiter.check().is_err() {
+                        // Drop the frame; don't tear down the session. Legitimate
+                        // bursts shouldn't kill the connection.
+                        limiter_metrics.ws_frame_drop();
+                        debug!("client→upstream frame dropped: rate limit");
+                        continue;
+                    }
                     let tung_msg = match axum_to_tungstenite(msg) {
                         Some(m) => m,
                         None => continue, // ignore unconvertible (e.g. axum's reserved frames)
