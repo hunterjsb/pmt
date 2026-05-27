@@ -29,7 +29,15 @@ use tracing::{debug, error, info, warn};
 
 use crate::{authenticate, ProxyState};
 
-const UPSTREAM_WS_BASE: &str = "wss://ws-subscriptions-clob.polymarket.com/ws";
+const DEFAULT_UPSTREAM_WS_BASE: &str = "wss://ws-subscriptions-clob.polymarket.com/ws";
+
+/// Resolve the upstream WS base URL. `PMPROXY_WS_UPSTREAM_BASE` overrides
+/// the Polymarket default — used by integration tests to point at a local
+/// mock server.
+fn upstream_ws_base() -> String {
+    std::env::var("PMPROXY_WS_UPSTREAM_BASE")
+        .unwrap_or_else(|_| DEFAULT_UPSTREAM_WS_BASE.to_string())
+}
 
 /// Per-session client→upstream frame budget. Polymarket WS subscriptions
 /// are typically a few subscribe messages then read-mostly; this budget
@@ -71,7 +79,7 @@ pub async fn ws_handler(
         return (StatusCode::NOT_FOUND, "Unknown WS channel").into_response();
     }
 
-    let upstream_url = format!("{}/{}", UPSTREAM_WS_BASE, channel);
+    let upstream_url = format!("{}/{}", upstream_ws_base(), channel);
     let metrics = state.metrics.clone();
     metrics.ws_connect();
 
