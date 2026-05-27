@@ -105,8 +105,28 @@ aws.lambda_.Permission(
     statement_id="FunctionURLAllowPublicInvokeFunction",
 )
 
-# Alarm: high 4xx rate suggests someone is brute-forcing tokens or scanning.
-# Trips if >20 4xx responses in a 5-min window for 2 consecutive periods.
+# SNS topic for all pmproxy ops alarms. One subscription = one place to look
+# when something pages. Budget alarms (below) hit email directly without SNS,
+# but CloudWatch alarms need a topic to publish to.
+alarm_topic = aws.sns.Topic(
+    "pmproxy-alarms",
+    name="pmproxy-alarms",
+    display_name="pmproxy ops alarms",
+)
+
+aws.sns.TopicSubscription(
+    "pmproxy-alarms-email",
+    topic=alarm_topic.arn,
+    protocol="email",
+    endpoint=budget_email,
+)
+
+# --- alarms ---
+# All follow the same shape: notBreaching when there's no data (avoids
+# alarming during idle hours), 2 consecutive evaluation periods to ride
+# out transient spikes, and a description that names the playbook step.
+
+# 4xx rate: brute-force tokens / scanning. >20 in 5min for 2 periods.
 alarm_4xx = aws.cloudwatch.MetricAlarm(
     "pmproxy-4xx-alarm",
     name="pmproxy-high-4xx",
@@ -120,6 +140,82 @@ alarm_4xx = aws.cloudwatch.MetricAlarm(
     alarm_description="pmproxy Function URL is returning >20 4xx/5min — possible auth abuse",
     dimensions={"FunctionName": lambda_function.name},
     treat_missing_data="notBreaching",
+    alarm_actions=[alarm_topic.arn],
+    ok_actions=[alarm_topic.arn],
+)
+
+# 5xx rate: Lambda or upstream failures. Any sustained 5xx is a P1.
+alarm_5xx = aws.cloudwatch.MetricAlarm(
+    "pmproxy-5xx-alarm",
+    name="pmproxy-high-5xx",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=2,
+    metric_name="Url5xxCount",
+    namespace="AWS/Lambda",
+    period=300,
+    statistic="Sum",
+    threshold=5,  # 5 5xx in 5min sustained = something's wrong
+    alarm_description="pmproxy returning >5 5xx/5min — see CloudWatch logs",
+    dimensions={"FunctionName": lambda_function.name},
+    treat_missing_data="notBreaching",
+    alarm_actions=[alarm_topic.arn],
+    ok_actions=[alarm_topic.arn],
+)
+
+# Lambda function errors (uncaught panics, init failures, etc.).
+alarm_errors = aws.cloudwatch.MetricAlarm(
+    "pmproxy-errors-alarm",
+    name="pmproxy-function-errors",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=1,
+    metric_name="Errors",
+    namespace="AWS/Lambda",
+    period=300,
+    statistic="Sum",
+    threshold=3,
+    alarm_description="pmproxy Lambda crashed >3 times/5min — investigate runtime errors",
+    dimensions={"FunctionName": lambda_function.name},
+    treat_missing_data="notBreaching",
+    alarm_actions=[alarm_topic.arn],
+    ok_actions=[alarm_topic.arn],
+)
+
+# Throttles: reserved concurrency cap hit. If this fires we either have
+# legitimate traffic growth (raise the cap) or runaway invocations (find them).
+alarm_throttles = aws.cloudwatch.MetricAlarm(
+    "pmproxy-throttles-alarm",
+    name="pmproxy-throttles",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=1,
+    metric_name="Throttles",
+    namespace="AWS/Lambda",
+    period=300,
+    statistic="Sum",
+    threshold=10,  # 10 throttles/5min = either growth or attack
+    alarm_description="pmproxy throttled >10 times/5min — at reserved concurrency cap",
+    dimensions={"FunctionName": lambda_function.name},
+    treat_missing_data="notBreaching",
+    alarm_actions=[alarm_topic.arn],
+    ok_actions=[alarm_topic.arn],
+)
+
+# Duration p99: latency regression. Lambda emits per-invocation duration;
+# we alarm on p99 > 5s (proxy passes are usually <1s).
+alarm_latency = aws.cloudwatch.MetricAlarm(
+    "pmproxy-latency-alarm",
+    name="pmproxy-p99-latency",
+    comparison_operator="GreaterThanThreshold",
+    evaluation_periods=3,
+    metric_name="Duration",
+    namespace="AWS/Lambda",
+    period=300,
+    extended_statistic="p99",
+    threshold=5000,  # ms
+    alarm_description="pmproxy p99 latency >5s for 15min — check upstream / cold-start storms",
+    dimensions={"FunctionName": lambda_function.name},
+    treat_missing_data="notBreaching",
+    alarm_actions=[alarm_topic.arn],
+    ok_actions=[alarm_topic.arn],
 )
 
 # Budget: alert at $5/mo of Lambda spend. AWS Budgets emails directly, no SNS needed.
