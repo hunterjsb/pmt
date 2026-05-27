@@ -121,4 +121,12 @@ jobs:
         run: cargo audit
       - name: Audit pmengine
         working-directory: pmengine
-        run: cargo audit
+        # The rustls-webpki advisories ignored here are pinned by the
+        # aws-config / aws-smithy transitive dep chain. See
+        # pmengine/audit.toml for full rationale + threat-model reasoning.
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2026-0049 \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099 \
+            --ignore RUSTSEC-2026-0104

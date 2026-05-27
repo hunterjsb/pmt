@@ -1,0 +1,22 @@
+# cargo-audit configuration for pmengine.
+#
+# The advisories ignored below are pinned by the aws-config / aws-smithy
+# transitive dep chain (→ hyper-rustls 0.24 → rustls 0.21 → rustls-webpki
+# 0.101). They'll clear when aws-config publishes a version built on
+# newer rustls; until then, ignoring them here is honest about the
+# constraint instead of silently failing CI.
+#
+# pmengine is a local-only HFT binary that does NOT terminate TLS for
+# inbound traffic — it makes outbound HTTPS calls to Polymarket (their
+# certs) and Cognito (Amazon certs). The CRL / wildcard-name-constraint
+# issues these advisories describe require an attacker to control the
+# certificate authority, which is not in our threat model for outbound
+# calls to known endpoints.
+
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0049",  # rustls-webpki: CRLs not authoritative by DP matching
+    "RUSTSEC-2026-0098",  # rustls-webpki: URI names in name constraints
+    "RUSTSEC-2026-0099",  # rustls-webpki: wildcard names in name constraints
+    "RUSTSEC-2026-0104",  # rustls-webpki: panic in CRL parsing
+]
