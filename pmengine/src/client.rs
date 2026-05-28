@@ -45,6 +45,9 @@ pub struct PolymarketClient {
     http: reqwest::Client,
     /// Proxy URL base (without /clob/ suffix)
     proxy_url: Option<String>,
+    /// Funder address (the wallet that actually holds positions/USDC).
+    /// Stored so the data-api position reconcile can query the right user.
+    funder_address: Option<String>,
     /// Dry run mode
     dry_run: bool,
     /// Optional Cognito auth for pmproxy multi-tenant auth
@@ -158,6 +161,7 @@ impl PolymarketClient {
             address,
             http,
             proxy_url,
+            funder_address: config.funder_address.clone(),
             dry_run,
             #[cfg(feature = "cognito")]
             cognito_auth: None,
@@ -500,6 +504,61 @@ impl PolymarketClient {
             .await
             .map_err(|e| ClientError::OrderError(format!("public trades parse: {}", e)))?;
         Ok(trades)
+    }
+
+    /// Fetch the authoritative position size for a token from the data-api.
+    ///
+    /// Returns `(size, avg_price)` where size is signed (negative = short).
+    /// `None` if we hold no position in that token, or no funder is set.
+    ///
+    /// This is the engine's source of truth for position reconciliation —
+    /// incremental fill detection can miss fills (e.g. partials landing in
+    /// the MM's cancel/replace window), so the engine periodically corrects
+    /// its tracked size against this. Unauthenticated data-api endpoint, not
+    /// proxied through pmproxy.
+    pub async fn get_position(
+        &self,
+        token_id: &str,
+    ) -> Result<Option<(Decimal, Decimal)>, ClientError> {
+        let Some(funder) = self.funder_address.as_ref() else {
+            return Ok(None);
+        };
+        let url = format!(
+            "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0",
+            funder
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ClientError::OrderError(format!("positions request failed: {}", e)))?;
+        if !resp.status().is_success() {
+            return Err(ClientError::OrderError(format!(
+                "positions HTTP {}",
+                resp.status()
+            )));
+        }
+        let positions: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| ClientError::OrderError(format!("positions parse: {}", e)))?;
+        for p in positions {
+            if p.get("asset").and_then(|a| a.as_str()) == Some(token_id) {
+                let size = p
+                    .get("size")
+                    .and_then(|s| s.as_f64())
+                    .and_then(Decimal::from_f64_retain)
+                    .unwrap_or(Decimal::ZERO);
+                let avg = p
+                    .get("avgPrice")
+                    .and_then(|s| s.as_f64())
+                    .and_then(Decimal::from_f64_retain)
+                    .unwrap_or(Decimal::ZERO);
+                return Ok(Some((size, avg)));
+            }
+        }
+        Ok(None)
     }
 
     /// Cancel every open user-side order on a token (asset_id).

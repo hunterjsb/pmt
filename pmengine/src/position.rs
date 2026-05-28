@@ -149,6 +149,30 @@ impl PositionTracker {
         );
     }
 
+    /// Reconcile a position's size + avg entry against the authoritative
+    /// on-chain holding (from the data-api). Corrects drift caused by fills
+    /// that incremental detection missed — the data-api is ground truth.
+    ///
+    /// Preserves accumulated `realized_pnl` and `last_price` (those aren't
+    /// recoverable from a position snapshot). Returns the size delta applied,
+    /// so the caller can log meaningful corrections.
+    pub fn reconcile(&mut self, token_id: &str, true_size: Decimal, avg_price: Decimal) -> Decimal {
+        let position = self.get_or_create(token_id);
+        let delta = true_size - position.size;
+        if delta != Decimal::ZERO {
+            position.size = true_size;
+            // Only adopt the data-api avg when we actually hold something;
+            // a flat position has no meaningful entry price.
+            if true_size != Decimal::ZERO {
+                position.avg_entry_price = avg_price;
+            }
+            if let Some(p) = position.last_price {
+                position.update_price(p);
+            }
+        }
+        delta
+    }
+
     /// Update prices for all positions.
     pub fn update_prices(&mut self, prices: &HashMap<String, Decimal>) {
         for (token_id, price) in prices {
@@ -221,5 +245,43 @@ mod tests {
         });
         assert_eq!(pos.size, dec!(5));
         assert_eq!(pos.realized_pnl, dec!(0.50)); // 5 * (0.60 - 0.50)
+    }
+
+    #[test]
+    fn test_reconcile_corrects_missed_fill() {
+        let mut tracker = PositionTracker::new();
+        // Engine thinks it holds 50 (seeded at startup).
+        tracker.reconcile("t", dec!(50), dec!(0.90));
+        assert_eq!(tracker.get("t").unwrap().size, dec!(50));
+
+        // A 5-share sell filled but the trades-poll missed it; data-api now
+        // reports 45. Reconcile corrects the drift and returns the delta.
+        let delta = tracker.reconcile("t", dec!(45), dec!(0.90));
+        assert_eq!(delta, dec!(-5));
+        assert_eq!(tracker.get("t").unwrap().size, dec!(45));
+
+        // No change → zero delta, no-op.
+        let delta2 = tracker.reconcile("t", dec!(45), dec!(0.90));
+        assert_eq!(delta2, dec!(0));
+    }
+
+    #[test]
+    fn test_reconcile_preserves_realized_pnl() {
+        let mut tracker = PositionTracker::new();
+        tracker.apply_fill(&Fill {
+            order_id: "1".to_string(), token_id: "t".to_string(), is_buy: true,
+            price: dec!(0.50), size: dec!(10), timestamp: chrono::Utc::now(), fee: Decimal::ZERO,
+        });
+        tracker.apply_fill(&Fill {
+            order_id: "2".to_string(), token_id: "t".to_string(), is_buy: false,
+            price: dec!(0.60), size: dec!(5), timestamp: chrono::Utc::now(), fee: Decimal::ZERO,
+        });
+        let pnl_before = tracker.get("t").unwrap().realized_pnl;
+        assert_eq!(pnl_before, dec!(0.50));
+
+        // Reconcile to a different size — realized P&L must survive.
+        tracker.reconcile("t", dec!(8), dec!(0.55));
+        assert_eq!(tracker.get("t").unwrap().size, dec!(8));
+        assert_eq!(tracker.get("t").unwrap().realized_pnl, dec!(0.50));
     }
 }

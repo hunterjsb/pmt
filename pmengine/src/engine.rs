@@ -622,6 +622,28 @@ impl Engine {
             }
         }
 
+        // Seed positions from the authoritative data-api holdings for every
+        // subscribed token. The PositionTracker otherwise starts empty, so the
+        // strategy + risk manager would be blind to inventory we already hold
+        // before the engine launched (e.g. a manual 208-share position). With
+        // this seed, MAX_POSITION is enforced against true total holdings.
+        for token_id in self.subscribed_tokens.clone() {
+            match self.client.get_position(&token_id).await {
+                Ok(Some((size, avg))) => {
+                    let delta = self.positions.reconcile(&token_id, size, avg);
+                    tracing::info!(
+                        token_id = %token_id, size = %size, avg_price = %avg, delta = %delta,
+                        "Startup reconcile: seeded position from data-api"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    error = %e, token_id = %token_id,
+                    "Startup reconcile: failed to seed position; starting from zero"
+                ),
+            }
+        }
+
         // Get tick interval
         let tick_duration = Duration::from_millis(self.config.tick_interval_ms);
         let mut tick_timer = interval(tick_duration);
@@ -1064,6 +1086,28 @@ impl Engine {
                         last_tick = Instant::now();
 
                         tracing::info!(tick = tick_count, elapsed_ms = elapsed.as_millis(), "Tick");
+
+                        // Periodic position reconcile against the data-api (every
+                        // 30 ticks ≈ 30s). Incremental fill detection can miss
+                        // fills — notably partials that land in the MM's
+                        // cancel/replace window get attributed to an order the
+                        // engine no longer tracks and are dropped. The data-api
+                        // is ground truth, so we correct drift here. This keeps
+                        // MAX_POSITION enforcement honest even when a fill slips
+                        // past the trades poller.
+                        if tick_count % 30 == 0 {
+                            for token_id in self.subscribed_tokens.clone() {
+                                if let Ok(Some((size, avg))) = self.client.get_position(&token_id).await {
+                                    let delta = self.positions.reconcile(&token_id, size, avg);
+                                    if delta != Decimal::ZERO {
+                                        tracing::warn!(
+                                            token_id = %token_id, corrected_to = %size, delta = %delta,
+                                            "Position reconcile: corrected drift from missed fill(s)"
+                                        );
+                                    }
+                                }
+                            }
+                        }
 
                         // Drain TTL-scheduled cancels whose deadline has passed.
                         // Runs before warmup checks so externally-placed orders
