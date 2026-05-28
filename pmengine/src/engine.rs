@@ -1587,6 +1587,7 @@ impl Engine {
                                         id: s.id,
                                         tick_interval_ms: s.tick_interval_ms,
                                         subscribed_tokens: s.subscriptions,
+                                        paused: s.paused,
                                         last_tick_at: s.last_tick_at.map(|t| {
                                             // Instant → wall-clock by aligning the
                                             // monotonic delta against the observed
@@ -1864,6 +1865,41 @@ impl Engine {
                                     }
                                 };
                                 let _ = reply.send(res);
+                            }
+                            EngineCommand::PauseStrategy { id, reply } => {
+                                match self.strategy_runtime.pause(&id) {
+                                    Some(tokens) => {
+                                        // Pull the strategy's resting quotes so it
+                                        // stops sitting on the book (and stops the
+                                        // bid-erroring loop when cash is starved).
+                                        for token in &tokens {
+                                            let _ = self.order_manager.cancel_all(token).await;
+                                        }
+                                        tracing::info!(strategy_id = %id, "Strategy paused via control plane");
+                                        let _ = reply.send(Ok(()));
+                                    }
+                                    None => { let _ = reply.send(Err(format!("no strategy '{}'", id))); }
+                                }
+                            }
+                            EngineCommand::ResumeStrategy { id, reply } => {
+                                if self.strategy_runtime.resume(&id) {
+                                    tracing::info!(strategy_id = %id, "Strategy resumed via control plane");
+                                    let _ = reply.send(Ok(()));
+                                } else {
+                                    let _ = reply.send(Err(format!("no strategy '{}'", id)));
+                                }
+                            }
+                            EngineCommand::StopStrategy { id, reply } => {
+                                match self.strategy_runtime.stop(&id) {
+                                    Some(tokens) => {
+                                        for token in &tokens {
+                                            let _ = self.order_manager.cancel_all(token).await;
+                                        }
+                                        tracing::info!(strategy_id = %id, "Strategy stopped + removed via control plane");
+                                        let _ = reply.send(Ok(()));
+                                    }
+                                    None => { let _ = reply.send(Err(format!("no strategy '{}'", id))); }
+                                }
                             }
                         }
                     }

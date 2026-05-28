@@ -115,6 +115,24 @@ pub enum EngineCommand {
         size: Decimal,
         reply: oneshot::Sender<Result<String, String>>, // order_id or error
     },
+    /// Pause a strategy: stop ticking it and pull its resting orders, but
+    /// keep it registered so it can be resumed. Reply is Ok(()) if the
+    /// strategy exists, Err with a message otherwise.
+    PauseStrategy {
+        id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Resume a paused strategy — it starts quoting again on its next tick.
+    ResumeStrategy {
+        id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Stop and remove a strategy entirely (runs on_shutdown, pulls its
+    /// orders). Cannot be resumed without a restart.
+    StopStrategy {
+        id: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// An order placed outside the engine that the engine has been told to
@@ -194,6 +212,7 @@ pub struct StrategyInfo {
     pub tick_interval_ms: u64,
     pub subscribed_tokens: Vec<String>,
     pub last_tick_at: Option<DateTime<Utc>>,
+    pub paused: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,6 +253,18 @@ pub async fn spawn(
         let app = Router::new()
             .route("/status", get(status_handler))
             .route("/strategies", get(strategies_handler))
+            .route(
+                "/strategies/:id/pause",
+                axum::routing::post(pause_strategy_handler),
+            )
+            .route(
+                "/strategies/:id/resume",
+                axum::routing::post(resume_strategy_handler),
+            )
+            .route(
+                "/strategies/:id/stop",
+                axum::routing::post(stop_strategy_handler),
+            )
             .route("/orders", get(orders_handler))
             .route("/alerts", get(alerts_handler))
             .route(
@@ -356,6 +387,54 @@ async fn reject_alert_handler(
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "engine offline".to_string()))?;
     match rx.await {
         Ok(Ok(())) => Ok(Json(serde_json::json!({"rejected": true}))),
+        Ok(Err(e)) => Err((StatusCode::NOT_FOUND, e)),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string())),
+    }
+}
+
+async fn pause_strategy_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::PauseStrategy { id, reply: tx })
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "engine offline".to_string()))?;
+    match rx.await {
+        Ok(Ok(())) => Ok(Json(serde_json::json!({"paused": true}))),
+        Ok(Err(e)) => Err((StatusCode::NOT_FOUND, e)),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string())),
+    }
+}
+
+async fn resume_strategy_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::ResumeStrategy { id, reply: tx })
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "engine offline".to_string()))?;
+    match rx.await {
+        Ok(Ok(())) => Ok(Json(serde_json::json!({"resumed": true}))),
+        Ok(Err(e)) => Err((StatusCode::NOT_FOUND, e)),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string())),
+    }
+}
+
+async fn stop_strategy_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::StopStrategy { id, reply: tx })
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "engine offline".to_string()))?;
+    match rx.await {
+        Ok(Ok(())) => Ok(Json(serde_json::json!({"stopped": true}))),
         Ok(Err(e)) => Err((StatusCode::NOT_FOUND, e)),
         Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string())),
     }

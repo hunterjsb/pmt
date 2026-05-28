@@ -897,7 +897,7 @@ def engine_strategies() -> None:
         console.print("[yellow]No strategies registered.[/yellow]")
         return
     t = Table(title="strategies")
-    for col in ("id", "tick interval", "tokens", "last tick"):
+    for col in ("id", "state", "tick interval", "tokens", "last tick"):
         t.add_column(col)
     for r in rows:
         last = r.get("last_tick_at")
@@ -912,8 +912,33 @@ def engine_strategies() -> None:
             last_disp = "never"
         tokens = r["subscribed_tokens"]
         token_disp = tokens[0][:12] + "…" if len(tokens) == 1 else f"{len(tokens)} tokens"
-        t.add_row(r["id"], f"{r['tick_interval_ms']}ms", token_disp, last_disp)
+        state = "[yellow]paused[/yellow]" if r.get("paused") else "[green]active[/green]"
+        t.add_row(r["id"], state, f"{r['tick_interval_ms']}ms", token_disp, last_disp)
     console.print(t)
+
+
+@engine.command("pause")
+@click.argument("strategy")
+def engine_pause(strategy: str) -> None:
+    """Pause a strategy: stop ticking it + pull its resting orders. No restart."""
+    _engine_post(f"/strategies/{strategy}/pause")
+    console.print(f"[yellow]paused[/yellow] {strategy} (orders pulled; resume with `pmt engine resume {strategy}`)")
+
+
+@engine.command("resume")
+@click.argument("strategy")
+def engine_resume(strategy: str) -> None:
+    """Resume a paused strategy; it quotes again on its next tick."""
+    _engine_post(f"/strategies/{strategy}/resume")
+    console.print(f"[green]resumed[/green] {strategy}")
+
+
+@engine.command("stop")
+@click.argument("strategy")
+def engine_stop(strategy: str) -> None:
+    """Stop + remove a strategy (runs on_shutdown, pulls orders). Needs restart to re-add."""
+    _engine_post(f"/strategies/{strategy}/stop")
+    console.print(f"[red]stopped[/red] {strategy} (removed from runtime)")
 
 
 @engine.command("orders")

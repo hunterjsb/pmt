@@ -261,6 +261,7 @@ pub struct StrategySummary {
     pub tick_interval_ms: u64,
     pub subscriptions: Vec<String>,
     pub last_tick_at: Option<std::time::Instant>,
+    pub paused: bool,
 }
 
 /// Runtime for executing multiple strategies.
@@ -269,6 +270,9 @@ pub struct StrategyRuntime {
     /// Last `on_tick` invocation time per strategy index. Used to gate calls
     /// by each strategy's declared `tick_interval_ms`.
     last_tick_at: Vec<Option<std::time::Instant>>,
+    /// IDs of strategies that are paused — skipped in `tick()` until resumed.
+    /// Keyed by id (not index) so it survives strategy removal/reordering.
+    paused: std::collections::HashSet<String>,
 }
 
 impl StrategyRuntime {
@@ -276,7 +280,43 @@ impl StrategyRuntime {
         Self {
             strategies: Vec::new(),
             last_tick_at: Vec::new(),
+            paused: std::collections::HashSet::new(),
         }
+    }
+
+    /// Pause a strategy: it stops being ticked until `resume`. Returns the
+    /// strategy's subscribed tokens so the engine can pull its resting
+    /// orders, or None if no strategy with that id is registered.
+    pub fn pause(&mut self, id: &str) -> Option<Vec<String>> {
+        let tokens = self.strategies.iter().find(|s| s.id() == id)?.subscriptions();
+        self.paused.insert(id.to_string());
+        Some(tokens)
+    }
+
+    /// Resume a paused strategy. Returns false if no such strategy.
+    pub fn resume(&mut self, id: &str) -> bool {
+        if self.strategies.iter().any(|s| s.id() == id) {
+            self.paused.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Stop and remove a strategy entirely (runs its `on_shutdown`). Returns
+    /// the strategy's subscribed tokens for order cleanup, or None if absent.
+    pub fn stop(&mut self, id: &str) -> Option<Vec<String>> {
+        let idx = self.strategies.iter().position(|s| s.id() == id)?;
+        let tokens = self.strategies[idx].subscriptions();
+        self.strategies[idx].on_shutdown();
+        self.strategies.remove(idx);
+        self.last_tick_at.remove(idx);
+        self.paused.remove(id);
+        Some(tokens)
+    }
+
+    pub fn is_paused(&self, id: &str) -> bool {
+        self.paused.contains(id)
     }
 
     /// Register a strategy.
@@ -323,6 +363,7 @@ impl StrategyRuntime {
                 tick_interval_ms: s.tick_interval_ms(),
                 subscriptions: s.subscriptions(),
                 last_tick_at: self.last_tick_at[i],
+                paused: self.paused.contains(s.id()),
             })
             .collect()
     }
@@ -354,6 +395,10 @@ impl StrategyRuntime {
         // indices stay valid as later ones are spliced out.
         let mut retired: Vec<usize> = Vec::new();
         for (i, strategy) in self.strategies.iter_mut().enumerate() {
+            // Paused strategies are skipped entirely — no tick, no signals.
+            if self.paused.contains(strategy.id()) {
+                continue;
+            }
             let interval = std::time::Duration::from_millis(strategy.tick_interval_ms());
             let due = match self.last_tick_at[i] {
                 None => true,
