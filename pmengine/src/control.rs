@@ -211,13 +211,26 @@ pub struct OrderInfo {
     pub created_at: DateTime<Utc>,
 }
 
-/// Spawn the control plane HTTP server on a background task.
+/// Bind the control-plane port and spawn the HTTP server on a background task.
 ///
-/// Returns the join handle so the engine can abort it on shutdown. The
-/// server runs forever until aborted; binding failures are logged and the
-/// task exits.
-pub fn spawn(bind: SocketAddr, cmd_tx: mpsc::Sender<EngineCommand>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+/// The bind happens synchronously (before spawning) so a bind failure is
+/// returned to the caller rather than swallowed inside the task. This lets
+/// the engine fail fast: if the port is already held by another instance,
+/// the engine refuses to start instead of trading headless without a
+/// reachable control plane (which previously let two engines quote the
+/// same token at once).
+///
+/// Returns the join handle so the engine can abort it on shutdown.
+pub async fn spawn(
+    bind: SocketAddr,
+    cmd_tx: mpsc::Sender<EngineCommand>,
+) -> Result<JoinHandle<()>, std::io::Error> {
+    let listener = tokio::net::TcpListener::bind(bind).await.inspect_err(|e| {
+        tracing::error!(bind = %bind, error = %e, "Control plane bind failed");
+    })?;
+    tracing::info!(bind = %bind, "Control plane listening");
+
+    let handle = tokio::spawn(async move {
         let app = Router::new()
             .route("/status", get(status_handler))
             .route("/strategies", get(strategies_handler))
@@ -256,20 +269,12 @@ pub fn spawn(bind: SocketAddr, cmd_tx: mpsc::Sender<EngineCommand>) -> JoinHandl
             )
             .with_state(cmd_tx);
 
-        let listener = match tokio::net::TcpListener::bind(bind).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!(bind = %bind, error = %e, "Control plane bind failed");
-                return;
-            }
-        };
-
-        tracing::info!(bind = %bind, "Control plane listening");
-
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "Control plane serve loop ended");
         }
-    })
+    });
+
+    Ok(handle)
 }
 
 async fn status_handler(

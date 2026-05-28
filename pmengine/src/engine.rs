@@ -552,7 +552,17 @@ impl Engine {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| "127.0.0.1:7531".parse().expect("default bind addr is valid"));
-        let control_handle = control::spawn(control_bind, cmd_tx.clone());
+        // Bind the control plane synchronously. If the port is already held
+        // (another engine instance is running), fail fast rather than trade
+        // headless — two engines quoting the same token is a real hazard.
+        let control_handle = control::spawn(control_bind, cmd_tx.clone())
+            .await
+            .map_err(|e| {
+                EngineError::ControlPlaneError(format!(
+                    "could not bind {} ({}). Another engine is likely already running.",
+                    control_bind, e
+                ))
+            })?;
 
         // Startup reconcile: clear any orphan orders left by a previous engine
         // session on the strategies' subscribed tokens. The engine treats
@@ -1915,6 +1925,7 @@ pub enum EngineError {
     OrderError(String),
     WebSocketError(String),
     UnknownStrategy(String),
+    ControlPlaneError(String),
 }
 
 impl std::fmt::Display for EngineError {
@@ -1925,6 +1936,7 @@ impl std::fmt::Display for EngineError {
             EngineError::OrderError(e) => write!(f, "Order error: {}", e),
             EngineError::WebSocketError(e) => write!(f, "WebSocket error: {}", e),
             EngineError::UnknownStrategy(name) => write!(f, "Unknown strategy: {}", name),
+            EngineError::ControlPlaneError(e) => write!(f, "Control plane error: {}", e),
         }
     }
 }
