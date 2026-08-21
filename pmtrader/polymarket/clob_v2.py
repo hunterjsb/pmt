@@ -1,15 +1,14 @@
-"""Authenticated py_clob_client_v2 ClobClient with proxy + Cognito support.
+"""Authenticated py_clob_client_v2 ClobClient with proxy + SigV4 support.
 
 Strategies use this so they don't each repeat the monkey-patch + L1/L2 setup.
 
-The pmproxy Lambda requires a Cognito Bearer header on every CLOB call, but
-py_clob_client_v2 has no native hook for custom headers, so we monkey-patch its
-HTTP helper. Idempotent — safe to import from multiple strategies.
+The pmproxy Lambda sits behind an AWS_IAM Function URL, so every proxied CLOB
+call must be SigV4-signed (see sigv4.py). py_clob_client_v2 has no native hook
+for this, so we monkey-patch its HTTP helper. Idempotent — safe to import from
+multiple strategies.
 
 Also persists CLOB API credentials to ~/.cache/pmt/ so warm starts skip the
 /clob/auth/api-key round-trip (creds are deterministic per private_key/chain).
-Cognito tokens are cached in-memory only (per-process); the boto3 round-trip
-takes ~200ms which isn't worth the persistence complexity.
 """
 
 from __future__ import annotations
@@ -19,36 +18,9 @@ import os
 import stat
 from pathlib import Path
 
-from .cognito import create_cognito_auth
+from .sigv4 import _install_sigv4_patch_once
 
 CHAIN_ID = 137  # Polygon mainnet
-
-
-def _install_cognito_patch_once() -> None:
-    """Patch py_clob_client_v2's HTTP layer to attach the Cognito Bearer.
-
-    Idempotent via a module-level marker on the helpers module.
-    """
-    import py_clob_client_v2.http_helpers.helpers as helpers
-
-    if getattr(helpers, "_pmt_cognito_patched", False):
-        return
-
-    cognito = create_cognito_auth()
-    if cognito is None:
-        # No PMPROXY_* env vars; running direct, no patch needed.
-        helpers._pmt_cognito_patched = True
-        return
-
-    original = helpers._overload_headers
-
-    def patched(method, headers):
-        h = original(method, headers)
-        h.update(cognito.get_auth_header())
-        return h
-
-    helpers._overload_headers = patched
-    helpers._pmt_cognito_patched = True
 
 
 def _creds_cache_path(funder: str) -> Path:
@@ -98,7 +70,7 @@ def create_authenticated_clob_v2():
     """
     from py_clob_client_v2 import ClobClient
 
-    _install_cognito_patch_once()
+    _install_sigv4_patch_once()
 
     from . import hosts
     proxy_url = hosts.proxy_url() + "/clob"
