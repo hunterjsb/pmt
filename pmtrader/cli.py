@@ -21,9 +21,10 @@ Pricing:
     --price P + --amount explicit limit at P, size = ceil(amount/P)
 
 Other commands:
+    pmt sweep  REF [OUTCOME] --to P [--max-cost $X] [--flip P]
     pmt flip   TOKEN --buy-price BP --sell-price SP --size N
     pmt cancel ORDER_ID
-    pmt orders | positions | pnl | rewards
+    pmt orders | positions | pnl | rewards | balance
     pmt market | search | book
     pmt engine status | strategies | orders | trades | alerts | approve | reject
     pmt scan cliff | expiring
@@ -39,7 +40,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import click
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
@@ -76,7 +76,6 @@ def _pnl_color(pnl: float) -> str:
 def _api():
     """Lazy-load PolymarketAPI so commands that don't need auth (search, market,
     book) can run without a configured proxy."""
-    load_dotenv()
     from polymarket import PolymarketAPI
 
     return PolymarketAPI()
@@ -90,6 +89,10 @@ def _api():
 @click.group()
 def cli() -> None:
     """pmtrader unified CLI."""
+    # Repo-root .env discovery so pmt works from any cwd.
+    from polymarket.env import load_project_env
+
+    load_project_env()
 
 
 # ---------- ref / book / amount helpers ----------
@@ -131,7 +134,7 @@ def _resolve_ref(
                    if m_low in (m.get("question") or "").lower()
                    or m_low in (m.get("groupItemTitle") or "").lower()]
         if not matched:
-            avail = "\n  ".join(m.get("groupItemTitle") or m.get("question") or "(unnamed)" for m in markets)
+            avail = "\n  ".join(_market_label(m) or "(unnamed)" for m in markets)
             raise click.UsageError(f"No sub-market matches '{match}'. Available:\n  {avail}")
         markets = matched
 
@@ -141,7 +144,7 @@ def _resolve_ref(
             outs = json.loads(m["outcomes"]) if isinstance(m["outcomes"], str) else (m["outcomes"] or [])
             raw_p = m.get("outcomePrices") or "[]"
             prices = json.loads(raw_p) if isinstance(raw_p, str) else raw_p
-            label = m.get("groupItemTitle") or m.get("question") or "(unnamed)"
+            label = _market_label(m) or "(unnamed)"
             px = "  ".join(f"{o}=${p}" for o, p in zip(outs, prices)) or "(no quotes)"
             lines.append(f"  • {label}   {px}")
         raise click.UsageError("\n".join(lines))
@@ -161,6 +164,20 @@ def _resolve_ref(
     if idx is None:
         raise click.UsageError(f"OUTCOME '{outcome}' not in {outs}")
     return tokens[idx], ev, m, outs[idx]
+
+
+def _market_label(market: dict | None) -> str | None:
+    """Display label for a gamma sub-market record."""
+    return (market.get("groupItemTitle") or market.get("question")) if market else None
+
+
+def _print_market_header(ev, market, side, outcome_name) -> None:
+    """Event:/Market: header shared by the order commands."""
+    if ev:
+        console.print(f"Event:   [bold]{ev.get('title')}[/bold]")
+    label = _market_label(market)
+    if label:
+        console.print(f"Market:  {label}  →  {side.upper()} [bold]{outcome_name}[/bold]")
 
 
 def _sweep_book(
@@ -255,11 +272,7 @@ def _place(side, ref, outcome, *, match, amount, size, price, tick, ttl, dry_run
         order_size = size if size is not None else max(int(math.ceil(target / limit_price)), 1)
 
     # Display block
-    label = (market.get("groupItemTitle") or market.get("question")) if market else None
-    if ev:
-        console.print(f"Event:   [bold]{ev.get('title')}[/bold]")
-    if label:
-        console.print(f"Market:  {label}  →  {side.upper()} [bold]{outcome_name}[/bold]")
+    _print_market_header(ev, market, side, outcome_name)
     if swept and swept[1] > 0:
         _, exp_size, exp_cost = swept
         console.print(
@@ -322,6 +335,97 @@ def sell(ref, outcome, match, amount, size, price, tick, ttl, dry_run):
     """Place a SELL order. Same surface as buy; sweeps the BID side."""
     _place("sell", ref, outcome, match=match, amount=amount, size=size,
            price=price, tick=tick, ttl=ttl, dry_run=dry_run)
+
+
+@cli.command()
+@click.argument("ref")
+@click.argument("outcome", required=False)
+@click.option("--match", default=None, help="Disambiguate sub-markets by keyword.")
+@click.option("--to", "to_price", required=True, type=float, help="Take asks priced <= this; the order is a GTC limit resting here.")
+@click.option("--max-cost", default=None, help="Budget cap in USD (e.g. '$150'); trims the plan from the worst level down.")
+@click.option("--flip", "flip_price", default=None, type=float, help="After the sweep fills, resell the filled size at this price.")
+@click.option("--dry-run", is_flag=True, help="Print the plan, never place.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the sweep result (+ flip) as JSON.")
+def sweep(ref, outcome, match, to_price, max_cost, flip_price, dry_run, as_json):
+    """Buy-side sweep: take displayed asks up to --to with one GTC limit there.
+
+    \b
+    REF      polymarket URL/slug OR numeric token id
+    OUTCOME  yes/no/up/down/... (defaults to yes; ignored for token refs)
+
+    Never places when the plan is under the 5-share exchange minimum.
+    """
+    api = _api()
+    token, ev, market, outcome_name = _resolve_ref(api, ref, outcome or "yes", match)
+    budget = _parse_amount(max_cost) if max_cost else None
+
+    res = api.sweep("buy", token=token, to_price=to_price, max_cost=budget, dry_run=dry_run)
+    plan, placed = res["plan"], res["placed"]
+    filled = float((placed or {}).get("takingAmount") or 0)
+    cost = float((placed or {}).get("makingAmount") or 0)
+
+    # Flip once, pre-branch, so JSON and rich output share one result.
+    flip_res = None
+    if flip_price is not None and placed is not None and filled >= 1:
+        flip_res = api._sell_with_settlement_retry(
+            token=token, price=flip_price, size=int(filled),
+            tick_size=api.get_tick_size(token),
+        )
+        res["flip"] = flip_res
+
+    if as_json:
+        click.echo(json.dumps(res, indent=2, default=str))
+        return
+
+    _print_market_header(ev, market, "buy", outcome_name)
+
+    if not plan["levels"]:
+        console.print(f"[dim]No asks at or under ${to_price} — nothing to sweep.[/dim]")
+        return
+    t = Table(title=f"sweep plan — asks ≤ ${to_price}")
+    for col in ("Price", "Size", "Notional"):
+        t.add_column(col, justify="right")
+    for p, sz in plan["levels"]:
+        t.add_row(f"${p:.4f}", f"{sz:.2f}", f"${p*sz:.2f}")
+    t.add_section()
+    avg = plan["est_cost"] / plan["size"] if plan["size"] else 0.0
+    t.add_row(
+        f"[bold]avg ${avg:.4f}[/bold]",
+        f"[bold]{plan['size']:.2f}[/bold]",
+        f"[bold]${plan['est_cost']:.2f}[/bold]",
+    )
+    console.print(t)
+
+    # The GTC rests at to_price: worst case every share fills there, not at the
+    # snapshot prices — surface the true commitment (and any budget cap).
+    place_size = plan.get("place_size", int(plan["size"]))
+    order_msg = f"Order:   GTC {place_size} @ ${to_price}  commits up to ${place_size*to_price:.2f}"
+    if place_size < int(plan["size"]):
+        order_msg += f"  [dim](budget-capped from {int(plan['size'])} sh)[/dim]"
+    console.print(order_msg)
+
+    if dry_run:
+        console.print("[dim]dry-run[/dim]")
+        return
+    if placed is None:
+        console.print("[yellow]not placed[/yellow] — order under the 5-share exchange minimum")
+        return
+
+    status = placed.get("status", "?")
+    if filled > 0:
+        console.print(
+            f"Fill:    {filled:.0f} sh @ avg ${cost/filled:.4f} = ${cost:.2f}  "
+            f"({status})  [dim]{placed.get('orderID', '')}[/dim]"
+        )
+    else:
+        console.print(f"Fill:    none yet — order resting ({status})  [dim]{placed.get('orderID', '')}[/dim]")
+
+    if flip_price is not None:
+        if flip_res is None:
+            console.print("[yellow]flip skipped[/yellow] — nothing filled to resell")
+            return
+        console.print(f"Flip:    SELL {int(filled)} @ ${flip_price}")
+        console.print(f"         {flip_res.get('status', '?')}  [dim]{flip_res.get('orderID', '')}[/dim]")
 
 
 def _resolve_token(value: str) -> str:
@@ -409,9 +513,15 @@ def _label_for_order(order: dict) -> str:
 
 
 @cli.command()
-def orders() -> None:
+@click.option("--json", "as_json", is_flag=True, help="Emit raw open orders as JSON")
+def orders(as_json: bool = False) -> None:
     """List open resting orders."""
+    from polymarket import locked_buy_cash
+
     rows = _api().get_orders()
+    if as_json:
+        click.echo(json.dumps(rows, indent=2, default=str))
+        return
     if not rows:
         console.print("[dim]No open orders.[/dim]")
         return
@@ -424,8 +534,8 @@ def orders() -> None:
         size = float(d.get("original_size", 0))
         price = float(d.get("price", 0))
         notional = size * price
-        if side == "BUY":
-            locked_cash += notional
+        # Locked counts only the unfilled remainder, matching `pmt balance`.
+        locked_cash += locked_buy_cash(d)
         market = _label_for_order(d)
         table.add_row(
             side,
@@ -441,12 +551,34 @@ def orders() -> None:
 
 
 @cli.command()
+@click.option("--json", "as_json", is_flag=True, help="Emit as JSON")
+def balance(as_json: bool) -> None:
+    """Cash view: spendable USDC + cash locked in resting BUY orders."""
+    b = _api().get_usdc_balance()
+    total = b["available"] + b["locked"]
+    if as_json:
+        click.echo(json.dumps({**b, "total": total}, indent=2))
+        return
+    t = Table(title="USDC balance", show_header=False)
+    t.add_column("key", style="bold")
+    t.add_column("value", justify="right")
+    t.add_row("available", f"${b['available']:,.2f}")
+    t.add_row("locked", f"${b['locked']:,.2f}")
+    t.add_row("total", f"[bold]${total:,.2f}[/bold]")
+    console.print(t)
+
+
+@cli.command()
 @click.option("--orders/--no-orders", "with_orders", default=False, help="Include open orders")
 @click.option("--themes", default=None, help="Comma-separated theme names")
-def positions(with_orders: bool, themes: str | None) -> None:
+@click.option("--json", "as_json", is_flag=True, help="Emit raw positions as JSON")
+def positions(with_orders: bool, themes: str | None, as_json: bool = False) -> None:
     """Portfolio view: positions, exposure, theme correlation."""
     api = _api()
     raw = api.get_positions()
+    if as_json:
+        click.echo(json.dumps(raw, indent=2, default=str))
+        return
     if not raw:
         console.print("[dim]No positions.[/dim]")
         return
@@ -826,31 +958,47 @@ def scan_expiring(min_price, max_hours, interval, once, verbose):
 
 
 @cli.command()
-@click.argument("token")
-def book(token: str) -> None:
-    """Show order book for a token."""
-    token = _resolve_token(token)
+@click.argument("ref")
+@click.argument("outcome", required=False)
+@click.option("--match", default=None, help="Disambiguate sub-markets by keyword.")
+@click.option("--depth", default=10, type=int, help="Levels per side (default 10)")
+@click.option("--json", "as_json", is_flag=True, help="Emit the normalized book as JSON")
+def book(ref, outcome, match, depth, as_json):
+    """Show the order book for REF (URL/slug/token). OUTCOME defaults to yes."""
     api = _api()
-    b = api.get_book(token)
+    token, ev, market, outcome_name = _resolve_ref(api, ref, outcome or "yes", match)
+    b = api.book_levels(token, depth=depth)
+    if as_json:
+        click.echo(json.dumps(b, indent=2, default=str))
+        return
 
-    def _level(x):
-        if hasattr(x, "price"):
-            return float(x.price), float(x.size)
-        return float(x["price"]), float(x["size"])
+    bids, asks = b["bids"], b["asks"]
+    if not bids and not asks:
+        console.print("[dim]Empty book.[/dim]")
+        return
 
-    raw_bids = (b.bids if hasattr(b, "bids") else b.get("bids", [])) or []
-    raw_asks = (b.asks if hasattr(b, "asks") else b.get("asks", [])) or []
-    bids = sorted([_level(x) for x in raw_bids], key=lambda x: x[0], reverse=True)[:8]
-    asks = sorted([_level(x) for x in raw_asks], key=lambda x: x[0])[:8]
-
-    t = Table(title=f"Book for {token[:12]}…")
-    for col in ("Side", "Price", "Size", "Notional"):
+    label = _market_label(market)
+    title = f"{label} — {outcome_name}" if label else f"Book for {token[:12]}…"
+    t = Table(title=title)
+    for col in ("Side", "Price", "Size", "Cum $"):
         t.add_column(col, justify="right" if col != "Side" else "left")
-    for p, sz in reversed(asks):
-        t.add_row("ASK", f"${p:.4f}", f"{sz:.2f}", f"${p*sz:.2f}")
+    # Cum $ accumulates outward from the touch on each side.
+    cum = 0.0
+    ask_rows = []
+    for p, sz in asks:  # best-ask first
+        cum += p * sz
+        ask_rows.append((p, sz, cum))
+    for p, sz, c in reversed(ask_rows):
+        t.add_row("ASK", f"${p:.4f}", f"{sz:.2f}", f"${c:,.2f}")
     t.add_section()
-    for p, sz in bids:
-        t.add_row("BID", f"${p:.4f}", f"{sz:.2f}", f"${p*sz:.2f}")
+    mid = f"${b['mid']:.4f}" if b["mid"] is not None else "—"
+    spr = f"spread ${b['spread']:.4f}" if b["spread"] is not None else ""
+    t.add_row("[bold]MID[/bold]", f"[bold]{mid}[/bold]", "", f"[dim]{spr}[/dim]")
+    t.add_section()
+    cum = 0.0
+    for p, sz in bids:  # best-bid first
+        cum += p * sz
+        t.add_row("BID", f"${p:.4f}", f"{sz:.2f}", f"${cum:,.2f}")
     console.print(t)
 
 

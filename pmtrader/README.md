@@ -35,6 +35,10 @@ pmt buy URL no --amount $50 --ttl 30m
 # Two-leg buy-then-sell (token-only, for niche maker-taker plays)
 pmt flip --token 14658... --buy-price 0.09 --sell-price 0.10 --size 850
 
+# Buy-side sweep: take every displayed ask ≤ --to with one GTC limit resting there
+pmt sweep URL yes --to 0.95 --max-cost $150 --dry-run
+pmt sweep 14658... --to 0.95 --flip 0.99     # on fill, resell the filled size at 0.99
+
 pmt cancel 0xeb78787c2c55...
 ```
 
@@ -43,6 +47,7 @@ Every order command supports `--dry-run`.
 ### Reads
 
 ```bash
+pmt balance                          # spendable USDC + cash locked in resting BUYs
 pmt orders                           # open resting orders w/ market labels
 pmt positions --orders               # current positions + theme exposure + open orders
 pmt positions --themes btc,eth       # filter themes
@@ -50,10 +55,12 @@ pmt pnl                              # realized 1d/7d/30d/all + unrealized (acti
 pmt rewards --days 7                 # REWARD + YIELD income (last N days)
 ```
 
+`balance`, `orders`, and `positions` take `--json` for raw output.
+
 ### Discovery
 
 ```bash
-pmt book   <token-id>                # depth chart
+pmt book   REF [OUTCOME]             # depth chart w/ mid + spread (URL/slug/token; --depth N, --json)
 pmt market <slug-or-condition-id>    # event metadata
 pmt search pandemic                  # free-text active-market search
 ```

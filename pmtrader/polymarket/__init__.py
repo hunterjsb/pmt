@@ -8,7 +8,7 @@
 """
 
 from . import hosts
-from .api import FlipResult, PolymarketAPI, lookup_market_name
+from .api import FlipResult, PolymarketAPI, locked_buy_cash, lookup_market_name
 from .clob import get_order_book_depth, sampling_markets
 from .gamma import Gamma
 from .models import Market, OrderBook, OrderBookLevel, Token
@@ -23,6 +23,7 @@ __all__ = [
     "Token",
     "get_order_book_depth",
     "hosts",
+    "locked_buy_cash",
     "lookup_market_name",
     "sampling_markets",
 ]

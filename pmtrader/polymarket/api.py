@@ -52,6 +52,17 @@ def lookup_market_name(condition_id: str) -> str | None:
         return None
 
 
+def locked_buy_cash(order: dict) -> float:
+    """Cash a resting BUY still commits: unfilled remainder x price.
+
+    Shared by `pmt balance` and `pmt orders` so their Locked figures agree.
+    """
+    if str(order.get("side", "")).upper() != "BUY":
+        return 0.0
+    remaining = float(order.get("original_size") or 0) - float(order.get("size_matched") or 0)
+    return remaining * float(order.get("price") or 0)
+
+
 @dataclass
 class FlipResult:
     buy_id: str
@@ -71,7 +82,9 @@ class PolymarketAPI:
 
     def __init__(self) -> None:
         from .clob_v2 import create_authenticated_clob_v2
+        from .env import load_project_env
 
+        load_project_env()
         self.client = create_authenticated_clob_v2()
 
     # --- order placement ---
@@ -118,8 +131,6 @@ class PolymarketAPI:
         The sell side retries on the "not enough balance / allowance" error
         Polymarket returns when the buy hasn't settled on-chain yet.
         """
-        from py_clob_client_v2.exceptions import PolyApiException
-
         ts = tick_size or self.get_tick_size(token)
 
         buy_resp = self.place_buy(token=token, price=buy_price, size=size, tick_size=ts)
@@ -128,21 +139,13 @@ class PolymarketAPI:
             raise RuntimeError(f"buy did not fill: {buy_resp}")
         cost = float(buy_resp.get("makingAmount") or 0)
 
-        sell_resp: dict | None = None
-        for attempt in range(max_settlement_attempts):
-            try:
-                sell_resp = self.place_sell(
-                    token=token, price=sell_price, size=filled, tick_size=ts
-                )
-                break
-            except PolyApiException as e:
-                msg = str(e).lower()
-                if attempt + 1 < max_settlement_attempts and (
-                    "balance" in msg or "allowance" in msg
-                ):
-                    time.sleep(0.5 * (2 ** attempt))
-                    continue
-                raise
+        sell_resp = self._sell_with_settlement_retry(
+            token=token,
+            price=sell_price,
+            size=filled,
+            tick_size=ts,
+            max_attempts=max_settlement_attempts,
+        )
 
         return FlipResult(
             buy_id=buy_resp.get("orderID", ""),
@@ -152,6 +155,87 @@ class PolymarketAPI:
             sell_price=sell_price,
             sell_status=(sell_resp or {}).get("status", ""),
         )
+
+    def _sell_with_settlement_retry(
+        self,
+        *,
+        token: str,
+        price: float,
+        size: int,
+        tick_size: str | None,
+        max_attempts: int = 6,
+    ) -> dict:
+        """Sell with backoff on the balance/allowance error an unsettled buy causes."""
+        from py_clob_client_v2.exceptions import PolyApiException
+
+        for attempt in range(max_attempts):
+            try:
+                return self.place_sell(token=token, price=price, size=size, tick_size=tick_size)
+            except PolyApiException as e:
+                msg = str(e).lower()
+                if attempt + 1 < max_attempts and ("balance" in msg or "allowance" in msg):
+                    time.sleep(0.5 * (2 ** attempt))
+                    continue
+                raise
+        raise RuntimeError("unreachable")  # loop always returns or raises
+
+    def sweep(
+        self,
+        side: str,
+        *,
+        token: str,
+        to_price: float,
+        max_cost: float | None = None,
+        tick_size: str | None = None,
+        dry_run: bool = False,
+    ) -> dict:
+        """Take displayed liquidity through to_price with one GTC limit at to_price.
+
+        buy consumes asks priced <= to_price; sell consumes bids priced >= to_price.
+        Returns {"plan": {"levels", "size", "est_cost", "place_size"}, "placed": resp | None};
+        never places when dry_run or place_size < 5 shares (exchange minimum).
+        max_cost caps both the snapshot plan and the committed notional of the
+        placed order (place_size * to_price) — displayed levels can vanish
+        before the match, leaving every share to fill at to_price.
+        """
+        s = side.lower()
+        if s not in ("buy", "sell"):
+            raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
+
+        book = self.book_levels(token)
+        if s == "buy":
+            band = [(p, sz) for p, sz in book["asks"] if p <= to_price]
+        else:
+            band = [(p, sz) for p, sz in book["bids"] if p >= to_price]
+
+        if max_cost is not None:
+            # Trim from the worst level down: partial-take the level that breaches budget.
+            trimmed: list[tuple[float, float]] = []
+            cost = 0.0
+            for p, sz in band:
+                level_cost = p * sz
+                if cost + level_cost <= max_cost:
+                    trimmed.append((p, sz))
+                    cost += level_cost
+                else:
+                    part = (max_cost - cost) / p
+                    if part > 0:
+                        trimmed.append((p, part))
+                    break
+            band = trimmed
+
+        size = sum(sz for _, sz in band)
+        est_cost = sum(p * sz for p, sz in band)
+        place_size = int(size)
+        if max_cost is not None:
+            place_size = min(place_size, int(max_cost / to_price))
+        plan = {"levels": band, "size": size, "est_cost": est_cost, "place_size": place_size}
+
+        placed = None
+        if not dry_run and place_size >= 5:
+            ts = tick_size or self.get_tick_size(token)
+            placed = self.place(s, token=token, price=to_price, size=place_size, tick_size=ts)
+        return {"plan": plan, "placed": placed}
 
     def cancel(self, order_id: str) -> dict:
         return self.client.cancel_orders([order_id])
@@ -168,6 +252,38 @@ class PolymarketAPI:
 
     def get_book(self, token: str) -> dict:
         return self.client.get_order_book(token)
+
+    def book_levels(self, token: str, depth: int | None = None) -> dict:
+        """Normalized float book: bids desc, asks asc, plus mid/spread from top of book."""
+        b = self.get_book(token)
+
+        def _lv(x) -> tuple[float, float]:
+            if hasattr(x, "price"):
+                return float(x.price), float(x.size)
+            return float(x["price"]), float(x["size"])
+
+        raw_bids = (b.bids if hasattr(b, "bids") else b.get("bids", [])) or []
+        raw_asks = (b.asks if hasattr(b, "asks") else b.get("asks", [])) or []
+        bids = sorted((_lv(x) for x in raw_bids), key=lambda x: x[0], reverse=True)
+        asks = sorted((_lv(x) for x in raw_asks), key=lambda x: x[0])
+        mid = spread = None
+        if bids and asks:
+            mid = (bids[0][0] + asks[0][0]) / 2
+            spread = asks[0][0] - bids[0][0]
+        if depth is not None:
+            bids, asks = bids[:depth], asks[:depth]
+        return {"bids": bids, "asks": asks, "mid": mid, "spread": spread}
+
+    def get_usdc_balance(self) -> dict:
+        """Cash view: spendable USDC plus cash committed to resting BUY orders."""
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
+        resp = self.client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        available = float((resp or {}).get("balance") or 0) / 1e6
+        locked = sum(locked_buy_cash(o) for o in self.get_orders())
+        return {"available": available, "locked": locked}
 
     # --- public reads (no auth) ---
 

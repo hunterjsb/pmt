@@ -77,7 +77,10 @@ pmt --help                                                  # list subcommands
 pmt buy  https://polymarket.com/event/btc-updown-4h-1779825600 down --amount $910
 pmt sell URL no --amount $50 --match Trump                  # URL ref + outcome
 pmt buy  14658893069672317885... --price 0.92 --size 217    # token ref + explicit limit
+pmt sweep URL yes --to 0.95 --max-cost $150 --dry-run       # take all asks ≤ 0.95, one GTC limit
 
+pmt balance                                                 # spendable USDC + locked in resting BUYs
+pmt book URL yes                                            # depth chart w/ mid + spread
 pmt positions --orders                                      # portfolio + open orders + exposure
 pmt pnl                                                     # realized 1d/7d/30d/all + unrealized
 pmt rewards --days 7                                        # REWARD + YIELD income

@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run pmt book:*)",
+      "Bash(uv run pmt balance:*)",
+      "Bash(uv run pmt positions:*)",
+      "Bash(uv run pmt orders:*)",
+      "Bash(uv run pmt pnl:*)",
+      "Bash(uv run pmt rewards:*)",
+      "Bash(uv run pmt search:*)",
+      "Bash(uv run pmt scan:*)",
+      "Bash(cd /var/home/hunter/Desktop/code/pmt/pmtrader && uv run pmt book:*)",
+      "Bash(cd /var/home/hunter/Desktop/code/pmt/pmtrader && uv run pmt balance:*)",
+      "Bash(cd /var/home/hunter/Desktop/code/pmt/pmtrader && uv run pmt positions:*)",
+      "Bash(cd /var/home/hunter/Desktop/code/pmt/pmtrader && uv run pmt orders:*)",
+      "Bash(cd /var/home/hunter/Desktop/code/pmt/pmtrader && uv run pmt pnl:*)",
+      "Bash(cd /var/home/hunter/Desktop/code/pmt/pmtrader && uv run pmt rewards:*)",
+      "Bash(cd /var/home/hunter/Desktop/code/pmt/pmtrader && uv run pmt search:*)",
+      "Bash(cd /var/home/hunter/Desktop/code/pmt/pmtrader && uv run pmt scan:*)",
+      "Bash(uv run pytest:*)",
+      "Bash(uv sync:*)",
+      "Bash(cd /var/home/hunter/Desktop/code/pmt/pmtrader && uv run pytest:*)",
+      "Bash(cd /var/home/hunter/Desktop/code/pmt/pmtrader && uv sync:*)",
+      "Bash(cd /var/home/hunter/Desktop/code/pmt/pmtrader)"
+    ]
+  }
+}
