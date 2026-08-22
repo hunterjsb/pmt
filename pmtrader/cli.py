@@ -1543,6 +1543,61 @@ def crypto_updown(ref: str, as_json: bool) -> None:
     console.print(f"[bold]{r['verdict']}[/bold]")
 
 
+@crypto_group.command("arm")
+@click.argument("ref")
+@click.option("--size", type=float, required=True, help="Max notional (USDC) the trigger may spend")
+@click.option("--min-edge", type=float, default=0.03, show_default=True, help="Min net-of-fee edge to fire")
+@click.option("--max-price", type=float, default=0.97, show_default=True, help="Never pay above this")
+@click.option("--side", type=click.Choice(["up", "down"]), default=None, help="Restrict to one side")
+@click.option("--quiesce", type=float, default=20.0, show_default=True, help="No orders in the final N seconds")
+def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
+               side: str | None, quiesce: float) -> None:
+    """Arm the pmengine updown trigger on a market.
+
+    Prices the market (semantics, vol, fee) and hands the parameters to the
+    running engine's `updown` strategy, which watches Binance + the book and
+    takes the ask only while every gate holds. Engine must be running with
+    the strategy loaded: `pmengine run updown`.
+    """
+    from polymarket.crypto import eval_updown
+
+    try:
+        r = eval_updown(ref)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+    if r["rem_s"] <= 0:
+        raise click.UsageError("window already over")
+    payload = {
+        "action": "arm", "slug": r["slug"], "kind": r["kind"], "symbol": r["symbol"],
+        "token_up": r["tokens"]["up"], "token_down": r["tokens"]["down"],
+        "start": r["start"], "end": r["end"],
+        "sigma_bp_per_min": r["sigma_bp_per_min"], "fee_rate": r["fee_rate"],
+        "size_usdc": size, "min_edge": min_edge, "max_price": max_price,
+        "quiesce_secs": quiesce,
+    }
+    if side:
+        payload["side_filter"] = side
+    reply = _engine_post("/strategies/updown/command", payload)
+    console.print(f"[green]armed[/green] {reply.get('armed')}  "
+                  f"[dim]{r['kind']} · {r['rem_s']:.0f}s left · size ${size:.0f} · "
+                  f"min edge {min_edge * 100:.0f}¢ · σ {r['sigma_bp_per_min']:.2f}bp/min[/dim]")
+    console.print(f"[dim]market now: {r['verdict']}[/dim]")
+
+
+@crypto_group.command("disarm")
+def crypto_disarm() -> None:
+    """Disarm the updown trigger (does not cancel already-placed orders)."""
+    reply = _engine_post("/strategies/updown/command", {"action": "disarm"})
+    console.print(f"disarmed: {reply.get('disarmed') or '(was idle)'}")
+
+
+@crypto_group.command("trigger")
+def crypto_trigger() -> None:
+    """Live state of the updown trigger: gates, model, edges."""
+    reply = _engine_post("/strategies/updown/command", {"action": "status"})
+    console.print_json(json.dumps(reply))
+
+
 @cli.group("sports")
 def sports_group() -> None:
     """Live sports data: scores, game state, ESPN win probability."""

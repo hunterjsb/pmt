@@ -247,6 +247,15 @@ pub trait Strategy: Send + Sync {
 
     /// Called on shutdown for cleanup.
     fn on_shutdown(&mut self) {}
+
+    /// Control-plane entry point: `POST /strategies/:id/command` routes its
+    /// JSON body here. Lets an operator (or the pmt CLI) feed parameters
+    /// into a running strategy — e.g. arming the updown trigger on a
+    /// specific market — without restarting the engine. Strategies opt in
+    /// by overriding; the default rejects everything.
+    fn on_command(&mut self, _cmd: &serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("strategy accepts no commands".to_string())
+    }
 }
 
 /// Owned summary of a registered strategy.
@@ -312,6 +321,16 @@ impl StrategyRuntime {
 
     pub fn is_paused(&self, id: &str) -> bool {
         self.paused.contains(id)
+    }
+
+    /// Route a control-plane command to a strategy by id.
+    pub fn command(&mut self, id: &str, cmd: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let strategy = self
+            .strategies
+            .iter_mut()
+            .find(|s| s.id() == id)
+            .ok_or_else(|| format!("no strategy '{}'", id))?;
+        strategy.on_command(cmd)
     }
 
     /// Register a strategy.

@@ -9,6 +9,7 @@ mod momentum_fade;
 mod order_test;
 mod spread_watcher;
 mod sure_bets;
+mod updown;
 
 use std::collections::HashMap;
 use crate::strategy::Strategy;
@@ -21,6 +22,7 @@ pub use momentum_fade::MomentumFade;
 pub use order_test::OrderTest;
 pub use spread_watcher::SpreadWatcher;
 pub use sure_bets::SureBets;
+pub use updown::Updown;
 
 /// Information about a strategy in the registry.
 pub struct StrategyInfo {
@@ -75,6 +77,11 @@ pub fn registry() -> HashMap<&'static str, StrategyInfo> {
     m.insert("sure_bets", StrategyInfo {
         factory: || Box::new(sure_bets::SureBets::new()),
         requires_market_discovery: true,
+    });
+
+    m.insert("updown", StrategyInfo {
+        factory: || Box::new(updown::Updown::new()),
+        requires_market_discovery: false,
     });
 
     m

@@ -1898,6 +1898,13 @@ impl Engine {
                                     None => { let _ = reply.send(Err(format!("no strategy '{}'", id))); }
                                 }
                             }
+                            EngineCommand::StrategyCommand { id, body, reply } => {
+                                let res = self.strategy_runtime.command(&id, &body);
+                                if let Ok(ref v) = res {
+                                    tracing::info!(strategy_id = %id, reply = %v, "Strategy command handled");
+                                }
+                                let _ = reply.send(res);
+                            }
                         }
                     }
 

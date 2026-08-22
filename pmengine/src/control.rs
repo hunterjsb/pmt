@@ -133,6 +133,14 @@ pub enum EngineCommand {
         id: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Route a JSON command to a strategy's `on_command` — the channel for
+    /// feeding parameters into a running strategy (e.g. arming the updown
+    /// trigger on a market the operator just priced).
+    StrategyCommand {
+        id: String,
+        body: serde_json::Value,
+        reply: oneshot::Sender<Result<serde_json::Value, String>>,
+    },
 }
 
 /// An order placed outside the engine that the engine has been told to
@@ -264,6 +272,10 @@ pub async fn spawn(
             .route(
                 "/strategies/:id/stop",
                 axum::routing::post(stop_strategy_handler),
+            )
+            .route(
+                "/strategies/:id/command",
+                axum::routing::post(strategy_command_handler),
             )
             .route("/orders", get(orders_handler))
             .route("/alerts", get(alerts_handler))
@@ -436,6 +448,23 @@ async fn stop_strategy_handler(
     match rx.await {
         Ok(Ok(())) => Ok(Json(serde_json::json!({"stopped": true}))),
         Ok(Err(e)) => Err((StatusCode::NOT_FOUND, e)),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string())),
+    }
+}
+
+async fn strategy_command_handler(
+    State(cmd_tx): State<mpsc::Sender<EngineCommand>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(EngineCommand::StrategyCommand { id, body, reply: tx })
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "engine offline".to_string()))?;
+    match rx.await {
+        Ok(Ok(v)) => Ok(Json(v)),
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e)),
         Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string())),
     }
 }
