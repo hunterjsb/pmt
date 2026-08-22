@@ -13,10 +13,21 @@
 # certificate authority, which is not in our threat model for outbound
 # calls to known endpoints.
 
+# RUSTSEC-2026-0258 (h2 empty-DATA-frame flood): the fixed 0.4 line is
+# lockfile-bumped past it; the remaining h2 0.3.27 is pinned by the same
+# aws-smithy chain above and only speaks to AWS endpoints, which are not
+# going to flood their own client. Clears with the aws-config refresh too.
+#
+# RUSTSEC-2026-0235 (rkyv OOB read): rkyv appears in Cargo.lock only as a
+# non-enabled optional feature of rust_decimal — it is never compiled into
+# pmengine, so the vulnerable code doesn't exist in the binary.
+
 [advisories]
 ignore = [
     "RUSTSEC-2026-0049",  # rustls-webpki: CRLs not authoritative by DP matching
     "RUSTSEC-2026-0098",  # rustls-webpki: URI names in name constraints
     "RUSTSEC-2026-0099",  # rustls-webpki: wildcard names in name constraints
     "RUSTSEC-2026-0104",  # rustls-webpki: panic in CRL parsing
+    "RUSTSEC-2026-0258",  # h2 0.3 via aws-smithy (0.4 line bumped to fixed)
+    "RUSTSEC-2026-0235",  # rkyv: unbuilt optional feature of rust_decimal
 ]
