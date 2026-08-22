@@ -29,6 +29,7 @@ Other commands:
     pmt engine status | strategies | orders | trades | alerts | approve | reject
     pmt scan REF | cliff | expiring
     pmt fit REF
+    pmt sports board LEAGUE | game LEAGUE REF
 """
 
 from __future__ import annotations
@@ -1473,6 +1474,64 @@ def engine_reject(alert_id: str) -> None:
     """Reject a pending alert; the engine drops it without executing."""
     _engine_post(f"/alerts/{alert_id}/reject")
     console.print(f"[yellow]rejected[/yellow] alert {alert_id}")
+
+
+# ============================================================
+# Sports data (ESPN reference for pricing sports markets)
+# ============================================================
+
+
+@cli.group("sports")
+def sports_group() -> None:
+    """Live sports data: scores, game state, ESPN win probability."""
+
+
+@sports_group.command("board")
+@click.argument("league")
+@click.option("--date", default=None, help="YYYYMMDD (default today)")
+def sports_board(league: str, date: str | None) -> None:
+    """Scoreboard for a league (mlb, nfl, nba, nhl, wnba, ncaaf, ncaab, mls, epl)."""
+    from sportsdata import espn
+
+    try:
+        games = espn.scoreboard(league, date)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+    t = Table(title=f"{league.upper()} scoreboard")
+    for col in ("Event", "Matchup", "Score", "State"):
+        t.add_column(col)
+    for g in games:
+        score = " - ".join(f"{tm['abbrev']} {tm['score'] or ''}".strip() for tm in g["teams"])
+        t.add_row(g["event_id"], g["short_name"], score, g["detail"] or g["state"] or "")
+    console.print(t)
+
+
+@sports_group.command("game")
+@click.argument("league")
+@click.argument("ref")
+def sports_game_cmd(league: str, ref: str) -> None:
+    """Game state + ESPN win prob. REF is an event id or team-name substring."""
+    from sportsdata import espn
+
+    try:
+        if not ref.isdigit():
+            matches = espn.find_games(league, ref)
+            if not matches:
+                raise click.UsageError(f"No {league} game matches '{ref}' today")
+            ref = matches[0]["event_id"]
+        g = espn.game_state(league, ref)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+    home, away = g["teams"].get("home", {}), g["teams"].get("away", {})
+    console.print(f"[bold]{away.get('name')} @ {home.get('name')}[/bold]  ({g['detail']})")
+    console.print(f"  score: {away.get('abbrev')} {away.get('score')} - {home.get('abbrev')} {home.get('score')}")
+    if g["home_win_prob"] is not None:
+        console.print(f"  ESPN win prob: {home.get('abbrev')} {g['home_win_prob']:.1%} / {away.get('abbrev')} {g['away_win_prob']:.1%}")
+    if g["situation"]:
+        console.print(f"  situation: {g['situation']}")
+    for o in g["odds"]:
+        console.print(f"  [dim]{o['book']}: spread {o['spread']} O/U {o['over_under']} ML {o['away_ml']}/{o['home_ml']}[/dim]")
+
 
 
 if __name__ == "__main__":
