@@ -1645,8 +1645,11 @@ def crypto_updown(ref: str, as_json: bool) -> None:
               help="Only buy a side the model prices at least this high (the safety gate)")
 @click.option("--min-elapsed", type=float, default=0.5, show_default=True,
               help="No fires before this fraction of the window has elapsed")
+@click.option("--roll/--no-roll", default=True, show_default=True,
+              help="Auto-rearm the next window in the series at close (same budget)")
 def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
-               side: str | None, quiesce: float, min_fair: float, min_elapsed: float) -> None:
+               side: str | None, quiesce: float, min_fair: float, min_elapsed: float,
+               roll: bool) -> None:
     """Arm the pmengine updown trigger on a market.
 
     Prices the market (semantics, vol, fee) and hands the parameters to the
@@ -1669,13 +1672,16 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         "sigma_bp_per_min": r["sigma_bp_per_min"], "fee_rate": r["fee_rate"],
         "size_usdc": size, "min_edge": min_edge, "max_price": max_price,
         "quiesce_secs": quiesce, "min_fair": min_fair, "min_elapsed_frac": min_elapsed,
+        "roll": roll,
     }
     if side:
         payload["side_filter"] = side
     reply = _engine_post("/strategies/updown/command", payload)
+    rolling = " · rolling" if roll else ""
     console.print(f"[green]armed[/green] {reply.get('armed')}  "
                   f"[dim]{r['kind']} · {r['rem_s']:.0f}s left · size ${size:.0f} · "
-                  f"min edge {min_edge * 100:.0f}¢ · σ {r['sigma_bp_per_min']:.2f}bp/min[/dim]")
+                  f"min edge {min_edge * 100:.0f}¢ · σ {r['sigma_bp_per_min']:.2f}bp/min"
+                  f"{rolling}[/dim]")
     console.print(f"[dim]market now: {r['verdict']}[/dim]")
 
 
@@ -1750,6 +1756,8 @@ def _tape_render(line: str) -> str | None:
         return click.style(body, dim=True) + banked
     if ev == "gated":
         return click.style(f"{head} gated  {r.get('reason', '?')}", fg="yellow", dim=True)
+    if ev == "roll":
+        return click.style(f"{head} ROLL  next window armed (${r['size']:g})", fg="cyan")
     if ev == "cleanup":
         return click.style(f"{head} ── window closed ──", dim=True)
     return line.rstrip()

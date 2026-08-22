@@ -110,6 +110,11 @@ struct ArmParams {
     /// the TWAP is beyond anyone's reach and late buys are safe.
     #[serde(default = "d_manip_push")]
     pub manip_push_bp: f64,
+    /// Re-arm the next window in this recurring series at window close —
+    /// same gates and budget, fresh spend. The fleet keeps hunting with
+    /// nobody at the keyboard; `disarm` breaks the chain.
+    #[serde(default)]
+    pub roll: bool,
 }
 
 // Two-mode tuning. Early: small clips, only on outsized mispricing, capped
@@ -190,6 +195,75 @@ pub struct Updown {
     /// Tokens whose resting orders still need pulling after a disarm —
     /// on_command can't emit signals, so the next tick does it.
     pending_cleanup: Vec<String>,
+    /// Successor windows waiting on gamma for their token ids. Retried
+    /// on a slow clock; a task whose window expires hops to the next one,
+    /// so the chain survives gamma outages.
+    rolls: Vec<RollTask>,
+}
+
+struct RollTask {
+    params: ArmParams,
+    next_slug: String,
+    next_start: f64,
+    next_end: f64,
+    next_try_at: f64,
+}
+
+/// btc-updown-5m-1787442000 + its bounds -> the following window.
+/// Recurring series are contiguous: next start = this end.
+fn next_window(slug: &str, start: f64, end: f64) -> Option<(String, f64, f64)> {
+    let dur = end - start;
+    if dur <= 0.0 {
+        return None;
+    }
+    let (prefix, tail) = slug.rsplit_once('-')?;
+    if tail.parse::<i64>().ok()? != start as i64 {
+        return None;
+    }
+    Some((format!("{}-{}", prefix, end as i64), end, end + dur))
+}
+
+/// Gamma encodes outcomes and clobTokenIds as JSON-in-a-string; map the
+/// Up/Down labels to their token ids by index.
+fn parse_gamma_tokens(body: &serde_json::Value) -> Result<(String, String), String> {
+    let m = body.get(0).ok_or("market not listed yet")?;
+    let outcomes: Vec<String> =
+        serde_json::from_str(m.get("outcomes").and_then(|v| v.as_str()).ok_or("no outcomes")?)
+            .map_err(|e| format!("outcomes: {}", e))?;
+    let tokens: Vec<String> = serde_json::from_str(
+        m.get("clobTokenIds").and_then(|v| v.as_str()).ok_or("no clobTokenIds")?,
+    )
+    .map_err(|e| format!("clobTokenIds: {}", e))?;
+    let mut up = None;
+    let mut down = None;
+    for (o, t) in outcomes.iter().zip(tokens.iter()) {
+        match o.to_lowercase().as_str() {
+            "up" => up = Some(t.clone()),
+            "down" => down = Some(t.clone()),
+            _ => {}
+        }
+    }
+    match (up, down) {
+        (Some(u), Some(d)) => Ok((u, d)),
+        _ => Err("outcomes are not Up/Down".to_string()),
+    }
+}
+
+fn fetch_gamma_tokens(slug: &str) -> Result<(String, String), String> {
+    // Short timeout: this runs on the tick thread. One quick call per
+    // window close; failures retry on RollTask's slow clock.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(1200))
+        .build()
+        .map_err(|e| format!("client: {}", e))?;
+    let body: serde_json::Value = client
+        .get("https://gamma-api.polymarket.com/markets")
+        .query(&[("slug", slug)])
+        .send()
+        .map_err(|e| format!("gamma: {}", e))?
+        .json()
+        .map_err(|e| format!("gamma json: {}", e))?;
+    parse_gamma_tokens(&body)
 }
 
 /// Append one JSONL record to the durable tape at ~/.pmt/engine/. The tape
@@ -716,7 +790,62 @@ impl Updown {
             id: "updown".to_string(),
             arms: std::collections::BTreeMap::new(),
             pending_cleanup: Vec::new(),
+            rolls: Vec::new(),
         }
+    }
+
+    /// Arm any due successor windows. Gamma hiccups retry every 10s; a
+    /// task whose target window has already ended hops forward instead
+    /// of dying, so an unattended fleet self-heals.
+    fn process_rolls(&mut self, now: f64) {
+        if self.rolls.is_empty() {
+            return;
+        }
+        let mut keep = Vec::new();
+        for mut task in std::mem::take(&mut self.rolls) {
+            if now < task.next_try_at {
+                keep.push(task);
+                continue;
+            }
+            if now >= task.next_end {
+                if let Some((ns, s, e)) =
+                    next_window(&task.next_slug, task.next_start, task.next_end)
+                {
+                    task.next_slug = ns;
+                    task.next_start = s;
+                    task.next_end = e;
+                    keep.push(task);
+                }
+                continue;
+            }
+            match fetch_gamma_tokens(&task.next_slug) {
+                Ok((up, down)) => {
+                    let mut p = task.params;
+                    p.slug = task.next_slug;
+                    p.start = task.next_start;
+                    p.end = task.next_end;
+                    p.token_up = up;
+                    p.token_down = down;
+                    tracing::info!(slug = %p.slug, size = p.size_usdc, "updown roll — next window armed");
+                    tape(serde_json::json!({
+                        "t": now, "ev": "roll", "slug": p.slug, "size": p.size_usdc,
+                    }));
+                    if let Some(mut old) = self.arms.remove(&p.slug) {
+                        old.stop_feed();
+                    }
+                    let slug = p.slug.clone();
+                    let mut arm = ArmState::with_params(p);
+                    arm.start_feeds();
+                    self.arms.insert(slug, arm);
+                }
+                Err(e) => {
+                    tracing::warn!(slug = %task.next_slug, err = %e, "updown roll retry");
+                    task.next_try_at = now + 10.0;
+                    keep.push(task);
+                }
+            }
+        }
+        self.rolls = keep;
     }
 }
 
@@ -760,8 +889,21 @@ impl Strategy for Updown {
         for slug in finished {
             if let Some(mut arm) = self.arms.remove(&slug) {
                 arm.stop_feed();
+                if arm.p.roll {
+                    if let Some((ns, s, e)) = next_window(&arm.p.slug, arm.p.start, arm.p.end) {
+                        tracing::info!(from = %slug, to = %ns, "updown roll scheduled");
+                        self.rolls.push(RollTask {
+                            params: arm.p.clone(),
+                            next_slug: ns,
+                            next_start: s,
+                            next_end: e,
+                            next_try_at: now,
+                        });
+                    }
+                }
             }
         }
+        self.process_rolls(now);
 
         if signals.is_empty() {
             vec![Signal::Hold]
@@ -822,8 +964,14 @@ impl Strategy for Updown {
                     Some(s) => self.arms.keys().filter(|k| *k == s).cloned().collect(),
                     None => self.arms.keys().cloned().collect(),
                 };
-                if slugs.is_empty() {
-                    return Ok(serde_json::json!({"disarmed": [], "arms": self.arms.len()}));
+                // Break roll chains too — a disarm means STOP, including the
+                // successor a closed window queued up.
+                let rolls_before = self.rolls.len();
+                match &target {
+                    Some(s) => self
+                        .rolls
+                        .retain(|t| t.next_slug != *s && t.params.slug != *s),
+                    None => self.rolls.clear(),
                 }
                 for slug in &slugs {
                     if let Some(mut arm) = self.arms.remove(slug) {
@@ -832,7 +980,9 @@ impl Strategy for Updown {
                     }
                 }
                 Ok(serde_json::json!({
-                    "disarmed": slugs, "arms": self.arms.len(), "cleanup": "next tick",
+                    "disarmed": slugs, "arms": self.arms.len(),
+                    "rolls_cancelled": rolls_before - self.rolls.len(),
+                    "cleanup": "next tick",
                 }))
             }
             Some("status") => {
@@ -842,11 +992,16 @@ impl Strategy for Updown {
                     .map(|(slug, a)| {
                         (slug.clone(), serde_json::json!({
                             "filled_usdc": a.filled_usdc,
+                            "roll": a.p.roll,
                             "eval": a.last_eval,
                         }))
                     })
                     .collect();
-                Ok(serde_json::json!({"arms": arms, "count": self.arms.len()}))
+                let rolls: Vec<&str> =
+                    self.rolls.iter().map(|t| t.next_slug.as_str()).collect();
+                Ok(serde_json::json!({
+                    "arms": arms, "count": self.arms.len(), "pending_rolls": rolls,
+                }))
             }
             _ => Err("unknown action (arm | disarm | status)".to_string()),
         }
@@ -1175,5 +1330,49 @@ mod tests {
 
         let d2 = s.on_command(&serde_json::json!({"action": "disarm"})).unwrap();
         assert_eq!(d2["arms"], 0);
+    }
+
+    #[test]
+    fn next_window_rolls_the_series() {
+        let (slug, s, e) =
+            next_window("btc-updown-5m-1787442000", 1787442000.0, 1787442300.0).unwrap();
+        assert_eq!(slug, "btc-updown-5m-1787442300");
+        assert_eq!(s, 1787442300.0);
+        assert_eq!(e, 1787442600.0);
+        // Slug tail must match start — anything else is not a rolling series.
+        assert!(next_window("some-market", 0.0, 300.0).is_none());
+        assert!(next_window("btc-updown-5m-999", 1787442000.0, 1787442300.0).is_none());
+    }
+
+    #[test]
+    fn gamma_tokens_parse_by_outcome_label() {
+        let body = serde_json::json!([{
+            "slug": "btc-updown-5m-1787443200",
+            "outcomes": "[\"Up\", \"Down\"]",
+            "clobTokenIds": "[\"111\", \"222\"]",
+        }]);
+        assert_eq!(parse_gamma_tokens(&body).unwrap(), ("111".into(), "222".into()));
+        // Reversed order must still land on the right sides.
+        let rev = serde_json::json!([{
+            "outcomes": "[\"Down\", \"Up\"]",
+            "clobTokenIds": "[\"111\", \"222\"]",
+        }]);
+        assert_eq!(parse_gamma_tokens(&rev).unwrap(), ("222".into(), "111".into()));
+        assert!(parse_gamma_tokens(&serde_json::json!([])).is_err());
+    }
+
+    #[test]
+    fn disarm_breaks_roll_chain() {
+        let mut s = Updown::new();
+        s.rolls.push(RollTask {
+            params: params("btc-updown-5m-1787442000"),
+            next_slug: "btc-updown-5m-1787442300".into(),
+            next_start: 1787442300.0,
+            next_end: 1787442600.0,
+            next_try_at: 0.0,
+        });
+        let d = s.on_command(&serde_json::json!({"action": "disarm"})).unwrap();
+        assert_eq!(d["rolls_cancelled"], 1);
+        assert!(s.rolls.is_empty());
     }
 }
