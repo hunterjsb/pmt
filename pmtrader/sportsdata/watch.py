@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import threading
 import time
 from collections import deque
@@ -228,10 +229,41 @@ def sparkline(series, width: int = 56, window: float = 900.0) -> str:
 # ============================================================
 
 
+def fetch_positions(resolved: dict) -> list[dict]:
+    """Live holdings on the two moneyline tokens, straight from the data API —
+    no --pos flag needed. Empty when PM_FUNDER_ADDRESS isn't configured."""
+    from polymarket.env import load_project_env
+
+    load_project_env()
+    addr = os.environ.get("PM_FUNDER_ADDRESS")
+    if not addr:
+        return []
+    r = requests.get(
+        f"{hosts.DATA}/positions",
+        params={"user": addr, "limit": 200},
+        headers=hosts.UA,
+        timeout=10,
+    )
+    r.raise_for_status()
+    by_token = {resolved[s]["token"]: s for s in ("home", "away")}
+    out = []
+    for p in r.json() or []:
+        side = by_token.get(str(p.get("asset")))
+        if side and float(p.get("size") or 0) > 0:
+            out.append({
+                "side": side,
+                "size": float(p["size"]),
+                "avg": float(p.get("avgPrice") or 0),
+            })
+    return out
+
+
 class WatchState:
     def __init__(self, resolved: dict, log_path: Path | None):
         self.lock = threading.Lock()
         self.resolved = resolved
+        self.positions: list[dict] = []
+        self.pos_manual = False
         self.game: dict = {}
         self.espn_rtt = None
         self.espn_wp = deque(maxlen=21600)     # (mono, home_wp)
@@ -301,7 +333,16 @@ def _espn_loop(state: WatchState, stop: threading.Event, interval: float) -> Non
     league = state.resolved["game"].get("_league")
     event_id = state.resolved["game"]["event_id"]
     prev = {}
+    cycle = 0
     while not stop.is_set():
+        cycle += 1
+        if cycle % 30 == 1 and not state.pos_manual:  # ~every minute: catch mid-game adds
+            try:
+                fresh = fetch_positions(state.resolved)
+                with state.lock:
+                    state.positions = fresh
+            except Exception as e:
+                state.log({"type": "pos_err", "err": str(e)})
         t0 = time.perf_counter()
         try:
             gs = espn.game_state(league, event_id)
@@ -461,7 +502,124 @@ def _handle_ws(state: WatchState, msg: dict) -> None:
 # ============================================================
 
 
-def _render(state: WatchState, pos: dict | None):
+def _diamond(sit: dict):
+    """Bases + count, scoreboard-style."""
+    from rich.text import Text
+
+    def base(k):
+        return ("◆", "bold yellow") if sit.get(k) else ("◇", "dim")
+
+    t = Text()
+    t.append("   ")
+    t.append(*base("onSecond"))
+    t.append("\n ")
+    t.append(*base("onThird"))
+    t.append("   ")
+    t.append(*base("onFirst"))
+    t.append("\n   ")
+    t.append("⌂", style="dim")
+    t.append("\n")
+
+    def dots(n, mx):
+        n = min(int(n or 0), mx)
+        return "●" * n + "○" * (mx - n)
+
+    t.append(f"B {dots(sit.get('balls'), 3)}\n", style="cyan")
+    t.append(f"S {dots(sit.get('strikes'), 2)}\n", style="cyan")
+    t.append(f"O {dots(sit.get('outs'), 2)}", style="red")
+    return t
+
+
+def _scorebox(teams: dict):
+    """Line score: innings, R/H/E."""
+    from rich.table import Table
+
+    away, home = teams.get("away") or {}, teams.get("home") or {}
+    n = max(9, len(away.get("linescores") or []), len(home.get("linescores") or []))
+    t = Table(box=None, padding=(0, 1), header_style="dim")
+    t.add_column("")
+    for i in range(1, n + 1):
+        t.add_column(str(i), justify="right")
+    for lbl in ("R", "H", "E"):
+        t.add_column(lbl, justify="right", style="bold")
+    for tm in (away, home):
+        ls = tm.get("linescores") or []
+        cells = [str(v) for v in ls] + [" "] * (n - len(ls))
+        t.add_row(
+            tm.get("abbrev") or "",
+            *cells,
+            str(tm.get("score") or "0"),
+            "—" if tm.get("hits") is None else str(tm.get("hits")),
+            "—" if tm.get("errors") is None else str(tm.get("errors")),
+        )
+    return t
+
+
+def _matchup(gs: dict):
+    """Current pitcher vs batter, plus ESPN's situational notes (RISP, BvP)."""
+    from rich.text import Text
+
+    t = Text()
+    p = gs.get("pitcher")
+    if p:
+        st = p.get("pitching") or {}
+        parts = [x for x in (
+            f"{st.get('IP')} IP" if st.get("IP") else None,
+            f"{st.get('H')} H" if st.get("H") is not None else None,
+            f"{st.get('ER')} ER" if st.get("ER") is not None else None,
+            f"{st.get('K')} K" if st.get("K") is not None else None,
+            f"{st.get('PC')} P" if st.get("PC") else None,
+            f"ERA {st.get('ERA')}" if st.get("ERA") else None,
+        ) if x]
+        t.append("P  ", style="dim")
+        t.append(f"{p.get('name')} ({p.get('team')})  ", style="bold")
+        t.append(" · ".join(parts) + "\n")
+    b = gs.get("batter")
+    if b:
+        st = b.get("batting") or {}
+        parts = [x for x in (
+            st.get("H-AB"),
+            f"{st.get('HR')} HR" if st.get("HR") not in (None, "0") else None,
+            f"{st.get('RBI')} RBI" if st.get("RBI") not in (None, "0") else None,
+            f"AVG {st.get('AVG')}" if st.get("AVG") else None,
+        ) if x]
+        t.append("AB ", style="dim")
+        t.append(f"{b.get('name')} ({b.get('team')})  ", style="bold")
+        t.append(" · ".join(parts) + "\n")
+    for note in (gs.get("notes") or [])[:2]:
+        t.append(note + "\n", style="dim italic")
+    if not t.plain:
+        t.append("between innings", style="dim")
+    return t
+
+
+def _ladder(book: dict, depth: int = 4):
+    """Order-book depth ladder: asks above, bids below, sized bars."""
+    from rich.table import Table
+    from rich.text import Text
+
+    asks = sorted((book.get("asks") or {}).items())[:depth]
+    bids = sorted((book.get("bids") or {}).items(), reverse=True)[:depth]
+    if not asks and not bids:
+        return Text("no depth", style="dim")
+    mx = max(s for _, s in asks + bids)
+    t = Table.grid(padding=(0, 1))
+    t.add_column(justify="right", width=4)
+    t.add_column()
+
+    def bar(sz, style):
+        return Text("█" * max(1, round(sz / mx * 12)) + f" {sz:,.0f}", style=style)
+
+    for px, sz in reversed(asks):
+        t.add_row(f"{px:.2f}", bar(sz, "red"))
+    mid = _mid(book)
+    t.add_row("", Text(f"· {mid * 100:.1f}¢ ·" if mid else "·", style="dim"))
+    for px, sz in bids:
+        t.add_row(f"{px:.2f}", bar(sz, "green"))
+    return t
+
+
+def _render(state: WatchState):
     from rich.console import Group
     from rich.panel import Panel
     from rich.table import Table
@@ -515,18 +673,17 @@ def _render(state: WatchState, pos: dict | None):
             f"   (vig-free mkt {mkt * 100:.1f}%)",
             "espn − mkt",
         )
-    if pos and mkt is not None:
-        side = home if pos["team"] in (home["abbrev"].lower(), home["name"].lower()) else away
-        b = state.books.get(side["token"], {})
-        mark = _mid(b)
+    for pos in state.positions:
+        side = r[pos["side"]]
+        mark = _mid(state.books.get(side["token"], {}))
         if mark:
-            pnl = pos["size"] * (mark - pos["price"])
+            pnl = pos["size"] * (mark - pos["avg"])
             color = "green" if pnl >= 0 else "red"
             t.add_row(
                 "POS",
-                f"{side['abbrev']} {pos['size']:g} @ {pos['price'] * 100:.1f}¢ → mark {mark * 100:.1f}¢"
+                f"{side['abbrev']} {pos['size']:g} @ {pos['avg'] * 100:.1f}¢ → mark {mark * 100:.1f}¢"
                 f"  [{color}]{pnl:+.2f}$[/]",
-                "",
+                "live" if not state.pos_manual else "--pos",
             )
 
     sparks = Table.grid(padding=(0, 1))
@@ -540,7 +697,7 @@ def _render(state: WatchState, pos: dict | None):
     feed.add_column(width=5)
     feed.add_column()
     now_mono, now_wall = time.monotonic(), time.time()
-    for mono, kind, txt in list(state.feed_log)[-10:]:
+    for mono, kind, txt in list(state.feed_log)[-6:]:
         wall = datetime.fromtimestamp(now_wall - (now_mono - mono)).strftime("%H:%M:%S")
         feed.add_row(wall, Text(kind, style="cyan" if kind == "GAME" else "yellow"), txt)
 
@@ -554,12 +711,35 @@ def _render(state: WatchState, pos: dict | None):
         f"mkt-led {lat.get('led', 0)} · no-react {lat.get('unmatched', 0)}"
     )
 
-    return Group(
-        Panel(t, title=title, border_style="blue"),
+    blocks = [Panel(t, title=title, border_style="blue")]
+
+    sit = gs.get("situation") or {}
+    if any(k in sit for k in ("balls", "strikes", "outs")):  # baseball mode
+        field = Table.grid(padding=(0, 1))
+        for _ in range(3):
+            field.add_column()
+        field.add_row(
+            Panel(_diamond(sit), border_style="dim"),
+            Panel(_scorebox(gs.get("teams") or {}), title="line score", border_style="dim"),
+            Panel(_matchup(gs), title="matchup", border_style="dim"),
+        )
+        blocks.append(field)
+
+    books_row = Table.grid(padding=(0, 1))
+    books_row.add_column()
+    books_row.add_column()
+    books_row.add_row(
+        Panel(_ladder(ab), title=f"{away['abbrev']} book", border_style="dim"),
+        Panel(_ladder(hb), title=f"{home['abbrev']} book", border_style="dim"),
+    )
+    blocks.append(books_row)
+
+    blocks += [
         Panel(sparks, title="last 15m (home prob)", border_style="dim"),
         Panel(feed, title="events", border_style="dim"),
         Panel(Text.from_markup(stats_line), title="game→market coupling", border_style="magenta"),
-    )
+    ]
+    return Group(*blocks)
 
 
 def run_watch(
@@ -589,13 +769,21 @@ def run_watch(
         stamp = datetime.now().strftime("%H%M%S")
         path = Path(log_path) if log_path else default_dir / f"{resolved['slug']}-{stamp}.jsonl"
 
-    pos_parsed = None
-    if pos:
+    state = WatchState(resolved, path)
+    if pos:  # manual override, e.g. what-if sizing
         team, rest = pos.split(":", 1)
         size, price = rest.split("@")
-        pos_parsed = {"team": team.lower(), "size": float(size), "price": float(price)}
-
-    state = WatchState(resolved, path)
+        team = team.lower()
+        side = "home" if team in (
+            resolved["home"]["abbrev"].lower(), resolved["home"]["name"].lower()
+        ) else "away"
+        state.positions = [{"side": side, "size": float(size), "avg": float(price)}]
+        state.pos_manual = True
+    else:
+        try:
+            state.positions = fetch_positions(resolved)
+        except Exception:
+            pass  # no funder configured / data-api hiccup: watch still works
     state.log({"type": "start", "slug": resolved["slug"],
                "home": resolved["home"]["abbrev"], "away": resolved["away"]["abbrev"]})
     stop = threading.Event()
@@ -608,8 +796,10 @@ def run_watch(
 
     started = time.monotonic()
     last_stats = last_stats_log = 0.0
+    with state.lock:
+        first = _render(state)
     try:
-        with Live(_render(state, pos_parsed), console=console, refresh_per_second=6, screen=True) as live:
+        with Live(first, console=console, refresh_per_second=6, screen=True) as live:
             while not stop.is_set():
                 time.sleep(0.15)
                 now = time.monotonic()
@@ -630,7 +820,7 @@ def run_watch(
                                    **{f"lat_{k}": v for k, v in lat.items()}})
                         last_stats_log = now
                 with state.lock:
-                    live.update(_render(state, pos_parsed))
+                    live.update(_render(state))
                 if duration and now - started >= duration:
                     break
     except KeyboardInterrupt:

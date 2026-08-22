@@ -1537,7 +1537,7 @@ def sports_game_cmd(league: str, ref: str) -> None:
 @click.argument("league")
 @click.argument("ref")
 @click.option("--slug", default=None, help="Override the Polymarket event slug")
-@click.option("--pos", default=None, help="TEAM:SIZE@PRICE — live P&L row (e.g. nyy:43@0.442)")
+@click.option("--pos", default=None, help="TEAM:SIZE@PRICE override; default = your live positions")
 @click.option("--interval", default=2.0, show_default=True, help="ESPN poll seconds")
 @click.option("--log", "log_path", default=None, help="JSONL path (default ~/.pmt/gamewatch/)")
 @click.option("--no-log", is_flag=True, help="Don't record the session")

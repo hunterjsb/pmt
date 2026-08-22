@@ -75,6 +75,23 @@ def scoreboard(league: str, date: str | None = None) -> list[dict]:
     return rows
 
 
+def _player_map(data: dict) -> dict:
+    """playerId -> {name, team, batting: {label: stat}, pitching: {...}} from the boxscore."""
+    out: dict = {}
+    for team in (data.get("boxscore") or {}).get("players") or []:
+        abbrev = (team.get("team") or {}).get("abbreviation")
+        for grp in team.get("statistics") or []:
+            key = grp.get("type") or grp.get("name")
+            labels = grp.get("labels") or []
+            for a in grp.get("athletes") or []:
+                ath = a.get("athlete") or {}
+                pid = str(ath.get("id"))
+                rec = out.setdefault(pid, {"name": None, "team": abbrev})
+                rec["name"] = ath.get("shortName") or ath.get("displayName")
+                rec[key] = dict(zip(labels, a.get("stats") or []))
+    return out
+
+
 def game_state(league: str, event_id: str) -> dict:
     """Live state for one game: score, situation, ESPN win prob, book odds."""
     data = _get(f"{_league_path(league)}/summary", {"event": event_id})
@@ -89,6 +106,9 @@ def game_state(league: str, event_id: str) -> dict:
             "name": (c.get("team") or {}).get("displayName"),
             "score": c.get("score"),
             "record": next((r.get("summary") for r in c.get("record") or []), None),
+            "linescores": [ls.get("displayValue") for ls in c.get("linescores") or []],
+            "hits": c.get("hits"),
+            "errors": c.get("errors"),
         }
 
     # last entry of the winprobability series = current model estimate
@@ -106,6 +126,12 @@ def game_state(league: str, event_id: str) -> dict:
         })
 
     situation = data.get("situation") or {}
+    players = _player_map(data)
+
+    def _actor(key: str) -> dict | None:
+        pid = str((situation.get(key) or {}).get("playerId") or "")
+        return players.get(pid)
+
     return {
         "event_id": event_id,
         "state": status.get("state"),
@@ -119,6 +145,10 @@ def game_state(league: str, event_id: str) -> dict:
                       "possession", "downDistanceText", "lastPlay")
             if situation.get(k) is not None
         },
+        "batter": _actor("batter"),
+        "pitcher": _actor("pitcher"),
+        # ESPN's own matchup color: RISP splits, batter-vs-pitcher career, etc.
+        "notes": [n.get("text") for n in situation.get("situationNotes") or [] if n.get("text")],
         "odds": odds,
     }
 
