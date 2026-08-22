@@ -28,8 +28,8 @@ pub mod risk;
 pub mod strategy;
 pub mod strategies;
 
-#[cfg(feature = "cognito")]
-pub mod cognito;
+#[cfg(feature = "sigv4")]
+pub mod sigv4;
 
 pub use client::{ClientError, PolymarketClient, Side};
 pub use config::Config;

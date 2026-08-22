@@ -4,7 +4,7 @@
 //! in later phases, action endpoints (approve/reject alerts, cancel orders,
 //! pause strategies). All traffic is local: the server binds to a loopback
 //! address by default. Remote access, if ever wanted, should route through
-//! pmproxy with Cognito.
+//! pmproxy behind its IAM-authed Function URL.
 //!
 //! ## Pattern
 //!

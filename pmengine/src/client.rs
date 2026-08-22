@@ -28,8 +28,8 @@ use sha2::Sha256;
 use crate::config::Config;
 
 use std::sync::Arc;
-#[cfg(feature = "cognito")]
-use crate::cognito::CognitoAuth;
+#[cfg(feature = "sigv4")]
+use crate::sigv4::SigV4Signer;
 
 /// Authenticated Polymarket client.
 pub struct PolymarketClient {
@@ -50,9 +50,9 @@ pub struct PolymarketClient {
     funder_address: Option<String>,
     /// Dry run mode
     dry_run: bool,
-    /// Optional Cognito auth for pmproxy multi-tenant auth
-    #[cfg(feature = "cognito")]
-    cognito_auth: Option<Arc<CognitoAuth>>,
+    /// Optional SigV4 signer for pmproxy behind an AWS_IAM Function URL
+    #[cfg(feature = "sigv4")]
+    sigv4: Option<Arc<SigV4Signer>>,
     /// Cached tick-size decimal places per token. Lets us round each
     /// market's prices to its actual tick (0.001 vs 0.01 vs 0.0001)
     /// instead of the previous hard-coded 2-decimal rounding that
@@ -62,26 +62,26 @@ pub struct PolymarketClient {
 
 impl PolymarketClient {
     /// Create and authenticate a new client.
-    #[cfg(not(feature = "cognito"))]
+    #[cfg(not(feature = "sigv4"))]
     pub async fn new(config: &Config, dry_run: bool) -> Result<Self, ClientError> {
         Self::new_internal(config, dry_run).await
     }
 
-    /// Create and authenticate a new client with optional Cognito auth.
-    #[cfg(feature = "cognito")]
+    /// Create and authenticate a new client with optional SigV4 signing.
+    #[cfg(feature = "sigv4")]
     pub async fn new(config: &Config, dry_run: bool) -> Result<Self, ClientError> {
-        Self::new_with_cognito(config, dry_run, None).await
+        Self::new_with_sigv4(config, dry_run, None).await
     }
 
-    /// Create and authenticate a new client with Cognito auth.
-    #[cfg(feature = "cognito")]
-    pub async fn new_with_cognito(
+    /// Create and authenticate a new client with SigV4 signing for pmproxy.
+    #[cfg(feature = "sigv4")]
+    pub async fn new_with_sigv4(
         config: &Config,
         dry_run: bool,
-        cognito_auth: Option<Arc<CognitoAuth>>,
+        sigv4: Option<Arc<SigV4Signer>>,
     ) -> Result<Self, ClientError> {
         let mut client = Self::new_internal(config, dry_run).await?;
-        client.cognito_auth = cognito_auth;
+        client.sigv4 = sigv4;
         Ok(client)
     }
 
@@ -163,8 +163,8 @@ impl PolymarketClient {
             proxy_url,
             funder_address: config.funder_address.clone(),
             dry_run,
-            #[cfg(feature = "cognito")]
-            cognito_auth: None,
+            #[cfg(feature = "sigv4")]
+            sigv4: None,
             tick_decimals: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         })
     }
@@ -235,23 +235,10 @@ impl PolymarketClient {
     }
 
     /// Make an L2-authenticated POST request.
-    #[allow(unused_mut)] // mut needed only when cognito feature is enabled
+    #[allow(unused_mut)] // mut needed only when sigv4 feature is enabled
     async fn l2_post<T: serde::de::DeserializeOwned>(&self, path: &str, body: &impl serde::Serialize) -> Result<T, ClientError> {
         let body_str = serde_json::to_string(body)
             .map_err(|e| ClientError::OrderError(format!("JSON serialization failed: {}", e)))?;
-
-        let mut headers = self.create_l2_headers("POST", path, &body_str)?;
-
-        // Add Cognito auth header if using proxy with auth
-        #[cfg(feature = "cognito")]
-        if self.proxy_url.is_some() {
-            if let Some(ref cognito) = self.cognito_auth {
-                let auth_header = cognito.get_auth_header().await
-                    .map_err(|e| ClientError::AuthError(format!("Cognito auth failed: {}", e)))?;
-                headers.insert("Authorization", HeaderValue::from_str(&auth_header)
-                    .map_err(|e| ClientError::OrderError(e.to_string()))?);
-            }
-        }
 
         // Determine URL: if using proxy, use proxy URL with /clob prefix; otherwise use CLOB directly
         // Note: We compute HMAC for the canonical path (/order), but send to proxy path (/clob/order)
@@ -260,6 +247,21 @@ impl PolymarketClient {
         } else {
             format!("https://clob.polymarket.com{}", path)
         };
+
+        let mut headers = self.create_l2_headers("POST", path, &body_str)?;
+
+        // Sign for the IAM Function URL when routed through the proxy. Signed
+        // bytes must equal wire bytes, so sign the final URL + serialized body;
+        // the POLY_* L2 headers ride along unsigned.
+        #[cfg(feature = "sigv4")]
+        if self.proxy_url.is_some() {
+            if let Some(ref signer) = self.sigv4 {
+                let signed = signer
+                    .sign_headers("POST", &url, body_str.as_bytes())
+                    .map_err(|e| ClientError::AuthError(e.to_string()))?;
+                headers.extend(signed);
+            }
+        }
 
         tracing::debug!(url = %url, path = %path, body_len = body_str.len(), "L2 POST request");
 
@@ -597,9 +599,9 @@ impl PolymarketClient {
 
     /// Fetch a snapshot of the order book via REST.
     ///
-    /// Routes through pmproxy when `PMPROXY_URL` is set (adding the Cognito
-    /// Bearer header), otherwise hits `clob.polymarket.com` directly. The
-    /// `/book` endpoint is unauthenticated from Polymarket's side, so we
+    /// Routes through pmproxy when `PMPROXY_URL` is set (SigV4-signing for
+    /// the IAM Function URL), otherwise hits `clob.polymarket.com` directly.
+    /// The `/book` endpoint is unauthenticated from Polymarket's side, so we
     /// don't compute L2 headers.
     ///
     /// Used by the engine's REST polling task as an alternative to the WS
@@ -621,14 +623,13 @@ impl PolymarketClient {
 
         let mut req = self.http.get(&url);
 
-        #[cfg(feature = "cognito")]
+        #[cfg(feature = "sigv4")]
         if self.proxy_url.is_some() {
-            if let Some(ref cognito) = self.cognito_auth {
-                let auth_header = cognito
-                    .get_auth_header()
-                    .await
-                    .map_err(|e| ClientError::AuthError(format!("Cognito auth failed: {}", e)))?;
-                req = req.header("Authorization", auth_header);
+            if let Some(ref signer) = self.sigv4 {
+                let signed = signer
+                    .sign_headers("GET", &url, b"")
+                    .map_err(|e| ClientError::AuthError(e.to_string()))?;
+                req = req.headers(signed);
             }
         }
 

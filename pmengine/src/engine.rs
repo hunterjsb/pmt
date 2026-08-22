@@ -13,8 +13,8 @@ use crate::position::{Fill, PositionTracker};
 use crate::risk::{RiskCheckResult, RiskLimits, RiskManager};
 use crate::strategy::{DummyStrategy, MarketInfo, Signal, StrategyContext, StrategyRuntime};
 
-#[cfg(feature = "cognito")]
-use crate::cognito::create_cognito_auth;
+#[cfg(feature = "sigv4")]
+use crate::sigv4::SigV4Signer;
 
 use futures::StreamExt;
 use polymarket_client_sdk_v2::clob::ws::Client as WsClient;
@@ -101,23 +101,28 @@ pub struct FillEvent {
 impl Engine {
     /// Create a new engine instance.
     pub async fn new(config: Config, dry_run: bool) -> Result<Self, EngineError> {
-        // Create and authenticate client (with Cognito auth if using proxy)
-        #[cfg(feature = "cognito")]
+        // Create and authenticate client (SigV4-signing proxy requests).
+        // Missing credentials with a proxy configured is a hard error — the
+        // IAM Function URL 403s every unsigned request, so running without
+        // a signer can only fail later and less legibly.
+        #[cfg(feature = "sigv4")]
         let client = {
-            let cognito_auth = if std::env::var("PMPROXY_URL").is_ok() {
-                tracing::info!("Proxy detected, initializing Cognito auth...");
-                create_cognito_auth().await
+            let sigv4 = if std::env::var("PMPROXY_URL").is_ok() {
+                tracing::info!("Proxy detected, initializing SigV4 signing...");
+                Some(Arc::new(SigV4Signer::from_env().await.map_err(|e| {
+                    EngineError::SdkError(e.to_string())
+                })?))
             } else {
                 None
             };
             Arc::new(
-                PolymarketClient::new_with_cognito(&config, dry_run, cognito_auth)
+                PolymarketClient::new_with_sigv4(&config, dry_run, sigv4)
                     .await
                     .map_err(|e| EngineError::SdkError(e.to_string()))?,
             )
         };
 
-        #[cfg(not(feature = "cognito"))]
+        #[cfg(not(feature = "sigv4"))]
         let client = Arc::new(
             PolymarketClient::new(&config, dry_run)
                 .await

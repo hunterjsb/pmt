@@ -56,14 +56,16 @@ async-broadcast = "0.7"
 # Control plane HTTP server (local introspection + future alert approval)
 axum = "0.7"
 
-# AWS SDK for Cognito authentication (optional, for pmproxy multi-tenant auth)
+# AWS SigV4 signing (optional, for pmproxy behind an AWS_IAM Function URL)
 aws-config = { version = "1", optional = true }
-aws-sdk-cognitoidentityprovider = { version = "1", optional = true }
+aws-sigv4 = { version = "1", optional = true }
+aws-credential-types = { version = "1", optional = true }
+aws-smithy-runtime-api = { version = "1", optional = true }
 
 [features]
 default = ["ec2"]
-ec2 = ["clap", "cognito"]
-cognito = ["aws-config", "aws-sdk-cognitoidentityprovider"]
+ec2 = ["clap", "sigv4"]
+sigv4 = ["aws-config", "aws-sigv4", "aws-credential-types", "aws-smithy-runtime-api"]
 
 [lib]
 name = "pmengine"
