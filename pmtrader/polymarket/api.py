@@ -312,6 +312,40 @@ class PolymarketAPI:
         data = r.json()
         return data[0].get("value", 0) if data else 0
 
+    def get_pnl_series(self, interval: str = "all", fidelity: str = "1d") -> list[dict]:
+        """Cumulative P/L series behind the polymarket.com profile graph.
+
+        Returns [{"t": unix_seconds, "p": cumulative_pnl}, ...]. Values are
+        mark-to-market — realized plus open positions marked at current odds —
+        which is why they diverge from the realized-only activity replay.
+        """
+        r = requests.get(
+            f"{hosts.USER_PNL}/user-pnl",
+            params={"user_address": self.funder, "interval": interval, "fidelity": fidelity},
+            headers=hosts.UA,
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json() or []
+
+    def get_ui_pnl(self) -> dict[str, float | None]:
+        """Window P/L exactly as the polymarket.com profile shows it.
+
+        None for a window whose fetch failed — the endpoint can be slow on a
+        cold cache, and a partial answer beats none.
+        """
+        from .pnl import UI_WINDOWS, ui_window_value
+
+        out: dict[str, float | None] = {}
+        for window, (interval, fidelity) in UI_WINDOWS.items():
+            try:
+                series = self.get_pnl_series(interval, fidelity)
+            except requests.RequestException:
+                out[window] = None
+                continue
+            out[window] = ui_window_value(series, all_time=window == "all")
+        return out
+
     def get_activity(self, *, kind: str | None = None, limit: int = 100) -> list[dict]:
         params: dict = {"user": self.funder, "limit": limit}
         if kind:

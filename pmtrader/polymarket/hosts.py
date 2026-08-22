@@ -12,6 +12,7 @@ import os
 CLOB = "https://clob.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
 DATA = "https://data-api.polymarket.com"
+USER_PNL = "https://user-pnl-api.polymarket.com"
 POLYGON_RPC = "https://polygon-rpc.com"
 
 UA = {"User-Agent": "pmtrader/1.0"}

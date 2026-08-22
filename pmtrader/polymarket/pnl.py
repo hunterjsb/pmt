@@ -171,6 +171,30 @@ def reconcile_expired(result: ReplayResult, current_positions: list[dict]) -> No
         L.shares = 0.0
 
 
+# polymarket.com profile-graph windows → user-pnl API (interval, fidelity).
+# Coarser fidelities time out or come back empty on the short intervals.
+UI_WINDOWS: dict[str, tuple[str, str]] = {
+    "1d": ("1d", "1h"),
+    "7d": ("1w", "1h"),
+    "30d": ("1m", "1d"),
+    "all": ("all", "1d"),
+}
+
+
+def ui_window_value(series: list[dict], *, all_time: bool = False) -> float | None:
+    """Headline number for one profile-graph window.
+
+    The series is cumulative all-time P/L sampled inside the window, so a
+    window's move is last-minus-first; all-time is simply the latest value.
+    """
+    if not series:
+        return None
+    last = float(series[-1]["p"])
+    if all_time:
+        return last
+    return last - float(series[0]["p"])
+
+
 def bucket_by_window(
     events: list[RealizedEvent],
     now_ts: int,

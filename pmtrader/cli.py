@@ -700,20 +700,22 @@ def rewards(days: int, all_history: bool, kind: str) -> None:
 
 @cli.command()
 @click.option("--top", default=10, type=int, help="Show top N realized winners and losers (all-time)")
-def pnl(top: int) -> None:
-    """Realized P&L over 1d/7d/30d/all-time + current unrealized.
+@click.option("--json", "as_json", is_flag=True, help="Emit ui + realized P&L as JSON")
+def pnl(top: int, as_json: bool) -> None:
+    """P&L over 1d/7d/30d/all-time — headline matches the polymarket.com profile.
 
-    Replays the full activity stream into a per-asset cost-basis ledger and
-    emits realized events on SELL/REDEEM disposals. Positions held in the
-    ledger but no longer in the current portfolio are written off as expired
-    (timestamp unknown → all-time bucket only)."""
+    The headline row is the site's own user-pnl series (mark-to-market:
+    realized + open positions marked at current odds). The breakdown below
+    replays the activity stream into a cost-basis ledger and counts realized
+    cash flow only — the two legitimately differ while positions are open."""
     import time
     from polymarket.pnl import (
         replay_activity, reconcile_expired, bucket_by_window,
     )
 
     api = _api()
-    with console.status("[dim]paginating /activity…[/dim]"):
+    with console.status("[dim]fetching profile P/L + paginating /activity…[/dim]"):
+        ui = api.get_ui_pnl()
         acts = api.get_full_activity()
     res = replay_activity(acts)
     positions = api.get_positions()
@@ -734,23 +736,47 @@ def pnl(top: int) -> None:
     yields    = [e for e in res.income   if e.kind == "YIELD"]
 
     rows = [
-        ("Trade SELL",  bucket_by_window(sells,   now, windows)),
-        ("Redemptions", bucket_by_window(redeems, now, windows)),
-        ("Expired (worthless)", bucket_by_window(expired, now, windows)),
-        ("Rewards",     bucket_by_window(rewards, now, windows)),
-        ("Yield",       bucket_by_window(yields,  now, windows)),
+        ("sell",    "Trade SELL",  bucket_by_window(sells,   now, windows)),
+        ("redeem",  "Redemptions", bucket_by_window(redeems, now, windows)),
+        ("expired", "Expired (worthless)", bucket_by_window(expired, now, windows)),
+        ("reward",  "Rewards",     bucket_by_window(rewards, now, windows)),
+        ("yield",   "Yield",       bucket_by_window(yields,  now, windows)),
     ]
+    subtotal_per_window = {w: sum(b[w] for _, _, b in rows) for w in windows}
 
     unrealized = sum(
         p.get("cashPnl", p.get("currentValue", 0) - p["size"] * p["avgPrice"])
         for p in positions
     )
+    grand = subtotal_per_window["all"] + unrealized
 
-    t = Table(title=f"Realized P&L  ({len(acts)} activity events)")
+    if as_json:
+        click.echo(json.dumps({
+            "ui": ui,
+            "realized": subtotal_per_window,
+            "realized_breakdown": {key: bucket for key, _, bucket in rows},
+            "unrealized_snapshot": unrealized,
+            "grand_total": grand,
+            "activity_events": len(acts),
+        }, indent=2))
+        return
+
+    t0 = Table(title="P&L — polymarket.com profile (mark-to-market)")
+    for w in windows:
+        t0.add_column(w, justify="right")
+    hrow = []
+    for w in windows:
+        v = ui.get(w)
+        hrow.append("[dim]—[/dim]" if v is None else f"[bold {_pnl_color(v)}]${v:+.2f}[/]")
+    t0.add_row(*hrow)
+    console.print(t0)
+    console.print()
+
+    t = Table(title=f"Realized-only breakdown  ({len(acts)} activity events)")
     t.add_column("Source", justify="left")
     for w in windows:
         t.add_column(w, justify="right")
-    for label, bucket in rows:
+    for _, label, bucket in rows:
         row = [label]
         for w in windows:
             v = bucket[w]
@@ -758,7 +784,6 @@ def pnl(top: int) -> None:
             row.append(f"[{c}]${v:+.2f}[/]")
         t.add_row(*row)
     t.add_section()
-    subtotal_per_window = {w: sum(b[w] for _, b in rows) for w in windows}
     sub_row = ["[bold]Realized subtotal[/bold]"]
     for w in windows:
         v = subtotal_per_window[w]
@@ -769,14 +794,15 @@ def pnl(top: int) -> None:
     console.print()
     c = _pnl_color(unrealized)
     console.print(f"Current [bold]unrealized[/bold] (mark - cost): [{c}]${unrealized:+.2f}[/]")
-    grand = subtotal_per_window["all"] + unrealized
     c = _pnl_color(grand)
     console.print(f"[bold]Grand total[/bold] (all-time realized + current unrealized): [{c}]${grand:+.2f}[/]")
+    if ui.get("all") is not None:
+        resid = ui["all"] - grand
+        console.print(f"[dim]vs profile all-time ${ui['all']:+.2f} — Δ ${resid:+.2f} ledger reconstruction error[/dim]")
 
     console.print()
-    console.print("[dim]Note: window P&L is realized cash flow only. "
-                  "Polymarket UI also reflects mark-to-market changes within "
-                  "the window, which requires historical price snapshots we don't store.[/dim]")
+    console.print("[dim]Headline = the site's own P/L series (realized + open-position "
+                  "drift at current odds). Breakdown = realized cash flow only.[/dim]")
 
     # Top movers (all-time realized only — windowed views would need history)
     if top > 0:
