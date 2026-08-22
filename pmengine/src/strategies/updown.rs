@@ -26,6 +26,14 @@ use std::sync::{Arc, Mutex};
 const BINANCE_DATA: &str = "https://data-api.binance.vision";
 /// Spot older than this is a dead feed — hold, never trade through it.
 const MAX_SPOT_AGE_S: f64 = 5.0;
+/// Exit rule (the 2026-08-22 -$318 lesson: a 99%-fair entry died with no
+/// hands to act as it flipped). Dump a held side when its fair collapses
+/// below EXIT_FAIR — but only into a bid that isn't already dead, i.e.
+/// within EXIT_MAX_DISCOUNT of fair. Selling below that donates to panic.
+const EXIT_FAIR: f64 = 0.40;
+const EXIT_MAX_DISCOUNT: f64 = 0.08;
+/// Live vol floor: minutes of trailing 1m closes for the fast estimate.
+const VOL_FAST_WINDOW: usize = 12;
 /// One order in flight per token; assume dead if no fill inside this window.
 /// Must comfortably outlive the engine's ~5s position-reconcile cadence:
 /// taker fills are often MISSED by the realtime fill path and only show up
@@ -92,6 +100,8 @@ struct FeedState {
     per_min: std::collections::BTreeMap<i64, f64>,
     /// Exact 1h candle open once the close_open window starts.
     candle_open: Option<f64>,
+    /// Recent 1m closes, oldest first — feeds the fast vol estimate.
+    closes: Vec<f64>,
     last_err: Option<String>,
 }
 
@@ -193,6 +203,9 @@ impl Updown {
                         if update.candle_open.is_some() {
                             f.candle_open = update.candle_open;
                         }
+                        if !update.closes.is_empty() {
+                            f.closes = update.closes;
+                        }
                         f.last_err = None;
                     }
                     Err(e) => {
@@ -204,8 +217,8 @@ impl Updown {
         }));
     }
 
-    /// Model fair P(UP) from the current feed. None while gated.
-    fn fair_p_up(&self, p: &ArmParams, now: f64) -> Result<f64, String> {
+    /// Model fair P(UP) plus the vol actually used (bp/min). Errors = gated.
+    fn fair_p_up(&self, p: &ArmParams, now: f64) -> Result<(f64, f64), String> {
         let f = self.feed.lock().unwrap();
         if now - f.spot_ts > MAX_SPOT_AGE_S {
             return Err(match &f.last_err {
@@ -214,13 +227,30 @@ impl Updown {
             });
         }
         let spot = f.spot;
-        let sig_frac = p.sigma_bp_per_min / 1e4;
+        // Vol only ratchets UP intraminute: the arm-time trailing sigma is a
+        // floor, the fast window catches the storm the trailing estimate
+        // lags (the -$318 window quoted 99% fair off calm-market vol).
+        let fast_bp = {
+            let c = &f.closes;
+            let n = c.len().min(VOL_FAST_WINDOW + 1);
+            if n >= 4 {
+                let rets: Vec<f64> =
+                    c[c.len() - n..].windows(2).map(|w| (w[1] / w[0]).ln()).collect();
+                let mu = rets.iter().sum::<f64>() / rets.len() as f64;
+                let var = rets.iter().map(|r| (r - mu).powi(2)).sum::<f64>() / (rets.len() - 1) as f64;
+                var.sqrt() * 1e4
+            } else {
+                0.0
+            }
+        };
+        let sig_bp = p.sigma_bp_per_min.max(fast_bp);
+        let sig_frac = sig_bp / 1e4;
 
         if p.kind == "close_open" {
             let open = f.candle_open.ok_or("candle open not printed yet")?;
             let t_min = ((p.end - now) / 60.0).max(0.005);
             let z = (spot / open).ln() / (sig_frac * t_min.sqrt());
-            Ok(norm_cdf(z))
+            Ok((norm_cdf(z), sig_bp))
         } else {
             let ref_px = *f
                 .per_min
@@ -241,7 +271,7 @@ impl Updown {
             let rem = (p.end - now).max(0.0);
             let window = banked_s + rem;
             if window <= 0.0 || rem <= 0.0 {
-                return Ok(if banked_avg >= ref_px { 1.0 } else { 0.0 });
+                return Ok((if banked_avg >= ref_px { 1.0 } else { 0.0 }, sig_bp));
             }
             let proj = (banked_avg * banked_s + spot * rem) / window;
             let margin_bp = (proj / ref_px - 1.0) * 1e4;
@@ -253,8 +283,67 @@ impl Updown {
             }
             let breakeven = (ref_px * window - banked_avg * banked_s) / rem;
             let sig_avg = sig_frac * ((rem / 60.0).max(0.02) / 3.0).sqrt();
-            Ok(1.0 - norm_cdf((breakeven / spot).ln() / sig_avg))
+            Ok((1.0 - norm_cdf((breakeven / spot).ln() / sig_avg), sig_bp))
         }
+    }
+
+    /// Math-forced evacuation: dump a held side whose fair has collapsed,
+    /// into a bid that still resembles fair. Runs every armed tick AND
+    /// through quiesce (exits are most needed late; only new buys stop).
+    fn exit_signals(
+        &mut self,
+        ctx: &StrategyContext,
+        p: &ArmParams,
+        p_up: f64,
+        now: f64,
+    ) -> Vec<Signal> {
+        let mut signals = Vec::new();
+        for (side, token, fair) in [
+            ("up", &p.token_up, p_up),
+            ("down", &p.token_down, 1.0 - p_up),
+        ] {
+            if fair >= EXIT_FAIR || self.inflight.contains_key(token) {
+                continue;
+            }
+            let held = ctx
+                .positions
+                .get(token)
+                .map(|pos| pos.size.to_f64().unwrap_or(0.0))
+                .unwrap_or(0.0);
+            if held < 5.0 {
+                continue;
+            }
+            let Some((bid, bid_size)) = ctx.order_books.get(token).and_then(|b| {
+                b.best_bid()
+                    .map(|l| (l.price.to_f64().unwrap_or(0.0), l.size.to_f64().unwrap_or(0.0)))
+            }) else {
+                continue;
+            };
+            if bid < fair - EXIT_MAX_DISCOUNT {
+                continue; // bid already dead — holding beats donating
+            }
+            let size = held.min(bid_size).floor();
+            if size < 5.0 {
+                continue;
+            }
+            tracing::warn!(
+                side, fair, bid, size, slug = %p.slug,
+                "updown EXIT — side fair collapsed, evacuating at the bid"
+            );
+            tape(serde_json::json!({
+                "t": now, "ev": "exit", "slug": p.slug, "side": side,
+                "fair": fair, "bid": bid, "size": size,
+            }));
+            self.inflight.insert(token.clone(), (0.0, now));
+            signals.push(Signal::Cancel { token_id: token.clone() });
+            signals.push(Signal::Sell {
+                token_id: token.clone(),
+                price: Decimal::from_f64(bid).unwrap_or(Decimal::ONE),
+                size: Decimal::from_f64(size).unwrap_or(Decimal::ZERO),
+                urgency: Urgency::High,
+            });
+        }
+        signals
     }
 }
 
@@ -319,10 +408,17 @@ impl Strategy for Updown {
             return signals;
         }
 
-        // Quiesce: standing orders pulled, nothing new until resolution.
+        // Quiesce: standing orders pulled, no new buys — but exits stay
+        // live until the final seconds (they matter most late).
         if now >= p.end - p.quiesce_secs {
             signals.push(Signal::Cancel { token_id: p.token_up.clone() });
             signals.push(Signal::Cancel { token_id: p.token_down.clone() });
+            if now < p.end - 5.0 {
+                if let Ok((p_up, _)) = self.fair_p_up(&p, now) {
+                    let exits = self.exit_signals(ctx, &p, p_up, now);
+                    signals.extend(exits);
+                }
+            }
             self.last_eval = Some(serde_json::json!({"state": "quiesce", "t": now}));
             return signals;
         }
@@ -338,7 +434,7 @@ impl Strategy for Updown {
             return vec![Signal::Hold];
         }
 
-        let p_up = match self.fair_p_up(&p, now) {
+        let (p_up, sig_bp) = match self.fair_p_up(&p, now) {
             Ok(v) => v,
             Err(gate) => {
                 self.last_eval = Some(serde_json::json!({"state": "gated", "reason": gate, "t": now}));
@@ -374,6 +470,9 @@ impl Strategy for Updown {
             .sum();
         let committed = self.filled_usdc.max(position_usdc);
         let mut budget = p.size_usdc - committed - inflight_usdc;
+
+        let exits = self.exit_signals(ctx, &p, p_up, now);
+        signals.extend(exits);
 
         let mut evals = Vec::new();
         for (side, token, fair) in [
@@ -431,7 +530,7 @@ impl Strategy for Updown {
         }
 
         self.last_eval = Some(serde_json::json!({
-            "state": "armed", "t": now, "p_up": p_up,
+            "state": "armed", "t": now, "p_up": p_up, "sig_bp": sig_bp,
             "committed": committed, "budget": budget,
             "inflight": inflight_usdc, "sides": evals,
         }));
@@ -439,7 +538,7 @@ impl Strategy for Updown {
             self.last_tape_at = now;
             tape(serde_json::json!({
                 "t": now, "ev": "eval", "slug": p.slug, "p_up": p_up,
-                "committed": committed, "sides": evals,
+                "sig_bp": sig_bp, "committed": committed, "sides": evals,
             }));
         }
 
@@ -454,10 +553,15 @@ impl Strategy for Updown {
         if let Some(p) = &self.params {
             if fill.token_id == p.token_up || fill.token_id == p.token_down {
                 let notional = (fill.price * fill.size).to_f64().unwrap_or(0.0);
-                self.filled_usdc += notional;
+                // Only buys consume budget; exit sells free shares but the
+                // gross-buys number stays (no re-deploying after an exit in
+                // the same window — evacuated capital stays evacuated).
+                if fill.is_buy {
+                    self.filled_usdc += notional;
+                }
                 self.inflight.remove(&fill.token_id);
                 tracing::info!(
-                    token = %fill.token_id, notional,
+                    token = %fill.token_id, notional, is_buy = fill.is_buy,
                     total = self.filled_usdc,
                     "updown fill"
                 );
@@ -513,6 +617,7 @@ struct FeedUpdate {
     spot: f64,
     per_min: Vec<(i64, f64)>,
     candle_open: Option<f64>,
+    closes: Vec<f64>,
 }
 
 fn poll_binance(
@@ -539,6 +644,7 @@ fn poll_binance(
 
     let mut per_min = Vec::new();
     let mut candle_open = None;
+    let mut closes = Vec::new();
     if kind == "twap" {
         let start_ms = ((start as i64 - 120) * 1000).to_string();
         let v: serde_json::Value = client
@@ -555,9 +661,26 @@ fn poll_binance(
             let c: f64 = k[4].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             if o > 0.0 && c > 0.0 {
                 per_min.push((t, (o + c) / 2.0));
+                closes.push(c);
             }
         }
-    } else if now >= start {
+    } else {
+        // Fast-vol input for close_open markets (twap reuses its klines).
+        let v: serde_json::Value = client
+            .get(format!("{}/api/v3/klines", BINANCE_DATA))
+            .query(&[("symbol", symbol), ("interval", "1m"), ("limit", "30")])
+            .send()
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| format!("vol klines: {}", e))?
+            .json()
+            .map_err(|e| format!("vol klines json: {}", e))?;
+        for k in v.as_array().unwrap_or(&Vec::new()) {
+            if let Some(c) = k[4].as_str().and_then(|s| s.parse::<f64>().ok()) {
+                closes.push(c);
+            }
+        }
+    }
+    if kind != "twap" && now >= start {
         let start_ms = ((start as i64) * 1000).to_string();
         let v: serde_json::Value = client
             .get(format!("{}/api/v3/klines", BINANCE_DATA))
@@ -574,7 +697,7 @@ fn poll_binance(
             .and_then(|s| s.parse().ok());
     }
 
-    Ok(FeedUpdate { spot, per_min, candle_open })
+    Ok(FeedUpdate { spot, per_min, candle_open, closes })
 }
 
 fn unix_now() -> f64 {
@@ -654,13 +777,32 @@ mod tests {
     #[test]
     fn twap_banked_above_ref_is_locked_up() {
         let (s, p, now) = armed_with_feed(101.0, 101.0); // +100bp margin
-        assert!(s.fair_p_up(&p, now).unwrap() > 0.999);
+        assert!(s.fair_p_up(&p, now).unwrap().0 > 0.999);
     }
 
     #[test]
     fn twap_banked_below_ref_is_locked_down() {
         let (s, p, now) = armed_with_feed(99.0, 99.0);
-        assert!(s.fair_p_up(&p, now).unwrap() < 0.001);
+        assert!(s.fair_p_up(&p, now).unwrap().0 < 0.001);
+    }
+
+    #[test]
+    fn fast_vol_ratchets_sigma_up_and_softens_p() {
+        // +6bp margin: locked under calm vol, genuinely uncertain in a storm
+        let (s, p, now) = armed_with_feed(100.06, 100.06);
+        let (p_calm, sig_calm) = s.fair_p_up(&p, now).unwrap();
+        assert!((sig_calm - 3.0).abs() < 1e-9); // no closes -> arm sigma
+        assert!(p_calm > 0.99);
+        {
+            // violent recent tape: ±60bp swings per minute
+            let mut f = s.feed.lock().unwrap();
+            f.closes = (0..14)
+                .map(|i| if i % 2 == 0 { 100.0 } else { 100.6 })
+                .collect();
+        }
+        let (p_storm, sig_storm) = s.fair_p_up(&p, now).unwrap();
+        assert!(sig_storm > 30.0, "sig {}", sig_storm);
+        assert!(p_storm < p_calm - 0.01, "storm p {} vs calm {}", p_storm, p_calm);
     }
 
     #[test]
