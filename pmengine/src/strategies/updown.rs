@@ -73,11 +73,14 @@ struct ArmParams {
     pub min_elapsed_frac: f64,
 }
 
-fn d_min_edge() -> f64 { 0.03 }
-fn d_max_price() -> f64 { 0.97 }
+// Resolution-snipe tuning: the bread-and-butter trade is paying 0.97-0.985
+// for a >=0.99-fair side late in the window (~+1.5-2c net at very low risk);
+// 3c+ mispricings still fire, they just clear the gate by more.
+fn d_min_edge() -> f64 { 0.015 }
+fn d_max_price() -> f64 { 0.985 }
 fn d_quiesce() -> f64 { 20.0 }
 fn d_basis_guard() -> f64 { 3.0 }
-fn d_min_fair() -> f64 { 0.95 }
+fn d_min_fair() -> f64 { 0.97 }
 fn d_min_elapsed() -> f64 { 0.5 }
 
 /// Shared state the Binance poller thread keeps warm.
@@ -576,10 +579,12 @@ mod tests {
             "sigma_bp_per_min": 2.5, "fee_rate": 0.07, "size_usdc": 100.0,
         }))
         .unwrap();
-        assert_eq!(p.min_edge, 0.03);
-        assert_eq!(p.max_price, 0.97);
+        assert_eq!(p.min_edge, 0.015);
+        assert_eq!(p.max_price, 0.985);
         assert_eq!(p.quiesce_secs, 20.0);
         assert_eq!(p.basis_guard_bp, 3.0);
+        assert_eq!(p.min_fair, 0.97);
+        assert_eq!(p.min_elapsed_frac, 0.5);
     }
 
     #[test]

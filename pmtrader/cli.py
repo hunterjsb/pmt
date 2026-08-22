@@ -1546,11 +1546,11 @@ def crypto_updown(ref: str, as_json: bool) -> None:
 @crypto_group.command("arm")
 @click.argument("ref")
 @click.option("--size", type=float, required=True, help="Max notional (USDC) the trigger may spend")
-@click.option("--min-edge", type=float, default=0.03, show_default=True, help="Min net-of-fee edge to fire")
-@click.option("--max-price", type=float, default=0.97, show_default=True, help="Never pay above this")
+@click.option("--min-edge", type=float, default=0.015, show_default=True, help="Min net-of-fee edge to fire")
+@click.option("--max-price", type=float, default=0.985, show_default=True, help="Never pay above this")
 @click.option("--side", type=click.Choice(["up", "down"]), default=None, help="Restrict to one side")
 @click.option("--quiesce", type=float, default=20.0, show_default=True, help="No orders in the final N seconds")
-@click.option("--min-fair", type=float, default=0.95, show_default=True,
+@click.option("--min-fair", type=float, default=0.97, show_default=True,
               help="Only buy a side the model prices at least this high (the safety gate)")
 @click.option("--min-elapsed", type=float, default=0.5, show_default=True,
               help="No fires before this fraction of the window has elapsed")
