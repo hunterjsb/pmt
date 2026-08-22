@@ -29,7 +29,7 @@ Other commands:
     pmt engine status | strategies | orders | trades | alerts | approve | reject
     pmt scan REF | cliff | expiring
     pmt fit REF
-    pmt sports board LEAGUE | game LEAGUE REF
+    pmt sports board LEAGUE | game LEAGUE REF | watch LEAGUE REF
 """
 
 from __future__ import annotations
@@ -1532,6 +1532,29 @@ def sports_game_cmd(league: str, ref: str) -> None:
     for o in g["odds"]:
         console.print(f"  [dim]{o['book']}: spread {o['spread']} O/U {o['over_under']} ML {o['away_ml']}/{o['home_ml']}[/dim]")
 
+
+@sports_group.command("watch")
+@click.argument("league")
+@click.argument("ref")
+@click.option("--slug", default=None, help="Override the Polymarket event slug")
+@click.option("--pos", default=None, help="TEAM:SIZE@PRICE — live P&L row (e.g. nyy:43@0.442)")
+@click.option("--interval", default=2.0, show_default=True, help="ESPN poll seconds")
+@click.option("--log", "log_path", default=None, help="JSONL path (default ~/.pmt/gamewatch/)")
+@click.option("--no-log", is_flag=True, help="Don't record the session")
+@click.option("--duration", default=None, type=float, help="Auto-stop after N seconds")
+def sports_watch_cmd(league, ref, slug, pos, interval, log_path, no_log, duration) -> None:
+    """Live dashboard: game state vs the Polymarket moneyline, with
+    game→market correlation and reaction-latency stats. Ctrl+C to stop."""
+    from sportsdata.watch import resolve_moneyline, run_watch
+
+    try:
+        resolved = resolve_moneyline(league, ref, slug=slug)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+    run_watch(
+        league, ref, slug=slug, pos=pos, interval=interval,
+        log_path=log_path, no_log=no_log, duration=duration, resolved=resolved,
+    )
 
 
 if __name__ == "__main__":
