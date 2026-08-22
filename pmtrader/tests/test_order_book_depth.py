@@ -7,6 +7,8 @@ the order book parsing works correctly with actual data.
 import json
 import os
 
+import pytest
+
 from polymarket import get_order_book_depth
 from polymarket.models import OrderBook
 
@@ -64,12 +66,13 @@ def test_order_book_has_liquidity_depth():
         assert bid["size"] > 0, "Each bid level should have positive size"
 
 
+@pytest.mark.network
 def test_live_api_call():
     """Test that we can actually call the live API and get structured data back.
 
     This is a real integration test - it will fail if:
     - The API is down
-    - The token no longer exists
+    - The token no longer exists (the token below is already dead — 404s)
     - The API response format changes
     """
     # Use a known active token (Altman jail market June 2026 - No outcome)
