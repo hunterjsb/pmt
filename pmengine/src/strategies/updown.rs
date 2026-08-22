@@ -104,6 +104,12 @@ struct ArmParams {
     /// mean-reverting chop: speculative clips are disabled entirely.
     #[serde(default = "d_rho_block")]
     pub rho_block: f64,
+    /// Assumed max adversarial spot push (bp) for the flip-proof test.
+    /// Boundary manipulators shove Binance in the final seconds; when the
+    /// banked margin exceeds even that push times the remaining weight,
+    /// the TWAP is beyond anyone's reach and late buys are safe.
+    #[serde(default = "d_manip_push")]
+    pub manip_push_bp: f64,
 }
 
 // Two-mode tuning. Early: small clips, only on outsized mispricing, capped
@@ -121,6 +127,9 @@ fn d_early_frac() -> f64 { 0.2 }
 fn d_early_min_edge() -> f64 { 0.08 }
 fn d_late_frac() -> f64 { 0.6 }
 fn d_rho_block() -> f64 { -0.25 }
+fn d_manip_push() -> f64 { 25.0 }
+/// Flip-proof buys stay live until this close to resolution.
+const FLIP_BUY_CUTOFF_S: f64 = 8.0;
 
 /// Shared state an arm's Binance feed threads keep warm.
 #[derive(Default)]
@@ -148,6 +157,11 @@ struct ModelEval {
     /// the remaining path fully reverts, with basis + vol cushion. The one
     /// entry condition immune to mean reversion.
     banked_decided: bool,
+    /// Stronger: the banked margin survives even an adversarial spot push
+    /// (manip_push_bp) sustained for the whole remaining window. When true,
+    /// the book's late panic/push prices are free money — nobody can flip
+    /// this TWAP anymore.
+    flip_proof: bool,
     rho: f64,
 }
 
@@ -360,7 +374,7 @@ impl ArmState {
             let open = f.candle_open.ok_or("candle open not printed yet")?;
             let t_min = ((p.end - now) / 60.0).max(0.005);
             let z = (spot / open).ln() / (sig_frac * t_min.sqrt());
-            Ok(ModelEval { p_up: norm_cdf(z), sig_bp, banked_decided: false, rho })
+            Ok(ModelEval { p_up: norm_cdf(z), sig_bp, banked_decided: false, flip_proof: false, rho })
         } else {
             let ref_px = *f
                 .per_min
@@ -382,7 +396,7 @@ impl ArmState {
             let window = banked_s + rem;
             if window <= 0.0 || rem <= 0.0 {
                 let p_up = if banked_avg >= ref_px { 1.0 } else { 0.0 };
-                return Ok(ModelEval { p_up, sig_bp, banked_decided: true, rho });
+                return Ok(ModelEval { p_up, sig_bp, banked_decided: true, flip_proof: true, rho });
             }
             let proj = (banked_avg * banked_s + spot * rem) / window;
             let margin_bp = (proj / ref_px - 1.0) * 1e4;
@@ -403,7 +417,12 @@ impl ArmState {
                 + sig_bp * ((rem / 60.0).max(0.02) / 3.0).sqrt() * (rem / window);
             let banked_decided =
                 banked_margin_bp.abs() > cushion_bp && (banked_margin_bp > 0.0) == (p_up > 0.5);
-            Ok(ModelEval { p_up, sig_bp, banked_decided, rho })
+            // Flip-proof: survives basis noise PLUS a full-remaining-window
+            // adversarial push. rem/window scales the push's TWAP influence.
+            let flip_proof = banked_decided
+                && banked_margin_bp.abs()
+                    > p.basis_guard_bp + p.manip_push_bp * (rem / window);
+            Ok(ModelEval { p_up, sig_bp, banked_decided, flip_proof, rho })
         }
     }
 
@@ -486,18 +505,76 @@ impl ArmState {
             return (signals, true);
         }
 
-        // Quiesce: standing orders pulled, no new buys — but exits stay
-        // live until the final seconds (they matter most late).
+        // Quiesce: standing orders pulled, no new buys — with one carve-out.
+        // When the TWAP is flip-proof (banked beyond even an adversarial
+        // spot push), the book's late panic/push prices are free money and
+        // clips stay live until FLIP_BUY_CUTOFF_S. Exits always stay live
+        // until the final seconds.
         if now >= p.end - p.quiesce_secs {
-            signals.push(Signal::Cancel { token_id: p.token_up.clone() });
-            signals.push(Signal::Cancel { token_id: p.token_down.clone() });
-            if now < p.end - 5.0 {
-                if let Ok(m) = self.fair_p_up(now) {
+            let model = self.fair_p_up(now).ok();
+            let flip_live = model.as_ref().map(|m| m.flip_proof).unwrap_or(false)
+                && now < p.end - FLIP_BUY_CUTOFF_S;
+            if !flip_live {
+                signals.push(Signal::Cancel { token_id: p.token_up.clone() });
+                signals.push(Signal::Cancel { token_id: p.token_down.clone() });
+            }
+            if let Some(m) = model {
+                if now < p.end - 5.0 {
                     let exits = self.exit_signals(ctx, m.p_up, now);
                     signals.extend(exits);
                 }
+                if flip_live {
+                    self.inflight.retain(|_, (_, at)| now - *at < INFLIGHT_TTL_S);
+                    let inflight_usdc: f64 = self.inflight.values().map(|(n, _)| n).sum();
+                    let committed = self.filled_usdc.max(position_floor(ctx, &p));
+                    let room = p.size_usdc - committed - inflight_usdc;
+                    let (side, token, fair) = if m.p_up > 0.5 {
+                        ("up", p.token_up.clone(), m.p_up)
+                    } else {
+                        ("down", p.token_down.clone(), 1.0 - m.p_up)
+                    };
+                    let allowed = p.side_filter.as_ref().map(|s| s == side).unwrap_or(true);
+                    let cooled = now - self.last_clip.get(&token).copied().unwrap_or(0.0)
+                        >= p.clip_cooldown_s;
+                    if allowed && cooled && room > 5.0 && !self.inflight.contains_key(&token) {
+                        if let Some((ask, ask_size)) = ctx.order_books.get(&token).and_then(|b| {
+                            b.best_ask().map(|l| {
+                                (l.price.to_f64().unwrap_or(1.0), l.size.to_f64().unwrap_or(0.0))
+                            })
+                        }) {
+                            let fee = p.fee_rate * ask.min(1.0 - ask);
+                            let net = fair - ask - fee;
+                            if net >= p.min_edge && ask <= p.max_price {
+                                let size =
+                                    (p.clip_usdc / ask).min(ask_size).min(room / ask).floor();
+                                if size >= 5.0 {
+                                    tracing::info!(
+                                        side, ask, fair, net, size, slug = %p.slug,
+                                        "updown FLIP clip — TWAP beyond reach, book still trading the print"
+                                    );
+                                    tape(serde_json::json!({
+                                        "t": now, "ev": "fire", "slug": p.slug, "side": side,
+                                        "ask": ask, "fair": fair, "net": net, "size": size,
+                                        "committed": committed, "mode": "flip", "rho": m.rho,
+                                    }));
+                                    self.last_clip.insert(token.clone(), now);
+                                    self.inflight.insert(token.clone(), (size * ask, now));
+                                    signals.push(Signal::Cancel { token_id: token.clone() });
+                                    signals.push(Signal::Buy {
+                                        token_id: token.clone(),
+                                        price: Decimal::from_f64(ask).unwrap_or(Decimal::ONE),
+                                        size: Decimal::from_f64(size).unwrap_or(Decimal::ZERO),
+                                        urgency: Urgency::High,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            self.last_eval = Some(serde_json::json!({"state": "quiesce", "t": now}));
+            self.last_eval = Some(serde_json::json!({
+                "state": if flip_live { "flip" } else { "quiesce" }, "t": now,
+            }));
             return (signals, false);
         }
 
@@ -534,24 +611,7 @@ impl ArmState {
         // shares held x entry price. Take the max of every signal we have.
         self.inflight.retain(|_, (_, at)| now - *at < INFLIGHT_TTL_S);
         let inflight_usdc: f64 = self.inflight.values().map(|(n, _)| n).sum();
-        let position_usdc: f64 = [&p.token_up, &p.token_down]
-            .iter()
-            .filter_map(|t| ctx.positions.get(*t).map(|pos| (*t, pos)))
-            .map(|(t, pos)| {
-                let size = pos.size.to_f64().unwrap_or(0.0);
-                let avg = pos.avg_entry_price.to_f64().unwrap_or(0.0);
-                // Reconcile-seeded positions can carry avg 0 briefly; the
-                // live ask is the honest estimate, max_price last resort.
-                let fallback = ctx
-                    .order_books
-                    .get(t)
-                    .and_then(|b| b.best_ask())
-                    .and_then(|l| l.price.to_f64())
-                    .unwrap_or(p.max_price);
-                size * if avg > 0.0 { avg } else { fallback }
-            })
-            .sum();
-        let committed = self.filled_usdc.max(position_usdc);
+        let committed = self.filled_usdc.max(position_floor(ctx, &p));
         let budget = p.size_usdc - committed - inflight_usdc;
 
         let exits = self.exit_signals(ctx, p_up, now);
@@ -882,6 +942,28 @@ fn poll_binance(
     Ok(FeedUpdate { spot, per_min, candle_open, closes })
 }
 
+/// Notional the position tracker proves is already spent on an arm's pair.
+/// on_fill misses taker fills (reconcile catches them ~5s later), so this
+/// is the authoritative budget floor: shares held x entry price, with the
+/// live ask as the honest estimate while reconcile-seeded avg is still 0.
+fn position_floor(ctx: &StrategyContext, p: &ArmParams) -> f64 {
+    [&p.token_up, &p.token_down]
+        .iter()
+        .filter_map(|t| ctx.positions.get(*t).map(|pos| (*t, pos)))
+        .map(|(t, pos)| {
+            let size = pos.size.to_f64().unwrap_or(0.0);
+            let avg = pos.avg_entry_price.to_f64().unwrap_or(0.0);
+            let fallback = ctx
+                .order_books
+                .get(t)
+                .and_then(|b| b.best_ask())
+                .and_then(|l| l.price.to_f64())
+                .unwrap_or(p.max_price);
+            size * if avg > 0.0 { avg } else { fallback }
+        })
+        .sum()
+}
+
 /// Lag-1 autocorrelation of log-returns over the last `n` closes.
 fn lag1_autocorr(closes: &[f64], n: usize) -> f64 {
     let m = closes.len().min(n + 1);
@@ -989,6 +1071,20 @@ mod tests {
     fn twap_banked_below_ref_is_locked_down() {
         let (arm, now) = armed_with_feed(99.0, 99.0);
         assert!(arm.fair_p_up(now).unwrap().p_up < 0.001);
+    }
+
+    #[test]
+    fn decided_but_pushable_is_not_flip_proof() {
+        // +4.4bp banked contribution: survives natural reversion (decided)
+        // but an adversarial 25bp push over the remaining window could
+        // still flip it — no late-window flip clips.
+        let (arm, now) = armed_with_feed(100.05, 100.05);
+        let m = arm.fair_p_up(now).unwrap();
+        assert!(m.banked_decided);
+        assert!(!m.flip_proof);
+        // +100bp is beyond any push.
+        let (arm2, now2) = armed_with_feed(101.0, 101.0);
+        assert!(arm2.fair_p_up(now2).unwrap().flip_proof);
     }
 
     #[test]
