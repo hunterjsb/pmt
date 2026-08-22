@@ -47,6 +47,9 @@ secrecy = "0.10"
 # HTTP client (for L2 auth requests; blocking for strategy feed threads)
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 
+# Sync WS client for strategy feed threads (Binance trade stream)
+tungstenite = { version = "0.24", features = ["native-tls"] }
+
 # OpenSSL with vendored feature for static linking (avoids version mismatches)
 openssl = { version = "0.10", features = ["vendored"] }
 

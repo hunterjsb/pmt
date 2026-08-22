@@ -1256,7 +1256,7 @@ def _engine_bin() -> str:
 
 @engine.command("start")
 @click.argument("strategies", nargs=-1)
-@click.option("--tick-ms", default=250, show_default=True)
+@click.option("--tick-ms", default=50, show_default=True)
 def engine_start(strategies: tuple[str, ...], tick_ms: int) -> None:
     """Start pmengine detached (default strategy: updown). Logs + pidfile in ~/.pmt/engine."""
     import os
@@ -1311,7 +1311,7 @@ def engine_restart(ctx: click.Context) -> None:
     import time as _time
 
     _time.sleep(1)
-    ctx.invoke(engine_start, strategies=(), tick_ms=250)
+    ctx.invoke(engine_start, strategies=(), tick_ms=50)
 
 
 @engine.command("logs")
