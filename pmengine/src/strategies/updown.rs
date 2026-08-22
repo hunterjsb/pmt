@@ -27,7 +27,11 @@ const BINANCE_DATA: &str = "https://data-api.binance.vision";
 /// Spot older than this is a dead feed — hold, never trade through it.
 const MAX_SPOT_AGE_S: f64 = 5.0;
 /// One order in flight per token; assume dead if no fill inside this window.
-const INFLIGHT_TTL_S: f64 = 5.0;
+/// Must comfortably outlive the engine's ~5s position-reconcile cadence:
+/// taker fills are often MISSED by the realtime fill path and only show up
+/// via reconcile (proven live 2026-08-22), so freeing the budget sooner
+/// than reconcile lands means buying the same fill twice.
+const INFLIGHT_TTL_S: f64 = 12.0;
 
 // Private on purpose: the registry generator registers the first `pub struct`
 // in the file, which must be Updown.
@@ -90,6 +94,9 @@ pub struct Updown {
     filled_usdc: f64,
     /// token -> (notional, emitted_at unix) for the one order we allow in flight.
     inflight: std::collections::HashMap<String, (f64, f64)>,
+    /// Tokens whose resting orders still need pulling after a disarm —
+    /// on_command can't emit signals, so the next tick does it.
+    pending_cleanup: Vec<String>,
     last_eval: Option<serde_json::Value>,
 }
 
@@ -106,6 +113,7 @@ impl Updown {
             cleaned: false,
             filled_usdc: 0.0,
             inflight: std::collections::HashMap::new(),
+            pending_cleanup: Vec::new(),
             last_eval: None,
         }
     }
@@ -237,6 +245,16 @@ impl Strategy for Updown {
     }
 
     fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
+        if !self.pending_cleanup.is_empty() {
+            let signals = self
+                .pending_cleanup
+                .drain(..)
+                .flat_map(|t| {
+                    [Signal::Cancel { token_id: t.clone() }, Signal::Unsubscribe { token_id: t }]
+                })
+                .collect();
+            return signals;
+        }
         let p = match &self.params {
             Some(p) => p.clone(),
             None => return vec![Signal::Hold],
@@ -283,10 +301,26 @@ impl Strategy for Updown {
             }
         };
 
-        // Notional already committed: fills plus anything still in flight.
+        // Notional already committed. on_fill events are unreliable for taker
+        // orders (the engine often only learns of the fill via its ~5s
+        // position reconcile), so the authoritative floor is the position
+        // tracker itself: shares held x entry price. Take the max of every
+        // signal we have, then add anything still in flight.
         self.inflight.retain(|_, (_, at)| now - *at < INFLIGHT_TTL_S);
         let inflight_usdc: f64 = self.inflight.values().map(|(n, _)| n).sum();
-        let mut budget = p.size_usdc - self.filled_usdc - inflight_usdc;
+        let position_usdc: f64 = [&p.token_up, &p.token_down]
+            .iter()
+            .filter_map(|t| ctx.positions.get(t))
+            .map(|pos| {
+                let size = pos.size.to_f64().unwrap_or(0.0);
+                let avg = pos.avg_entry_price.to_f64().unwrap_or(0.0);
+                // Reconcile-seeded positions can carry avg 0 briefly; price
+                // those shares at our max_price so the budget errs tight.
+                size * if avg > 0.0 { avg } else { p.max_price }
+            })
+            .sum();
+        let committed = self.filled_usdc.max(position_usdc);
+        let mut budget = p.size_usdc - committed - inflight_usdc;
 
         let mut evals = Vec::new();
         for (side, token, fair) in [
@@ -391,11 +425,12 @@ impl Strategy for Updown {
             }
             Some("disarm") => {
                 self.stop_feed();
+                if let Some(p) = &self.params {
+                    self.pending_cleanup = vec![p.token_up.clone(), p.token_down.clone()];
+                }
                 let was = self.params.take().map(|p| p.slug);
                 self.tokens = Vec::new();
-                // Leave resting-order cleanup to the operator's next Cancel —
-                // strategy state is already dropped here.
-                Ok(serde_json::json!({"disarmed": was}))
+                Ok(serde_json::json!({"disarmed": was, "cleanup": "next tick"}))
             }
             Some("status") => Ok(serde_json::json!({
                 "armed": self.params.as_ref().map(|p| p.slug.clone()),
