@@ -1550,8 +1550,12 @@ def crypto_updown(ref: str, as_json: bool) -> None:
 @click.option("--max-price", type=float, default=0.97, show_default=True, help="Never pay above this")
 @click.option("--side", type=click.Choice(["up", "down"]), default=None, help="Restrict to one side")
 @click.option("--quiesce", type=float, default=20.0, show_default=True, help="No orders in the final N seconds")
+@click.option("--min-fair", type=float, default=0.95, show_default=True,
+              help="Only buy a side the model prices at least this high (the safety gate)")
+@click.option("--min-elapsed", type=float, default=0.5, show_default=True,
+              help="No fires before this fraction of the window has elapsed")
 def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
-               side: str | None, quiesce: float) -> None:
+               side: str | None, quiesce: float, min_fair: float, min_elapsed: float) -> None:
     """Arm the pmengine updown trigger on a market.
 
     Prices the market (semantics, vol, fee) and hands the parameters to the
@@ -1573,7 +1577,7 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         "start": r["start"], "end": r["end"],
         "sigma_bp_per_min": r["sigma_bp_per_min"], "fee_rate": r["fee_rate"],
         "size_usdc": size, "min_edge": min_edge, "max_price": max_price,
-        "quiesce_secs": quiesce,
+        "quiesce_secs": quiesce, "min_fair": min_fair, "min_elapsed_frac": min_elapsed,
     }
     if side:
         payload["side_filter"] = side

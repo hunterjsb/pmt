@@ -63,12 +63,22 @@ struct ArmParams {
     /// Optional "up"/"down" to trade one side only.
     #[serde(default)]
     pub side_filter: Option<String>,
+    /// Only buy a side the model prices at least this high — "take the
+    /// winning side once the outcome is clear", not fat early edges.
+    #[serde(default = "d_min_fair")]
+    pub min_fair: f64,
+    /// No fires before this fraction of the window has elapsed; early
+    /// extreme readings are fragile to vol misestimate.
+    #[serde(default = "d_min_elapsed")]
+    pub min_elapsed_frac: f64,
 }
 
 fn d_min_edge() -> f64 { 0.03 }
 fn d_max_price() -> f64 { 0.97 }
 fn d_quiesce() -> f64 { 20.0 }
 fn d_basis_guard() -> f64 { 3.0 }
+fn d_min_fair() -> f64 { 0.95 }
+fn d_min_elapsed() -> f64 { 0.5 }
 
 /// Shared state the Binance poller thread keeps warm.
 #[derive(Default)]
@@ -293,6 +303,17 @@ impl Strategy for Updown {
             return signals;
         }
 
+        let elapsed_frac = (now - p.start) / (p.end - p.start).max(1.0);
+        if elapsed_frac < p.min_elapsed_frac {
+            self.last_eval = Some(serde_json::json!({
+                "state": "gated",
+                "reason": format!("window {:.0}% elapsed, firing opens at {:.0}%",
+                                  elapsed_frac * 100.0, p.min_elapsed_frac * 100.0),
+                "t": now,
+            }));
+            return vec![Signal::Hold];
+        }
+
         let p_up = match self.fair_p_up(&p, now) {
             Ok(v) => v,
             Err(gate) => {
@@ -344,7 +365,8 @@ impl Strategy for Updown {
             let net = fair - ask - fee;
             evals.push(serde_json::json!({"side": side, "fair": fair, "ask": ask, "net": net}));
 
-            let firing = net >= p.min_edge
+            let firing = fair >= p.min_fair
+                && net >= p.min_edge
                 && ask <= p.max_price
                 && budget > 5.0
                 && !self.inflight.contains_key(token);
