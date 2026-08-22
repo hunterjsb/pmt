@@ -503,30 +503,38 @@ def _handle_ws(state: WatchState, msg: dict) -> None:
 
 
 def _diamond(sit: dict):
-    """Bases + count, scoreboard-style."""
+    """Bases + count, scoreboard-style: occupied bases light up solid."""
     from rich.text import Text
 
-    def base(k):
-        return ("◆", "bold yellow") if sit.get(k) else ("◇", "dim")
+    def sty(k):
+        return "bold black on yellow" if sit.get(k) else "dim"
 
+    s1, s2, s3 = sty("onFirst"), sty("onSecond"), sty("onThird")
+    rows = [
+        [("      ", None), ("╭───╮", s2), ("      ", None)],
+        [("      ", None), ("│ 2 │", s2), ("      ", None)],
+        [("    ╱ ", "dim"), ("╰───╯", s2), (" ╲    ", "dim")],
+        [("╭───╮", s3), ("       ", None), ("╭───╮", s1)],
+        [("│ 3 │", s3), ("       ", None), ("│ 1 │", s1)],
+        [("╰───╯", s3), (" ╲   ╱ ", "dim"), ("╰───╯", s1)],
+        [("        ⌂        ", "bold")],
+    ]
     t = Text()
-    t.append("   ")
-    t.append(*base("onSecond"))
-    t.append("\n ")
-    t.append(*base("onThird"))
-    t.append("   ")
-    t.append(*base("onFirst"))
-    t.append("\n   ")
-    t.append("⌂", style="dim")
-    t.append("\n")
+    for row in rows:
+        for chunk, style in row:
+            t.append(chunk, style=style)
+        t.append("\n")
 
     def dots(n, mx):
         n = min(int(n or 0), mx)
         return "●" * n + "○" * (mx - n)
 
-    t.append(f"B {dots(sit.get('balls'), 3)}\n", style="cyan")
-    t.append(f"S {dots(sit.get('strikes'), 2)}\n", style="cyan")
-    t.append(f"O {dots(sit.get('outs'), 2)}", style="red")
+    t.append("\n ")
+    t.append(f"B {dots(sit.get('balls'), 3)}", style="cyan")
+    t.append("  ")
+    t.append(f"S {dots(sit.get('strikes'), 2)}", style="cyan")
+    t.append("\n      ")
+    t.append(f"O {dots(sit.get('outs'), 2)}", style="bold red")
     return t
 
 
@@ -545,8 +553,11 @@ def _scorebox(teams: dict):
     for tm in (away, home):
         ls = tm.get("linescores") or []
         cells = [str(v) for v in ls] + [" "] * (n - len(ls))
+        name = tm.get("abbrev") or ""
+        if tm.get("record"):
+            name += f" [dim]{tm['record']}[/]"
         t.add_row(
-            tm.get("abbrev") or "",
+            name,
             *cells,
             str(tm.get("score") or "0"),
             "—" if tm.get("hits") is None else str(tm.get("hits")),
@@ -605,17 +616,22 @@ def _ladder(book: dict, depth: int = 4):
     mx = max(s for _, s in asks + bids)
     t = Table.grid(padding=(0, 1))
     t.add_column(justify="right", width=4)
+    t.add_column(justify="right", width=6)
     t.add_column()
 
     def bar(sz, style):
-        return Text("█" * max(1, round(sz / mx * 12)) + f" {sz:,.0f}", style=style)
+        return Text("█" * max(1, round(sz / mx * 12)), style=style)
 
+    t.add_row(Text("¢", style="dim"), Text("shares", style="dim"), "")
     for px, sz in reversed(asks):
-        t.add_row(f"{px:.2f}", bar(sz, "red"))
-    mid = _mid(book)
-    t.add_row("", Text(f"· {mid * 100:.1f}¢ ·" if mid else "·", style="dim"))
+        t.add_row(Text(f"{px * 100:.1f}", style="red"), f"{sz:,.0f}", bar(sz, "red"))
+    mid, spr = _mid(book), None
+    if book.get("bb") and book.get("ba"):
+        spr = book["ba"] - book["bb"]
+    label = f"mid {mid * 100:.1f}" + (f" · spr {spr * 100:.1f}" if spr else "") if mid else "·"
+    t.add_row("", "", Text(label, style="bold"))
     for px, sz in bids:
-        t.add_row(f"{px:.2f}", bar(sz, "green"))
+        t.add_row(Text(f"{px * 100:.1f}", style="green"), f"{sz:,.0f}", bar(sz, "green"))
     return t
 
 
@@ -683,21 +699,30 @@ def _render(state: WatchState):
                 "POS",
                 f"{side['abbrev']} {pos['size']:g} @ {pos['avg'] * 100:.1f}¢ → mark {mark * 100:.1f}¢"
                 f"  [{color}]{pnl:+.2f}$[/]",
-                "live" if not state.pos_manual else "--pos",
+                "manual" if state.pos_manual else "auto",
             )
 
     sparks = Table.grid(padding=(0, 1))
     sparks.add_column(style="dim", width=5)
     sparks.add_column()
-    sparks.add_row("espn", Text(sparkline(list(state.espn_wp)), style="cyan"))
-    sparks.add_row("mkt", Text(sparkline(list(state.mkt_prob)), style="yellow"))
+    sparks.add_column(justify="right", width=6)
+
+    def spark_row(label, series, style):
+        cur = f"{series[-1][1] * 100:.1f}%" if series else "—"
+        sparks.add_row(label, Text(sparkline(series), style=style), Text(cur, style=f"bold {style}"))
+
+    spark_row("ESPN", list(state.espn_wp), "cyan")
+    spark_row("MKT", list(state.mkt_prob), "yellow")
 
     feed = Table.grid(padding=(0, 1))
     feed.add_column(style="dim", width=8)
     feed.add_column(width=5)
     feed.add_column()
     now_mono, now_wall = time.monotonic(), time.time()
-    for mono, kind, txt in list(state.feed_log)[-6:]:
+    tail = list(state.feed_log)[-5:]
+    if not tail:
+        feed.add_row("", "", Text("waiting for game events and book moves…", style="dim"))
+    for mono, kind, txt in tail:
         wall = datetime.fromtimestamp(now_wall - (now_mono - mono)).strftime("%H:%M:%S")
         feed.add_row(wall, Text(kind, style="cyan" if kind == "GAME" else "yellow"), txt)
 
@@ -716,12 +741,15 @@ def _render(state: WatchState):
     sit = gs.get("situation") or {}
     if any(k in sit for k in ("balls", "strikes", "outs")):  # baseball mode
         field = Table.grid(padding=(0, 1))
-        for _ in range(3):
-            field.add_column()
+        field.add_column()
+        field.add_column()
         field.add_row(
-            Panel(_diamond(sit), border_style="dim"),
-            Panel(_scorebox(gs.get("teams") or {}), title="line score", border_style="dim"),
-            Panel(_matchup(gs), title="matchup", border_style="dim"),
+            Panel(_diamond(sit), title="field", border_style="dim", padding=(0, 1)),
+            Group(
+                Panel(_scorebox(gs.get("teams") or {}), title="line score",
+                      border_style="dim", padding=(0, 1)),
+                Panel(_matchup(gs), title="matchup", border_style="dim", padding=(0, 1)),
+            ),
         )
         blocks.append(field)
 
@@ -729,13 +757,13 @@ def _render(state: WatchState):
     books_row.add_column()
     books_row.add_column()
     books_row.add_row(
-        Panel(_ladder(ab), title=f"{away['abbrev']} book", border_style="dim"),
-        Panel(_ladder(hb), title=f"{home['abbrev']} book", border_style="dim"),
+        Panel(_ladder(ab), title=f"{away['abbrev']} to win", border_style="dim", padding=(0, 1)),
+        Panel(_ladder(hb), title=f"{home['abbrev']} to win", border_style="dim", padding=(0, 1)),
     )
     blocks.append(books_row)
 
     blocks += [
-        Panel(sparks, title="last 15m (home prob)", border_style="dim"),
+        Panel(sparks, title=f"{home['abbrev']} win prob · espn vs market · 15m", border_style="dim"),
         Panel(feed, title="events", border_style="dim"),
         Panel(Text.from_markup(stats_line), title="game→market coupling", border_style="magenta"),
     ]
