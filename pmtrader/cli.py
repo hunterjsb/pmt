@@ -1481,6 +1481,68 @@ def engine_reject(alert_id: str) -> None:
 # ============================================================
 
 
+@cli.group("crypto")
+def crypto_group() -> None:
+    """Crypto up/down market pricing against Binance/Chainlink data."""
+
+
+@crypto_group.command("spot")
+@click.argument("symbol", default="BTCUSDT")
+def crypto_spot(symbol: str) -> None:
+    """Live Binance spot price (default BTCUSDT)."""
+    from polymarket.crypto import spot_price
+
+    console.print(f"{symbol.upper()}: {spot_price(symbol.upper()):,.2f}")
+
+
+@crypto_group.command("updown")
+@click.argument("ref")
+@click.option("--json", "as_json", is_flag=True, help="Emit the full eval as JSON")
+def crypto_updown(ref: str, as_json: bool) -> None:
+    """Price an up/down market: semantics, fair value, book edge, verdict.
+
+    REF is a polymarket.com event URL or bare slug. Detects TWAP vs
+    close-vs-open resolution from the description and models accordingly.
+    """
+    from polymarket.crypto import eval_updown
+
+    try:
+        r = eval_updown(ref)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+    if as_json:
+        console.print_json(json.dumps(r))
+        return
+
+    m = r["model"]
+    console.print(f"[bold]{r['title']}[/bold]  [dim]{r['kind']} · {r['symbol']} · {r['rem_s']:.0f}s left[/dim]")
+    if m.get("pending"):
+        console.print(f"spot {r['spot']:,.0f}  σ {r['sigma_bp_per_min']:.2f}bp/min")
+    else:
+        if r["kind"] == "twap":
+            line = (f"spot {r['spot']:,.0f}  ref {m['ref']:,.0f}  banked({m.get('banked_s', 0):.0f}s) "
+                    f"{m['banked']:,.0f}")
+            if not m.get("expired"):
+                line += f"  proj {m['proj']:,.0f}  breakeven {m['breakeven']:,.0f}"
+        else:
+            line = f"spot {r['spot']:,.0f}  open {m['open']:,.0f}"
+        console.print(f"{line}  margin {m['margin_bp']:+.1f}bp  σ {r['sigma_bp_per_min']:.2f}bp/min")
+        if not m.get("expired"):
+            console.print(f"P(UP) [bold]{m['p_up']:.3f}[/bold]  [dim]vol x0.5: {m['p_up_lowvol']:.3f} · x1.5: {m['p_up_highvol']:.3f}[/dim]")
+
+    t = Table(show_header=True)
+    for col in ("side", "fair", "bid", "ask", "cost w/fee", "net edge"):
+        t.add_column(col, justify="right")
+    for side in ("up", "down"):
+        e = r["edges"][side]
+        fmt = lambda v, p="{:.3f}": p.format(v) if v is not None else "—"
+        edge = f"{e['net_edge'] * 100:+.1f}¢" if e["net_edge"] is not None else "—"
+        t.add_row(side.upper(), f"{e['fair']:.3f}", fmt(e["bid"]), fmt(e["ask"]),
+                  fmt(e["taker_cost"]), edge)
+    console.print(t)
+    console.print(f"[bold]{r['verdict']}[/bold]")
+
+
 @cli.group("sports")
 def sports_group() -> None:
     """Live sports data: scores, game state, ESPN win probability."""
