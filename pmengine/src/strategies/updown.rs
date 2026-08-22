@@ -551,6 +551,15 @@ impl Strategy for Updown {
             Ok(v) => v,
             Err(gate) => {
                 self.last_eval = Some(serde_json::json!({"state": "gated", "reason": gate, "t": now}));
+                // Gated windows must be reconstructable from the tape too —
+                // v2's first outing sat out 5 straight minutes and left
+                // nothing but a cleanup record to autopsy.
+                if now - self.last_tape_at >= 5.0 {
+                    self.last_tape_at = now;
+                    tape(serde_json::json!({
+                        "t": now, "ev": "gated", "slug": p.slug, "reason": gate,
+                    }));
+                }
                 return vec![Signal::Hold];
             }
         };
