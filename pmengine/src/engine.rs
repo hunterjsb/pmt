@@ -769,14 +769,6 @@ impl Engine {
         // newcomers get SubscribeToken commands, drop-outs get
         // UnsubscribeToken. Each filter contributes its share up to
         // `max_subscriptions`; the union is the desired set.
-        let scanner_filters: Vec<crate::gamma::MarketFilter> = self
-            .strategy_runtime
-            .summaries()
-            .into_iter()
-            .filter_map(|_| None) // populated below — summaries doesn't carry filters
-            .collect();
-        // Actually pull filters off the trait — summaries() doesn't expose
-        // them. Iterate the live strategies via a helper accessor.
         let scanner_filters: Vec<crate::gamma::MarketFilter> =
             self.strategy_runtime.market_filters();
         // Tokens statically declared by ANY strategy. The scanner must
@@ -1105,7 +1097,7 @@ impl Engine {
                         // is ground truth, so we correct drift here. This keeps
                         // MAX_POSITION enforcement honest even when a fill slips
                         // past the trades poller.
-                        if tick_count % 30 == 0 {
+                        if tick_count.is_multiple_of(30) {
                             for token_id in self.subscribed_tokens.clone() {
                                 if let Ok(Some((size, avg))) = self.client.get_position(&token_id).await {
                                     let delta = self.positions.reconcile(&token_id, size, avg);

@@ -15,7 +15,7 @@ pub enum TenantTier {
 
 impl TenantTier {
     /// Parse tier from string (case-insensitive).
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_tier_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "pro" => TenantTier::Pro,
             "enterprise" => TenantTier::Enterprise,
@@ -39,6 +39,14 @@ impl TenantTier {
             TenantTier::Pro => 50,
             TenantTier::Enterprise => 100,
         }
+    }
+}
+
+impl std::str::FromStr for TenantTier {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from_tier_str(s))
     }
 }
 
@@ -121,12 +129,16 @@ mod tests {
 
     #[test]
     fn test_tenant_tier_from_str() {
-        assert_eq!(TenantTier::from_str("free"), TenantTier::Free);
-        assert_eq!(TenantTier::from_str("pro"), TenantTier::Pro);
-        assert_eq!(TenantTier::from_str("PRO"), TenantTier::Pro);
-        assert_eq!(TenantTier::from_str("enterprise"), TenantTier::Enterprise);
-        assert_eq!(TenantTier::from_str("ENTERPRISE"), TenantTier::Enterprise);
-        assert_eq!(TenantTier::from_str("unknown"), TenantTier::Free);
+        use std::str::FromStr;
+        assert_eq!(TenantTier::from_tier_str("free"), TenantTier::Free);
+        assert_eq!(TenantTier::from_tier_str("pro"), TenantTier::Pro);
+        assert_eq!(TenantTier::from_tier_str("PRO"), TenantTier::Pro);
+        assert_eq!(TenantTier::from_tier_str("enterprise"), TenantTier::Enterprise);
+        assert_eq!(TenantTier::from_tier_str("ENTERPRISE"), TenantTier::Enterprise);
+        assert_eq!(TenantTier::from_tier_str("unknown"), TenantTier::Free);
+
+        assert_eq!(TenantTier::from_str("pro").unwrap(), TenantTier::Pro);
+        assert_eq!("enterprise".parse::<TenantTier>().unwrap(), TenantTier::Enterprise);
     }
 
     #[test]

@@ -15,11 +15,12 @@ Use `uv` for Python (not pip). Use `uv run` to execute, `uv sync` to install.
 
 ```bash
 # Python (pmtrader, pmstrat)
-uv sync && uv run pytest tests/ -v
+(cd pmtrader && uv sync && uv run pytest tests/ -v)
+(cd pmstrat && uv sync && uv run pytest tests/ -v)
 
 # Rust (pmproxy, pmengine)
-cargo build --features ec2
-cargo test
+(cd pmproxy && cargo test)
+(cd pmengine && cargo build --features ec2 && cargo test)
 ```
 
 ## Architecture

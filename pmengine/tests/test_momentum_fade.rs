@@ -7,6 +7,7 @@ mod fixtures;
 use fixtures::*;
 use pmengine::strategies::MomentumFade;
 use pmengine::strategy::Strategy;
+#[allow(unused_imports)]
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 

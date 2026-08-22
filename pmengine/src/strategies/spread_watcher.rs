@@ -60,7 +60,7 @@ impl Strategy for SpreadWatcher {
             let mid = (bid + ask) / dec!(2);
             signals.push(Signal::Buy { token_id: token.to_string(), price: mid, size: dec!(1), urgency: Urgency::Low });
         }
-        return signals;
+        signals
     }
 
     fn on_fill(&mut self, _fill: &Fill) {}

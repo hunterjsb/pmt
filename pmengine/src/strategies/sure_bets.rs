@@ -64,11 +64,11 @@ impl Strategy for SureBets {
             if excluded {
                 continue;
             }
-            if (market.liquidity.is_some() && market.liquidity.map(|v| v < MIN_LIQUIDITY).unwrap_or(false)) {
+            if market.liquidity.is_some() && market.liquidity.map(|v| v < MIN_LIQUIDITY).unwrap_or(false) {
                 continue;
             }
             let hours_left = market.hours_until_expiry;
-            if (hours_left.is_none() || hours_left.map(|v| v < 0.0).unwrap_or(false) || hours_left.map(|v| v > MAX_HOURS_TO_EXPIRY).unwrap_or(false)) {
+            if hours_left.is_none() || hours_left.map(|v| v < 0.0).unwrap_or(false) || hours_left.map(|v| v > MAX_HOURS_TO_EXPIRY).unwrap_or(false) {
                 continue;
             }
             let book = match ctx.order_books.get(token_id) {
@@ -109,9 +109,9 @@ impl Strategy for SureBets {
             if size < MIN_ORDER_SIZE {
                 continue;
             }
-            signals.push(Signal::Buy { token_id: token_id.to_string(), price: ask_price, size: size, urgency: Urgency::Medium });
+            signals.push(Signal::Buy { token_id: token_id.to_string(), price: ask_price, size, urgency: Urgency::Medium });
         }
-        return if !signals.is_empty() { signals } else { vec![Signal::Hold] };
+        if !signals.is_empty() { signals } else { vec![Signal::Hold] }
     }
 
     fn on_fill(&mut self, _fill: &Fill) {}

@@ -277,7 +277,7 @@ impl CognitoClaims {
     pub fn tier(&self) -> TenantTier {
         self.tenant_tier
             .as_ref()
-            .map(|t| TenantTier::from_str(t))
+            .map(|t| TenantTier::from_tier_str(t))
             .unwrap_or_default()
     }
 }

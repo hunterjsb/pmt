@@ -797,8 +797,8 @@ fn parse_datetime(s: &str) -> Option<DateTime<Utc>> {
     }
 
     // Try with Z suffix converted
-    let s_fixed = if s.ends_with('Z') {
-        format!("{}+00:00", &s[..s.len() - 1])
+    let s_fixed = if let Some(stripped) = s.strip_suffix('Z') {
+        format!("{}+00:00", stripped)
     } else {
         s.to_string()
     };

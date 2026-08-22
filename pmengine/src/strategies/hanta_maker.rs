@@ -84,7 +84,7 @@ impl Strategy for HantaMaker {
             signals.push(Signal::Buy { token_id: token_id.to_string(), price: my_bid, size: ORDER_SIZE, urgency: Urgency::Medium });
         }
         signals.push(Signal::Sell { token_id: token_id.to_string(), price: my_ask, size: ORDER_SIZE, urgency: Urgency::Medium });
-        return signals;
+        signals
     }
 
     fn on_fill(&mut self, _fill: &Fill) {}

@@ -101,23 +101,21 @@ def on_tick(ctx) -> list[Signal]:
         sell_size = remaining_sell
 
     # Place bid if we can buy and size > 0
-    if can_buy:
-        if buy_size > Decimal("0"):
-            signals.append(Buy(
-                token_id=token_id,
-                price=my_bid,
-                size=buy_size,
-                urgency=Urgency.LOW,  # Post-only
-            ))
+    if can_buy and buy_size > Decimal("0"):
+        signals.append(Buy(
+            token_id=token_id,
+            price=my_bid,
+            size=buy_size,
+            urgency=Urgency.LOW,  # Post-only
+        ))
 
     # Place ask if we can sell and size > 0
-    if can_sell:
-        if sell_size > Decimal("0"):
-            signals.append(Sell(
-                token_id=token_id,
-                price=my_ask,
-                size=sell_size,
-                urgency=Urgency.LOW,  # Post-only
-            ))
+    if can_sell and sell_size > Decimal("0"):
+        signals.append(Sell(
+            token_id=token_id,
+            price=my_ask,
+            size=sell_size,
+            urgency=Urgency.LOW,  # Post-only
+        ))
 
     return signals

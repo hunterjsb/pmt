@@ -135,19 +135,15 @@ impl Strategy for DynamicMarketMaker {
                 sell_size = remaining_sell;
             }
             signals.push(Signal::Cancel { token_id: token_id.to_string() });
-            if can_buy {
-                if buy_size > dec!(0) {
-                    signals.push(Signal::Buy { token_id: token_id.to_string(), price: my_bid, size: buy_size, urgency: Urgency::Low });
-                }
+            if can_buy && buy_size > dec!(0) {
+                signals.push(Signal::Buy { token_id: token_id.to_string(), price: my_bid, size: buy_size, urgency: Urgency::Low });
             }
-            if can_sell {
-                if sell_size > dec!(0) {
-                    signals.push(Signal::Sell { token_id: token_id.to_string(), price: my_ask, size: sell_size, urgency: Urgency::Low });
-                }
+            if can_sell && sell_size > dec!(0) {
+                signals.push(Signal::Sell { token_id: token_id.to_string(), price: my_ask, size: sell_size, urgency: Urgency::Low });
             }
-            tokens_quoted = tokens_quoted + 1;
+            tokens_quoted += 1;
         }
-        return if !signals.is_empty() { signals } else { vec![Signal::Hold] };
+        if !signals.is_empty() { signals } else { vec![Signal::Hold] }
     }
 
     fn on_fill(&mut self, _fill: &Fill) {}

@@ -5,170 +5,159 @@
 [![pmengine](https://img.shields.io/github/v/release/hunterjsb/pmt?filter=pmengine-*&label=pmengine)](https://github.com/hunterjsb/pmt/releases?q=pmengine)
 [![pmtrader](https://img.shields.io/github/v/release/hunterjsb/pmt?filter=pmtrader-*&label=pmtrader)](https://github.com/hunterjsb/pmt/releases?q=pmtrader)
 
-Polymarket trading toolkit.
+Polymarket trading toolchain designed for agentic workflows, discretionary execution, and algorithmic market making.
 
 ```
-pmtrader/   Python SDK + CLI
-pmproxy/    Rust reverse proxy (Lambda live; EC2 binary as fallback)
-pmengine/   Rust HFT trading engine
-pmstrat/    Python strategy DSL + backtesting + transpiler to Rust
+pmtrader/   Python SDK + pmt CLI (Agentic trading cockpit, portfolio & PnL, order routing)
+pmproxy/    Rust reverse proxy (AWS Lambda in eu-west-1 w/ Function URL + Cognito/SigV4)
+pmengine/   Rust execution & risk daemon (HTTP control plane, trade buffer, human-in-the-loop alerts)
+pmstrat/    Python strategy DSL + transpiler to Rust for high-throughput execution
 ```
+
+---
 
 ## Architecture
 
 ```mermaid
-flowchart LR
-    subgraph Clients
+flowchart TD
+    subgraph UsersAndAgents["Agents & Traders"]
+        AGENT["AI Agents / Scripts"]
+        USER["Interactive Trader"]
+    end
+
+    subgraph PMTRADER["pmtrader (Python 3.14)"]
         CLI["pmt CLI"]
-        BOT["Bots / Scripts"]
+        SDK["PolymarketAPI SDK"]
+        RESOLVE["URL / Slug / Token Resolver"]
+        SIGV4["SigV4 Signer"]
     end
 
-    subgraph PMT["pmtrader (Python)"]
-        API["PolymarketAPI"]
-        AUTH["Auth & Signing"]
+    AGENT --> CLI
+    AGENT --> SDK
+    USER --> CLI
+
+    CLI --> RESOLVE
+    SDK --> RESOLVE
+
+    subgraph ENGINE_LOCAL["pmengine (Local Rust Daemon)"]
+        CP["HTTP Control Plane (:7531)"]
+        ALERTS["Human Alert / Approval Pipeline"]
+        SCANNER["Dynamic Gamma Scanner"]
+        RISK["Account-Wide Risk & Exposure"]
+        TRADES["Rolling Trades Buffer"]
     end
 
-    subgraph STRATDSL["pmstrat (Python)"]
-        DSL["Strategy DSL"]
-        TRANS["Transpiler"]
+    RESOLVE -.->|"Optional Local Routing / TTLs"| CP
+    CLI -.->|"pmt engine status/approve/reject"| CP
+
+    subgraph PROXY["pmproxy (AWS Lambda eu-west-1)"]
+        AUTH["Cognito JWT / SigV4 Auth"]
+        RATELIMIT["Tenant Rate Limiting"]
+        ROUTE["Upstream Router"]
     end
 
-    subgraph ENGINE["pmengine (Rust)"]
-        STRAT["Strategy Runtime"]
-        ORDER["Order Manager"]
-        RISK["Risk Manager"]
-    end
+    RESOLVE -->|"SigV4 Authed Requests"| PROXY
+    CP -->|"Proxy Upstream"| PROXY
 
-    DSL --> TRANS
-    TRANS -->|"generates"| STRAT
-
-    CLI --> PMT
-    BOT --> PMT
-
-    PMT --> DECIDE{"PMPROXY_URL?"}
-
-    subgraph PROXY["pmproxy (Rust)"]
-        LAMBDA["Lambda (eu-west-1)"]
-    end
-
-    DECIDE -->|set| PROXY
-    DECIDE -->|unset| POLY
-
-    subgraph POLY["Polymarket"]
-        CLOB["CLOB API"]
-        GAMMA["Gamma API"]
+    subgraph POLY["Polymarket Infrastructure"]
+        CLOB["CLOB API (clob.polymarket.com)"]
+        GAMMA["Gamma Markets API"]
+        DATA["Data API / Position Tape"]
         RPC["Polygon RPC"]
     end
 
     PROXY --> POLY
-    ENGINE --> POLY
 ```
 
-## pmtrader
+---
+
+## 1. `pmtrader` (`pmt` CLI & Python SDK)
+
+The central daily driver for agentic and manual trading. All orders support Polymarket event URLs, slug URLs, or direct token IDs, with `--amount $X` notionals, multi-market disambiguation (`--match`), and automatic SigV4 signing through `pmproxy`.
 
 ```bash
 cd pmtrader && uv sync
 ```
 
+### Orders & Execution
 ```bash
-pmt --help                                                  # list subcommands
-
-# Symmetric buy/sell: REF is a polymarket URL/slug OR numeric token id.
+# Place orders using Polymarket URL or slug
 pmt buy  https://polymarket.com/event/btc-updown-4h-1779825600 down --amount $910
-pmt sell URL no --amount $50 --match Trump                  # URL ref + outcome
-pmt buy  14658893069672317885... --price 0.92 --size 217    # token ref + explicit limit
-pmt sweep URL yes --to 0.95 --max-cost $150 --dry-run       # take all asks ≤ 0.95, one GTC limit
+pmt sell nobel-peace-prize-winner-2026 no --amount $50 --match Trump
 
-pmt balance                                                 # spendable USDC + locked in resting BUYs
-pmt book URL yes                                            # depth chart w/ mid + spread
-pmt positions --orders                                      # portfolio + open orders + exposure
-pmt pnl                                                     # realized 1d/7d/30d/all + unrealized
-pmt rewards --days 7                                        # REWARD + YIELD income
-pmt search pandemic                                         # cross-market search
-pmt engine status                                           # local engine snapshot
-pmt scan cliff                                              # opportunity scanners
+# Direct token limit orders
+pmt buy  14658893069672317885... --price 0.92 --size 217
+pmt sell 14658893069672317885... --price 0.98 --size 50
+
+# Market sweep: sweep all asks ≤ 0.95 and optionally place a take-profit flip
+pmt sweep URL yes --to 0.95 --max-cost $150 --dry-run
+pmt sweep 14658... --to 0.95 --flip 0.99
+
+# Auto-cancel with TTL (routes through local pmengine when active)
+pmt buy URL no --amount $50 --ttl 30m
+```
+
+### Portfolio, PnL & Market Discovery
+```bash
+pmt balance                          # Spendable USDC vs cash locked in resting BUYs
+pmt positions --orders               # Live positions, open orders & theme exposure
+pmt pnl                              # Realized (1d/7d/30d/all) & unrealized (matches polymarket profile)
+pmt rewards --days 7                 # REWARD + YIELD distributions
+pmt book URL yes                     # Depth chart with mid price and spread
+pmt search pandemic                  # Query active markets by keyword
+pmt scan cliff                       # Scan order books for liquidity cliffs
 ```
 
 See [pmtrader/README.md](pmtrader/README.md) for the full CLI reference.
 
-### Config
+---
 
-```bash
-# .env (for trading)
-PM_PRIVATE_KEY=0x...
-PM_FUNDER_ADDRESS=0x...
-PM_SIGNATURE_TYPE=1             # 0=EOA, 1=Poly Proxy, 2=EIP-1271
+## 2. `pmengine` (Execution & Risk Daemon)
 
-# pmproxy (required to trade from a geoblocked region)
-PMPROXY_URL=https://<...>.lambda-url.eu-west-1.on.aws
-PMPROXY_USERNAME=...
-PMPROXY_PASSWORD=...
-```
-
-### Python SDK
-
-```python
-from polymarket import PolymarketAPI
-
-api = PolymarketAPI()
-api.place("buy", token=..., price=0.93, size=217)
-api.flip(token=..., buy_price=0.09, sell_price=0.10, size=850)
-api.get_positions()
-api.search_markets("pandemic")
-```
-
-## pmproxy
-
-```bash
-cd pmproxy && cargo build --release --features ec2
-./target/release/pmproxy
-```
-
-Routes `/clob/*`, `/gamma/*`, `/chain/*` to Polymarket APIs.
-
-See [pmproxy/README.md](pmproxy/README.md).
-
-## pmengine
+High-performance Rust trading daemon that manages WebSocket orderbooks, enforces portfolio risk limits, runs transpiled strategies, and exposes a local HTTP control plane (`http://127.0.0.1:7531`).
 
 ```bash
 cd pmengine && cargo build --release --features ec2
-./target/release/pmengine --dry-run
+./target/release/pmengine run sure_bets dynamic_market_maker
 ```
 
-### Config
+### Key Capabilities
+- **Local Control Plane**: `pmt engine status`, `pmt engine strategies`, and `pmt engine subscriptions`.
+- **Human-in-the-Loop Alerts**: Strategies can emit `Signal::Alert` for high-edge opportunities; review and approve them via `pmt engine alerts` and `pmt engine approve <id>`.
+- **Position Reconciliation**: Automatically syncs with Polymarket Data API every 30s to eliminate fill accounting drift.
+- **Dynamic Scanner**: Subscribes and unsubscribes tokens on the fly based on strategy `MarketFilter` rules.
 
-```bash
-# .env
-PMENGINE_PRIVATE_KEY=0x...
-PMENGINE_MAX_POSITION_SIZE=1000
-PMENGINE_MAX_TOTAL_EXPOSURE=5000
-PMENGINE_TICK_INTERVAL_MS=1000
-```
+---
 
-## pmstrat
+## 3. `pmproxy` (AWS Lambda Gateway)
+
+Rust reverse proxy deployed as an AWS Lambda with a Function URL in `eu-west-1` (near Polymarket infrastructure).
+
+- **Geoblock Bypass**: Bridges requests to `clob.polymarket.com`, `gamma-api.polymarket.com`, and Polygon RPC.
+- **Security & Multi-Tenancy**: Cognito JWT auth validation and SigV4 client signing.
+- **Automated CI/CD**: Managed via Pulumi (`infra/pulumi/`) and auto-deployed via GitHub Actions OIDC on version bumps.
+
+See [pmproxy/README.md](pmproxy/README.md).
+
+---
+
+## 4. `pmstrat` (Strategy DSL & Transpiler)
+
+Define trading strategies in a clean Python subset, validate with local backtesting, and transpile to high-performance Rust for `pmengine`.
 
 ```bash
 cd pmstrat && uv sync
-uv run pmstrat
+uv run pmstrat transpile --all    # Transpile Python strategies to Rust
+uv run pmstrat lint sure_bets     # Validate strategy DSL
 ```
 
-Strategy DSL and backtesting framework. Define strategies in a constrained Python subset using the `@strategy` decorator, backtest locally, then transpile to Rust for execution by pmengine.
+---
 
-```
-Python Strategy (pmstrat DSL)
-    ↓ transpile
-Rust Strategy Code
-    ↓ compile into
-pmengine binary
-    ↓ execute
-Polymarket (production)
-```
-
-## Test
+## Testing
 
 ```bash
-cd pmtrader && uv run pytest      # Python SDK tests
-cd pmstrat && uv run pytest       # Strategy tests
-cd pmproxy && cargo test          # Proxy tests
-cd pmengine && cargo test         # Engine tests
+(cd pmproxy && cargo test)                           # Proxy tests
+(cd pmengine && cargo test)                          # Engine & strategy integration tests
+(cd pmtrader && uv sync && uv run pytest tests/ -v)  # Trader CLI & SDK tests
+(cd pmstrat && uv sync && uv run pytest tests/ -v)   # DSL & transpiler tests
 ```

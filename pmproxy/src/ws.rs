@@ -175,10 +175,10 @@ async fn handle_socket(
 
 fn axum_to_tungstenite(msg: AxumMessage) -> Option<TungMessage> {
     match msg {
-        AxumMessage::Text(t) => Some(TungMessage::Text(t.to_string().into())),
-        AxumMessage::Binary(b) => Some(TungMessage::Binary(b.to_vec().into())),
-        AxumMessage::Ping(p) => Some(TungMessage::Ping(p.to_vec().into())),
-        AxumMessage::Pong(p) => Some(TungMessage::Pong(p.to_vec().into())),
+        AxumMessage::Text(t) => Some(TungMessage::Text(t.to_string())),
+        AxumMessage::Binary(b) => Some(TungMessage::Binary(b.to_vec())),
+        AxumMessage::Ping(p) => Some(TungMessage::Ping(p.to_vec())),
+        AxumMessage::Pong(p) => Some(TungMessage::Pong(p.to_vec())),
         AxumMessage::Close(Some(cf)) => Some(TungMessage::Close(Some(
             tokio_tungstenite::tungstenite::protocol::CloseFrame {
                 code: cf.code.into(),

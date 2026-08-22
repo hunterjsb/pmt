@@ -95,13 +95,13 @@ impl Strategy for MomentumFade {
             if suggested_price <= dec!(0.01) {
                 suggested_price = dec!(0.01);
             }
-            let bucket = (ctx.timestamp.timestamp() as i64) / 60;
+            let bucket = ctx.timestamp.timestamp() / 60;
             signals.push(Signal::Alert { reason: format!("vol spike: short {} / baseline {:.0} ({:.1}x)", short_vol, baseline_vol, short_rate / baseline_rate).to_string(), suggested: Box::new(Signal::Sell { token_id: token_id.to_string(), price: suggested_price, size: SUGGESTED_SIZE, urgency: Urgency::Medium }), ttl_secs: ALERT_TTL_SECS, dedupe_key: format!("momentum_fade-{}-{}", token_id.chars().take(16).collect::<String>(), bucket).to_string() });
         }
         if signals.is_empty() {
             return vec![Signal::Hold];
         }
-        return signals;
+        signals
     }
 
     fn on_fill(&mut self, _fill: &Fill) {}

@@ -183,9 +183,8 @@ pub async fn authenticate(
     }
 
     // Extract and validate token
-    let token = extract_bearer_token(auth_header).map_err(|e| {
+    let token = extract_bearer_token(auth_header).inspect_err(|_| {
         state.metrics.record_auth_failure("missing_token");
-        e
     })?;
 
     let jwks_cache = state
@@ -196,23 +195,21 @@ pub async fn authenticate(
             AuthError::JwksFetchError("Auth enabled but JWKS cache not initialized".to_string())
         })?;
 
-    let claims = jwks_cache.validate_token(token).await.map_err(|e| {
-        let reason = match &e {
+    let claims = jwks_cache.validate_token(token).await.inspect_err(|e| {
+        let reason = match e {
             AuthError::ExpiredToken => "expired_token",
             AuthError::InvalidToken(_) => "invalid_token",
             AuthError::JwksFetchError(_) => "service_unavailable",
             _ => "other",
         };
         state.metrics.record_auth_failure(reason);
-        e
     })?;
     let tenant = AuthenticatedTenant::from(claims);
 
     // Check rate limit
     if let Some(ref limiter) = state.rate_limiter {
-        limiter.check(&tenant.tenant_id, tenant.tier).map_err(|e| {
+        limiter.check(&tenant.tenant_id, tenant.tier).inspect_err(|_| {
             state.metrics.record_rate_limit_drop();
-            e
         })?;
     }
 

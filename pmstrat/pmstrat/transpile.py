@@ -84,11 +84,17 @@ def _get_source(func: Callable) -> str:
             content = None
             
             if not file_path.exists():
-                # Try relative to current working directory if it's a relative path
-                # Or try to fix the common 'Desktop/pmt' vs 'Desktop/code/pmt' mismatch
-                alt_path = Path(str(file_path).replace("Desktop/pmt", "Desktop/code/pmt"))
-                if alt_path.exists():
-                    file_path = alt_path
+                # Try relative to current working directory or importlib spec
+                if Path.cwd().joinpath(filename).exists():
+                    file_path = Path.cwd().joinpath(filename)
+                elif hasattr(func, "__module__"):
+                    try:
+                        import importlib.util
+                        spec = importlib.util.find_spec(func.__module__)
+                        if spec and spec.origin and Path(spec.origin).exists():
+                            file_path = Path(spec.origin)
+                    except Exception:
+                        pass
 
             if file_path.exists():
                 content = file_path.read_text()
@@ -677,11 +683,18 @@ impl Strategy for {self.struct_name} {{
         # Pre-process to combine assign + None check patterns
         processed_stmts = self._preprocess_option_patterns(stmts)
 
-        for stmt in processed_stmts:
-            # Skip docstrings
-            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
-                continue
-            lines.append(self._gen_stmt(stmt))
+        non_doc_stmts = [
+            s for s in processed_stmts
+            if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str))
+        ]
+
+        for i, stmt in enumerate(non_doc_stmts):
+            is_tail = (i == len(non_doc_stmts) - 1)
+            if is_tail and isinstance(stmt, ast.Return):
+                expr = self._gen_expr(stmt.value) if stmt.value else "vec![]"
+                lines.append(f"{self._indent()}{expr}")
+            else:
+                lines.append(self._gen_stmt(stmt))
         return "\n".join(lines)
 
     def _scan_int_vars(self, stmts: List[ast.stmt]) -> None:
@@ -725,8 +738,11 @@ impl Strategy for {self.struct_name} {{
             return True
         if isinstance(expr, ast.BinOp):
             return self._expr_is_int(expr.left) and self._expr_is_int(expr.right)
-        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
-            return expr.func.id == "int"
+        if isinstance(expr, ast.Call):
+            if isinstance(expr.func, ast.Name):
+                return expr.func.id == "int"
+            if isinstance(expr.func, ast.Attribute):
+                return expr.func.attr == "timestamp"
         return False
 
     def _check_compare_for_int_vars(self, expr: ast.expr) -> None:
@@ -1129,7 +1145,10 @@ impl Strategy for {self.struct_name} {{
 
     def _gen_aug_assign(self, stmt: ast.AugAssign) -> str:
         target = self._gen_expr(stmt.target)
-        value = self._gen_expr(stmt.value)
+        if isinstance(stmt.target, ast.Name) and stmt.target.id in self.int_vars:
+            value = self._gen_int_expr(stmt.value)
+        else:
+            value = self._gen_expr(stmt.value)
         op = self._gen_binop(stmt.op)
         return f"{self._indent()}{target} {op}= {value};"
 
@@ -1511,6 +1530,8 @@ impl Strategy for {self.struct_name} {{
             # `int(ctx.timestamp.timestamp())`-style use.
             elif func_name == "int" and len(expr.args) == 1:
                 inner = self._gen_expr(expr.args[0])
+                if self._expr_is_int(expr.args[0]):
+                    return inner
                 return f"({inner} as i64)"
             # Python float() in f-strings is a no-op for our purposes —
             # rust_decimal's Display impl honours `{:.N}` precision specs
@@ -1543,12 +1564,15 @@ impl Strategy for {self.struct_name} {{
             urgency = urgency.replace("Urgency.", "Urgency::")
 
         # Always convert token_id to String using .to_string()
-        # This works for both &str (constants/variables) and &String (iteration variables)
-        # since both implement ToString
         if not token_id.startswith('"'):
             token_id = f"{token_id}.to_string()"
 
-        return f"Signal::{signal_type} {{ token_id: {token_id}, price: {price}, size: {size}, urgency: {urgency} }}"
+        fields = [f"token_id: {token_id}"]
+        fields.append("price" if price == "price" else f"price: {price}")
+        fields.append("size" if size == "size" else f"size: {size}")
+        fields.append("urgency" if urgency == "urgency" else f"urgency: {urgency}")
+
+        return f"Signal::{signal_type} {{ {', '.join(fields)} }}"
 
     def _gen_cancel_call(self, expr: ast.Call) -> str:
         """Generate Signal::Cancel."""
@@ -1744,8 +1768,14 @@ impl Strategy for {self.struct_name} {{
 
     def _gen_boolop(self, expr: ast.BoolOp) -> str:
         op_str = " && " if isinstance(expr.op, ast.And) else " || "
-        values = [self._gen_expr(v) for v in expr.values]
-        return f"({op_str.join(values)})"
+        parts = []
+        for v in expr.values:
+            gen = self._gen_expr(v)
+            if isinstance(v, ast.BoolOp) and type(v.op) is not type(expr.op):
+                parts.append(f"({gen})")
+            else:
+                parts.append(gen)
+        return op_str.join(parts)
 
     def _binop_is_int(self, expr: ast.BinOp) -> bool:
         """Best-effort detection of whether a BinOp produces an i64.
@@ -2148,6 +2178,7 @@ class RustTestGenerator:
 use fixtures::*;
 use pmengine::strategies::{self.config.struct_name};
 use pmengine::strategy::Strategy;
+#[allow(unused_imports)]
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
