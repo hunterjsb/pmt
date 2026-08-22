@@ -1697,16 +1697,88 @@ def crypto_trigger() -> None:
     console.print_json(json.dumps(reply))
 
 
+def _tape_slug(slug: str) -> str:
+    """btc-updown-5m-1787442000 -> 'btc 5m 23:40' (window start, local time)."""
+    import re
+    import time as _t
+
+    m = re.match(r"([a-z]+)-updown-(\d+m)-(\d+)$", slug)
+    if not m:
+        return slug
+    start = _t.strftime("%H:%M", _t.localtime(int(m.group(3))))
+    return f"{m.group(1)} {m.group(2)} {start}"
+
+
+def _tape_render(line: str) -> str | None:
+    import time as _t
+
+    try:
+        r = json.loads(line)
+    except ValueError:
+        return None
+    ts = _t.strftime("%H:%M:%S", _t.localtime(r.get("t", 0)))
+    head = f"{ts}  {_tape_slug(r.get('slug', '')):<13}"
+
+    def money(v: float) -> str:
+        return f"${v:,.2f}".rstrip("0").rstrip(".")
+
+    ev = r.get("ev")
+    if ev == "fire":
+        tag = {"flip": "FLIP", "spec": "SPEC"}.get(r.get("mode", "safe"), "FIRE")
+        label = click.style(f"{tag} {r['side'].upper():<4}", fg="green", bold=True)
+        pct = f"  {r['elapsed_frac'] * 100:.0f}% thru" if "elapsed_frac" in r else ""
+        return (
+            f"{head} {label} {r['size']:g}sh @ {r['ask']:.2f}"
+            f"  fair {r['fair']:.4f}  {r['net'] * 100:+.1f}¢"
+            f"  ρ{r['rho']:+.2f}  {money(r['committed'])} in{pct}"
+        )
+    if ev == "exit":
+        label = click.style(f"EXIT {r['side'].upper():<4}", fg="red", bold=True)
+        return f"{head} {label} {r['size']:g}sh @ bid {r['bid']:.2f}  fair {r['fair']:.4f}"
+    if ev == "eval":
+        best = max(r.get("sides") or [], key=lambda s: s["net"], default=None)
+        book = (
+            f"{best['side']} @ {best['ask']:.2f} {best['net'] * 100:+.1f}¢"
+            if best
+            else "no book"
+        )
+        banked = click.style("  BANKED", fg="cyan") if r.get("banked_decided") else ""
+        body = (
+            f"{head} eval  p↑{r['p_up']:.4f}  {book}"
+            f"  ρ{r['rho']:+.2f}  {money(r['committed'])} in"
+        )
+        return click.style(body, dim=True) + banked
+    if ev == "gated":
+        return click.style(f"{head} gated  {r.get('reason', '?')}", fg="yellow", dim=True)
+    if ev == "cleanup":
+        return click.style(f"{head} ── window closed ──", dim=True)
+    return line.rstrip()
+
+
 @crypto_group.command("tape")
 @click.option("-n", default=20, show_default=True)
 @click.option("-f", "--follow", is_flag=True, help="Stream the decision tape live")
-def crypto_tape(n: int, follow: bool) -> None:
+@click.option("--json", "as_json", is_flag=True, help="Raw JSONL records")
+def crypto_tape(n: int, follow: bool, as_json: bool) -> None:
     """The strategy's decision tape: every fire, exit, eval, and gate."""
     import subprocess
 
     path = "/var/home/hunter/.pmt/engine/updown-tape.jsonl"
     cmd = ["tail", "-n", str(n)] + (["-f"] if follow else []) + [path]
-    subprocess.run(cmd)
+    if as_json:
+        subprocess.run(cmd)
+        return
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+    assert proc.stdout is not None
+    try:
+        for raw in proc.stdout:
+            rendered = _tape_render(raw)
+            if rendered:
+                click.echo(rendered)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proc.terminate()
 
 
 @cli.group("sports")
