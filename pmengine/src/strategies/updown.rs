@@ -792,7 +792,9 @@ fn poll_binance(
     let mut candle_open = None;
     let mut closes = Vec::new();
     if kind == "twap" {
-        let start_ms = ((start as i64 - 120) * 1000).to_string();
+        // Reach back 45min so the regime autocorr has real history — a
+        // window-only fetch left rho pinned at 0 and the chop gate dead.
+        let start_ms = ((start as i64 - 2700) * 1000).to_string();
         let v: serde_json::Value = client
             .get(format!("{}/api/v3/klines", BINANCE_DATA))
             .query(&[("symbol", symbol), ("interval", "1m"), ("startTime", &start_ms), ("limit", "500")])
