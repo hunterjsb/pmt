@@ -1675,10 +1675,14 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
 
 
 @crypto_group.command("disarm")
-def crypto_disarm() -> None:
-    """Disarm the updown trigger (does not cancel already-placed orders)."""
-    reply = _engine_post("/strategies/updown/command", {"action": "disarm"})
-    console.print(f"disarmed: {reply.get('disarmed') or '(was idle)'}")
+@click.argument("slug", required=False)
+def crypto_disarm(slug: str | None) -> None:
+    """Disarm one armed market (SLUG) or all of them (no arg)."""
+    body = {"action": "disarm"}
+    if slug:
+        body["slug"] = slug
+    reply = _engine_post("/strategies/updown/command", body)
+    console.print(f"disarmed: {reply.get('disarmed') or '(was idle)'} · {reply.get('arms', 0)} arms left")
 
 
 @crypto_group.command("trigger")

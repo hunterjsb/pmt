@@ -1,19 +1,23 @@
-//! TWAP-gated trigger for Polymarket's recurring crypto up/down markets.
+//! TWAP-gated clip trigger for Polymarket's recurring crypto up/down
+//! markets — multi-arm: one strategy instance hunts several windows at
+//! once (BTC 5m + BTC 15m + ETH 5m, ...), each arm with its own feed,
+//! budget, and clip clock.
 //!
 //! The division of labor: the operator prices a market out-of-band
-//! (`pmt crypto updown --json`) and arms this strategy with the semantics
-//! and thresholds via `POST /strategies/updown/command`. The strategy then
-//! owns the latency-critical part — a background Binance feed plus the live
-//! CLOB book — and takes the ask only while every gate holds. Human minutes
-//! decide *whether* to hunt a market; engine milliseconds decide *when*.
+//! (`pmt crypto arm`) and feeds params via `POST /strategies/updown/command`.
+//! Each arm owns the latency-critical part — a Binance trade-stream
+//! websocket plus the live CLOB book — and buys in small clips only while
+//! every gate holds. Human minutes decide *what* to hunt; engine
+//! milliseconds decide *when*.
 //!
-//! Gates encode the lessons hand-trading these markets taught us:
+//! Gates encode the lessons live trading taught us (2026-08-22):
 //!   - edge is net of the crypto_fees_v2 taker fee, never gross
-//!   - twap margins inside the Chainlink-vs-Binance basis band are coin
-//!     flips regardless of what the proxy model says — no trade
+//!   - twap margins inside Chainlink-vs-Binance basis noise are coin flips
 //!   - a stale spot feed means no trade, not "trade on the last print"
-//!   - the final seconds are quiesce: cancel everything, place nothing
-//!     (a bid resting into resolution only ever fills against a winner)
+//!   - mean-reverting chop (negative return autocorr) disables speculative
+//!     clips entirely — momentum "locks" are mirages there
+//!   - the full budget unlocks only late or banked-beyond-reversion
+//!   - quiesce pulls everything before resolution; exits stay live longer
 
 use crate::position::Fill;
 use crate::strategy::{Signal, Strategy, StrategyContext, Urgency};
@@ -26,23 +30,24 @@ use std::sync::{Arc, Mutex};
 const BINANCE_DATA: &str = "https://data-api.binance.vision";
 /// Spot older than this is a dead feed — hold, never trade through it.
 const MAX_SPOT_AGE_S: f64 = 5.0;
-/// Exit rule (the 2026-08-22 -$318 lesson: a 99%-fair entry died with no
-/// hands to act as it flipped). Dump a held side when its fair collapses
-/// below EXIT_FAIR — but only into a bid that isn't already dead, i.e.
-/// within EXIT_MAX_DISCOUNT of fair. Selling below that donates to panic.
+/// Exit rule (the -$318 lesson: a 99%-fair entry died with no hands to act
+/// as it flipped). Dump a held side when its fair collapses below
+/// EXIT_FAIR — but only into a bid within EXIT_MAX_DISCOUNT of fair;
+/// selling below that donates to panic.
 const EXIT_FAIR: f64 = 0.40;
 const EXIT_MAX_DISCOUNT: f64 = 0.08;
 /// Live vol floor: minutes of trailing 1m closes for the fast estimate.
 const VOL_FAST_WINDOW: usize = 12;
 /// One order in flight per token; assume dead if no fill inside this window.
-/// Must comfortably outlive the engine's ~5s position-reconcile cadence:
-/// taker fills are often MISSED by the realtime fill path and only show up
-/// via reconcile (proven live 2026-08-22), so freeing the budget sooner
-/// than reconcile lands means buying the same fill twice.
+/// Must outlive the engine's ~5s position-reconcile cadence: taker fills
+/// are often MISSED by the realtime fill path and only show up via
+/// reconcile (proven live), so freeing budget sooner buys fills twice.
 const INFLIGHT_TTL_S: f64 = 12.0;
+/// Speculative clips still need the model leaning clearly one way.
+const EARLY_MIN_FAIR: f64 = 0.55;
 
-// Private on purpose: the registry generator registers the first `pub struct`
-// in the file, which must be Updown.
+// Private on purpose: the registry generator registers the first `pub
+// struct` in the file, which must be Updown.
 #[derive(Debug, Clone, Deserialize)]
 struct ArmParams {
     pub slug: String,
@@ -96,8 +101,7 @@ struct ArmParams {
     #[serde(default = "d_late_frac")]
     pub late_frac: f64,
     /// Lag-1 autocorrelation of 1m returns below which the tape counts as
-    /// mean-reverting chop: speculative clips are disabled entirely (the
-    /// 2026-08-22 regime that ate two "locks").
+    /// mean-reverting chop: speculative clips are disabled entirely.
     #[serde(default = "d_rho_block")]
     pub rho_block: f64,
 }
@@ -118,10 +122,7 @@ fn d_early_min_edge() -> f64 { 0.08 }
 fn d_late_frac() -> f64 { 0.6 }
 fn d_rho_block() -> f64 { -0.25 }
 
-/// Speculative clips still need the model leaning clearly one way.
-const EARLY_MIN_FAIR: f64 = 0.55;
-
-/// Shared state the Binance poller thread keeps warm.
+/// Shared state an arm's Binance feed threads keep warm.
 #[derive(Default)]
 struct FeedState {
     spot: f64,
@@ -150,31 +151,36 @@ struct ModelEval {
     rho: f64,
 }
 
-pub struct Updown {
-    id: String,
-    tokens: Vec<String>,
-    params: Option<ArmParams>,
+/// Everything one hunted window owns: params, feeds, budget, clip clocks.
+struct ArmState {
+    p: ArmParams,
     feed: Arc<Mutex<FeedState>>,
     feed_stop: Arc<AtomicBool>,
     feed_handles: Vec<std::thread::JoinHandle<()>>,
     subscribed: bool,
     cleaned: bool,
     filled_usdc: f64,
-    /// token -> (notional, emitted_at unix) for the one order we allow in flight.
+    /// token -> (notional, emitted_at) for the one order allowed in flight.
     inflight: std::collections::HashMap<String, (f64, f64)>,
     /// token -> last clip time, enforcing the per-side clip cadence.
     last_clip: std::collections::HashMap<String, f64>,
+    last_eval: Option<serde_json::Value>,
+    /// Throttle for eval/gated lines in the durable tape.
+    last_tape_at: f64,
+}
+
+pub struct Updown {
+    id: String,
+    /// slug -> arm. Every armed window is hunted concurrently.
+    arms: std::collections::BTreeMap<String, ArmState>,
     /// Tokens whose resting orders still need pulling after a disarm —
     /// on_command can't emit signals, so the next tick does it.
     pending_cleanup: Vec<String>,
-    last_eval: Option<serde_json::Value>,
-    /// Throttle for eval lines in the durable tape.
-    last_tape_at: f64,
 }
 
 /// Append one JSONL record to the durable tape at ~/.pmt/engine/. The tape
 /// is the cross-session dataset for calibrating gate parameters — every
-/// fire and periodic eval survives reboots, unlike engine stdout logs.
+/// fire, exit, and periodic eval survives reboots, unlike engine stdout.
 fn tape(record: serde_json::Value) {
     use std::io::Write;
     let Ok(home) = std::env::var("HOME") else { return };
@@ -189,12 +195,11 @@ fn tape(record: serde_json::Value) {
     }
 }
 
-impl Updown {
-    pub fn new() -> Self {
+impl ArmState {
+    /// Build without feeds (tests use this directly).
+    fn with_params(p: ArmParams) -> Self {
         Self {
-            id: "updown".to_string(),
-            tokens: Vec::new(),
-            params: None,
+            p,
             feed: Arc::new(Mutex::new(FeedState::default())),
             feed_stop: Arc::new(AtomicBool::new(false)),
             feed_handles: Vec::new(),
@@ -203,10 +208,13 @@ impl Updown {
             filled_usdc: 0.0,
             inflight: std::collections::HashMap::new(),
             last_clip: std::collections::HashMap::new(),
-            pending_cleanup: Vec::new(),
             last_eval: None,
             last_tape_at: 0.0,
         }
+    }
+
+    fn tokens(&self) -> [String; 2] {
+        [self.p.token_up.clone(), self.p.token_down.clone()]
     }
 
     fn stop_feed(&mut self) {
@@ -216,14 +224,15 @@ impl Updown {
         }
     }
 
-    /// Push-based spot off the Binance trade stream (~100ms event age vs
-    /// the REST poll's 750ms cadence) — this is where the "ms not s" lives.
-    fn spawn_ws_spot(&mut self, symbol: &str, end: f64) {
+    /// Push-based spot off the Binance trade stream (~100ms event age) —
+    /// this is where the "ms not s" lives.
+    fn spawn_ws_spot(&mut self) {
         let feed = self.feed.clone();
         let stop = self.feed_stop.clone();
+        let end = self.p.end;
         let url = format!(
             "wss://data-stream.binance.vision/ws/{}@trade",
-            symbol.to_lowercase()
+            self.p.symbol.to_lowercase()
         );
         self.feed_handles.push(std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) && unix_now() < end + 30.0 {
@@ -267,16 +276,13 @@ impl Updown {
         }));
     }
 
-    fn start_feed(&mut self, p: &ArmParams) {
-        self.stop_feed();
-        self.feed = Arc::new(Mutex::new(FeedState::default()));
-        self.feed_stop = Arc::new(AtomicBool::new(false));
-        self.spawn_ws_spot(&p.symbol, p.end);
+    fn start_feeds(&mut self) {
+        self.spawn_ws_spot();
         let feed = self.feed.clone();
         let stop = self.feed_stop.clone();
-        let symbol = p.symbol.clone();
-        let kind = p.kind.clone();
-        let (start, end) = (p.start, p.end);
+        let symbol = self.p.symbol.clone();
+        let kind = self.p.kind.clone();
+        let (start, end) = (self.p.start, self.p.end);
 
         self.feed_handles.push(std::thread::spawn(move || {
             let client = match reqwest::blocking::Client::builder()
@@ -320,7 +326,8 @@ impl Updown {
     }
 
     /// Model fair P(UP) plus regime/decidedness context. Errors = gated.
-    fn fair_p_up(&self, p: &ArmParams, now: f64) -> Result<ModelEval, String> {
+    fn fair_p_up(&self, now: f64) -> Result<ModelEval, String> {
+        let p = &self.p;
         let f = self.feed.lock().unwrap();
         if now - f.spot_ts > MAX_SPOT_AGE_S {
             return Err(match &f.last_err {
@@ -329,9 +336,8 @@ impl Updown {
             });
         }
         let spot = f.spot;
-        // Vol only ratchets UP intraminute: the arm-time trailing sigma is a
-        // floor, the fast window catches the storm the trailing estimate
-        // lags (the -$318 window quoted 99% fair off calm-market vol).
+        // Vol only ratchets UP: the arm-time trailing sigma is a floor, the
+        // fast window catches the storm the trailing estimate lags.
         let fast_bp = {
             let c = &f.closes;
             let n = c.len().min(VOL_FAST_WINDOW + 1);
@@ -339,7 +345,8 @@ impl Updown {
                 let rets: Vec<f64> =
                     c[c.len() - n..].windows(2).map(|w| (w[1] / w[0]).ln()).collect();
                 let mu = rets.iter().sum::<f64>() / rets.len() as f64;
-                let var = rets.iter().map(|r| (r - mu).powi(2)).sum::<f64>() / (rets.len() - 1) as f64;
+                let var =
+                    rets.iter().map(|r| (r - mu).powi(2)).sum::<f64>() / (rets.len() - 1) as f64;
                 var.sqrt() * 1e4
             } else {
                 0.0
@@ -392,10 +399,10 @@ impl Updown {
             // reversion of the remaining path to the reference, with basis
             // noise + one sigma of remaining-average cushion on top.
             let banked_margin_bp = (banked_avg / ref_px - 1.0) * 1e4 * (banked_s / window);
-            let cushion_bp =
-                p.basis_guard_bp + sig_bp * ((rem / 60.0).max(0.02) / 3.0).sqrt() * (rem / window);
-            let banked_decided = banked_margin_bp.abs() > cushion_bp
-                && (banked_margin_bp > 0.0) == (p_up > 0.5);
+            let cushion_bp = p.basis_guard_bp
+                + sig_bp * ((rem / 60.0).max(0.02) / 3.0).sqrt() * (rem / window);
+            let banked_decided =
+                banked_margin_bp.abs() > cushion_bp && (banked_margin_bp > 0.0) == (p_up > 0.5);
             Ok(ModelEval { p_up, sig_bp, banked_decided, rho })
         }
     }
@@ -403,18 +410,12 @@ impl Updown {
     /// Math-forced evacuation: dump a held side whose fair has collapsed,
     /// into a bid that still resembles fair. Runs every armed tick AND
     /// through quiesce (exits are most needed late; only new buys stop).
-    fn exit_signals(
-        &mut self,
-        ctx: &StrategyContext,
-        p: &ArmParams,
-        p_up: f64,
-        now: f64,
-    ) -> Vec<Signal> {
+    fn exit_signals(&mut self, ctx: &StrategyContext, p_up: f64, now: f64) -> Vec<Signal> {
+        let p = self.p.clone();
         let mut signals = Vec::new();
-        for (side, token, fair) in [
-            ("up", &p.token_up, p_up),
-            ("down", &p.token_down, 1.0 - p_up),
-        ] {
+        for (side, token, fair) in
+            [("up", &p.token_up, p_up), ("down", &p.token_down, 1.0 - p_up)]
+        {
             if fair >= EXIT_FAIR || self.inflight.contains_key(token) {
                 continue;
             }
@@ -458,53 +459,20 @@ impl Updown {
         }
         signals
     }
-}
 
-impl Default for Updown {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Strategy for Updown {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn subscriptions(&self) -> Vec<String> {
-        self.tokens.clone()
-    }
-
-    fn tick_interval_ms(&self) -> u64 {
-        50
-    }
-
-    fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
-        if !self.pending_cleanup.is_empty() {
-            let signals = self
-                .pending_cleanup
-                .drain(..)
-                .flat_map(|t| {
-                    [Signal::Cancel { token_id: t.clone() }, Signal::Unsubscribe { token_id: t }]
-                })
-                .collect();
-            return signals;
-        }
-        let p = match &self.params {
-            Some(p) => p.clone(),
-            None => return vec![Signal::Hold],
-        };
-        let now = unix_now();
+    /// One decision pass for this arm. Returns (signals, finished).
+    fn tick(&mut self, ctx: &StrategyContext, now: f64) -> (Vec<Signal>, bool) {
+        let p = self.p.clone();
         let mut signals = Vec::new();
 
         if !self.subscribed {
             self.subscribed = true;
             signals.push(Signal::Subscribe { token_id: p.token_up.clone() });
             signals.push(Signal::Subscribe { token_id: p.token_down.clone() });
-            return signals;
+            return (signals, false);
         }
 
-        // Window over: pull everything, drop the market, disarm.
+        // Window over: pull everything, drop the market, retire the arm.
         if now >= p.end {
             if !self.cleaned {
                 self.cleaned = true;
@@ -514,11 +482,8 @@ impl Strategy for Updown {
                 signals.push(Signal::Cancel { token_id: p.token_down.clone() });
                 signals.push(Signal::Unsubscribe { token_id: p.token_up.clone() });
                 signals.push(Signal::Unsubscribe { token_id: p.token_down.clone() });
-                self.stop_feed();
-                self.params = None;
-                self.tokens = Vec::new();
             }
-            return signals;
+            return (signals, true);
         }
 
         // Quiesce: standing orders pulled, no new buys — but exits stay
@@ -527,13 +492,13 @@ impl Strategy for Updown {
             signals.push(Signal::Cancel { token_id: p.token_up.clone() });
             signals.push(Signal::Cancel { token_id: p.token_down.clone() });
             if now < p.end - 5.0 {
-                if let Ok(m) = self.fair_p_up(&p, now) {
-                    let exits = self.exit_signals(ctx, &p, m.p_up, now);
+                if let Ok(m) = self.fair_p_up(now) {
+                    let exits = self.exit_signals(ctx, m.p_up, now);
                     signals.extend(exits);
                 }
             }
             self.last_eval = Some(serde_json::json!({"state": "quiesce", "t": now}));
-            return signals;
+            return (signals, false);
         }
 
         let elapsed_frac = (now - p.start) / (p.end - p.start).max(1.0);
@@ -544,32 +509,29 @@ impl Strategy for Updown {
                                   elapsed_frac * 100.0, p.min_elapsed_frac * 100.0),
                 "t": now,
             }));
-            return vec![Signal::Hold];
+            return (signals, false);
         }
 
-        let m = match self.fair_p_up(&p, now) {
+        let m = match self.fair_p_up(now) {
             Ok(v) => v,
             Err(gate) => {
-                self.last_eval = Some(serde_json::json!({"state": "gated", "reason": gate, "t": now}));
-                // Gated windows must be reconstructable from the tape too —
-                // v2's first outing sat out 5 straight minutes and left
-                // nothing but a cleanup record to autopsy.
+                self.last_eval =
+                    Some(serde_json::json!({"state": "gated", "reason": gate, "t": now}));
                 if now - self.last_tape_at >= 5.0 {
                     self.last_tape_at = now;
                     tape(serde_json::json!({
                         "t": now, "ev": "gated", "slug": p.slug, "reason": gate,
                     }));
                 }
-                return vec![Signal::Hold];
+                return (signals, false);
             }
         };
         let (p_up, sig_bp) = (m.p_up, m.sig_bp);
 
-        // Notional already committed. on_fill events are unreliable for taker
-        // orders (the engine often only learns of the fill via its ~5s
-        // position reconcile), so the authoritative floor is the position
-        // tracker itself: shares held x entry price. Take the max of every
-        // signal we have, then add anything still in flight.
+        // Notional already committed. on_fill events are unreliable for
+        // taker orders (fills often only surface via the ~5s position
+        // reconcile), so the authoritative floor is the position tracker:
+        // shares held x entry price. Take the max of every signal we have.
         self.inflight.retain(|_, (_, at)| now - *at < INFLIGHT_TTL_S);
         let inflight_usdc: f64 = self.inflight.values().map(|(n, _)| n).sum();
         let position_usdc: f64 = [&p.token_up, &p.token_down]
@@ -578,10 +540,8 @@ impl Strategy for Updown {
             .map(|(t, pos)| {
                 let size = pos.size.to_f64().unwrap_or(0.0);
                 let avg = pos.avg_entry_price.to_f64().unwrap_or(0.0);
-                // Reconcile-seeded positions can carry avg 0 briefly. Pricing
-                // them at max_price once blocked a legitimate top-up re-arm
-                // (2026-08-22); the live ask is the honest estimate, with
-                // max_price only as the last resort.
+                // Reconcile-seeded positions can carry avg 0 briefly; the
+                // live ask is the honest estimate, max_price last resort.
                 let fallback = ctx
                     .order_books
                     .get(t)
@@ -594,7 +554,7 @@ impl Strategy for Updown {
         let committed = self.filled_usdc.max(position_usdc);
         let budget = p.size_usdc - committed - inflight_usdc;
 
-        let exits = self.exit_signals(ctx, &p, p_up, now);
+        let exits = self.exit_signals(ctx, p_up, now);
         signals.extend(exits);
 
         // Exposure envelope: small speculative clips until the window is
@@ -611,10 +571,9 @@ impl Strategy for Updown {
         let chop_blocked = !unlocked && m.rho < p.rho_block;
 
         let mut evals = Vec::new();
-        for (side, token, fair) in [
-            ("up", &p.token_up, p_up),
-            ("down", &p.token_down, 1.0 - p_up),
-        ] {
+        for (side, token, fair) in
+            [("up", &p.token_up, p_up), ("down", &p.token_down, 1.0 - p_up)]
+        {
             if let Some(only) = &p.side_filter {
                 if only != side {
                     continue;
@@ -632,8 +591,8 @@ impl Strategy for Updown {
             let net = fair - ask - fee;
             evals.push(serde_json::json!({"side": side, "fair": fair, "ask": ask, "net": net}));
 
-            let cooled = now - self.last_clip.get(token).copied().unwrap_or(0.0)
-                >= p.clip_cooldown_s;
+            let cooled =
+                now - self.last_clip.get(token).copied().unwrap_or(0.0) >= p.clip_cooldown_s;
             let firing = !chop_blocked
                 && fair >= fair_req
                 && net >= edge_req
@@ -687,6 +646,63 @@ impl Strategy for Updown {
             }));
         }
 
+        (signals, false)
+    }
+}
+
+impl Updown {
+    pub fn new() -> Self {
+        Self {
+            id: "updown".to_string(),
+            arms: std::collections::BTreeMap::new(),
+            pending_cleanup: Vec::new(),
+        }
+    }
+}
+
+impl Default for Updown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Strategy for Updown {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn subscriptions(&self) -> Vec<String> {
+        self.arms.values().flat_map(|a| a.tokens()).collect()
+    }
+
+    fn tick_interval_ms(&self) -> u64 {
+        50
+    }
+
+    fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
+        let now = unix_now();
+        let mut signals: Vec<Signal> = self
+            .pending_cleanup
+            .drain(..)
+            .flat_map(|t| {
+                [Signal::Cancel { token_id: t.clone() }, Signal::Unsubscribe { token_id: t }]
+            })
+            .collect();
+
+        let mut finished = Vec::new();
+        for (slug, arm) in self.arms.iter_mut() {
+            let (mut s, done) = arm.tick(ctx, now);
+            signals.append(&mut s);
+            if done {
+                finished.push(slug.clone());
+            }
+        }
+        for slug in finished {
+            if let Some(mut arm) = self.arms.remove(&slug) {
+                arm.stop_feed();
+            }
+        }
+
         if signals.is_empty() {
             vec![Signal::Hold]
         } else {
@@ -695,19 +711,18 @@ impl Strategy for Updown {
     }
 
     fn on_fill(&mut self, fill: &Fill) {
-        if let Some(p) = &self.params {
-            if fill.token_id == p.token_up || fill.token_id == p.token_down {
+        for arm in self.arms.values_mut() {
+            if fill.token_id == arm.p.token_up || fill.token_id == arm.p.token_down {
                 let notional = (fill.price * fill.size).to_f64().unwrap_or(0.0);
                 // Only buys consume budget; exit sells free shares but the
-                // gross-buys number stays (no re-deploying after an exit in
-                // the same window — evacuated capital stays evacuated).
+                // gross-buys number stays (evacuated capital stays out).
                 if fill.is_buy {
-                    self.filled_usdc += notional;
+                    arm.filled_usdc += notional;
                 }
-                self.inflight.remove(&fill.token_id);
+                arm.inflight.remove(&fill.token_id);
                 tracing::info!(
                     token = %fill.token_id, notional, is_buy = fill.is_buy,
-                    total = self.filled_usdc,
+                    slug = %arm.p.slug, total = arm.filled_usdc,
                     "updown fill"
                 );
             }
@@ -715,7 +730,9 @@ impl Strategy for Updown {
     }
 
     fn on_shutdown(&mut self) {
-        self.stop_feed();
+        for arm in self.arms.values_mut() {
+            arm.stop_feed();
+        }
     }
 
     fn on_command(&mut self, cmd: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -729,31 +746,48 @@ impl Strategy for Updown {
                 if unix_now() >= p.end {
                     return Err("window already over".to_string());
                 }
-                self.start_feed(&p);
-                self.tokens = vec![p.token_up.clone(), p.token_down.clone()];
-                self.subscribed = false;
-                self.cleaned = false;
-                self.filled_usdc = 0.0;
-                self.inflight.clear();
-                self.last_clip.clear();
                 let slug = p.slug.clone();
-                self.params = Some(p);
-                Ok(serde_json::json!({"armed": slug}))
+                // Re-arming a slug replaces its arm (fresh budget + feeds).
+                if let Some(mut old) = self.arms.remove(&slug) {
+                    old.stop_feed();
+                }
+                let mut arm = ArmState::with_params(p);
+                arm.start_feeds();
+                self.arms.insert(slug.clone(), arm);
+                Ok(serde_json::json!({"armed": slug, "arms": self.arms.len()}))
             }
             Some("disarm") => {
-                self.stop_feed();
-                if let Some(p) = &self.params {
-                    self.pending_cleanup = vec![p.token_up.clone(), p.token_down.clone()];
+                let target = cmd.get("slug").and_then(|s| s.as_str()).map(str::to_string);
+                let slugs: Vec<String> = match &target {
+                    Some(s) => self.arms.keys().filter(|k| *k == s).cloned().collect(),
+                    None => self.arms.keys().cloned().collect(),
+                };
+                if slugs.is_empty() {
+                    return Ok(serde_json::json!({"disarmed": [], "arms": self.arms.len()}));
                 }
-                let was = self.params.take().map(|p| p.slug);
-                self.tokens = Vec::new();
-                Ok(serde_json::json!({"disarmed": was, "cleanup": "next tick"}))
+                for slug in &slugs {
+                    if let Some(mut arm) = self.arms.remove(slug) {
+                        arm.stop_feed();
+                        self.pending_cleanup.extend(arm.tokens());
+                    }
+                }
+                Ok(serde_json::json!({
+                    "disarmed": slugs, "arms": self.arms.len(), "cleanup": "next tick",
+                }))
             }
-            Some("status") => Ok(serde_json::json!({
-                "armed": self.params.as_ref().map(|p| p.slug.clone()),
-                "filled_usdc": self.filled_usdc,
-                "eval": self.last_eval,
-            })),
+            Some("status") => {
+                let arms: serde_json::Map<String, serde_json::Value> = self
+                    .arms
+                    .iter()
+                    .map(|(slug, a)| {
+                        (slug.clone(), serde_json::json!({
+                            "filled_usdc": a.filled_usdc,
+                            "eval": a.last_eval,
+                        }))
+                    })
+                    .collect();
+                Ok(serde_json::json!({"arms": arms, "count": self.arms.len()}))
+            }
             _ => Err("unknown action (arm | disarm | status)".to_string()),
         }
     }
@@ -902,15 +936,19 @@ mod tests {
         assert!((norm_cdf(-1.96) - 0.025).abs() < 1e-3);
     }
 
+    fn params(slug: &str) -> ArmParams {
+        serde_json::from_value(serde_json::json!({
+            "slug": slug, "kind": "twap", "symbol": "BTCUSDT",
+            "token_up": format!("{}-u", slug), "token_down": format!("{}-d", slug),
+            "start": 600.0, "end": 1500.0,
+            "sigma_bp_per_min": 3.0, "fee_rate": 0.07, "size_usdc": 100.0,
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn arm_params_defaults() {
-        let p: ArmParams = serde_json::from_value(serde_json::json!({
-            "slug": "s", "kind": "twap", "symbol": "BTCUSDT",
-            "token_up": "1", "token_down": "2",
-            "start": 0.0, "end": 900.0,
-            "sigma_bp_per_min": 2.5, "fee_rate": 0.07, "size_usdc": 100.0,
-        }))
-        .unwrap();
+        let p = params("s");
         assert_eq!(p.min_edge, 0.015);
         assert_eq!(p.max_price, 0.985);
         assert_eq!(p.quiesce_secs, 20.0);
@@ -924,18 +962,11 @@ mod tests {
         assert_eq!(p.rho_block, -0.25);
     }
 
-    fn armed_with_feed(banked_px: f64, spot: f64) -> (Updown, ArmParams, f64) {
-        let s = Updown::new();
-        let p: ArmParams = serde_json::from_value(serde_json::json!({
-            "slug": "s", "kind": "twap", "symbol": "BTCUSDT",
-            "token_up": "1", "token_down": "2",
-            "start": 600.0, "end": 1500.0,
-            "sigma_bp_per_min": 3.0, "fee_rate": 0.07, "size_usdc": 100.0,
-        }))
-        .unwrap();
+    fn armed_with_feed(banked_px: f64, spot: f64) -> (ArmState, f64) {
+        let arm = ArmState::with_params(params("s"));
         let now = 1400.0;
         {
-            let mut f = s.feed.lock().unwrap();
+            let mut f = arm.feed.lock().unwrap();
             f.spot = spot;
             f.spot_ts = now;
             f.per_min.insert(540, 100.0); // range-start reference
@@ -943,30 +974,29 @@ mod tests {
                 f.per_min.insert(t, banked_px);
             }
         }
-        (s, p, now)
+        (arm, now)
     }
 
     #[test]
     fn twap_banked_above_ref_is_locked_up() {
-        let (s, p, now) = armed_with_feed(101.0, 101.0); // +100bp margin
-        let m = s.fair_p_up(&p, now).unwrap();
+        let (arm, now) = armed_with_feed(101.0, 101.0); // +100bp margin
+        let m = arm.fair_p_up(now).unwrap();
         assert!(m.p_up > 0.999);
         assert!(m.banked_decided, "a +100bp banked margin survives full reversion");
     }
 
     #[test]
     fn twap_banked_below_ref_is_locked_down() {
-        let (s, p, now) = armed_with_feed(99.0, 99.0);
-        assert!(s.fair_p_up(&p, now).unwrap().p_up < 0.001);
+        let (arm, now) = armed_with_feed(99.0, 99.0);
+        assert!(arm.fair_p_up(now).unwrap().p_up < 0.001);
     }
 
     #[test]
     fn thin_banked_margin_is_not_decided() {
         // +3.5bp banked contribution sits inside basis + vol cushion:
         // clears the basis guard for pricing, but is NOT safe-bet material
-        let (s, p, now) = armed_with_feed(100.035, 100.035);
-        let m = s.fair_p_up(&p, now).unwrap();
-        assert!(!m.banked_decided);
+        let (arm, now) = armed_with_feed(100.035, 100.035);
+        assert!(!arm.fair_p_up(now).unwrap().banked_decided);
     }
 
     #[test]
@@ -982,34 +1012,31 @@ mod tests {
     #[test]
     fn fast_vol_ratchets_sigma_up_and_softens_p() {
         // +6bp margin: locked under calm vol, genuinely uncertain in a storm
-        let (s, p, now) = armed_with_feed(100.06, 100.06);
-        let calm = s.fair_p_up(&p, now).unwrap();
-        let (p_calm, sig_calm) = (calm.p_up, calm.sig_bp);
-        assert!((sig_calm - 3.0).abs() < 1e-9); // no closes -> arm sigma
-        assert!(p_calm > 0.99);
+        let (arm, now) = armed_with_feed(100.06, 100.06);
+        let calm = arm.fair_p_up(now).unwrap();
+        assert!((calm.sig_bp - 3.0).abs() < 1e-9); // no closes -> arm sigma
+        assert!(calm.p_up > 0.99);
         {
             // violent recent tape: ±60bp swings per minute
-            let mut f = s.feed.lock().unwrap();
-            f.closes = (0..14)
-                .map(|i| if i % 2 == 0 { 100.0 } else { 100.6 })
-                .collect();
+            let mut f = arm.feed.lock().unwrap();
+            f.closes = (0..14).map(|i| if i % 2 == 0 { 100.0 } else { 100.6 }).collect();
         }
-        let storm = s.fair_p_up(&p, now).unwrap();
+        let storm = arm.fair_p_up(now).unwrap();
         assert!(storm.sig_bp > 30.0, "sig {}", storm.sig_bp);
-        assert!(storm.p_up < p_calm - 0.01, "storm p {} vs calm {}", storm.p_up, p_calm);
+        assert!(storm.p_up < calm.p_up - 0.01, "storm {} vs calm {}", storm.p_up, calm.p_up);
     }
 
     #[test]
     fn twap_thin_margin_trips_basis_guard() {
-        let (s, p, now) = armed_with_feed(100.001, 100.001); // ~0.1bp
-        let err = s.fair_p_up(&p, now).unwrap_err();
+        let (arm, now) = armed_with_feed(100.001, 100.001); // ~0.1bp
+        let err = arm.fair_p_up(now).unwrap_err();
         assert!(err.contains("basis guard"), "{}", err);
     }
 
     #[test]
     fn twap_stale_feed_refuses() {
-        let (s, p, _) = armed_with_feed(101.0, 101.0);
-        let err = s.fair_p_up(&p, 1400.0 + MAX_SPOT_AGE_S + 1.0).unwrap_err();
+        let (arm, _) = armed_with_feed(101.0, 101.0);
+        let err = arm.fair_p_up(1400.0 + MAX_SPOT_AGE_S + 1.0).unwrap_err();
         assert!(err.contains("stale"), "{}", err);
     }
 
@@ -1029,6 +1056,28 @@ mod tests {
             "sigma_bp_per_min": 2.5, "fee_rate": 0.07, "size_usdc": 100.0,
         }));
         assert!(res.is_err());
-        assert!(s.params.is_none());
+        assert!(s.arms.is_empty());
+    }
+
+    #[test]
+    fn multi_arm_status_and_selective_disarm() {
+        let mut s = Updown::new();
+        // Insert arms directly — arm() would spawn live feed threads.
+        s.arms.insert("a".into(), ArmState::with_params(params("a")));
+        s.arms.insert("b".into(), ArmState::with_params(params("b")));
+        assert_eq!(s.subscriptions().len(), 4);
+
+        let st = s.on_command(&serde_json::json!({"action": "status"})).unwrap();
+        assert_eq!(st["count"], 2);
+
+        let d = s
+            .on_command(&serde_json::json!({"action": "disarm", "slug": "a"}))
+            .unwrap();
+        assert_eq!(d["arms"], 1);
+        assert_eq!(s.pending_cleanup.len(), 2);
+        assert!(s.arms.contains_key("b"));
+
+        let d2 = s.on_command(&serde_json::json!({"action": "disarm"})).unwrap();
+        assert_eq!(d2["arms"], 0);
     }
 }
