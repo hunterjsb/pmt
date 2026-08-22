@@ -553,18 +553,17 @@ def orders(as_json: bool = False) -> None:
 @cli.command()
 @click.option("--json", "as_json", is_flag=True, help="Emit as JSON")
 def balance(as_json: bool) -> None:
-    """Cash view: spendable USDC + cash locked in resting BUY orders."""
+    """Cash view: total USDC, cash locked in resting BUY orders, spendable rest."""
     b = _api().get_usdc_balance()
-    total = b["available"] + b["locked"]
     if as_json:
-        click.echo(json.dumps({**b, "total": total}, indent=2))
+        click.echo(json.dumps(b, indent=2))
         return
     t = Table(title="USDC balance", show_header=False)
     t.add_column("key", style="bold")
     t.add_column("value", justify="right")
-    t.add_row("available", f"${b['available']:,.2f}")
+    t.add_row("total", f"${b['total']:,.2f}")
     t.add_row("locked", f"${b['locked']:,.2f}")
-    t.add_row("total", f"[bold]${total:,.2f}[/bold]")
+    t.add_row("available", f"[bold]${b['available']:,.2f}[/bold]")
     console.print(t)
 
 

@@ -33,8 +33,10 @@ def test_usdc_balance_available_and_locked(api):
         {"side": "BUY", "original_size": "10", "size_matched": "0", "price": "0.25"},
     ]
     out = api.get_usdc_balance()
-    assert out["available"] == pytest.approx(123.45)
+    # CLOB balance is gross — available must already net out the bid locks
+    assert out["total"] == pytest.approx(123.45)
     assert out["locked"] == pytest.approx(32.5)
+    assert out["available"] == pytest.approx(90.95)
 
     from py_clob_client_v2 import AssetType
 
@@ -44,7 +46,7 @@ def test_usdc_balance_available_and_locked(api):
 def test_usdc_balance_no_orders(api):
     api.client = _StubClient("0")
     api.get_orders = lambda: []
-    assert api.get_usdc_balance() == {"available": 0.0, "locked": 0.0}
+    assert api.get_usdc_balance() == {"total": 0.0, "locked": 0.0, "available": 0.0}
 
 
 def test_locked_buy_cash_counts_unfilled_remainder_only():
@@ -58,5 +60,6 @@ def test_usdc_balance_tolerates_missing_fields(api):
     api.client = _StubClient("1000000")
     api.get_orders = lambda: [{"side": "BUY"}]  # no size/price fields → contributes $0
     out = api.get_usdc_balance()
-    assert out["available"] == pytest.approx(1.0)
+    assert out["total"] == pytest.approx(1.0)
     assert out["locked"] == 0.0
+    assert out["available"] == pytest.approx(1.0)

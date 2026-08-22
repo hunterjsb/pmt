@@ -275,15 +275,16 @@ class PolymarketAPI:
         return {"bids": bids, "asks": asks, "mid": mid, "spread": spread}
 
     def get_usdc_balance(self) -> dict:
-        """Cash view: spendable USDC plus cash committed to resting BUY orders."""
+        """Cash view. The CLOB reports the gross wallet balance — resting bids
+        don't move funds on-chain — so spendable cash is total minus bid locks."""
         from py_clob_client_v2 import AssetType, BalanceAllowanceParams
 
         resp = self.client.get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
-        available = float((resp or {}).get("balance") or 0) / 1e6
+        total = float((resp or {}).get("balance") or 0) / 1e6
         locked = sum(locked_buy_cash(o) for o in self.get_orders())
-        return {"available": available, "locked": locked}
+        return {"total": total, "locked": locked, "available": total - locked}
 
     # --- public reads (no auth) ---
 
