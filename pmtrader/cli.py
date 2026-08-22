@@ -27,7 +27,7 @@ Other commands:
     pmt orders | positions | pnl | rewards | balance
     pmt market | search | book
     pmt engine status | strategies | orders | trades | alerts | approve | reject
-    pmt scan cliff | expiring
+    pmt scan REF | cliff | expiring
 """
 
 from __future__ import annotations
@@ -885,9 +885,134 @@ def search(query: str, keyword: str | None) -> None:
 # ============================================================
 
 
-@cli.group()
+class _ScanGroup(click.Group):
+    """Bare `pmt scan REF` runs the due-diligence scan; `cliff`/`expiring` still resolve as named subcommands."""
+
+    def resolve_command(self, ctx, args):
+        implicit = bool(args) and not args[0].startswith("-") and args[0] not in self.commands
+        if implicit:
+            args = ["diligence", *args]
+        name, cmd, rest = super().resolve_command(ctx, args)
+        if implicit:
+            # user typed `pmt scan REF`, not `pmt scan diligence` — don't leak the internal
+            # routing name into usage/error banners (blanking it costs a cosmetic extra space)
+            name = ""
+        return name, cmd, rest
+
+
+@cli.group(cls=_ScanGroup)
 def scan() -> None:
-    """Market opportunity scanners."""
+    """Market opportunity scanners. Bare `pmt scan REF` runs due-diligence; see also cliff/expiring."""
+
+
+@scan.command("diligence")
+@click.argument("ref")
+@click.option("--match", default=None, help="Target sub-market by keyword (default: highest-volume open one).")
+@click.option("--json", "as_json", is_flag=True, help="Emit the scan as JSON")
+def scan_diligence(ref: str, match: str | None, as_json: bool) -> None:
+    """Pre-trade due-diligence scan for an event's sub-markets.
+
+    Checks thinness (low volume at a non-extreme price), resolution-risk
+    chatter in comments, smart-money side asymmetry on the target
+    sub-market, and how identically-shaped sibling sub-markets already
+    resolved.
+
+    \b
+    REF is a polymarket.com event URL or bare slug.
+
+    \b
+    Examples:
+      pmt scan israel-x-hamas-ceasefire-cancelled-by-october-31
+      pmt scan some-event --match "December" --json
+    """
+    from polymarket.scanner import scan_event
+
+    try:
+        data = scan_event(ref, match)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+
+    if as_json:
+        click.echo(json.dumps(data, indent=2, default=str))
+        return
+
+    ev = data["event"]
+    console.print(f"[bold]{ev['title']}[/bold]")
+    console.print(
+        f"  volume ${ev['volume']:,.0f}   liquidity ${ev['liquidity']:,.0f}   comments {ev['commentCount']}"
+    )
+
+    if data["markets"]:
+        t = Table(title="MARKETS")
+        t.add_column("Sub-market", justify="left")
+        t.add_column("Yes", justify="right")
+        t.add_column("Volume", justify="right")
+        t.add_column("Flag", justify="left")
+        for m in data["markets"]:
+            px = f"{m['yes_price']:.3f}" if m["yes_price"] is not None else "-"
+            flag = "[yellow]thin[/yellow]" if m["thin"] else ""
+            t.add_row(m["title"], px, f"${m['volume']:,.0f}", flag)
+        console.print(t)
+    else:
+        console.print("[dim]No open sub-markets.[/dim]")
+
+    cm_data = data["comments"]
+    pct = cm_data["ratio"] * 100
+    console.print(
+        f"\n[bold]RESOLUTION RISK[/bold]  {len(cm_data['flagged'])}/{cm_data['total']} flagged  ({pct:.0f}%)"
+    )
+    for c in cm_data["flagged"][:3]:
+        author = (c.get("profile") or {}).get("name") or "?"
+        created = c.get("createdAt") or ""  # explicit null on deleted/legacy comments, not just missing
+        try:
+            date = datetime.fromisoformat(created.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+        except ValueError:
+            date = created[:10]
+        body = (c.get("body") or "").strip().replace("\n", " ")
+        snippet = body[:160] + ("..." if len(body) > 160 else "")
+        console.print(f"  [dim]{date}[/dim] [cyan]{author}[/cyan]: {snippet}")
+
+    console.print("\n[bold]SIBLING PRECEDENT[/bold]")
+    if data["siblings"]:
+        for s in data["siblings"]:
+            console.print(f"  {s['title']}  →  [bold]{s['outcome']}[/bold]   (${s['volume']:,.0f} vol)")
+    else:
+        console.print("[dim]No resolved sibling sub-markets.[/dim]")
+
+    tgt = data["target"]
+    console.print(f"\n[bold]SMART MONEY[/bold]  — {tgt['title'] or '(no target sub-market)'}")
+
+    def holder_table(title: str, holders: list[dict]) -> Table:
+        ht = Table(title=title)
+        ht.add_column("Name", justify="left")
+        ht.add_column("Shares", justify="right")
+        ht.add_column("Lifetime PnL", justify="right")
+        ht.add_column("Lifetime Vol", justify="right")
+        ht.add_column("Markets", justify="right")
+        ht.add_column("Score", justify="right")
+        for h in sorted(holders, key=lambda x: -x.get("amount", 0)):
+            col = _pnl_color(h.get("pnl", 0))
+            ht.add_row(
+                h.get("name") or h.get("pseudonym") or "?",
+                f"{h.get('amount', 0):,.1f}",
+                f"[{col}]${h.get('pnl', 0):+,.0f}[/{col}]",
+                f"${h.get('volume', 0):,.0f}",
+                f"{h.get('markets', 0)}",
+                f"{h.get('score', 0):.2f}",
+            )
+        return ht
+
+    if data["holders_yes"]:
+        console.print(holder_table("YES holders", data["holders_yes"]))
+    else:
+        console.print("[dim]No YES holders.[/dim]")
+    if data["holders_no"]:
+        console.print(holder_table("NO holders", data["holders_no"]))
+    else:
+        console.print("[dim]No NO holders.[/dim]")
+    console.print(f"  side score — YES {data['score_yes']:.2f}   NO {data['score_no']:.2f}")
+
+    console.print(f"\n[bold]VERDICT[/bold]  {data['verdict']}")
 
 
 @scan.command("cliff")

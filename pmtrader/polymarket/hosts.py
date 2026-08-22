@@ -14,6 +14,7 @@ GAMMA = "https://gamma-api.polymarket.com"
 DATA = "https://data-api.polymarket.com"
 USER_PNL = "https://user-pnl-api.polymarket.com"
 POLYGON_RPC = "https://polygon-rpc.com"
+LB_API = "https://lb-api.polymarket.com"  # leaderboard: lifetime pnl/volume by wallet
 
 UA = {"User-Agent": "pmtrader/1.0"}
 
