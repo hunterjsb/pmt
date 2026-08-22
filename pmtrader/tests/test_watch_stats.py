@@ -1,6 +1,6 @@
 """Pure-math tests for the gamewatch coupling stats."""
 
-from sportsdata.watch import corr_and_lag, match_latencies, pearson, resample
+from polymarket.gamewatch import corr_and_lag, match_latencies, pearson, resample
 
 
 def test_pearson_perfect():

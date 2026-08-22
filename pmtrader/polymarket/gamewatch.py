@@ -22,8 +22,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from polymarket import hosts
-from . import espn
+from . import espn, hosts
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 WP_EVENT_THRESH = 0.015   # ESPN wp jump that counts as a game event

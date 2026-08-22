@@ -1491,7 +1491,7 @@ def sports_group() -> None:
 @click.option("--date", default=None, help="YYYYMMDD (default today)")
 def sports_board(league: str, date: str | None) -> None:
     """Scoreboard for a league (mlb, nfl, nba, nhl, wnba, ncaaf, ncaab, mls, epl)."""
-    from sportsdata import espn
+    from polymarket import espn
 
     try:
         games = espn.scoreboard(league, date)
@@ -1511,7 +1511,7 @@ def sports_board(league: str, date: str | None) -> None:
 @click.argument("ref")
 def sports_game_cmd(league: str, ref: str) -> None:
     """Game state + ESPN win prob. REF is an event id or team-name substring."""
-    from sportsdata import espn
+    from polymarket import espn
 
     try:
         if not ref.isdigit():
@@ -1545,7 +1545,7 @@ def sports_game_cmd(league: str, ref: str) -> None:
 def sports_watch_cmd(league, ref, slug, pos, interval, log_path, no_log, duration) -> None:
     """Live dashboard: game state vs the Polymarket moneyline, with
     game→market correlation and reaction-latency stats. Ctrl+C to stop."""
-    from sportsdata.watch import resolve_moneyline, run_watch
+    from polymarket.gamewatch import resolve_moneyline, run_watch
 
     try:
         resolved = resolve_moneyline(league, ref, slug=slug)
