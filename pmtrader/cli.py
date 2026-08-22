@@ -28,6 +28,7 @@ Other commands:
     pmt market | search | book
     pmt engine status | strategies | orders | trades | alerts | approve | reject
     pmt scan REF | cliff | expiring
+    pmt fit REF
 """
 
 from __future__ import annotations
@@ -883,6 +884,84 @@ def search(query: str, keyword: str | None) -> None:
 # ============================================================
 # Scanners
 # ============================================================
+
+
+@cli.command("fit")
+@click.argument("ref")
+@click.option("--lookback", default=90, show_default=True, help="Vol lookback in daily candles.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the fit as JSON")
+def fit_cmd(ref: str, lookback: int, as_json: bool) -> None:
+    """Compare an event's touch buckets against the realized distribution.
+
+    Computes realized vol from the resolution exchange's own candles, prices
+    every ↓/↑ barrier bucket analytically (2Φ(-z)) and empirically (rolling
+    same-length windows), and flags buckets whose market price doesn't fit.
+    Buckets that already touched since market creation are reported as settled.
+
+    \b
+    REF is a polymarket.com event URL or bare slug.
+
+    \b
+    Examples:
+      pmt fit what-price-will-bitcoin-hit-in-august-2026
+      pmt fit some-event --lookback 180 --json
+    """
+    from polymarket.fit import fit_event
+    from polymarket.scanner import parse_event_ref
+
+    try:
+        data = fit_event(parse_event_ref(ref), lookback)
+    except ValueError as e:
+        raise click.UsageError(str(e))
+
+    if as_json:
+        click.echo(json.dumps(data, indent=2, default=str))
+        return
+
+    console.print(f"[bold]{data['event_title']}[/bold]")
+    console.print(
+        f"  {data['symbol']}  spot ${data['spot']:,.0f}   "
+        f"daily σ {data['sigma_daily'] * 100:.2f}% ({data['lookback_days']}d lookback)"
+    )
+
+    t = Table(title="DISTRIBUTION FIT")
+    for col, j in (("Bucket", "left"), ("Dist", "right"), ("σ req", "right"), ("P model", "right"),
+                   ("P emp", "right"), ("Mkt YES", "right"), ("Edge", "right"), ("Flag", "left")):
+        t.add_column(col, justify=j)
+
+    def _pct(p: float | None) -> str:
+        return f"{p * 100:.1f}%" if p is not None else "-"
+
+    for b in data["buckets"]:
+        if b["status"] in ("unsupported", "no end date", "expired"):
+            t.add_row(b["title"], "-", "-", "-", "-", "-", "-", f"[dim]{b['status']}[/dim]")
+            continue
+        edge = b["edge"]
+        if edge is None:
+            edge_s = "-"
+        else:
+            col = "green" if edge > 0 else "red"
+            edge_s = f"[{col}]{edge * 100:+.1f}%[/{col}]"
+        flag = b["flag"]
+        if "check price" in flag:
+            flag = f"[bold red]{flag}[/bold red]"
+        elif "cheap" in flag:
+            flag = f"[yellow]{flag}[/yellow]"
+        t.add_row(
+            b["title"],
+            f"{b['distance_pct']:+.1f}%",
+            f"{b['sigma_required']:.2f}σ" if b["status"] == "ok" else "-",
+            _pct(b["p_model"]),
+            _pct(b["p_empirical"]),
+            _pct(b["market_yes"]),
+            edge_s,
+            flag,
+        )
+    console.print(t)
+    console.print(
+        "[dim]P emp = share of rolling same-length historical windows that touched; "
+        "edge = P emp − market YES; TOUCHED = already hit since market creation.[/dim]"
+    )
 
 
 class _ScanGroup(click.Group):
