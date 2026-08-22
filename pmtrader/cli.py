@@ -1316,7 +1316,8 @@ def engine_restart(ctx: click.Context) -> None:
 
 @engine.command("logs")
 @click.option("-n", default=40, show_default=True)
-def engine_logs(n: int) -> None:
+@click.option("-f", "--follow", is_flag=True, help="Stream live (Tick spam filtered)")
+def engine_logs(n: int, follow: bool) -> None:
     """Tail the most recent engine log."""
     import glob
     import subprocess
@@ -1325,7 +1326,11 @@ def engine_logs(n: int) -> None:
     if not logs:
         console.print("no engine logs yet")
         return
-    subprocess.run(["tail", "-n", str(n), logs[-1]])
+    if follow:
+        # 50ms ticks make the raw stream unreadable — drop the heartbeat.
+        subprocess.run(["bash", "-c", f"tail -n {n} -f '{logs[-1]}' | grep -v --line-buffered ' Tick '"])
+    else:
+        subprocess.run(["tail", "-n", str(n), logs[-1]])
 
 
 @engine.command("status")
@@ -1690,6 +1695,18 @@ def crypto_trigger() -> None:
     """Live state of the updown trigger: gates, model, edges."""
     reply = _engine_post("/strategies/updown/command", {"action": "status"})
     console.print_json(json.dumps(reply))
+
+
+@crypto_group.command("tape")
+@click.option("-n", default=20, show_default=True)
+@click.option("-f", "--follow", is_flag=True, help="Stream the decision tape live")
+def crypto_tape(n: int, follow: bool) -> None:
+    """The strategy's decision tape: every fire, exit, eval, and gate."""
+    import subprocess
+
+    path = "/var/home/hunter/.pmt/engine/updown-tape.jsonl"
+    cmd = ["tail", "-n", str(n)] + (["-f"] if follow else []) + [path]
+    subprocess.run(cmd)
 
 
 @cli.group("sports")
