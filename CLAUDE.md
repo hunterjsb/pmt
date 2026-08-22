@@ -65,7 +65,7 @@ Tag-triggered workflows (`publish-pmproxy.yml`, `publish-pmengine.yml`, `publish
 ## Live trading ops (crypto up/down trigger)
 
 - `pmt` works from ANY cwd — shim at `~/.local/bin/pmt` cds into pmtrader first (kills the "Failed to spawn pmt" class of error).
-- Engine lifecycle: `pmt engine start|stop|restart|logs` — detached, pidfile + timestamped logs in `~/.pmt/engine/`, prefers `target/release`. Never launch it piped into `head` (SIGPIPE kills it).
+- Engine lifecycle: `pmt engine start|kill|restart|logs` — detached, pidfile + timestamped logs in `~/.pmt/engine/`, prefers `target/release` (`engine stop <strategy>` is the older per-strategy command). Never launch it piped into `head` (SIGPIPE kills it).
 - Flow: `pmt crypto updown <url|slug>` prices a market (semantics auto-parsed from the description — TWAP vs close-vs-open); `pmt crypto arm <url> --size N [--side up|down]` hands params to the resident `updown` strategy; `pmt crypto trigger` shows its live eval (incl. committed/budget); `pmt crypto disarm` stops it and pulls its orders next tick.
 - Manual momentum override: `--min-elapsed 0 --min-fair 0 --min-edge 0.005 --side X`.
 - Durable eval/fire tape: `~/.pmt/engine/updown-tape.jsonl` — cross-session calibration data. Session scratchpads are tmpfs and die on the nightly poweroff; never leave data you want there.

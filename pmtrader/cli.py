@@ -1282,9 +1282,9 @@ def engine_start(strategies: tuple[str, ...], tick_ms: int) -> None:
         console.print(f"[red]engine did not come up — check {log}[/red]")
 
 
-@engine.command("stop")
-def engine_stop() -> None:
-    """Stop the running pmengine."""
+@engine.command("kill")
+def engine_kill() -> None:
+    """Stop the running pmengine process (`engine stop` stops a strategy)."""
     import os
     import signal as _signal
     import subprocess
@@ -1307,7 +1307,7 @@ def engine_stop() -> None:
 @click.pass_context
 def engine_restart(ctx: click.Context) -> None:
     """Stop then start pmengine (picks up a freshly-built binary)."""
-    ctx.invoke(engine_stop)
+    ctx.invoke(engine_kill)
     import time as _time
 
     _time.sleep(1)
