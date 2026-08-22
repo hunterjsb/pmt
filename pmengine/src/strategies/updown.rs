@@ -111,6 +111,25 @@ pub struct Updown {
     /// on_command can't emit signals, so the next tick does it.
     pending_cleanup: Vec<String>,
     last_eval: Option<serde_json::Value>,
+    /// Throttle for eval lines in the durable tape.
+    last_tape_at: f64,
+}
+
+/// Append one JSONL record to the durable tape at ~/.pmt/engine/. The tape
+/// is the cross-session dataset for calibrating gate parameters — every
+/// fire and periodic eval survives reboots, unlike engine stdout logs.
+fn tape(record: serde_json::Value) {
+    use std::io::Write;
+    let Ok(home) = std::env::var("HOME") else { return };
+    let dir = std::path::PathBuf::from(home).join(".pmt/engine");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("updown-tape.jsonl"))
+    {
+        let _ = writeln!(f, "{}", record);
+    }
 }
 
 impl Updown {
@@ -128,6 +147,7 @@ impl Updown {
             inflight: std::collections::HashMap::new(),
             pending_cleanup: Vec::new(),
             last_eval: None,
+            last_tape_at: 0.0,
         }
     }
 
@@ -287,6 +307,7 @@ impl Strategy for Updown {
             if !self.cleaned {
                 self.cleaned = true;
                 tracing::info!(slug = %p.slug, filled_usdc = self.filled_usdc, "updown window closed — cleaning up");
+                tape(serde_json::json!({"t": now, "ev": "cleanup", "slug": p.slug}));
                 signals.push(Signal::Cancel { token_id: p.token_up.clone() });
                 signals.push(Signal::Cancel { token_id: p.token_down.clone() });
                 signals.push(Signal::Unsubscribe { token_id: p.token_up.clone() });
@@ -334,13 +355,21 @@ impl Strategy for Updown {
         let inflight_usdc: f64 = self.inflight.values().map(|(n, _)| n).sum();
         let position_usdc: f64 = [&p.token_up, &p.token_down]
             .iter()
-            .filter_map(|t| ctx.positions.get(t))
-            .map(|pos| {
+            .filter_map(|t| ctx.positions.get(*t).map(|pos| (*t, pos)))
+            .map(|(t, pos)| {
                 let size = pos.size.to_f64().unwrap_or(0.0);
                 let avg = pos.avg_entry_price.to_f64().unwrap_or(0.0);
-                // Reconcile-seeded positions can carry avg 0 briefly; price
-                // those shares at our max_price so the budget errs tight.
-                size * if avg > 0.0 { avg } else { p.max_price }
+                // Reconcile-seeded positions can carry avg 0 briefly. Pricing
+                // them at max_price once blocked a legitimate top-up re-arm
+                // (2026-08-22); the live ask is the honest estimate, with
+                // max_price only as the last resort.
+                let fallback = ctx
+                    .order_books
+                    .get(t)
+                    .and_then(|b| b.best_ask())
+                    .and_then(|l| l.price.to_f64())
+                    .unwrap_or(p.max_price);
+                size * if avg > 0.0 { avg } else { fallback }
             })
             .sum();
         let committed = self.filled_usdc.max(position_usdc);
@@ -385,6 +414,11 @@ impl Strategy for Updown {
                 slug = %p.slug,
                 "updown trigger firing — taking the ask"
             );
+            tape(serde_json::json!({
+                "t": now, "ev": "fire", "slug": p.slug, "side": side,
+                "ask": ask, "fair": fair, "net": net, "size": size,
+                "committed": committed, "elapsed_frac": elapsed_frac,
+            }));
             budget -= size * ask;
             self.inflight.insert(token.clone(), (size * ask, now));
             signals.push(Signal::Cancel { token_id: token.clone() });
@@ -398,8 +432,16 @@ impl Strategy for Updown {
 
         self.last_eval = Some(serde_json::json!({
             "state": "armed", "t": now, "p_up": p_up,
-            "filled_usdc": self.filled_usdc, "sides": evals,
+            "committed": committed, "budget": budget,
+            "inflight": inflight_usdc, "sides": evals,
         }));
+        if now - self.last_tape_at >= 5.0 {
+            self.last_tape_at = now;
+            tape(serde_json::json!({
+                "t": now, "ev": "eval", "slug": p.slug, "p_up": p_up,
+                "committed": committed, "sides": evals,
+            }));
+        }
 
         if signals.is_empty() {
             vec![Signal::Hold]
@@ -585,6 +627,54 @@ mod tests {
         assert_eq!(p.basis_guard_bp, 3.0);
         assert_eq!(p.min_fair, 0.97);
         assert_eq!(p.min_elapsed_frac, 0.5);
+    }
+
+    fn armed_with_feed(banked_px: f64, spot: f64) -> (Updown, ArmParams, f64) {
+        let s = Updown::new();
+        let p: ArmParams = serde_json::from_value(serde_json::json!({
+            "slug": "s", "kind": "twap", "symbol": "BTCUSDT",
+            "token_up": "1", "token_down": "2",
+            "start": 600.0, "end": 1500.0,
+            "sigma_bp_per_min": 3.0, "fee_rate": 0.07, "size_usdc": 100.0,
+        }))
+        .unwrap();
+        let now = 1400.0;
+        {
+            let mut f = s.feed.lock().unwrap();
+            f.spot = spot;
+            f.spot_ts = now;
+            f.per_min.insert(540, 100.0); // range-start reference
+            for t in (600..1380).step_by(60) {
+                f.per_min.insert(t, banked_px);
+            }
+        }
+        (s, p, now)
+    }
+
+    #[test]
+    fn twap_banked_above_ref_is_locked_up() {
+        let (s, p, now) = armed_with_feed(101.0, 101.0); // +100bp margin
+        assert!(s.fair_p_up(&p, now).unwrap() > 0.999);
+    }
+
+    #[test]
+    fn twap_banked_below_ref_is_locked_down() {
+        let (s, p, now) = armed_with_feed(99.0, 99.0);
+        assert!(s.fair_p_up(&p, now).unwrap() < 0.001);
+    }
+
+    #[test]
+    fn twap_thin_margin_trips_basis_guard() {
+        let (s, p, now) = armed_with_feed(100.001, 100.001); // ~0.1bp
+        let err = s.fair_p_up(&p, now).unwrap_err();
+        assert!(err.contains("basis guard"), "{}", err);
+    }
+
+    #[test]
+    fn twap_stale_feed_refuses() {
+        let (s, p, _) = armed_with_feed(101.0, 101.0);
+        let err = s.fair_p_up(&p, 1400.0 + MAX_SPOT_AGE_S + 1.0).unwrap_err();
+        assert!(err.contains("stale"), "{}", err);
     }
 
     #[test]

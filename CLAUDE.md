@@ -61,3 +61,12 @@ Current live state and decisions are tracked in `.infra/INFRA.md` (gitignored).
 - **pmtrader** — Python package, no AWS deployment.
 
 Tag-triggered workflows (`publish-pmproxy.yml`, `publish-pmengine.yml`, `publish-pmtrader.yml`) build + cut GitHub releases. `deploy-pmproxy.yml` handles Lambda deploys via Pulumi.
+
+## Live trading ops (crypto up/down trigger)
+
+- `pmt` works from ANY cwd — shim at `~/.local/bin/pmt` cds into pmtrader first (kills the "Failed to spawn pmt" class of error).
+- Engine lifecycle: `pmt engine start|stop|restart|logs` — detached, pidfile + timestamped logs in `~/.pmt/engine/`, prefers `target/release`. Never launch it piped into `head` (SIGPIPE kills it).
+- Flow: `pmt crypto updown <url|slug>` prices a market (semantics auto-parsed from the description — TWAP vs close-vs-open); `pmt crypto arm <url> --size N [--side up|down]` hands params to the resident `updown` strategy; `pmt crypto trigger` shows its live eval (incl. committed/budget); `pmt crypto disarm` stops it and pulls its orders next tick.
+- Manual momentum override: `--min-elapsed 0 --min-fair 0 --min-edge 0.005 --side X`.
+- Durable eval/fire tape: `~/.pmt/engine/updown-tape.jsonl` — cross-session calibration data. Session scratchpads are tmpfs and die on the nightly poweroff; never leave data you want there.
+- Engine gotcha: realtime taker fills are MISSED (`on_fill` doesn't run); the ~5s position reconcile is the truth. Any budget/PnL logic must read the position tracker, never fill events alone.

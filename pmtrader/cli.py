@@ -1242,6 +1242,92 @@ def engine() -> None:
     pass
 
 
+_ENGINE_ROOT = "/var/home/hunter/Desktop/code/pmt/pmengine"
+_ENGINE_STATE = "/var/home/hunter/.pmt/engine"
+
+
+def _engine_bin() -> str:
+    release = f"{_ENGINE_ROOT}/target/release/pmengine"
+    debug = f"{_ENGINE_ROOT}/target/debug/pmengine"
+    import os
+
+    return release if os.path.exists(release) else debug
+
+
+@engine.command("start")
+@click.argument("strategies", nargs=-1)
+@click.option("--tick-ms", default=250, show_default=True)
+def engine_start(strategies: tuple[str, ...], tick_ms: int) -> None:
+    """Start pmengine detached (default strategy: updown). Logs + pidfile in ~/.pmt/engine."""
+    import os
+    import subprocess
+    import time as _time
+
+    os.makedirs(_ENGINE_STATE, exist_ok=True)
+    pidfile = f"{_ENGINE_STATE}/pmengine.pid"
+    log = f"{_ENGINE_STATE}/engine-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+    env = {**os.environ, "PMENGINE_TICK_INTERVAL_MS": str(tick_ms)}
+    cmd = [_engine_bin(), "--env-file", "/var/home/hunter/Desktop/code/pmt/.env",
+           "run", *(strategies or ("updown",)), "--skip-warmup"]
+    with open(log, "ab") as lf:
+        proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, env=env, start_new_session=True)
+    with open(pidfile, "w") as pf:
+        pf.write(str(proc.pid))
+    _time.sleep(2)
+    try:
+        s = _engine_get("/status")
+        console.print(f"[green]engine up[/green] pid {proc.pid} · dry_run {s['dry_run']} · "
+                      f"bin {_engine_bin().rsplit('/target/', 1)[-1]} · log {log}")
+    except SystemExit:
+        console.print(f"[red]engine did not come up — check {log}[/red]")
+
+
+@engine.command("stop")
+def engine_stop() -> None:
+    """Stop the running pmengine."""
+    import os
+    import signal as _signal
+    import subprocess
+
+    pidfile = f"{_ENGINE_STATE}/pmengine.pid"
+    stopped = False
+    if os.path.exists(pidfile):
+        try:
+            os.kill(int(open(pidfile).read().strip()), _signal.SIGTERM)
+            stopped = True
+        except (ProcessLookupError, ValueError):
+            pass
+        os.remove(pidfile)
+    if not stopped:  # fallback for engines started outside `pmt engine start`
+        stopped = subprocess.run(["pkill", "-f", "pmengine.*run"], capture_output=True).returncode == 0
+    console.print("[green]stopped[/green]" if stopped else "no engine running")
+
+
+@engine.command("restart")
+@click.pass_context
+def engine_restart(ctx: click.Context) -> None:
+    """Stop then start pmengine (picks up a freshly-built binary)."""
+    ctx.invoke(engine_stop)
+    import time as _time
+
+    _time.sleep(1)
+    ctx.invoke(engine_start, strategies=(), tick_ms=250)
+
+
+@engine.command("logs")
+@click.option("-n", default=40, show_default=True)
+def engine_logs(n: int) -> None:
+    """Tail the most recent engine log."""
+    import glob
+    import subprocess
+
+    logs = sorted(glob.glob(f"{_ENGINE_STATE}/engine-*.log"))
+    if not logs:
+        console.print("no engine logs yet")
+        return
+    subprocess.run(["tail", "-n", str(n), logs[-1]])
+
+
 @engine.command("status")
 def engine_status() -> None:
     """One-line health snapshot of the running engine."""
