@@ -220,3 +220,4 @@ analysis/net_probe_raw*.json
 analysis/manual_book_audit.md
 docs/ec2-euw-plan.md
 infra/pulumi/README.md
+infra/

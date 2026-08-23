@@ -1,5 +1,0 @@
-config:
-  aws:region: eu-west-1
-  pmt:cognitoPoolId: eu-west-1_BCrjnvkqQ
-  pmt:cognitoClientId: 31qer0atnp30hccnma0ki3o7ri
-encryptionsalt: v1:opQjtYsTVH4=:v1:hOCgQSioD6RURyhf:U1AxyLrZrZnE8V60H0QzPZbcH8oT0g==
