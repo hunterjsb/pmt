@@ -76,17 +76,30 @@ def _brake_sides(sides: list[dict]) -> list[tuple[str, str]]:
     return [(s["side"], s["brake"]) for s in sides if s.get("brake")]
 
 
-def _safety_rich(sides: list[dict], p_up: float | None) -> str:
-    txt = _safety_text(sides)
-    if not txt:
+def _paint(text: str, style: str, ansi: bool) -> str:
+    """One coloured fragment as Rich markup or as ANSI. The tables speak Rich
+    and the tape speaks ANSI; every badge below is written once and painted
+    for whichever is asking."""
+    if not text:
         return ""
-    style = "green" if _safety_is_strong(sides, p_up) else "dim"
-    return f"[{style}]{txt}[/{style}]"
+    if not ansi:
+        return f"[{style}]{text}[/{style}]"
+    words = style.split()
+    return click.style(text, fg=next((w for w in words if w not in ("bold", "dim")), None),
+                       bold="bold" in words, dim="dim" in words)
 
 
-def _brake_rich(sides: list[dict]) -> str:
-    return " ".join(f"[{_BRAKE_COLOR.get(b, 'white')}]{side}:{b}[/]"
-                     for side, b in _brake_sides(sides))
+def _safety_badge(sides: list[dict], p_up: float | None, ansi: bool = False) -> str:
+    """`saf +0.90/-0.30`, green once the model's favoured side clears theta."""
+    return _paint(_safety_text(sides),
+                  "green" if _safety_is_strong(sides, p_up) else "dim", ansi)
+
+
+def _brake_badge(sides: list[dict], ansi: bool = False) -> str:
+    """`up:safety down:distrust` — every side whose fire is currently blocked,
+    coloured by which brake did it."""
+    return " ".join(_paint(f"{side}:{b}", _BRAKE_COLOR.get(b, "white"), ansi)
+                    for side, b in _brake_sides(sides))
 
 
 def _has_rtds_arm(arms: dict | None) -> bool:
@@ -98,18 +111,14 @@ def _has_rtds_arm(arms: dict | None) -> bool:
 def rtds_cells(h: dict | None) -> list[str]:
     """The stream-health segments, as cells: `[head, "3.0/s", "age 0s", ...]`.
 
-    The head carries its own color (green connected / red down); the rest are
-    raw so a caller can dim them, or lay them out in a grid, without having to
-    re-derive a single number. `_rtds_rich` joins these into the one-line form
-    both watch rows use — one computation, two presentations.
+    The head carries its own colour (green connected / red down); the rest are
+    raw, so a caller can dim them or lay them out in a grid without having to
+    re-derive a number. One computation, two presentations.
     """
     if not h or not (h.get("started") or h.get("events")):
         return []
     age = h.get("last_event_age_s")
-    if h.get("connected"):
-        head = "[green]rtds[/green]"
-    else:
-        head = "[red]rtds DOWN[/red]"
+    head = "[green]rtds[/green]" if h.get("connected") else "[red]rtds DOWN[/red]"
     bits = [f"{h.get('events_per_s', 0):.1f}/s",
             f"age {age:.0f}s" if age is not None else "no events yet",
             f"{h.get('consumers', 0)} arms"]
@@ -120,25 +129,33 @@ def rtds_cells(h: dict | None) -> list[str]:
     return [head] + bits
 
 
-def _rtds_rich(h: dict | None) -> str:
-    """One line for the shared RTDS settlement-stream supervisor, or "" when
-    nothing has ever armed on it.
+def _one_line(cells: list[str]) -> str:
+    """Health cells as one line: coloured head, the rest dimmed and dotted."""
+    if not cells:
+        return ""
+    return f"{cells[0]} [dim]{' · '.join(cells[1:])}[/dim]"
 
-    Worth its own line rather than a per-arm field: it is ONE socket behind
-    every stream-fed arm, so when it drops they all gate at once and the
+
+def _rtds_rich(h: dict | None) -> str:
+    """One line for the shared settlement-stream supervisor, or "" when nothing
+    has ever armed on it.
+
+    Worth its own line rather than a per-arm field: ONE socket sits behind
+    every stream-fed arm, so when it drops they all gate at once and their
     per-arm reasons all say the same thing. Red the moment it is not
     connected — a dark stream is a fleet-wide event.
     """
-    cells = rtds_cells(h)
-    if not cells:
-        return ""
-    head, bits = cells[0], cells[1:]
-    return f"{head} [dim]{' · '.join(bits)}[/dim]"
+    return _one_line(rtds_cells(h))
 
 
 def rtds_line_cells(status: dict | None) -> list[str]:
-    """rtds_cells, gated the way _rtds_line is — empty unless an arm is on the
-    stream right now."""
+    """rtds_cells, but empty unless an arm is reading the stream right now.
+
+    The socket is opened lazily by the first rtds arm and outlives it: once
+    every stream-fed arm has rolled to binance or retired, its health is no
+    longer a fact about the fleet, and a line that never goes away stops being
+    read.
+    """
     status = status or {}
     if not _has_rtds_arm(status.get("arms")):
         return []
@@ -146,38 +163,7 @@ def rtds_line_cells(status: dict | None) -> list[str]:
 
 
 def _rtds_line(status: dict | None) -> str:
-    """_rtds_rich, but silent unless an arm is reading the stream right now.
-
-    The socket is opened lazily by the first rtds arm and outlives it — once
-    every stream-fed arm has rolled to binance or retired, its health is no
-    longer a fact about the fleet, and a line that never goes away stops
-    being read.
-    """
-    status = status or {}
-    if not _has_rtds_arm(status.get("arms")):
-        return ""
-    return _rtds_rich(status.get("rtds"))
-
-
-def _click_fg_bold(style: str) -> tuple[str | None, bool]:
-    parts = style.split()
-    return next((p for p in parts if p != "bold"), None), "bold" in parts
-
-
-def _safety_ansi(sides: list[dict], p_up: float | None) -> str:
-    txt = _safety_text(sides)
-    if not txt:
-        return ""
-    strong = _safety_is_strong(sides, p_up)
-    return click.style(txt, fg="green" if strong else None, dim=not strong)
-
-
-def _brake_ansi(sides: list[dict]) -> str:
-    parts = []
-    for side, b in _brake_sides(sides):
-        fg, bold = _click_fg_bold(_BRAKE_COLOR.get(b, "white"))
-        parts.append(click.style(f"{side}:{b}", fg=fg, bold=bold))
-    return "  ".join(parts)
+    return _one_line(rtds_line_cells(status))
 
 
 _MARGIN_RE = re.compile(r"projected margin ([+-]?\d+\.?\d*)bp inside (\d+\.?\d*)bp")
@@ -402,8 +388,8 @@ def _render_record(r: dict, raw: str, n: int = 1, t0: float | None = None) -> st
             tags += click.style("  ◇maker-candidate", fg="cyan")
         body = tagged("eval", f"p↑{r['p_up']:.4f}  {book}"
                               f"  ρ{r['rho']:+.2f}  {money(r['committed'])} in")
-        extras = "  ".join(x for x in (_safety_ansi(sides, r.get("p_up")),
-                                       _brake_ansi(sides)) if x)
+        extras = "  ".join(x for x in (_safety_badge(sides, r.get("p_up"), True),
+                                       _brake_badge(sides, True)) if x)
         return click.style(body, dim=True) + tags + ("  " + extras if extras else "")
     if ev == tape.EV_GATED:
         def ask(v: float | None) -> str:
@@ -782,58 +768,31 @@ def _risk_exposure(arms: dict | None) -> tuple[float, float, float]:
     return committed, undecided, resting
 
 
-def risk_cells(status: dict | None, sb: dict | None,
-                rtds: bool = True) -> list[str]:
-    """The exposure summary's segments, as cells:
-    `["committed $Y", "$Z un-decided", ("◇resting $R"), "riding N windows $W"]`.
-
-    THE one place committed/un-decided/resting/riding are computed and the
-    un-decided threshold color is chosen. `exposure_rows` lays these into the
-    header grid both the dashboard and `pmt crypto stats` render, so the two
-    views cannot disagree about what is at risk.
-
-    Reads only already-cached data (status/sb) — never fetches.
-    """
-    committed, undecided, resting = _risk_exposure((status or {}).get("arms"))
-    riding_n = (sb or {}).get("riding_n", 0)
-    riding_usd = (sb or {}).get("riding_usd", 0.0)
-    color = ("red" if undecided > _UNDECIDED_RED_USD else
-             "yellow" if undecided > _UNDECIDED_YELLOW_USD else "")
-    undecided_s = f"${_zero(undecided):,.2f} un-decided"
-    if color:
-        undecided_s = f"[{color}]{undecided_s}[/{color}]"
-    cells = [f"committed ${_zero(committed):,.2f}", undecided_s]
-    # Only when a bid is actually on the book — a "◇resting $0.00" every tick
-    # on a taker-only fleet is noise.
-    if resting > 0.005:
-        cells.append(f"[cyan]◇resting ${resting:,.2f}[/cyan]")
-    cells.append(f"riding {riding_n} windows ${riding_usd:,.2f}")
-    # One socket feeds every stream-fed arm, so its state belongs on the
-    # fleet's risk line, not buried per-arm.
-    health = _rtds_line(status) if rtds else ""
-    if health:
-        cells.append(health)
-    return cells
-
-
 def exposure_rows(status: dict | None, sb: dict | None) -> list[tuple]:
     """Live exposure as header-grid rows: `(label, v1, v2, v3)` tuples.
 
-    The numbers and the un-decided threshold color come from `risk_cells`, so
-    the watch dashboard and `pmt crypto stats` can never disagree about what
-    is at risk — only about how many columns they had to say it in. Both
-    render THESE rows; neither joins its own line any more, which is what let
-    the two drift out of alignment in the first place.
+    THE one place committed / un-decided / resting / riding are turned into
+    cells and the un-decided threshold colour is chosen. The watch dashboard
+    and `pmt crypto stats` both render THESE rows, so the two views cannot
+    disagree about what is at risk — only about how many columns they said it
+    in. Reads already-cached data; never fetches.
 
-    A resting maker bid earns its own row because it only exists on the days
-    a bid is actually on the book.
+    A resting maker bid earns a row of its own: it only exists on the days a
+    bid is actually on the book, and a "◇resting $0.00" every tick on a
+    taker-only fleet is noise.
     """
-    cells = risk_cells(status or {}, sb, rtds=False)
-    resting = next((c for c in cells if "resting" in c), None)
-    riding = next(c for c in cells if c.startswith("riding"))
-    rows = [("exposure", cells[0], cells[1], f"[dim]{riding}[/dim]")]
-    if resting:
-        rows.append(("resting", resting, "[dim]maker bid on the book[/dim]", ""))
+    committed, undecided, resting = _risk_exposure((status or {}).get("arms"))
+    sb = sb or {}
+    color = ("red" if undecided > _UNDECIDED_RED_USD else
+             "yellow" if undecided > _UNDECIDED_YELLOW_USD else "")
+    riding = f"riding {sb.get('riding_n', 0)} windows ${sb.get('riding_usd', 0.0):,.2f}"
+    undecided_s = f"${_zero(undecided):,.2f} un-decided"
+    rows = [("exposure", f"committed ${_zero(committed):,.2f}",
+             _paint(undecided_s, color, False) if color else undecided_s,
+             f"[dim]{riding}[/dim]")]
+    if resting > 0.005:
+        rows.append(("resting", f"[cyan]◇resting ${resting:,.2f}[/cyan]",
+                     "[dim]maker bid on the book[/dim]", ""))
     return rows
 
 
@@ -853,62 +812,42 @@ def feed_row(status: dict | None) -> tuple | None:
 
 # ---------- the windows table: the fleet's state, one row per window ----------
 #
-# DESIGN NOTE (2026-08-23) — the dashboard's ONE table. The recent-windows chip
-# strip, the trades table and the arms table are all folded in here; nothing
-# else on the dashboard is a table.
-#
-# The strip was a projection of the trades table's own rows — same source, same
-# order — so it spent three terminal rows restating them less precisely. The
-# arms table was the same window seen from the other side: its rows and the
-# trades panel's newest rows named the SAME windows, one panel apart, in two
-# vocabularies, with `committed` and `size` quietly answering the same question
-# from two sources. Two tables for one fleet is the thing this file no longer
-# does.
-#
-# What replaces them is not a log of trades. It is the STRATEGY'S STATE. Its
-# unit is the WINDOW, and a window has exactly one life:
+# The dashboard's ONE table. It is not a log of trades; it is the strategy's
+# state, and its unit is the WINDOW, which has exactly one life:
 #
 #     armed ──► gated ──► fired / riding ──► decided W/L ──► rolled away
 #       ○         ⊘             ◆               ✓  ✗          (ages off)
 #
-# Three properties let one table hold all of it:
+# Four properties let one table hold all of it:
 #
 #  1. ONE SORT KEY — window end, descending. A window's stage is a function of
-#     its age, so time order IS lifecycle order for free: live windows (end
-#     still in the future) sit on top, riding ones below them, then the decided
-#     tail. Reading down the table is reading backwards through the fleet's
-#     life. This is also the answer to "riding pinned vs recency": a fresh fill
-#     already tops the panel under recency (a still-open window sorts above
-#     every closed one), while a riding-always-first rule would hand four
-#     windows stuck undecided for 13-25h (2026-08-23, $317) permanent tenancy.
-#     Stuck money is totalled on the risk header's "riding N windows $W", which
-#     is where a total belongs; this panel answers "where is the fleet now".
+#     its age, so time order IS lifecycle order for free: live windows on top,
+#     riding below them, then the decided tail. Deliberately not "riding
+#     first": a window stuck undecided for a day would then hold a row
+#     forever. Stuck money is totalled on the header's "riding N windows $W",
+#     which is where a total belongs; this panel answers "where is the fleet
+#     now", and a fresh fill already tops it under recency.
 #
-#  2. ONE ROW PER WINDOW, keyed by slug, merged from two sources. The live head
-#     comes from the engine's /status arms — the ONLY place a window with no
-#     fill yet exists, since the wallet has nothing to grade. Everything with
-#     money in it comes from the ONE scoreboard (score_activity). A window in
-#     both is ONE row that gains its live posture, so a fire does not spawn a
-#     second row: it fills the row that was already on screen. The WALLET WINS
-#     on money and verdict; the engine contributes posture, and its committed $
-#     only for a window the wallet has not seen at all (rendered dim, because
-#     it is the engine's figure and not yet ground truth).
+#  2. ONE ROW PER WINDOW, keyed by slug, merged from the two sources that know
+#     about one. The live head comes from the engine's /status arms — the only
+#     place a window with no fill yet exists, since the wallet has nothing to
+#     grade. Everything with money in it comes from the scoreboard. A window
+#     in both is ONE row that gains its live posture, so a fire fills the row
+#     already on screen instead of adding a second below it. The WALLET WINS
+#     on money and verdict; the engine contributes posture, and its committed
+#     figure only where the wallet has never seen the window (rendered dim,
+#     because it is not ground truth yet).
 #
-#  3. THE STAGE GLYPH COLUMN carries everything the strip carried. Read
-#     straight down it is the same ✓/✗ sequence in the same order (the strip
-#     was ordered by these rows already), plus ◆ for a riding position and ○/⊘
-#     for the live head. Nothing the strip said is gone; the arm label, the
-#     P&L and the notional it compressed into a chip are now their own columns.
-#     Glyph and the arms table's ⟳/≈/◇ flags share the `arm` cell — both are
-#     properties of the row, not of a column of their own, and the glyph is
-#     safe there from Rich's narrow-console squeeze (see _WINDOWS_COLUMNS).
+#  3. THE STAGE GLYPH leads the `arm` cell rather than owning a column: it is
+#     a property of the row, and a 1-wide column is the first thing Rich
+#     squeezes out of existence on a narrow console (see _WINDOWS_COLUMNS).
+#     The ⟳/≈/◇ arm flags ride there for the same reason.
 #
-#  4. EVERY COLUMN IS REPURPOSED BY STAGE rather than duplicated. This is what
-#     made folding the arms table possible: a live un-filled window's money
-#     cells are dead space, and a rolled-away window's model cells are dead
-#     space, so the two sets share the SAME columns and the stage decides which
-#     meaning is showing. The column count never changes, so the geometry never
-#     jitters:
+#  4. EVERY COLUMN IS REPURPOSED BY STAGE rather than duplicated: a live
+#     un-filled window's money cells are dead space and a rolled-away
+#     window's model cells are dead space, so the two sets share the SAME
+#     columns and the stage decides which meaning is showing. The column
+#     count never changes, so the geometry never jitters:
 #
 #       col       live (armed/gated)            settled (riding/decided)
 #       ───────── ───────────────────────────── ─────────────────────────
@@ -926,19 +865,12 @@ def feed_row(status: dict | None) -> tuple | None:
 #
 # Grouping is FLAT, not by arm: a window belongs to a moment, not to an arm —
 # an arm that rolled away still owns its riding position, and per-arm grouping
-# would file that position under whichever arm happens to be alive now. The
-# `arm` column carries the grouping the eye needs at a dozen rows.
+# would file it under whichever arm happens to be alive now.
 #
-# The money question the two tables used to answer twice is now answered once:
-# `$` is the ENGINE's committed figure while the wallet has never seen the
-# window (dim, because it is not ground truth yet) and the WALLET's notional
-# from the moment it has. They can legitimately differ for a few seconds
-# across a fill; which one wins is never in doubt.
-#
-# The arms table's one thing that is not a row — its red "engine unreachable or
-# no arms" placeholder — moved to the header panel (see `engine_row`), because
-# with no arms there are no live rows to hang it on and the exposure row would
-# otherwise read a confident $0.00 committed.
+# "Engine unreachable or no arms" is the one thing here that is not a row, so
+# it lives on the header panel (see `engine_row`): with no arms there are no
+# live rows to hang it on, and the exposure row would otherwise read a
+# confident $0.00 committed.
 
 _WINDOWS_COLUMNS = (
     # Stage glyph + series + flags in ONE cell: "◆ doge 15m ⟳≈◇" is 14. The
@@ -1004,19 +936,23 @@ def _stage_cell(w: dict) -> str:
     return f"[{'dim' if w.get('est') else style}]{glyph}[/]"
 
 
-def _age_label(sec: float) -> str:
-    """Compact time-since for a window row — `live` while the window is still
-    open (which is every row of the live head), then s / m / h:mm. Age, not a
-    wall clock: "how long ago" is the question a live dashboard is asked. The
-    countdown to a live window's close is the arms table's T-, not this."""
-    if sec < 0:
-        return "live"
+def _dur_label(sec: float, coarse: bool = False) -> str:
+    """`45s` / `3m12s` / `1h04`. `coarse` drops the seconds off the minutes
+    form, which is what a time-since wants and a duration does not."""
     if sec < 60:
         return f"{int(sec)}s"
     if sec < 3600:
-        return f"{int(sec // 60)}m"
+        m, s = divmod(int(sec), 60)
+        return f"{m}m" if coarse else f"{m}m{s:02d}s"
     h, m = divmod(int(sec // 60), 60)
     return f"{h}h{m:02d}"
+
+
+def _age_label(sec: float) -> str:
+    """Time-since for a window row, `live` while the window is still open.
+    Age, not a wall clock: "how long ago" is what a live dashboard is asked;
+    the countdown to a live window's close is the `t` column's other half."""
+    return "live" if sec < 0 else _dur_label(sec, coarse=True)
 
 
 def _window_pnl_cell(w: dict) -> str:
@@ -1036,17 +972,6 @@ def _window_pnl_cell(w: dict) -> str:
         return "[dim]—[/dim]"
     v = _zero(float(w.get("pnl") or 0.0))
     return f"[{_pnl_color(v)}]{'~' if w.get('est') else ''}{v:+,.2f}[/{_pnl_color(v)}]"
-
-
-def _dur_label(sec: float) -> str:
-    """`45s` / `3m12s` / `1h04` — a duration, not a time-since (_age_label)."""
-    if sec < 60:
-        return f"{int(sec)}s"
-    if sec < 3600:
-        m, s = divmod(int(sec), 60)
-        return f"{m}m{s:02d}s"
-    h, m = divmod(int(sec // 60), 60)
-    return f"{h}h{m:02d}"
 
 
 def _t_cell(w: dict, now: float) -> str:
@@ -1074,8 +999,8 @@ def _live_state_text(e: dict) -> str:
         mode = _mode_text(e)
         head = "[green]armed[/green]" + (f" [dim]{mode}[/dim]" if mode != "—" else "")
         sides = e.get("sides") or []
-        badges = "  ".join(x for x in (_safety_rich(sides, e.get("p_up")),
-                                        _brake_rich(sides)) if x)
+        badges = "  ".join(x for x in (_safety_badge(sides, e.get("p_up")),
+                                        _brake_badge(sides)) if x)
         return f"{head}  {badges}" if badges else head
     # flip/quiesce ARE the mode, and an unknown state is printed as itself
     # rather than swallowed.
@@ -1550,7 +1475,7 @@ def _pnl_cell(net: float) -> str:
     return f"[dim]P&L[/dim] [{_pnl_color(_zero(net))}]{_zero(net):+,.2f}[/]"
 
 
-def header_rows(snap: dict, render_err: str | None = None) -> list[tuple]:
+def header_rows(snap: dict) -> list[tuple]:
     """The top panel's rows as `(label, v1, v2, v3)` tuples.
 
     Row order is the order the question is asked: how are we doing lately,
@@ -1605,7 +1530,7 @@ def header_height(snap: dict, render_err: str | None = None) -> int:
     """Terminal rows the header panel will occupy — its rows, the failure line
     if there is one, plus the border. The watch layout sizes its head slot from
     this, the same way it sizes the arms slot from the arm count."""
-    return (len(header_rows(snap, render_err))
+    return (len(header_rows(snap))
             + (1 if header_note(snap, render_err) is not None else 0) + 2)
 
 
@@ -1645,7 +1570,7 @@ def build_header_panel(snap: dict, floor_label: str, render_err: str | None):
     # off a money figure is the one failure this box may not have.
     for w in (_HEAD_V1_W, _HEAD_V2_W, _HEAD_V3_W):
         t.add_column(justify="left", width=w, overflow="fold")
-    for row in header_rows(snap, render_err):
+    for row in header_rows(snap):
         t.add_row(*row)
     note = header_note(snap, render_err)
     body = t if note is None else Group(t, note)

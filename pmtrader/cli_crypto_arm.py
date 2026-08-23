@@ -19,7 +19,7 @@ from rich.table import Table
 
 from cli_common import console
 from engine import post as _engine_post
-from watch_ui import _brake_rich, _rtds_line, _safety_rich, _tape_slug
+from watch_ui import _brake_badge, _rtds_line, _safety_badge, _tape_slug
 
 
 @click.command("updown")
@@ -291,10 +291,10 @@ def crypto_trigger(as_json: bool) -> None:
             if e.get("banked_decided"):
                 body += " [cyan]BANKED[/cyan]"
             sides = e.get("sides") or []
-            saf = _safety_rich(sides, e.get("p_up"))
+            saf = _safety_badge(sides, e.get("p_up"))
             if saf:
                 body += f"  {saf}"
-            brakes = _brake_rich(sides)
+            brakes = _brake_badge(sides)
             if brakes:
                 body += f"  {brakes}"
             committed = e.get("committed", a.get("filled_usdc", 0))
