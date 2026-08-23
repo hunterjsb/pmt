@@ -81,6 +81,34 @@ fn wire_shape(urgency: Urgency, is_buy: bool, price: Decimal, dp: u32) -> (bool,
     (post_only, price)
 }
 
+/// The tick the order path assumes when the tick lookup can't answer — the
+/// `unwrap_or` in `place_order`, named so the delta matcher's cold-cache
+/// fallback cannot drift from the one the wire actually uses.
+///
+/// 2 dp (0.01) is the COARSEST tick any measured crypto up/down book runs,
+/// which is the safe direction to guess in: believing the wire is coarser
+/// than it is can only floor a maker bid further from the book (cheaper,
+/// never a post-only rejection) and hold a standing quote through a
+/// sub-tick move. Guessing finer replaces orders that never moved.
+pub(crate) const FALLBACK_TICK_DECIMALS: u32 = 2;
+
+/// Where a model price actually RESTS once the order path has shaped it —
+/// `wire_shape`'s price half, with the model's binary residue scrubbed off
+/// first. Two model prices that land here are the same order on the wire.
+///
+/// The pre-round is the decimal form of `wire_px`'s 1e-9 epsilon in the
+/// private maker fix (pmt-strategies d59727f). A strategy price arrives as
+/// `Decimal::from_f64` of an f64, and a value a hair UNDER its own tick
+/// (0.29 is 28.999999999999996 ticks in binary; six of the ninety-nine cent
+/// ticks land short) would have a bare floor shave a whole tick off a price
+/// already ON the grid. That reads as a wire move and replaces the exact
+/// order the comparison exists to keep. Rounding nine digits below the tick
+/// absorbs that residue and nothing a 0.001-grid model can express.
+pub(crate) fn wire_price(urgency: Urgency, is_buy: bool, price: Decimal, dp: u32) -> Decimal {
+    let scrubbed = price.round_dp(dp.saturating_add(9).min(28));
+    wire_shape(urgency, is_buy, scrubbed, dp).1
+}
+
 /// Order manager wraps the SDK and tracks orders.
 pub struct OrderManager {
     client: Arc<PolymarketClient>,
@@ -147,7 +175,7 @@ impl OrderManager {
             .client
             .tick_decimals_for(token_id)
             .await
-            .unwrap_or(2);
+            .unwrap_or(FALLBACK_TICK_DECIMALS);
         let (post_only, price) = wire_shape(urgency, is_buy, price, dp);
         let size = size.round_dp(2);
 
@@ -381,6 +409,7 @@ impl std::error::Error for OrderError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::prelude::FromPrimitive;
     use rust_decimal_macros::dec;
 
     #[test]
@@ -414,5 +443,59 @@ mod tests {
         // On a tick the price already sits on, nothing moves.
         let (_, exact) = wire_shape(Urgency::Low, true, dec!(0.985), 3);
         assert_eq!(exact, dec!(0.985));
+    }
+
+    #[test]
+    fn wire_price_projects_a_model_price_onto_the_tick_it_will_rest_on() {
+        // A whole 0.001 neighbourhood of model prices is ONE order at 0.98
+        // on a cent book — which is the fact the delta matcher needs and the
+        // reason it cannot compare a model price to a wire price.
+        for px in [dec!(0.980), dec!(0.984), dec!(0.985), dec!(0.989)] {
+            assert_eq!(wire_price(Urgency::Low, true, px, 2), dec!(0.98), "{px}");
+        }
+        // A real move off the tick still lands somewhere else.
+        assert_eq!(wire_price(Urgency::Low, true, dec!(0.975), 2), dec!(0.97));
+        assert_eq!(wire_price(Urgency::Low, true, dec!(0.991), 2), dec!(0.99));
+
+        // Mirrored for a maker ask, and untouched for a crossing taker.
+        assert_eq!(wire_price(Urgency::Low, false, dec!(0.982), 2), dec!(0.99));
+        assert_eq!(wire_price(Urgency::High, true, dec!(0.987), 2), dec!(0.99));
+
+        // On a 0.001 market the model grid IS the wire grid: no-op.
+        for px in [dec!(0.984), dec!(0.985), dec!(0.987)] {
+            assert_eq!(wire_price(Urgency::Low, true, px, 3), px, "{px}");
+        }
+    }
+
+    #[test]
+    fn wire_price_scrubs_the_binary_shortfall_off_a_price_on_the_grid() {
+        // The 0.29/0.01 class (pmt-strategies d59727f): six of the ninety-
+        // nine cent ticks are a hair short of themselves in binary, and a
+        // bare floor reads them a whole tick low — a wire "move" that never
+        // happened, which replaces the order the matcher exists to keep.
+        for p in [0.29f64, 0.47, 0.57, 0.58, 0.59, 0.94] {
+            let residue = Decimal::from_f64_retain(p).unwrap();
+            let expected = Decimal::from_f64(p).unwrap();
+            assert_eq!(
+                wire_price(Urgency::Low, true, residue, 2),
+                expected,
+                "{p} sits on the cent grid",
+            );
+            // The maker ask ceils, so its hazard is the mirror image: a
+            // price a hair OVER its tick must not be lifted a whole one.
+            assert_eq!(
+                wire_price(Urgency::Low, false, residue, 2),
+                expected,
+                "{p} sits on the cent grid (ask side)",
+            );
+        }
+    }
+
+    #[test]
+    fn the_matchers_cold_tick_is_the_one_the_order_path_falls_back_to() {
+        // `place_order` shapes on this when `tick_decimals_for` fails, so a
+        // matcher guessing anything else would compare against a tick the
+        // wire never used.
+        assert_eq!(FALLBACK_TICK_DECIMALS, 2);
     }
 }

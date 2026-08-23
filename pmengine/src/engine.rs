@@ -94,6 +94,54 @@ struct Desired {
     decision_id: String,
 }
 
+/// Half of one wire tick — 0.005 on a cent book, 0.0005 on a 0.001 one.
+///
+/// Two DISTINCT wire prices are a full tick apart, so half a tick can never
+/// merge them; what it absorbs is a standing price that isn't exactly on the
+/// grid the matcher is reading now (an order placed while the tick cache was
+/// cold, or one whose price came back from outside the engine).
+fn half_tick(dp: u32) -> Decimal {
+    Decimal::new(5, dp.saturating_add(1).min(28))
+}
+
+/// Is this standing order already one of the quotes we want live?
+///
+/// The comparison happens in ONE unit — the wire's. `d.price` is the
+/// strategy's model price on its own 0.001 grid; `order_price` is what
+/// `wire_shape` already made of a price like it when the order went out (a
+/// post-only buy floored onto the market's tick, commonly 0.01). Comparing
+/// the two directly is a unit mismatch: on a cent book a 0.984 -> 0.985
+/// model drift looked like a different order than the 0.98 standing on the
+/// book, so the matcher cancelled and re-placed the SAME wire order, paying
+/// queue position for nothing and feeding the stale-cancel churn. Projecting
+/// the desired price through the same shaping first is what makes "same
+/// order" mean same order. Same bug the private maker fix killed one layer
+/// up (pmt-strategies d59727f); the maker path no longer reaches here, every
+/// taker cancel/replace on a coarse-tick market still does.
+///
+/// Only the keep-vs-replace decision moves: a genuinely different wire price
+/// still replaces, and the size delta is still exact.
+fn matches_standing(
+    d: &Desired,
+    token_id: &str,
+    is_buy: bool,
+    order_price: Decimal,
+    order_size: Decimal,
+    dp: u32,
+) -> bool {
+    if d.token_id != token_id || d.size != order_size {
+        return false;
+    }
+    // Side has to agree before the urgency means anything — it is what
+    // decides which way `wire_shape` rounds away from the book.
+    let urgency = match (&d.signal, is_buy) {
+        (Signal::Buy { urgency, .. }, true) | (Signal::Sell { urgency, .. }, false) => *urgency,
+        _ => return false,
+    };
+    let want = crate::order::wire_price(urgency, is_buy, d.price, dp);
+    (want - order_price).abs() <= half_tick(dp)
+}
+
 /// Tape label for a signal's side.
 fn signal_side(signal: &Signal) -> &'static str {
     match signal {
@@ -1191,9 +1239,10 @@ impl Engine {
                             Signal::Buy { token_id, price, size, urgency } => {
                                 // Don't pre-round price here. OrderManager rounds to the
                                 // per-market tick when actually placing; the delta-quote
-                                // matcher below uses a half-tick tolerance so any
-                                // sub-tick wobble in the strategy's target still matches
-                                // an existing aged order.
+                                // matcher below projects this raw model price through
+                                // that same shaping before comparing, so a wobble that
+                                // lands back on the standing order's tick still matches
+                                // it rather than re-aging it.
                                 let size = size.round_dp(2);
                                 let signal = Signal::Buy {
                                     token_id: token_id.clone(),
@@ -1241,24 +1290,35 @@ impl Engine {
                             .iter()
                             .map(|o| (o.id.clone(), o.is_buy, o.price, o.size))
                             .collect();
+                        // The tick this token's standing prices actually live
+                        // on. Cache read ONLY: the matcher sits inside the
+                        // decision->ack window and must not spend a round trip
+                        // resolving it. Anything with a live order resolved its
+                        // tick when that order was placed, so a miss means a
+                        // genuinely cold token and we match on the same
+                        // conservative 0.01 the order path itself falls back to.
+                        let dp = match self.client.cached_tick_decimals(token_id).await {
+                            Some(dp) => dp,
+                            None => {
+                                tracing::debug!(
+                                    token_id = %token_id,
+                                    dp = crate::order::FALLBACK_TICK_DECIMALS,
+                                    "Delta matcher: tick cache cold, matching on the 0.01 fallback tick"
+                                );
+                                crate::order::FALLBACK_TICK_DECIMALS
+                            }
+                        };
                         for (id, is_buy, price, size) in active {
                             // Find a desired order that matches this open order.
-                            // Tolerance: half a tick (0.0005) so a 0.1¢ mid wiggle
-                            // that shifts the target by 0.1¢ doesn't force a
-                            // cancel+replace and re-age. The reward score weight
-                            // changes very little inside ±0.5 tick anyway, but a
-                            // re-quote restarts the order-age timer from zero,
-                            // costing far more than the precision gained.
-                            let price_tol = rust_decimal::Decimal::new(5, 4); // 0.0005
-                            let matched_idx = desired.iter().position(|d| {
-                                d.token_id == *token_id
-                                    && (d.price - price).abs() <= price_tol
-                                    && d.size == size
-                                    && matches!(
-                                        (&d.signal, is_buy),
-                                        (Signal::Buy { .. }, true) | (Signal::Sell { .. }, false)
-                                    )
-                            });
+                            // Both prices are compared as the WIRE sees them —
+                            // `matches_standing` projects the strategy's model
+                            // price through the same tick shaping the order path
+                            // applies, because a re-quote restarts the order-age
+                            // timer from zero and a drift that lands back on the
+                            // same tick bought nothing to pay for it.
+                            let matched_idx = desired
+                                .iter()
+                                .position(|d| matches_standing(d, token_id, is_buy, price, size, dp));
                             if let Some(i) = matched_idx {
                                 // Already have this order — keep it, drop from desired.
                                 let kept = desired.remove(i);
@@ -1894,5 +1954,208 @@ impl std::error::Error for EngineError {}
 impl From<crate::config::ConfigError> for EngineError {
     fn from(e: crate::config::ConfigError) -> Self {
         EngineError::ConfigError(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategy::Urgency;
+    use rust_decimal::prelude::FromPrimitive;
+    use rust_decimal_macros::dec;
+
+    const TOK: &str = "tok-up";
+
+    /// One quote the strategy wants live, as it arrives from the pure core:
+    /// a RAW model price on the 0.001 grid, before anything shapes it.
+    fn want(price: Decimal, size: Decimal, urgency: Urgency, buy: bool) -> Desired {
+        let token_id = TOK.to_string();
+        let signal = if buy {
+            Signal::Buy { token_id: token_id.clone(), price, size, urgency }
+        } else {
+            Signal::Sell { token_id: token_id.clone(), price, size, urgency }
+        };
+        Desired { signal, token_id, price, size, decision_id: "d-test".to_string() }
+    }
+
+    /// What the old matcher decided: model price vs wire price, a flat
+    /// 0.0005 apart. Kept here so the golden cases below say what CHANGED
+    /// rather than only what is true now.
+    fn old_matcher(d: &Desired, order_price: Decimal, order_size: Decimal) -> bool {
+        (d.price - order_price).abs() <= dec!(0.0005) && d.size == order_size
+    }
+
+    #[test]
+    fn model_drift_inside_one_wire_tick_keeps_the_standing_order() {
+        // THE bug, in its measured shape. A cent-tick book: the strategy's
+        // model moved 0.984 -> 0.985, a post-only buy floors either onto
+        // 0.98, and 0.98 is exactly what is already resting. The old
+        // comparison read the 0.005 gap between a MODEL price and a WIRE
+        // price as a different order and cancelled a quote that was already
+        // correct, losing queue position for nothing.
+        let standing = dec!(0.98);
+        let size = dec!(25);
+        for px in [dec!(0.980), dec!(0.984), dec!(0.985), dec!(0.989)] {
+            let d = want(px, size, Urgency::Low, true);
+            assert!(
+                matches_standing(&d, TOK, true, standing, size, 2),
+                "{px} rests on 0.98 — it IS the standing order",
+            );
+        }
+        // The two that drift is made of are exactly the ones the old
+        // matcher threw away.
+        assert!(!old_matcher(&want(dec!(0.984), size, Urgency::Low, true), standing, size));
+        assert!(!old_matcher(&want(dec!(0.985), size, Urgency::Low, true), standing, size));
+
+        // A taker clip on the same book behaves the same way — and this is
+        // the path that still reaches the matcher at all, since a suppressed
+        // maker re-quote never emits. It rounds NEAREST rather than flooring
+        // (banker's, so 0.985 lands on 0.98), which is exactly why the
+        // projection has to go through `wire_shape` instead of a bare floor.
+        for px in [dec!(0.986), dec!(0.99), dec!(0.994)] {
+            let d = want(px, size, Urgency::High, true);
+            assert!(
+                matches_standing(&d, TOK, true, dec!(0.99), size, 2),
+                "{px} crosses at 0.99",
+            );
+        }
+        // Both of the drifted ones are what the old matcher threw away.
+        for px in [dec!(0.986), dec!(0.994)] {
+            assert!(!old_matcher(&want(px, size, Urgency::High, true), dec!(0.99), size));
+        }
+        for px in [dec!(0.984), dec!(0.985), dec!(0.9849)] {
+            let d = want(px, size, Urgency::High, true);
+            assert!(
+                matches_standing(&d, TOK, true, dec!(0.98), size, 2),
+                "{px} crosses at 0.98",
+            );
+        }
+    }
+
+    #[test]
+    fn a_move_across_the_wire_tick_still_replaces() {
+        // The other half of the contract: only the keep-vs-replace call
+        // changed, and a quote that genuinely lands somewhere else on the
+        // wire must still retire the standing one.
+        let standing = dec!(0.98);
+        let size = dec!(25);
+        for px in [dec!(0.979), dec!(0.975), dec!(0.99), dec!(0.991)] {
+            let d = want(px, size, Urgency::Low, true);
+            assert!(
+                !matches_standing(&d, TOK, true, standing, size, 2),
+                "{px} is a different tick — replace it",
+            );
+        }
+        // A maker ask mirrors: it ceils, so 0.982 is the 0.99 quote and
+        // 0.979 is not.
+        assert!(matches_standing(
+            &want(dec!(0.982), size, Urgency::Low, false), TOK, false, dec!(0.99), size, 2,
+        ));
+        assert!(!matches_standing(
+            &want(dec!(0.979), size, Urgency::Low, false), TOK, false, dec!(0.99), size, 2,
+        ));
+    }
+
+    #[test]
+    fn a_size_delta_replaces_exactly_as_it_did_before() {
+        // Untouched by the fix: the price can be the same order on the wire
+        // and a different clip is still a different order.
+        let standing = dec!(0.98);
+        let d = want(dec!(0.985), dec!(30), Urgency::Low, true);
+        assert!(!matches_standing(&d, TOK, true, standing, dec!(25), 2));
+        assert!(matches_standing(&d, TOK, true, standing, dec!(30), 2));
+    }
+
+    #[test]
+    fn a_different_side_or_token_never_matches() {
+        let size = dec!(25);
+        let buy = want(dec!(0.985), size, Urgency::Low, true);
+        assert!(!matches_standing(&buy, TOK, false, dec!(0.98), size, 2));
+        assert!(!matches_standing(&buy, "tok-down", true, dec!(0.98), size, 2));
+    }
+
+    #[test]
+    fn a_fine_tick_market_decides_exactly_as_it_did_before() {
+        // On a 0.001 book the model grid IS the wire grid: the projection is
+        // a no-op, `half_tick(3)` is the old hardcoded 0.0005, and every
+        // verdict over every price the model can express has to agree with
+        // the matcher this replaced.
+        let size = dec!(25);
+        let grid = [dec!(0.98), dec!(0.983), dec!(0.984), dec!(0.985), dec!(0.986), dec!(0.99)];
+        for standing in grid {
+            for px in grid {
+                for urgency in [Urgency::Low, Urgency::High] {
+                    let d = want(px, size, urgency, true);
+                    assert_eq!(
+                        matches_standing(&d, TOK, true, standing, size, 3),
+                        old_matcher(&d, standing, size),
+                        "{px} vs standing {standing} on a 0.001 tick must decide as before",
+                    );
+                }
+            }
+        }
+        // Spelled out: the same price keeps, one model tick away replaces.
+        assert!(matches_standing(
+            &want(dec!(0.985), size, Urgency::Low, true), TOK, true, dec!(0.985), size, 3,
+        ));
+        assert!(!matches_standing(
+            &want(dec!(0.984), size, Urgency::Low, true), TOK, true, dec!(0.985), size, 3,
+        ));
+    }
+
+    #[test]
+    fn a_price_already_on_the_cent_grid_is_not_a_wire_move() {
+        // The binary-representation edge (0.29/0.01 = 28.999999999999996):
+        // six cent ticks are a hair short of themselves, and a bare floor
+        // reads them a whole tick low — a phantom move that replaces the
+        // order this whole comparison exists to keep. Prices reach the
+        // engine as `Decimal::from_f64` of the model's f64, so build them
+        // that way rather than from a literal.
+        let size = dec!(25);
+        for p in [0.29f64, 0.47, 0.57, 0.58, 0.59, 0.94] {
+            let model = Decimal::from_f64(p).unwrap();
+            let standing = Decimal::from_f64(p).unwrap().round_dp(2);
+            let d = want(model, size, Urgency::Low, true);
+            assert!(
+                matches_standing(&d, TOK, true, standing, size, 2),
+                "{p} is already the standing tick",
+            );
+            // And with the full binary expansion retained, which is the
+            // shortfall in its rawest form.
+            let raw = want(Decimal::from_f64_retain(p).unwrap(), size, Urgency::Low, true);
+            assert!(
+                matches_standing(&raw, TOK, true, standing, size, 2),
+                "{p} with its binary residue is still the standing tick",
+            );
+        }
+    }
+
+    #[test]
+    fn the_cold_cache_falls_back_to_the_coarse_tick() {
+        // With no cached tick the matcher uses the order path's own
+        // fallback, so the two agree on where a quote rests. Guessing
+        // COARSER than the truth can only hold a standing quote through a
+        // sub-tick move; guessing finer replaces orders that never moved,
+        // which is the bug.
+        let dp = crate::order::FALLBACK_TICK_DECIMALS;
+        let size = dec!(25);
+        assert!(matches_standing(
+            &want(dec!(0.985), size, Urgency::Low, true), TOK, true, dec!(0.98), size, dp,
+        ));
+        assert!(!matches_standing(
+            &want(dec!(0.975), size, Urgency::Low, true), TOK, true, dec!(0.98), size, dp,
+        ));
+    }
+
+    #[test]
+    fn half_tick_tracks_the_market_not_a_constant() {
+        assert_eq!(half_tick(2), dec!(0.005));
+        assert_eq!(half_tick(3), dec!(0.0005), "the old hardcoded tolerance");
+        assert_eq!(half_tick(1), dec!(0.05));
+        // It can never bridge two real wire prices: they sit a FULL tick
+        // apart, and the tolerance is strictly half of one.
+        for dp in [1u32, 2, 3, 4] {
+            assert_eq!(half_tick(dp) * dec!(2), Decimal::new(1, dp), "dp {dp}");
+        }
     }
 }

@@ -337,6 +337,20 @@ impl PolymarketClient {
         Ok(self.token_meta(token_id).await?.tick_decimals)
     }
 
+    /// The token's tick if something has already resolved it, `None` if not.
+    /// Cache read only — this never touches the network.
+    ///
+    /// The delta matcher needs the real tick to compare a desired quote
+    /// against a standing one in wire units, and it runs inside the
+    /// decision->ack window that `prewarm_token` exists to keep off the
+    /// wire: `tick_decimals_for` would spend a ~119ms round trip there on a
+    /// miss. Every token carrying a live order has already been through
+    /// `token_meta` on the order path, so a miss here means a genuinely
+    /// cold token and the caller's conservative fallback is the right answer.
+    pub async fn cached_tick_decimals(&self, token_id: &str) -> Option<u32> {
+        self.meta.get(token_id).await.map(|m| m.tick_decimals)
+    }
+
     /// Compute L2 HMAC signature for a request.
     fn compute_l2_signature(&self, timestamp: i64, method: &str, path: &str, body: &str) -> Result<String, ClientError> {
         let message = format!("{}{}{}{}", timestamp, method, path, body);
