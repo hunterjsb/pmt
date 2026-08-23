@@ -48,6 +48,50 @@ def test_watch_fetch_sb_is_the_stats_acquisition_path(monkeypatch):
     assert calls == [(0.0, 1234.0)], "fetch_sb did not go through the module-level acquisition path"
 
 
+def test_a_graded_trade_always_reaches_the_watch_trades_table(monkeypatch):
+    """End-to-end over the ONE acquisition path: whatever score_activity
+    grades is what the dashboard's trades panel paints.
+
+    Both halves are pinned here because the dashboard has lost each of them:
+    a DECIDED window must render, and a FILLED-but-undecided one must render
+    too (the BNB window of 2026-08-23 14:35-14:40 was invisible for ~4
+    minutes between its fill and its redeem row, with the arm already rolled
+    and the fire scrolled off the tape).
+    """
+    import watch_ui
+    from rich.console import Console
+
+    now = int(time.time())
+    done_start, live_start = now - 5000, now - 400   # live_start ends inside grace
+    done, live = f"eth-updown-5m-{done_start}", f"bnb-updown-5m-{live_start}"
+    rows = [
+        {"type": "TRADE", "side": "BUY", "usdcSize": 9.0, "size": 10.0,
+         "slug": done, "timestamp": done_start + 60},
+        {"type": "REDEEM", "usdcSize": 10.0, "outcome": "up",
+         "slug": done, "timestamp": done_start + 330},
+        {"type": "TRADE", "side": "BUY", "usdcSize": 19.44, "size": 20.0,
+         "slug": live, "timestamp": live_start + 183},
+    ]
+    fires = [{"ev": "fire", "slug": s, "side": "up", "fair": 1.0, "t": 0}
+             for s in (done, live)]
+    monkeypatch.setattr(cs.wallet, "funder_address", lambda: "0xabc")
+    monkeypatch.setattr(cs.wallet, "fetch_wallet_activity", lambda addr, floor: rows)
+    monkeypatch.setattr(cs.tape, "iter_records", lambda *a, **k: iter(fires))
+    monkeypatch.setattr(cs, "_gamma_resolution_cached", lambda slug: None)
+
+    state = cw.WatchState()
+    cw.WatchFetcher(state, sliding_floor=0.0).fetch_sb()   # the real stats walk
+    sb = state.read()["sb"]
+
+    c = Console(record=True, width=90)
+    c.print(watch_ui.build_trades_table(sb, time.time(), limit=cw.TRADES_MAX_ROWS))
+    out = c.export_text()
+    assert "eth 5m" in out, "a decided trade vanished between the grade and the table"
+    assert "bnb 5m" in out, "a filled trade is invisible until its redeem posts"
+    assert "riding" in out
+    assert watch_ui.trades_title(sb) == "trades · last 1 decided · 1 riding"
+
+
 def _fetcher(monkeypatch, *, sb=None, status=None, bal=None, sb_boom=None):
     """A WatchFetcher with every network seam replaced. The scoreboard seam
     is _tape_scoreboard — the SAME function `pmt crypto stats` runs, which

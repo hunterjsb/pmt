@@ -28,7 +28,8 @@ from engine import post as _engine_post
 from polymarket import tape
 from watch_ui import (
     _SB_EMPTY, _cbreak_stdin, _controls_panel, _restore_stdin, _wait_key,
-    build_arms_table, build_header_panel, build_windows_strip,
+    build_arms_table, build_header_panel, build_trades_table,
+    build_windows_strip, trade_rows, trades_title,
 )
 
 
@@ -56,6 +57,13 @@ WORKER_INTERVAL_S = 0.25  # how often the worker checks what's due
 WORKER_JOIN_S = 0.25
 KEY_POLL_S = 0.05         # 20Hz key polling — the perceived-latency budget
 RENDER_EVERY_S = 1.0      # repaint cadence when no key changed anything
+
+# Trades panel geometry. TRADES_MAX_ROWS is a VIEW cap, and the panel title
+# names it ("last N decided · M riding") — a cap the operator can't see reads
+# as a dropped trade, which is the confusion this panel exists to end.
+TRADES_MAX_ROWS = 6
+TRADES_CHROME = 6         # panel border (2) + table border/header/rule (4)
+MIN_TAPE_ROWS = 6         # the tape never gets squeezed below this for a trade row
 
 
 class WatchState:
@@ -177,7 +185,7 @@ class WatchFetcher:
                    "All-time P&L, and the riding/recent-windows figures, "
                    "always walk the full wallet history regardless of this.")
 def crypto_watch(since: float | None) -> None:
-    """Full-screen live dashboard: risk header + scoreboard + arms + streaming tape."""
+    """Full-screen live dashboard: risk header + arms + trades + streaming tape."""
     import time as _t
     from collections import deque
     from datetime import datetime, timezone
@@ -222,9 +230,23 @@ def crypto_watch(since: float | None) -> None:
         return build_arms_table(snap["status"].get("arms"), _t.time())
 
     def strip_panel() -> Panel:
-        return Panel(Text.from_markup(build_windows_strip(snap["sb"].get("windows"))),
+        sb = snap["sb"]
+        return Panel(Text.from_markup(build_windows_strip(sb.get("windows"),
+                                                          sb.get("riding_windows"))),
                      title="recent windows", subtitle="[dim]h = controls[/dim]",
                      border_style="dim")
+
+    def trades_panel() -> Panel:
+        sb = snap["sb"]
+        return Panel(build_trades_table(sb, _t.time(), limit=TRADES_MAX_ROWS),
+                     title=trades_title(sb), border_style="dim")
+
+    def trades_size(console_h: int, arms_h: int) -> int:
+        """Rows for the trades panel: what it actually has, capped, and never
+        so many that the tape stops being readable."""
+        room = console_h - 4 - 3 - arms_h - MIN_TAPE_ROWS - TRADES_CHROME
+        n = min(TRADES_MAX_ROWS, len(trade_rows(snap["sb"])), room)
+        return max(1, n) + TRADES_CHROME
 
     def tape_panel(height: int) -> Panel:
         shown = list(lines)[-max(height - 2, 1):]
@@ -234,6 +256,7 @@ def crypto_watch(since: float | None) -> None:
     layout.split_column(
         Layout(name="head", size=4),
         Layout(name="arms", size=10),
+        Layout(name="trades", size=TRADES_MAX_ROWS + TRADES_CHROME),
         Layout(name="strip", size=3),
         Layout(name="tape", ratio=1),
     )
@@ -277,11 +300,15 @@ def crypto_watch(since: float | None) -> None:
                     except OSError:
                         pass
                     layout["arms"].size = max(len(snap["status"].get("arms") or {}), 1) + 4
+                    layout["trades"].size = trades_size(live.console.size.height,
+                                                         layout["arms"].size)
                     layout["head"].update(header())
                     layout["arms"].update(arms_table())
+                    layout["trades"].update(trades_panel())
                     layout["strip"].update(
                         _controls_panel() if show_controls else strip_panel())
-                    h = live.console.size.height - 4 - 3 - layout["arms"].size
+                    h = (live.console.size.height - 4 - 3
+                         - layout["arms"].size - layout["trades"].size)
                     layout["tape"].update(tape_panel(h))
                     render_err = None
                 except KeyboardInterrupt:

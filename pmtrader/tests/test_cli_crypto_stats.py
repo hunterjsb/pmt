@@ -96,6 +96,59 @@ def test_tape_scoreboard_windows_capped_at_twelve(monkeypatch):
     assert end_ts == sorted(end_ts, reverse=True)
 
 
+def test_a_filled_window_carries_its_identity_while_it_is_still_riding(monkeypatch):
+    """Modelled on the real BNB window of 2026-08-23 14:35-14:40: filled at
+    14:38, closed at 14:40, redeem row not posted until 14:41:43. For those
+    ~4 minutes it was decided nowhere, and `riding_n`/`riding_usd` alone could
+    not be rendered as a trade — so the dashboard showed nothing at all.
+    """
+    now = int(time.time())
+    start = now - 400
+    slug = f"bnb-updown-5m-{start}"       # ends now-100: inside the 300s grace
+    rows = [
+        {"type": "TRADE", "side": "BUY", "usdcSize": 9.62688, "size": 10.0,
+         "slug": slug, "timestamp": start + 183},
+        {"type": "TRADE", "side": "BUY", "usdcSize": 9.81372, "size": 10.0,
+         "slug": slug, "timestamp": start + 216},
+    ]
+    fires = {slug: [{"ev": "fire", "slug": slug, "side": "up", "fair": 1.0,
+                      "t": start + 183}]}
+    _install_fake_pipeline(monkeypatch, rows, fires, {})
+
+    sb = cs._tape_scoreboard(0.0)
+    assert sb["riding_n"] == 1 and sb["riding_usd"] == pytest.approx(19.4406)
+    assert sb["windows"] == []            # decided-only, unchanged contract
+
+    r, = sb["riding_windows"]
+    assert r["slug"] == slug and r["side"] == "up"
+    assert r["won"] is None and r["pnl"] is None   # no verdict, never a fake $0
+    assert r["notional"] == pytest.approx(19.4406)
+    assert r["shares"] == pytest.approx(20.0)
+    assert r["entry_px"] == pytest.approx(0.97203)
+    assert r["end_ts"] == start + 300
+
+
+def test_decided_windows_carry_the_side_and_entry_a_trade_row_needs(monkeypatch):
+    now = int(time.time())
+    start = now - 5000
+    slug = f"eth-updown-5m-{start}"
+    rows = [
+        {"type": "TRADE", "side": "BUY", "usdcSize": 9.0, "size": 10.0,
+         "slug": slug, "timestamp": start + 60},
+        {"type": "REDEEM", "usdcSize": 10.0, "outcome": "down",
+         "slug": slug, "timestamp": start + 330},
+    ]
+    fires = {slug: [{"ev": "fire", "slug": slug, "side": "down", "fair": 0.9,
+                      "t": start + 60}]}
+    _install_fake_pipeline(monkeypatch, rows, fires, {})
+
+    w, = cs._tape_scoreboard(0.0)["windows"]
+    assert w["side"] == "down"
+    assert w["shares"] == pytest.approx(10.0)
+    assert w["entry_px"] == pytest.approx(0.9)     # notional alone can't say it
+    assert w["pnl"] == pytest.approx(1.0)
+
+
 def test_tape_scoreboard_without_sliding_floor_omits_sliding_key(monkeypatch):
     _install_fake_pipeline(monkeypatch, [], {}, {})
     sb = cs._tape_scoreboard(0.0)

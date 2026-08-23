@@ -728,23 +728,133 @@ def build_risk_header(status: dict | None, sb: dict | None,
     return " · ".join([f"{cells[0]} ({cells[1]})"] + cells[2:])
 
 
+def _chip_label(w: dict) -> str:
+    """`btc5` / `eth15` — the compact arm label a chip has room for."""
+    parsed = updown_slugs.parse(w.get("slug", ""))
+    return f"{parsed[0]}{parsed[1] // 60}" if parsed else (w.get("slug", "?")[:8])
+
+
 def _window_chip(w: dict) -> str:
     """`✓ btc5 +12` / `✗ eth15 -44` for one resolved window; dim for a
     ~estimated (gamma-unreachable, or gamma-confirmed-win-pending-redeem)
     read rather than the win/loss color, since it's a lower-confidence read."""
-    parsed = updown_slugs.parse(w.get("slug", ""))
-    label = f"{parsed[0]}{parsed[1] // 60}" if parsed else (w.get("slug", "?")[:8])
     mark = "✓" if w.get("won") else "✗"
-    text = f"{mark} {label} {w.get('pnl', 0.0):+.0f}"
+    text = f"{mark} {_chip_label(w)} {w.get('pnl') or 0.0:+.0f}"
     style = "dim" if w.get("est") else ("green" if w.get("won") else "red")
     return f"[{style}]{text}[/{style}]"
 
 
-def build_windows_strip(windows: list[dict] | None) -> str:
-    """Chip row of the last resolved windows, newest first (caller supplies
-    an already-sorted/capped list — see _tape_scoreboard's "windows")."""
-    chips = [_window_chip(w) for w in (windows or [])]
-    return "  ".join(chips) if chips else "[dim]no resolved windows yet[/dim]"
+def _riding_chip(w: dict) -> str:
+    """`◆ bnb5 $19` — a FILLED window that hasn't decided yet.
+
+    Leads the strip because it is the only chip that is still money at risk,
+    and because it is the chip that used to be absent entirely: a win waits on
+    its redeem row and a loss posts no row at all for 300s, and for that whole
+    stretch the arm has already rolled and the fire has scrolled off the tape.
+    """
+    return f"[cyan]◆ {_chip_label(w)} ${w.get('notional') or 0.0:,.0f}[/cyan]"
+
+
+def build_windows_strip(windows: list[dict] | None,
+                         riding: list[dict] | None = None) -> str:
+    """Chip row: riding positions first, then the last resolved windows,
+    newest first (caller supplies already-sorted lists — see score_activity's
+    "riding_windows" and "windows")."""
+    chips = [_riding_chip(w) for w in (riding or [])]
+    chips += [_window_chip(w) for w in (windows or [])]
+    return "  ".join(chips) if chips else "[dim]no windows traded yet[/dim]"
+
+
+# ---------- the trades table ----------
+#
+# The one place the dashboard names an individual trade. It is fed from the
+# SAME scoreboard as everything else (score_activity's windows/riding_windows)
+# — never a second read of the wallet or the tape.
+
+_TRADES_COLUMNS = (
+    ("age", "right", 5),
+    ("arm", "left", 8),
+    ("side", "left", 4),
+    ("entry", "right", 5),
+    ("size", "right", 9),
+    ("P&L", "right", 9),
+)
+
+
+def _age_label(sec: float) -> str:
+    """Compact time-since for a trades row — `live` while the window is still
+    open, then s / m / h:mm. Age, not a wall clock: "how long ago" is the
+    question a trade row on a live dashboard is actually asked."""
+    if sec < 0:
+        return "live"
+    if sec < 60:
+        return f"{int(sec)}s"
+    if sec < 3600:
+        return f"{int(sec // 60)}m"
+    h, m = divmod(int(sec // 60), 60)
+    return f"{h}h{m:02d}"
+
+
+def _trade_pnl_cell(w: dict) -> str:
+    """Signed P&L, or `riding` while the window has no verdict yet. `~` marks
+    an estimated figure (imputed win / gamma-unreachable), same convention as
+    the header's "N ~estimated"."""
+    pnl = w.get("pnl")
+    if pnl is None or w.get("won") is None:
+        return "[cyan]riding[/cyan]"
+    v = _zero(float(pnl))
+    return f"[{_pnl_color(v)}]{'~' if w.get('est') else ''}{v:+,.2f}[/{_pnl_color(v)}]"
+
+
+def trade_rows(sb: dict | None, limit: int | None = None) -> list[dict]:
+    """Riding positions then decided windows, in the order they render.
+
+    `limit` trims the DECIDED tail only — riding rows lead, so a short panel
+    drops old history before it drops live money.
+    """
+    sb = sb or {}
+    rows = list(sb.get("riding_windows") or []) + list(sb.get("windows") or [])
+    return rows if limit is None else rows[:limit]
+
+
+def trades_title(sb: dict | None) -> str:
+    """`trades · last 12 decided · 2 riding` — retention STATED, not implied.
+
+    A cap the operator can't see is indistinguishable from a dropped trade,
+    which is the confusion this whole panel exists to end.
+    """
+    sb = sb or {}
+    return (f"trades · last {len(sb.get('windows') or [])} decided"
+            f" · {len(sb.get('riding_windows') or [])} riding")
+
+
+def build_trades_table(sb: dict | None, now: float,
+                        limit: int | None = None) -> Table:
+    """Per-trade table: age, arm, side, avg entry, notional, P&L.
+
+    Renders EVERY row it is handed (the caller caps via `limit`), so a window
+    present in the scoreboard is always on screen somewhere — the guarantee
+    the chip strip alone could not make, because it only ever carried decided
+    windows.
+    """
+    t = Table(expand=True, pad_edge=False)
+    for col, justify, width in _TRADES_COLUMNS:
+        t.add_column(col, justify=justify, width=width, no_wrap=True, overflow="ellipsis")
+    rows = trade_rows(sb, limit)
+    for w in rows:
+        px = w.get("entry_px")
+        end_ts = float(w.get("end_ts") or 0.0)
+        t.add_row(
+            _age_label(now - end_ts) if end_ts else "—",
+            _arm_label(w.get("slug", "")),
+            w.get("side") or "—",
+            f"{px:.2f}" if px else "—",
+            f"${_zero(float(w.get('notional') or 0.0)):,.2f}",
+            _trade_pnl_cell(w),
+        )
+    if not rows:
+        t.add_row("—", "—", "—", "—", "—", "[dim]no trades yet[/dim]")
+    return t
 
 
 # Fixed widths (+ ellipsis overflow below) so the arms table's geometry never
@@ -886,7 +996,7 @@ _SB_EMPTY_SLIDING = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "estimated"
 
 _SB_EMPTY = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "series": {}, "cal": {},
              "estimated": 0, "riding_n": 0, "riding_usd": 0.0, "windows": [],
-             "sliding": dict(_SB_EMPTY_SLIDING)}
+             "riding_windows": [], "sliding": dict(_SB_EMPTY_SLIDING)}
 
 
 def _controls_panel():

@@ -381,8 +381,121 @@ def test_window_chip_estimated_is_dim_not_win_loss_colored():
 
 
 def test_build_windows_strip_empty():
-    assert cc.build_windows_strip([]) == "[dim]no resolved windows yet[/dim]"
-    assert cc.build_windows_strip(None) == "[dim]no resolved windows yet[/dim]"
+    assert cc.build_windows_strip([]) == "[dim]no windows traded yet[/dim]"
+    assert cc.build_windows_strip(None) == "[dim]no windows traded yet[/dim]"
+
+
+def test_riding_chip_leads_the_strip_before_any_decided_window():
+    """A FILLED window with no verdict yet is the newest thing that happened —
+    it must be the first chip, not absent until its redeem row posts."""
+    strip = cc.build_windows_strip(
+        [{"slug": "eth-updown-5m-1700000000", "won": True, "pnl": 4.0, "est": False}],
+        [{"slug": "bnb-updown-5m-1787510100", "notional": 19.44}],
+    )
+    assert strip.startswith("[cyan]◆ bnb5 $19[/cyan]")
+    assert "✓ eth5 +4" in strip
+
+
+# ---------- trades table ----------
+#
+# The panel that exists because a real BNB fill (2026-08-23 14:38, window
+# 14:35-14:40) was invisible on the dashboard for nearly four minutes: the arm
+# had rolled, the fire had scrolled off the tape, and the only per-trade view
+# carried decided windows only.
+
+def _trades_text(sb, now=1787510500.0, width=90, limit=None):
+    from rich.console import Console
+
+    c = Console(record=True, width=width)
+    c.print(cc.build_trades_table(sb, now, limit=limit))
+    return c.export_text()
+
+
+def _decided(slug, pnl, end_ts, **kw):
+    row = {"slug": slug, "won": pnl >= 0, "pnl": pnl, "est": False, "end_ts": end_ts,
+           "notional": 10.0, "shares": 10.0, "entry_px": 0.96, "side": "up"}
+    row.update(kw)
+    return row
+
+
+def test_every_decided_window_in_the_scoreboard_renders_a_trades_row():
+    """The guarantee the chip strip could not make: hand the table a
+    scoreboard and every window in it is on screen. A trade that graded is a
+    trade the operator can see."""
+    sb = {"windows": [_decided(f"btc-updown-5m-{1787500000 + i * 300}", i - 3.0,
+                                1787500300 + i * 300) for i in range(6)],
+          "riding_windows": []}
+    out = _trades_text(sb)
+    assert out.count("btc 5m") == 6
+
+
+def test_a_filled_window_renders_before_its_redeem_posts():
+    """THE regression. A win waits on Polymarket's redeem row and a loss posts
+    no row at all until the 300s gamma grace expires; for that whole stretch
+    the window is undecided, and it used to exist on this dashboard only as
+    the header's "riding N windows $W" count."""
+    sb = {"windows": [], "riding_windows": [
+        {"slug": "bnb-updown-5m-1787510100", "won": None, "pnl": None, "est": False,
+         "end_ts": 1787510400, "notional": 19.44, "shares": 20.0,
+         "entry_px": 0.972, "side": "up"}]}
+    out = _trades_text(sb)
+    assert "bnb 5m" in out
+    assert "19.44" in out and "up" in out
+    assert "riding" in out          # no verdict yet — never a fake $0.00 P&L
+    assert "+0.00" not in out
+
+
+def test_trades_title_states_the_retention_cap():
+    sb = {"windows": [_decided("btc-updown-5m-1787500000", 1.0, 1787500300)] * 12,
+          "riding_windows": [{"slug": "bnb-updown-5m-1787510100", "notional": 19.0}] * 2}
+    assert cc.trades_title(sb) == "trades · last 12 decided · 2 riding"
+    assert cc.trades_title({}) == "trades · last 0 decided · 0 riding"
+    assert cc.trades_title(None) == "trades · last 0 decided · 0 riding"
+
+
+def test_a_short_panel_drops_history_before_it_drops_live_money():
+    sb = {"windows": [_decided(f"btc-updown-5m-{1787500000 + i * 300}", 1.0,
+                                1787500300 + i * 300) for i in range(6)],
+          "riding_windows": [{"slug": "bnb-updown-5m-1787510100", "won": None,
+                               "pnl": None, "end_ts": 1787510400, "notional": 19.44,
+                               "entry_px": 0.97, "side": "up"}]}
+    rows = cc.trade_rows(sb, limit=2)
+    assert [r["slug"] for r in rows][0] == "bnb-updown-5m-1787510100"
+    assert len(rows) == 2
+    assert len(cc.trade_rows(sb)) == 7  # no limit: everything
+
+
+def test_age_label_reads_as_time_since_not_a_clock():
+    assert cc._age_label(-30) == "live"      # window still open
+    assert cc._age_label(0) == "0s"
+    assert cc._age_label(45) == "45s"
+    assert cc._age_label(150) == "2m"
+    assert cc._age_label(3600 * 2 + 240) == "2h04"
+
+
+def test_trades_table_tolerates_a_half_built_row():
+    # An engine/data-api seam can leave side or entry unknown; the panel must
+    # still paint, the same rule the arms table lives by.
+    sb = {"windows": [{"slug": "xrp-updown-5m-1787500000", "won": False,
+                       "pnl": -23.19, "end_ts": 1787500300}],
+          "riding_windows": [{"slug": "not-a-slug"}]}
+    out = _trades_text(sb)
+    assert "xrp 5m" in out and "-23.19" in out
+    assert "riding" in out          # the unparseable row still paints a row
+
+
+def test_trades_table_empty_scoreboard_says_so():
+    assert "no trades yet" in _trades_text({"windows": [], "riding_windows": []})
+    assert "no trades yet" in _trades_text(None)
+
+
+def test_trades_table_marks_an_estimated_pnl_and_never_shows_negative_zero():
+    sb = {"windows": [_decided("sol-updown-5m-1787500000", 3.0, 1787500300, est=True),
+                      _decided("eth-updown-5m-1787500000", -0.001, 1787500300)],
+          "riding_windows": []}
+    out = _trades_text(sb)
+    assert "~+3.00" in out
+    assert "-0.00" not in out and "+0.00" in out  # _zero() snaps the residual
 
 
 # ---------- arms table: missing/partial eval tolerance (4d) ----------

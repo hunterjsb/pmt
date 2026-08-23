@@ -120,6 +120,33 @@ def _fire_roll_records() -> list[dict]:
                                   evs={tape.EV_FIRE, tape.EV_ROLL}))
 
 
+# How many decided windows the display strip carries. Views state this number
+# rather than implying "everything" — a retention cap that isn't on screen is
+# indistinguishable from a missing trade.
+WINDOWS_SHOWN = 12
+
+
+def _window_row(slug: str, w: dict, end: float, side: str | None,
+                 won: bool | None, pnl: float | None, est: bool) -> dict:
+    """One window's record, decided or still riding.
+
+    `won=None`/`pnl=None` IS the riding case, given the same shape as a decided
+    row on purpose: a live view renders both from one list without a second
+    convention for what a position looks like.
+    """
+    shares = w["buy_shares"]
+    return {
+        "slug": slug, "won": won, "pnl": pnl, "est": est, "end_ts": end,
+        "notional": w["buy"], "shares": shares,
+        # The average dollar's entry price. Notional alone can't say it —
+        # 10sh @ 0.96 and 96sh @ 0.10 are both $9.60 and opposite bets.
+        "entry_px": (w["buy"] / shares) if shares else None,
+        "side": side,
+        "entry_ts": effectiveness.weighted_ts(w["buy_ts_usd"], w["buy"]),
+        "exit_ts": w["exit_ts"],
+    }
+
+
 def score_activity(rows: list[dict], floor: float,
                    sliding_floor: float | None = None,
                    ceiling: float | None = None,
@@ -208,6 +235,7 @@ def score_activity(rows: list[dict], floor: float,
     series: dict[str, dict] = {}
     cal: dict[float, list] = {}
     window_list: list[dict] = []
+    riding_list: list[dict] = []
     wins = losses = estimated = 0
     riding_n = 0
     net = riding_usd = 0.0
@@ -240,6 +268,12 @@ def score_activity(rows: list[dict], floor: float,
             # arm's committed budget (this window may have already rolled off).
             riding_n += 1
             riding_usd += w["buy"]
+            # Its IDENTITY, not just its count. Between the fill and the redeem
+            # row — or the 300s gamma grace on a loss, which posts no row at all
+            # — this is the ONLY record of a position the operator is holding:
+            # the arm has already rolled to the next window, and the fire has
+            # scrolled off the tape. A count can't be rendered as a trade.
+            riding_list.append(_window_row(slug, w, end, fired, None, None, False))
             continue
         pnl_est = is_est
         if won and w["redeem"] <= 0.5 and not w["redeem_seen"]:
@@ -259,11 +293,7 @@ def score_activity(rows: list[dict], floor: float,
         if in_sliding:
             wins_s, losses_s, net_s = wins_s + won, losses_s + (not won), net_s + pnl
             estimated_s += pnl_est
-        window_list.append({"slug": slug, "won": won, "pnl": pnl,
-                             "est": bool(pnl_est), "end_ts": end,
-                             "notional": w["buy"],
-                             "entry_ts": effectiveness.weighted_ts(w["buy_ts_usd"], w["buy"]),
-                             "exit_ts": w["exit_ts"]})
+        window_list.append(_window_row(slug, w, end, fired, won, pnl, bool(pnl_est)))
         # Winning outcome for calibration: the paying redeem row names it
         # directly; else gamma's own read if we cross-checked one; else
         # infer from our fired side (right if we won, flipped if we lost).
@@ -288,10 +318,14 @@ def score_activity(rows: list[dict], floor: float,
         s["med"] = statistics.median(pnls) if pnls else None
     # Recent-windows strip wants newest-first, capped small — this is a
     # display list, not the ledger (pmt crypto window/outcomes for the rest).
-    windows = sorted(window_list, key=lambda r: r["end_ts"], reverse=True)[:12]
+    windows = sorted(window_list, key=lambda r: r["end_ts"], reverse=True)[:WINDOWS_SHOWN]
     result = {"wins": wins, "losses": losses, "net": net, "rolls": rolls,
               "series": series, "cal": cal, "estimated": estimated,
               "riding_n": riding_n, "riding_usd": riding_usd, "windows": windows,
+              # Uncapped: a handful at most, and every one of them is money
+              # currently at risk — capping THAT would be the same bug again.
+              "riding_windows": sorted(riding_list, key=lambda r: r["end_ts"],
+                                        reverse=True),
               # Every graded window (uncapped, unsorted) with its notional and
               # exposure timing — the input to polymarket.effectiveness. Kept
               # separate from `windows`, which is a 12-row display strip.
