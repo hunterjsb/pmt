@@ -12,6 +12,7 @@ tests below exist specifically to pin that behavior down.
 from __future__ import annotations
 
 import json
+import sys
 import time
 
 import click
@@ -405,3 +406,225 @@ def test_controls_panel_renders():
     con.print(cc._controls_panel())
     out = con.file.getvalue()
     assert "quit" in out and "controls" in out
+
+
+def test_poll_key_passes_timeout_through_to_select(monkeypatch):
+    seen = {}
+
+    def fake_select(r, w, x, t):
+        seen["timeout"] = t
+        return ([], [], [])
+
+    monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=True))
+    monkeypatch.setattr(cc.select, "select", fake_select)
+    assert cc._poll_key() is None
+    assert seen["timeout"] == 0.0          # default stays non-blocking
+    assert cc._poll_key(0.05) is None
+    assert seen["timeout"] == 0.05         # the watch loop's 20Hz pacing
+
+
+def test_wait_key_without_a_tty_paces_instead_of_spinning(monkeypatch):
+    slept = []
+    monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=False))
+    monkeypatch.setattr(cc.time, "sleep", lambda s: slept.append(s))
+    assert cc._wait_key(0.05) is None
+    assert slept == [0.05]  # no tty to select on -> the sleep is the pacing
+
+
+# ---------- watch: the render/fetch thread split ----------
+
+class _FakeLedger:
+    """Stands in for wallet.ActivityLedger: records refreshes, serves rows."""
+
+    def __init__(self, rows=None, boom=None):
+        self.rows = list(rows or [])
+        self.refreshes = 0
+        self.boom = boom
+
+    def refresh(self, addr):
+        self.refreshes += 1
+        if self.boom:
+            raise self.boom
+        return 0
+
+
+def _fetcher(monkeypatch, *, ledger=None, sb=None, status=None, bal=None):
+    """A WatchFetcher with every network seam replaced."""
+    state = cc.WatchState()
+    f = cc.WatchFetcher(state, sliding_floor=0.0, ledger=ledger or _FakeLedger())
+    monkeypatch.setattr(cc.wallet, "funder_address", lambda: "0xabc")
+    monkeypatch.setattr(cc, "score_activity",
+                        lambda rows, floor, sliding_floor=None: sb or {"wins": 1})
+    monkeypatch.setattr(cc, "_engine_post",
+                        (lambda *a, **k: status) if not isinstance(status, BaseException)
+                        else _raiser(status))
+    monkeypatch.setattr(cc, "_api", (lambda: _FakeApi(bal)) if not isinstance(bal, BaseException)
+                        else _raiser(bal))
+    return state, f
+
+
+def _raiser(exc):
+    def boom(*a, **k):
+        raise exc
+    return boom
+
+
+class _FakeApi:
+    def __init__(self, bal):
+        self._bal = bal
+
+    def get_usdc_balance(self):
+        return self._bal
+
+
+def test_watch_state_defaults_and_snapshot_isolation():
+    st = cc.WatchState()
+    snap = st.read()
+    assert snap["status"] == {} and snap["bal"] == {}
+    assert snap["sb_stale"] is False and snap["sb_fetched_at"] is None
+    assert snap["err"] is None
+    snap["status"] = {"arms": {"x": {}}}       # a renderer mangling its own copy
+    assert st.read()["status"] == {}           # must not reach the shared state
+
+
+def test_watch_state_update_swaps_whole_objects():
+    st = cc.WatchState()
+    sb = {"wins": 3, "losses": 1}
+    st.update(sb=sb, sb_fetched_at=123.0)
+    assert st.read()["sb"] is sb               # swapped in whole, not merged
+    assert st.read()["sb_fetched_at"] == 123.0
+    with pytest.raises(KeyError):
+        st.update(bogus=1)                     # typo'd field must not vanish silently
+
+
+def test_fetcher_publishes_scoreboard_off_the_ledger(monkeypatch):
+    led = _FakeLedger(rows=[{"slug": "x"}])
+    state, f = _fetcher(monkeypatch, ledger=led, sb={"wins": 7})
+    f.fetch_sb()
+    snap = state.read()
+    assert led.refreshes == 1                  # incremental refresh, not a full walk
+    assert snap["sb"] == {"wins": 7}
+    assert snap["sb_stale"] is False and snap["sb_fetched_at"] is not None
+
+
+def test_fetcher_scoreboard_failure_keeps_last_value_and_marks_stale(monkeypatch):
+    led = _FakeLedger()
+    state, f = _fetcher(monkeypatch, ledger=led, sb={"wins": 7})
+    f.tick(0.0)                                # first pass: everything succeeds
+    good = state.read()["sb"]
+    assert good == {"wins": 7}
+
+    led.boom = ConnectionError("data-api down")
+    f.tick(1000.0)
+    snap = state.read()
+    assert snap["sb"] is good                  # last good numbers still on screen
+    assert snap["sb_stale"] is True
+    assert "ConnectionError" in snap["err"]
+
+    led.boom = None                            # recovery clears both markers
+    f.tick(2000.0)
+    snap = state.read()
+    assert snap["sb_stale"] is False and snap["err"] is None
+
+
+def test_fetcher_status_failure_is_belted_including_systemexit(monkeypatch):
+    # engine.post() sys.exit()s when the engine is unreachable — SystemExit is
+    # not an Exception, so a bare `except Exception` would kill the worker.
+    state, f = _fetcher(monkeypatch, status=SystemExit(1))
+    f.tick(0.0)                                # must not raise
+    assert state.read()["status"] == {}         # arms table renders "engine unreachable"
+
+
+def test_fetcher_never_rebinds_process_stdout(monkeypatch):
+    # Rich resolves sys.stdout at write time, so a worker that swaps it (e.g.
+    # contextlib.redirect_stdout to hush engine.post's error print) makes the
+    # render thread see a non-tty and stop painting. The worker must leave
+    # sys.stdout alone even while a fetch is failing loudly.
+    seen: list = []
+
+    def noisy(*a, **k):
+        seen.append(sys.stdout)
+        print("Cannot reach pmengine")          # what engine.post() does before exiting
+        raise SystemExit(1)
+
+    state, f = _fetcher(monkeypatch, status=None)
+    monkeypatch.setattr(cc, "_engine_post", noisy)
+    before = sys.stdout
+    f.tick(0.0)
+    assert seen == [before]        # unchanged DURING the call
+    assert sys.stdout is before    # and after it
+
+
+def test_fetcher_balance_failure_keeps_last_capital(monkeypatch):
+    state, f = _fetcher(monkeypatch, bal={"total": 500.0})
+    f.tick(0.0)
+    assert state.read()["bal"] == {"total": 500.0}
+    monkeypatch.setattr(cc, "_api", _raiser(RuntimeError("rpc down")))
+    f.tick(10_000.0)
+    assert state.read()["bal"] == {"total": 500.0}  # blanking capital would be worse
+
+
+def test_fetcher_tick_honors_per_source_cadences(monkeypatch):
+    state, f = _fetcher(monkeypatch, bal={"total": 1.0})
+    ran: list[str] = []
+    for name in ("status", "sb", "bal"):
+        monkeypatch.setattr(f, f"fetch_{name}", lambda n=name: ran.append(n))
+
+    f.tick(1000.0)
+    assert sorted(ran) == ["bal", "sb", "status"]   # first tick primes everything
+    ran.clear()
+
+    f.tick(1001.0)                                   # nothing is due yet
+    assert ran == []
+    f.tick(1002.0)
+    assert ran == ["status"]                         # engine: 2s
+    ran.clear()
+    f.tick(1010.0)
+    assert sorted(ran) == ["sb", "status"]            # scoreboard: 10s
+    ran.clear()
+    f.tick(1060.0)
+    assert sorted(ran) == ["bal", "sb", "status"]     # balance: 60s
+
+
+def test_fetcher_loop_exits_on_stop_flag(monkeypatch):
+    import threading
+
+    state, f = _fetcher(monkeypatch)
+    stop = threading.Event()
+    th = threading.Thread(target=f.loop, args=(stop,), daemon=True)
+    th.start()
+    stop.set()
+    th.join(timeout=cc.WORKER_JOIN_S)
+    assert not th.is_alive()  # 'q' must never wait out a poll interval
+
+
+def test_render_path_is_never_blocked_by_a_slow_fetch(monkeypatch):
+    """The whole point of the split: a multi-second wallet walk on the worker
+    must not delay the loop that reads keys and repaints."""
+    import threading
+
+    led = _FakeLedger()
+    state, f = _fetcher(monkeypatch, ledger=led)
+    started = threading.Event()
+
+    def slow_refresh(addr):
+        started.set()
+        time.sleep(1.5)  # a full wallet walk, the old inline cost
+        return 0
+
+    led.refresh = slow_refresh
+    stop = threading.Event()
+    th = threading.Thread(target=f.loop, args=(stop,), daemon=True)
+    th.start()
+    try:
+        assert started.wait(1.0), "worker never entered the slow fetch"
+        # 20 render-loop passes while the worker is stuck mid-fetch.
+        t0 = time.monotonic()
+        for _ in range(20):
+            snap = state.read()
+            assert "sb" in snap
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.2, f"render reads blocked for {elapsed:.2f}s"
+    finally:
+        stop.set()
+        th.join(timeout=cc.WORKER_JOIN_S + 2)

@@ -87,3 +87,59 @@ def fetch_wallet_activity(addr: str, floor: float = 0.0) -> list[dict]:
             break
         offset += PAGE_STEP
     return rows
+
+
+class ActivityLedger:
+    """An accumulating wallet-activity ledger with an INCREMENTAL refresh.
+
+    fetch_wallet_activity() re-walks the whole history on every call, which
+    is fine for a one-shot report and ruinous for the `watch` dashboard: an
+    all-time scoreboard every 10s meant N sequential HTTP pages every 10s,
+    growing forever as the wallet trades. This keeps the rows in memory and
+    re-reads only the new head of the feed.
+
+    Refresh walks NEWEST-first and stops at the first page whose rows are
+    ALL already known. One known row is NOT enough to stop: offset
+    pagination over a live feed shifts rows across the page seam (see
+    PAGE_STEP above), so a page can legitimately open with rows we already
+    hold and still carry new ones below them. Requiring a FULL page of
+    known rows makes the stop exact — the row_key set is the same identity
+    the seam-dedupe uses, so "known" means known, not "looks similar".
+    """
+
+    def __init__(self) -> None:
+        self.rows: list[dict] = []
+        self._seen: set = set()
+        self.primed = False  # False until the first (full-history) walk lands
+        self.last_pages = 0  # pages fetched by the most recent refresh
+
+    def refresh(self, addr: str) -> int:
+        """Fetch new rows into the ledger; returns how many were new.
+
+        The first call walks the full history (no early stop — nothing is
+        known yet, so every page is "all new" anyway); later calls stop at
+        the first fully-known page, which in steady state is page 2.
+        """
+        offset = 0
+        new = 0
+        pages = 0
+        while True:
+            page = fetch_activity_page(addr, offset)
+            pages += 1
+            page_new = 0
+            for a in page:
+                k = row_key(a)
+                if k in self._seen:
+                    continue
+                self._seen.add(k)
+                self.rows.append(a)
+                page_new += 1
+            new += page_new
+            if len(page) < PAGE_SIZE:
+                break  # end of history
+            if self.primed and page_new == 0:
+                break  # a whole page we already hold — caught up with the head
+            offset += PAGE_STEP
+        self.primed = True
+        self.last_pages = pages
+        return new

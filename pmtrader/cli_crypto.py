@@ -15,6 +15,8 @@ import re
 import select
 import sys
 import termios
+import threading
+import time
 import tty
 
 import click
@@ -511,10 +513,33 @@ def _impute_win_pnl(buy_usd: float, sell_usd: float, buy_shares: float) -> float
 
 
 def _tape_scoreboard(floor: float, sliding_floor: float | None = None) -> dict:
+    """Fetch the wallet's activity and grade it — the synchronous one-shot
+    form used by `pmt crypto stats` and by anything that wants a fresh full
+    walk. The watch dashboard instead keeps a wallet.ActivityLedger warm and
+    calls score_activity() directly on its accumulated rows; both go through
+    the SAME aggregation below, so the two never drift.
+    """
+    # Ground truth: every updown trade + redemption on the proxy wallet.
+    # Bug found in the existing code: an unset addr used to fall through
+    # this silently and report a clean "0W-0L" — indistinguishable from a
+    # genuinely empty trading history. Every sibling command (activity/
+    # window/outcomes) already raises for this; match them.
+    addr = wallet.funder_address()
+    return score_activity(wallet.fetch_wallet_activity(addr, floor), floor,
+                          sliding_floor=sliding_floor)
+
+
+def score_activity(rows: list[dict], floor: float,
+                   sliding_floor: float | None = None) -> dict:
     """W-L / realized P&L graded by the WALLET (data-api activity), not the
     model's own final read — a model that's confidently wrong (XRP basis,
     2026-08-23) would otherwise grade its own loss as a win. The tape only
     contributes fire records (stated fairs) for the calibration table.
+
+    Pure aggregation over already-fetched activity `rows` (plus the local
+    tape file and the TTL-cached gamma cross-check) — no wallet pagination,
+    so a dashboard refresh costs CPU over the in-memory ledger instead of a
+    full re-walk of the history.
 
     The floor selects WINDOWS (slug start epoch >= floor), never individual
     transactions — filtering by row timestamp let a window's redeem into the
@@ -523,9 +548,9 @@ def _tape_scoreboard(floor: float, sliding_floor: float | None = None) -> dict:
 
     `sliding_floor`, if given, additionally derives a "sliding" aggregate
     (recent-window W-L/P&L, keyed "sliding" in the result) from windows with
-    start >= sliding_floor — computed in the SAME pass over the SAME wallet
-    walk (typically called with floor=0, i.e. all-time, from the watch
-    dashboard) so a side-by-side sliding/all-time P&L costs one wallet walk
+    start >= sliding_floor — computed in the SAME pass over the SAME rows
+    (typically called with floor=0, i.e. all-time, from the watch
+    dashboard) so a side-by-side sliding/all-time P&L costs one walk
     instead of two.
     """
     import time as _t
@@ -533,14 +558,8 @@ def _tape_scoreboard(floor: float, sliding_floor: float | None = None) -> dict:
     from polymarket import outcomes
 
     now = _t.time()
-    # Ground truth: every updown trade + redemption on the proxy wallet.
-    # Bug found in the existing code: an unset addr used to fall through
-    # this silently and report a clean "0W-0L" — indistinguishable from a
-    # genuinely empty trading history. Every sibling command (activity/
-    # window/outcomes) already raises for this; match them.
-    addr = wallet.funder_address()
     win_by_slug: dict[str, dict] = {}
-    for a in wallet.fetch_wallet_activity(addr, floor):
+    for a in rows:
         slug = a.get("slug") or ""
         if not updown_slugs.is_updown(slug) or updown_slugs.window_start(slug) < floor:
             continue
@@ -882,8 +901,9 @@ def _restore_stdin(saved: tuple[int, list] | None) -> None:
         pass
 
 
-def _poll_key() -> str | None:
-    """Non-blocking: the waiting keypress (lowercased) or None this tick.
+def _poll_key(timeout: float = 0.0) -> str | None:
+    """The waiting keypress (lowercased) or None. `timeout` is the select
+    wait in seconds; 0 (the default) polls without blocking at all.
 
     os.read on the raw fd, NOT sys.stdin.read — the TextIOWrapper's
     buffering can demand more bytes than the tty has and block the whole
@@ -893,13 +913,177 @@ def _poll_key() -> str | None:
         return None
     try:
         fd = sys.stdin.fileno()
-        ready, _, _ = select.select([fd], [], [], 0)
+        ready, _, _ = select.select([fd], [], [], timeout)
         if not ready:
             return None
         ch = os.read(fd, 1)
         return ch.decode(errors="ignore").lower() or None
     except Exception:
         return None
+
+
+def _wait_key(timeout: float) -> str | None:
+    """Wait up to `timeout` for one keypress — the watch loop's ONLY pacing.
+
+    The loop sleeps inside select(), so a keypress wakes it within
+    microseconds instead of sitting in the tty buffer behind a sleep(1) and
+    whatever network work followed it. With no tty (piped input, a test
+    harness) there's nothing to select on, so it just paces the loop.
+    """
+    if not sys.stdin.isatty():
+        time.sleep(timeout)
+        return None
+    return _poll_key(timeout)
+
+
+# ---------- watch: the render/fetch split ----------
+#
+# The dashboard runs two threads and nothing else:
+#
+#   main   — input + render, ZERO network. Polls the tty at 20Hz (the select
+#            timeout IS the loop's pacing) and repaints at 1Hz, or instantly
+#            when a key changed UI state.
+#   worker — one daemon thread owning every network call, each on its own
+#            cadence, publishing whole result objects into a WatchState.
+#
+# Before the split these were one loop: a key was polled once per second and
+# then the same loop went off to walk the entire wallet history inline, so a
+# keypress could wait out a multi-second HTTP walk before anything read it.
+
+_SB_EMPTY_SLIDING = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "estimated": 0}
+_SB_EMPTY = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "series": {}, "cal": {},
+             "estimated": 0, "riding_n": 0, "riding_usd": 0.0, "windows": [],
+             "sliding": dict(_SB_EMPTY_SLIDING)}
+
+# Fetch cadences — keep in sync with the line in _controls_panel().
+ENGINE_EVERY_S = 2.0
+SB_EVERY_S = 10.0
+BAL_EVERY_S = 60.0
+WORKER_INTERVAL_S = 0.25  # how often the worker checks what's due
+# 'q' must feel instant. An idle worker exits its wait immediately; one stuck
+# mid-fetch is simply abandoned (daemon thread, the process is leaving anyway)
+# rather than holding the operator's terminal for the length of an HTTP call.
+WORKER_JOIN_S = 0.25
+KEY_POLL_S = 0.05         # 20Hz key polling — the perceived-latency budget
+RENDER_EVERY_S = 1.0      # repaint cadence when no key changed anything
+
+
+class WatchState:
+    """The single hand-off point between the fetch thread and the render loop.
+
+    The worker never mutates a published value in place — it builds a whole
+    new result object and swaps it in — so a reader can never catch a
+    half-built scoreboard. read() takes the lock and copies the mapping,
+    handing the renderer one internally consistent snapshot per frame.
+    """
+
+    _FIELDS = ("status", "bal", "sb", "sb_stale", "sb_fetched_at", "err")
+
+    def __init__(self, sb: dict | None = None) -> None:
+        self._lock = threading.Lock()
+        self._d: dict = {
+            "status": {}, "bal": {},
+            "sb": dict(_SB_EMPTY) if sb is None else sb,
+            # Not stale, just not fetched yet: sb_fetched_at None already
+            # renders as the header's "—" data-age, which is the honest cue
+            # while the first walk is still in flight.
+            "sb_stale": False, "sb_fetched_at": None, "err": None,
+        }
+
+    def update(self, **kw) -> None:
+        unknown = set(kw) - set(self._FIELDS)
+        if unknown:
+            raise KeyError(f"unknown WatchState field(s): {sorted(unknown)}")
+        with self._lock:
+            self._d.update(kw)
+
+    def read(self) -> dict:
+        with self._lock:
+            return dict(self._d)
+
+
+class WatchFetcher:
+    """Every network call the watch dashboard makes, on one daemon thread.
+
+    Each source has its own cadence and its own belt: a failure keeps the
+    last good value and surfaces as staleness in the header, never as a
+    traceback and never as a dead dashboard. The wallet scoreboard runs off
+    an ActivityLedger, so a steady-state refresh re-reads only the head of
+    the activity feed instead of re-walking the whole history.
+    """
+
+    def __init__(self, state: WatchState, sliding_floor: float,
+                 ledger: "wallet.ActivityLedger | None" = None) -> None:
+        self.state = state
+        self.sliding_floor = sliding_floor
+        self.ledger = wallet.ActivityLedger() if ledger is None else ledger
+        self._due: dict[str, float] = {"status": 0.0, "sb": 0.0, "bal": 0.0}
+
+    # -- individual fetches: each may raise; tick() belts them --
+
+    def fetch_status(self) -> None:
+        # engine.post() prints its own red error before sys.exit()ing. Let it:
+        # inside Live's alternate screen that print is routed through Live's
+        # io redirect and painted over by the next frame — exactly as it was
+        # when this call ran on the main thread. Do NOT wrap it in
+        # contextlib.redirect_stdout to hush it: that swaps sys.stdout for the
+        # whole PROCESS, and Rich resolves sys.stdout at write time, so the
+        # render thread sees a non-tty and stops painting — the dashboard
+        # comes up entirely blank.
+        status = _engine_post("/strategies/updown/command", {"action": "status"})
+        self.state.update(status=status if isinstance(status, dict) else {})
+
+    def fetch_sb(self) -> None:
+        addr = wallet.funder_address()
+        self.ledger.refresh(addr)
+        # Always grade the FULL history (floor 0) and derive both the sliding
+        # (recent-pulse) and all-time figures from that one pass.
+        sb = score_activity(self.ledger.rows, 0.0, sliding_floor=self.sliding_floor)
+        self.state.update(sb=sb, sb_stale=False, sb_fetched_at=time.time(), err=None)
+
+    def fetch_bal(self) -> None:
+        self.state.update(bal=_api().get_usdc_balance() or {})
+
+    # -- failure handling: last good value + a visible marker --
+
+    def _status_failed(self, exc: BaseException) -> None:
+        # Deliberately NOT the last good arms: a stale committed-$ figure on a
+        # trading dashboard is worse than the arms table's red "engine
+        # unreachable or no arms", which is what an empty status renders as.
+        self.state.update(status={})
+
+    def _sb_failed(self, exc: BaseException) -> None:
+        self.state.update(sb_stale=True, err=f"scoreboard: {type(exc).__name__}"[:100])
+
+    def _bal_failed(self, exc: BaseException) -> None:
+        pass  # keep the last capital figure; a flaky balance call shouldn't blank it
+
+    def tick(self, now: float) -> None:
+        """Run whatever is due at `now`. Never raises."""
+        for name, every, fetch, failed in (
+            ("status", ENGINE_EVERY_S, self.fetch_status, self._status_failed),
+            ("sb", SB_EVERY_S, self.fetch_sb, self._sb_failed),
+            ("bal", BAL_EVERY_S, self.fetch_bal, self._bal_failed),
+        ):
+            if now < self._due[name]:
+                continue
+            self._due[name] = now + every
+            try:
+                fetch()
+            except (Exception, SystemExit) as e:
+                # engine.post() sys.exit()s on failure — SystemExit isn't an
+                # Exception, so it must be named explicitly.
+                failed(e)
+
+    def loop(self, stop: threading.Event, interval: float = WORKER_INTERVAL_S) -> None:
+        """Thread body. stop.wait() returns the moment the flag is set, so
+        quitting never waits out a full interval."""
+        while not stop.is_set():
+            try:
+                self.tick(time.time())
+            except Exception as e:  # a bug in tick() itself must not kill the feed
+                self.state.update(err=f"{type(e).__name__}: {e}"[:100])
+            stop.wait(interval)
 
 
 def _controls_panel():
@@ -932,7 +1116,6 @@ def crypto_watch(since: float | None) -> None:
     from rich.text import Text
 
     WATCH_DEFAULT_LOOKBACK_H = 6.0  # sliding recent window — it's a live dashboard, not the ledger
-    SB_REFRESH_TICKS = 10  # was 30s; stale P&L was the operator's top live pain
 
     def _safe_render(raw: str) -> str | None:
         # A line can be truncated mid-write by a concurrently-crashing
@@ -957,47 +1140,40 @@ def crypto_watch(since: float | None) -> None:
     except OSError:
         pass
 
-    _SB_EMPTY_SLIDING = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "estimated": 0}
-    _SB_EMPTY = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "series": {}, "cal": {},
-                 "estimated": 0, "riding_n": 0, "riding_usd": 0.0, "windows": [],
-                 "sliding": dict(_SB_EMPTY_SLIDING)}
-
-    # The dashboard must outlive every upstream hiccup: stale numbers with a
-    # marker, never a traceback to the terminal.
-    sb_stale = False
-    sb_fetched_at: float | None = None
-    try:
-        # Always walk the FULL wallet history (floor 0) and derive both the
-        # sliding (recent-pulse) and all-time P&L from that one pass — one
-        # walk serves both header figures instead of fetching twice.
-        sb = _tape_scoreboard(0.0, sliding_floor=floor)
-        sb_fetched_at = _t.time()
-    except Exception:
-        sb = dict(_SB_EMPTY)
-        sb_stale = True
-    status: dict = {}
-    bal: dict = {}
-    tick_err: str | None = None
+    # All network lives on the worker; the loop below only ever reads this
+    # snapshot. The first paint therefore happens immediately, with the data
+    # age showing "—" until the first wallet walk lands, instead of the
+    # operator staring at a blank terminal through a multi-second fetch.
+    state = WatchState()
+    stop = threading.Event()
+    fetcher = WatchFetcher(state, floor)
+    worker = threading.Thread(target=fetcher.loop, args=(stop,),
+                              name="pmt-watch-fetch", daemon=True)
+    snap = state.read()
+    render_err: str | None = None
 
     def header() -> Panel:
+        sb = snap["sb"]
         sliding = sb.get("sliding") or _SB_EMPTY_SLIDING
         wins, losses, net, rolls = sliding["wins"], sliding["losses"], sliding["net"], sliding["rolls"]
         n = wins + losses
         wr = f"{wins / n * 100:.0f}%" if n else "—"
+        bal = snap["bal"]
         cap = f"${bal['total']:,.2f}" if bal else "…"
         color = "green" if net >= 0 else "red"
-        stale = " · [yellow dim]stats stale[/]" if sb_stale else ""
+        stale = " · [yellow dim]stats stale[/]" if snap["sb_stale"] else ""
         est = (f" · [dim]{sliding.get('estimated', 0)} ~estimated[/dim]"
                if sliding.get("estimated") else "")
-        err = f" · [red dim]{tick_err}[/]" if tick_err else ""
+        note = render_err or snap["err"]
+        err = f" · [red dim]{note}[/]" if note else ""
         all_net = sb.get("net", 0.0)
         all_color = "green" if all_net >= 0 else "red"
         all_time = (f" · [dim]all-time {sb.get('wins', 0)}W-{sb.get('losses', 0)}L "
                     f"[{all_color}]{all_net:+,.2f}[/{all_color}][/dim]")
-        if sb_fetched_at is None:
+        if snap["sb_fetched_at"] is None:
             age = "[dim]—[/dim]"
         else:
-            age_s = _t.time() - sb_fetched_at
+            age_s = _t.time() - snap["sb_fetched_at"]
             age_style = "yellow" if age_s > 30 else "dim"
             age = f"[{age_style}]{age_s:.0f}s ago[/{age_style}]"
         return Panel(
@@ -1008,13 +1184,13 @@ def crypto_watch(since: float | None) -> None:
             title="updown fleet", border_style="cyan")
 
     def risk_panel() -> Text:
-        return Text.from_markup(build_risk_header(status, bal, sb))
+        return Text.from_markup(build_risk_header(snap["status"], snap["bal"], snap["sb"]))
 
     def arms_table() -> Table:
-        return build_arms_table(status.get("arms"), _t.time())
+        return build_arms_table(snap["status"].get("arms"), _t.time())
 
     def strip_panel() -> Panel:
-        return Panel(Text.from_markup(build_windows_strip(sb.get("windows"))),
+        return Panel(Text.from_markup(build_windows_strip(snap["sb"].get("windows"))),
                      title="recent windows", subtitle="[dim]h = controls[/dim]",
                      border_style="dim")
 
@@ -1031,21 +1207,36 @@ def crypto_watch(since: float | None) -> None:
         Layout(name="tape", ratio=1),
     )
 
-    tick = 0
     show_controls = False
+    next_render = 0.0
     saved_term = _cbreak_stdin()
+    worker.start()
     try:
         with Live(layout, refresh_per_second=4, screen=True) as live:
             while True:
-                key = _poll_key()
+                # The ONLY wait in this loop, and it's the key wait: 20Hz, so
+                # 'q'/'h' are seen within ~50ms no matter what the worker is
+                # doing. Nothing below this line touches the network.
+                key = _wait_key(KEY_POLL_S)
                 if key == "q":
                     break
+                dirty = False
                 if key == "h":
                     show_controls = not show_controls
-                # Final belt: nothing reachable from this tick — engine,
-                # data-api, disk — may tear the dashboard down. Note it in
-                # the header and keep ticking; only Ctrl+C or 'q' stops this.
+                    dirty = True  # a toggle repaints now, not on the next second
+                now = time.time()
+                if not dirty and now < next_render:
+                    continue
+                next_render = now + RENDER_EVERY_S
+                snap = state.read()
+                # Final belt: neither the tape file nor a render bug may tear
+                # the dashboard down. Note it in the header and keep painting;
+                # only Ctrl+C or 'q' stops this.
                 try:
+                    # Local file, seek+read from the last offset: sub-
+                    # millisecond, so the render never waits on it. Belted
+                    # because a torn mid-write line can be undecodable bytes,
+                    # which is a UnicodeDecodeError, not an OSError.
                     try:
                         with open(tape.UPDOWN_TAPE) as fh:
                             fh.seek(offset)
@@ -1056,32 +1247,7 @@ def crypto_watch(since: float | None) -> None:
                             offset = fh.tell()
                     except OSError:
                         pass
-                    if tick % 2 == 0:
-                        try:
-                            status = _engine_post("/strategies/updown/command",
-                                                  {"action": "status"})
-                        except (Exception, SystemExit):
-                            # engine.post() sys.exit()s on failure — SystemExit
-                            # isn't an Exception, so it must be named explicitly.
-                            status = {}
-                    # Single-threaded tick loop: a refresh runs to completion
-                    # before the next tick starts, so a slow scoreboard walk
-                    # delays tick advancement rather than ever queuing a
-                    # second overlapping fetch.
-                    if tick % SB_REFRESH_TICKS == 0 and tick > 0:
-                        try:
-                            sb = _tape_scoreboard(0.0, sliding_floor=floor)
-                            sb_stale = False
-                            sb_fetched_at = _t.time()
-                        except Exception:
-                            sb_stale = True
-                    # Balance is a slow call — after first paint, then per minute.
-                    if tick % 60 == 1:
-                        try:
-                            bal = _api().get_usdc_balance()
-                        except Exception:
-                            pass
-                    layout["arms"].size = max(len(status.get("arms") or {}), 1) + 4
+                    layout["arms"].size = max(len(snap["status"].get("arms") or {}), 1) + 4
                     layout["head"].update(header())
                     layout["risk"].update(risk_panel())
                     layout["arms"].update(arms_table())
@@ -1089,20 +1255,21 @@ def crypto_watch(since: float | None) -> None:
                         _controls_panel() if show_controls else strip_panel())
                     h = live.console.size.height - 3 - 1 - 3 - layout["arms"].size
                     layout["tape"].update(tape_panel(h))
-                    tick_err = None
+                    render_err = None
                 except KeyboardInterrupt:
                     raise
                 except (Exception, SystemExit) as e:
-                    tick_err = f"{type(e).__name__}: {e}"[:100]
+                    render_err = f"{type(e).__name__}: {e}"[:100]
                     try:
                         layout["head"].update(header())
                     except Exception:
                         pass
-                tick += 1
-                _t.sleep(1)
+                live.refresh()
     except KeyboardInterrupt:
         pass
     finally:
+        stop.set()
+        worker.join(timeout=WORKER_JOIN_S)  # daemon thread — never hang the exit
         _restore_stdin(saved_term)
 
 
