@@ -1933,14 +1933,20 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
     import time as _t
 
     floor = _t.time() - since * 3600 if since else _V2_ERA
-    sb = _tape_scoreboard(floor)
+    try:
+        sb = _tape_scoreboard(floor)
+    except Exception as e:
+        console.print(f"[red]data-api unreachable: {e}[/red]")
+        sys.exit(1)
     wins, losses, net, rolls = sb["wins"], sb["losses"], sb["net"], sb["rolls"]
     series, cal = sb["series"], sb["cal"]
 
     status, bal = {}, {}
     try:
         status = _engine_post("/strategies/updown/command", {"action": "status"})
-    except Exception:
+    except (Exception, SystemExit):
+        # engine.post() sys.exit()s on failure (SystemExit, not Exception) —
+        # engine down shouldn't blank the rest of a one-shot report.
         pass
     try:
         bal = _api().get_usdc_balance()
@@ -2011,17 +2017,25 @@ def crypto_watch(since: float | None) -> None:
     from rich.panel import Panel
     from rich.text import Text
 
+    def _safe_render(raw: str) -> str | None:
+        # A line can be truncated mid-write by a concurrently-crashing
+        # engine; a bad record must never take the dashboard down with it.
+        try:
+            return _tape_render(raw)
+        except Exception:
+            return None
+
     floor = _t.time() - since * 3600 if since else _V2_ERA
     lines: deque = deque(maxlen=200)
     offset = 0
     try:
         with open(_TAPE_PATH) as fh:
             for raw in fh.readlines()[-60:]:
-                r = _tape_render(raw)
+                r = _safe_render(raw)
                 if r:
                     lines.append(r)
             offset = fh.tell()
-    except FileNotFoundError:
+    except OSError:
         pass
 
     # The dashboard must outlive every upstream hiccup: stale numbers with a
@@ -2034,6 +2048,7 @@ def crypto_watch(since: float | None) -> None:
         sb_stale = True
     status: dict = {}
     bal: dict = {}
+    tick_err: str | None = None
 
     def header() -> Panel:
         wins, losses, net = sb["wins"], sb["losses"], sb["net"]
@@ -2042,9 +2057,10 @@ def crypto_watch(since: float | None) -> None:
         cap = f"${bal['total']:,.2f}" if bal else "…"
         color = "green" if net >= 0 else "red"
         stale = " · [yellow dim]stats stale[/]" if sb_stale else ""
+        err = f" · [red dim]{tick_err}[/]" if tick_err else ""
         return Panel(
             f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L [{color}]{net:+,.2f}[/] · "
-            f"{sb['rolls']} rolls · capital {cap}{stale} · [dim]{_t.strftime('%H:%M:%S')}[/dim]",
+            f"{sb['rolls']} rolls · capital {cap}{stale}{err} · [dim]{_t.strftime('%H:%M:%S')}[/dim]",
             title="updown fleet", border_style="cyan")
 
     def arms_table() -> Table:
@@ -2080,43 +2096,229 @@ def crypto_watch(since: float | None) -> None:
     try:
         with Live(layout, refresh_per_second=4, screen=True) as live:
             while True:
+                # Final belt: nothing reachable from this tick — engine,
+                # data-api, disk — may tear the dashboard down. Note it in
+                # the header and keep ticking; only Ctrl+C stops this.
                 try:
-                    with open(_TAPE_PATH) as fh:
-                        fh.seek(offset)
-                        for raw in fh:
-                            r = _tape_render(raw)
-                            if r:
-                                lines.append(r)
-                        offset = fh.tell()
-                except FileNotFoundError:
-                    pass
-                if tick % 2 == 0:
                     try:
-                        status = _engine_post("/strategies/updown/command",
-                                              {"action": "status"})
-                    except Exception:
-                        status = {}
-                if tick % 30 == 0 and tick > 0:
+                        with open(_TAPE_PATH) as fh:
+                            fh.seek(offset)
+                            for raw in fh:
+                                r = _safe_render(raw)
+                                if r:
+                                    lines.append(r)
+                            offset = fh.tell()
+                    except OSError:
+                        pass
+                    if tick % 2 == 0:
+                        try:
+                            status = _engine_post("/strategies/updown/command",
+                                                  {"action": "status"})
+                        except (Exception, SystemExit):
+                            # engine.post() sys.exit()s on failure — SystemExit
+                            # isn't an Exception, so it must be named explicitly.
+                            status = {}
+                    if tick % 30 == 0 and tick > 0:
+                        try:
+                            sb = _tape_scoreboard(floor)
+                            sb_stale = False
+                        except Exception:
+                            sb_stale = True
+                    # Balance is a slow call — after first paint, then per minute.
+                    if tick % 60 == 1:
+                        try:
+                            bal = _api().get_usdc_balance()
+                        except Exception:
+                            pass
+                    layout["arms"].size = max(len(status.get("arms") or {}), 1) + 4
+                    layout["head"].update(header())
+                    layout["arms"].update(arms_table())
+                    h = live.console.size.height - 3 - layout["arms"].size
+                    layout["tape"].update(tape_panel(h))
+                    tick_err = None
+                except KeyboardInterrupt:
+                    raise
+                except (Exception, SystemExit) as e:
+                    tick_err = f"{type(e).__name__}: {e}"[:100]
                     try:
-                        sb = _tape_scoreboard(floor)
-                        sb_stale = False
-                    except Exception:
-                        sb_stale = True
-                # Balance is a slow call — after first paint, then per minute.
-                if tick % 60 == 1:
-                    try:
-                        bal = _api().get_usdc_balance()
+                        layout["head"].update(header())
                     except Exception:
                         pass
-                layout["arms"].size = max(len(status.get("arms") or {}), 1) + 4
-                layout["head"].update(header())
-                layout["arms"].update(arms_table())
-                h = live.console.size.height - 3 - layout["arms"].size
-                layout["tape"].update(tape_panel(h))
                 tick += 1
                 _t.sleep(1)
     except KeyboardInterrupt:
         pass
+
+
+def _activity_page(addr: str, offset: int) -> list[dict]:
+    import requests
+
+    from polymarket import hosts
+
+    return requests.get(
+        "https://data-api.polymarket.com/activity",
+        params={"user": addr, "limit": 500, "offset": offset},
+        headers=hosts.UA, timeout=8,
+    ).json() or []
+
+
+@crypto_group.command("activity")
+@click.option("--limit", "n", default=40, show_default=True, help="Rows to show")
+@click.option("--all", "show_all", is_flag=True,
+              help="Every activity type, not just updown windows")
+def crypto_activity(n: int, show_all: bool) -> None:
+    """Recent wallet activity — the curl+jq boilerplate, built in."""
+    import os
+    import time as _t
+
+    addr = os.environ.get("PM_FUNDER_ADDRESS", "")
+    if not addr:
+        raise click.UsageError("PM_FUNDER_ADDRESS not set")
+
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        try:
+            page = _activity_page(addr, offset)
+        except Exception as e:
+            console.print(f"[red]data-api unreachable: {e}[/red]")
+            sys.exit(1)
+        rows.extend(page if show_all else
+                    (a for a in page if "-updown-" in (a.get("slug") or "")))
+        if len(page) < 500 or len(rows) >= n:
+            break
+        offset += 500
+    rows = rows[:n]
+
+    if not rows:
+        console.print("[dim]No activity.[/dim]")
+        return
+
+    t = Table(title=f"wallet activity{'' if show_all else ' (updown)'}")
+    for col in ("time", "type", "$", "size", "price", "outcome", "window"):
+        t.add_column(col, justify="right" if col in ("time", "$", "size", "price") else "left")
+    for a in rows:
+        ts = _t.strftime("%H:%M:%S", _t.localtime(a.get("timestamp", 0)))
+        typ, side = a.get("type", ""), a.get("side", "")
+        usd = a.get("usdcSize") or 0.0
+        if typ == "TRADE":
+            color = "green" if side == "BUY" else "yellow"
+            label = f"[{color} bold]{side or typ}[/]"
+        elif typ == "REDEEM":
+            # A $0 redeem means the held side lost — that's the loss signal,
+            # not a sale, so it needs its own color rather than reusing SELL's.
+            label = f"[{'cyan' if usd > 0 else 'red'} bold]REDEEM[/]"
+        else:
+            label = typ or "?"
+        slug = a.get("slug") or ""
+        window = _tape_slug(slug) if "-updown-" in slug else slug
+        t.add_row(ts, label, f"${usd:,.2f}", f"{a.get('size', 0):g}",
+                  f"{a.get('price', 0):.3f}", a.get("outcome", ""), window[:40])
+    console.print(t)
+
+
+@crypto_group.command("window")
+@click.argument("slug")
+def crypto_window(slug: str) -> None:
+    """Post-mortem for one updown window: wallet trades + tape, merged by time."""
+    import os
+    import time as _t
+
+    m = re.match(r"([a-z]+)-updown-(\d+m)-(\d+)$", slug)
+    if not m:
+        raise click.UsageError(f"not an updown slug: {slug!r} (want e.g. btc-updown-15m-1787449500)")
+    _, dur, start_s = m.groups()
+    start = int(start_s)
+    end = start + int(dur[:-1]) * 60
+
+    addr = os.environ.get("PM_FUNDER_ADDRESS", "")
+    if not addr:
+        raise click.UsageError("PM_FUNDER_ADDRESS not set")
+
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        try:
+            page = _activity_page(addr, offset)
+        except Exception as e:
+            console.print(f"[red]data-api unreachable: {e}[/red]")
+            sys.exit(1)
+        rows.extend(a for a in page if a.get("slug") == slug)
+        if len(page) < 500 or (page and page[-1]["timestamp"] < start):
+            break
+        offset += 500
+
+    buy = sell = redeem = 0.0
+    win_outcome: str | None = None
+    lost = False
+    events: list[tuple[float, str]] = []
+    for a in rows:
+        usd = a.get("usdcSize") or 0.0
+        typ, side = a.get("type", ""), a.get("side", "")
+        if typ == "TRADE":
+            if side == "BUY":
+                buy += usd
+            else:
+                sell += usd
+            color = "green" if side == "BUY" else "yellow"
+            label = click.style(f"{side:<5}", fg=color, bold=True)
+        elif typ == "REDEEM":
+            redeem += usd
+            if usd > 0.5:
+                win_outcome = a.get("outcome")
+            else:
+                lost = True
+            label = click.style("REDEEM", fg="cyan" if usd > 0.5 else "red", bold=True)
+        else:
+            label = typ or "?"
+        ts = a.get("timestamp", 0)
+        line = (f"{_t.strftime('%H:%M:%S', _t.localtime(ts))}  {label}  "
+                f"{a.get('size', 0):g}sh @ {a.get('price', 0):.3f}  "
+                f"${usd:,.2f}  {a.get('outcome', '')}")
+        events.append((ts, line))
+
+    try:
+        with open(_TAPE_PATH) as fh:
+            for raw in fh:
+                try:
+                    r = json.loads(raw)
+                except ValueError:
+                    continue
+                if r.get("slug") != slug:
+                    continue
+                try:
+                    rendered = _tape_render(raw)
+                except Exception:
+                    continue
+                if rendered:
+                    events.append((r.get("t", 0), rendered))
+    except (FileNotFoundError, OSError):
+        pass
+
+    net = redeem + sell - buy
+    now = _t.time()
+    if win_outcome:
+        outcome_label = f"[bold]{win_outcome}[/bold]"
+    elif lost:
+        outcome_label = "[bold red]LOSS[/bold red]"
+    elif now < end + 300:
+        outcome_label = "[dim]pending[/dim]"
+    else:
+        outcome_label = "[dim]?[/dim]"
+
+    fmt = "%H:%M:%S"
+    console.print(f"[bold]{slug}[/bold]  {_t.strftime(fmt, _t.localtime(start))}"
+                  f"–{_t.strftime(fmt, _t.localtime(end))} ({dur})")
+    console.print(
+        f"  bought ${buy:,.2f} · sold ${sell:,.2f} · redeemed ${redeem:,.2f} · "
+        f"P&L [{'green' if net >= 0 else 'red'}]{net:+,.2f}[/] · outcome {outcome_label}"
+    )
+    if not events:
+        console.print("[dim]No activity or tape for this window.[/dim]")
+        return
+    console.print()
+    for _, line in sorted(events, key=lambda x: x[0]):
+        click.echo(line)
 
 
 @cli.group("sports")
