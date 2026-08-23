@@ -1,4 +1,4 @@
-"""Tests for the single updown-slug parser shared by cli_crypto, outcomes, and shadow."""
+"""Tests for the single updown-slug parser shared by the cli_crypto_* modules, outcomes, and shadow."""
 
 from __future__ import annotations
 

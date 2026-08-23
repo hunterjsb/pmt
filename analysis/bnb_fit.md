@@ -25,7 +25,7 @@ Verified live via `eth_call` on the `_RPC_URLS` chain:
 
 `verify_feeds()` now returns `ok: True` for all six feeds. Added to `chainlink.py` `FEEDS` +
 `BINANCE_SYMBOL` (`BNBUSDT`); `GUARD_BP["bnb"] = None` (no live guard — this document proposes one).
-`cli_crypto._ORACLE_SYMBOLS` gained `bnb` to stay in sync with `chainlink.SYMBOLS`.
+`cli_crypto_data._ORACLE_SYMBOLS` gained `bnb` to stay in sync with `chainlink.SYMBOLS`.
 
 **Round cadence — the first thing that had to be checked, and it passes.** BNB updates on the same
 ~33s heartbeat as the majors, so the step-held TWAP is not measuring staleness:
