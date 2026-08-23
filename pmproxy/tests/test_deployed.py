@@ -1,56 +1,67 @@
 """Post-deploy verification against the live Lambda.
 
-Runs as the last step of `deploy-pmproxy.yml`. Standalone — uses boto3
-directly to mint a Cognito access token (no cross-package dependency on
-pmtrader). Set these env vars before invoking pytest:
+Runs as the last step of `deploy-pmproxy.yml`. The Function URL is
+`AuthType=AWS_IAM` — AuthType NONE 403s account-wide — so **every** request
+here is SigV4-signed, including the ones the proxy itself treats as public
+(`/health`, `/badge`, `/metrics`). IAM gates the door; pmproxy's own auth is
+off (`PMPROXY_AUTH_ENABLED=false`) and Cognito Bearer is retired, because a
+Bearer token and a SigV4 signature both want the `Authorization` header.
 
-    PMPROXY_URL                  https://...lambda-url.eu-west-1.on.aws
-    PMPROXY_COGNITO_REGION       e.g. eu-west-1
-    PMPROXY_COGNITO_CLIENT_ID    Cognito App Client ID
-    PMPROXY_USERNAME             Cognito username
-    PMPROXY_PASSWORD             Cognito password
+Credentials come from the ambient chain: the OIDC deploy role in CI, your
+profile locally. Env:
+
+    PMPROXY_URL           https://...lambda-url.eu-west-1.on.aws
+    PMPROXY_AWS_REGION    signing region (default eu-west-1)
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+from urllib.parse import urlencode
 
 import pytest
 import requests
 
 PROXY_URL = os.environ.get("PMPROXY_URL", "").rstrip("/")
+REGION = os.environ.get("PMPROXY_AWS_REGION", "eu-west-1")
 
 
-def _cognito_access_token() -> str | None:
-    """Mint a Cognito access token from USER_PASSWORD_AUTH. None if creds missing."""
-    required = ("PMPROXY_COGNITO_CLIENT_ID", "PMPROXY_USERNAME", "PMPROXY_PASSWORD")
-    if not all(os.environ.get(k) for k in required):
-        return None
-    try:
-        import boto3
-    except ImportError:
-        return None
+def _frozen_credentials():
+    import boto3
 
-    client = boto3.client(
-        "cognito-idp",
-        region_name=os.environ.get("PMPROXY_COGNITO_REGION", "us-east-1"),
+    creds = boto3.Session().get_credentials()
+    if creds is None:
+        pytest.fail("no AWS credentials — the Function URL requires SigV4")
+    return creds.get_frozen_credentials()
+
+
+def call(method: str, path: str, *, params=None, body=None, sign=True, timeout=15):
+    """Request the deployed proxy, SigV4-signed unless `sign=False`."""
+    url = f"{PROXY_URL}{path}"
+    if params:
+        url += ("&" if "?" in url else "?") + urlencode(params, doseq=True)
+
+    payload = b"" if body is None else json.dumps(body).encode("utf-8")
+    headers: dict[str, str] = {}
+    if body is not None:
+        headers["content-type"] = "application/json"
+
+    if sign:
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+
+        req = AWSRequest(method=method, url=url, data=payload, headers=dict(headers))
+        # Function URLs reject a signed request that omits this header with the
+        # same bare 403 they give an unsigned one. It is not optional.
+        req.headers["X-Amz-Content-SHA256"] = hashlib.sha256(payload).hexdigest()
+        SigV4Auth(_frozen_credentials(), "lambda", REGION).add_auth(req)
+        headers = dict(req.headers)
+
+    return requests.request(
+        method, url, headers=headers, data=payload or None, timeout=timeout
     )
-    resp = client.initiate_auth(
-        ClientId=os.environ["PMPROXY_COGNITO_CLIENT_ID"],
-        AuthFlow="USER_PASSWORD_AUTH",
-        AuthParameters={
-            "USERNAME": os.environ["PMPROXY_USERNAME"],
-            "PASSWORD": os.environ["PMPROXY_PASSWORD"],
-        },
-    )
-    return resp["AuthenticationResult"]["AccessToken"]
-
-
-@pytest.fixture(scope="module")
-def auth_headers() -> dict[str, str]:
-    """Bearer header for the deployed Lambda. {} if no Cognito creds."""
-    token = _cognito_access_token()
-    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 @pytest.mark.skipif(not PROXY_URL, reason="PMPROXY_URL not set")
@@ -58,54 +69,44 @@ class TestDeployed:
     """Smoke tests against the live Lambda. Each must pass for the deploy
     to be considered successful."""
 
-    def test_health(self, auth_headers):
-        # /health is unauth-gated by design (intentionally bypasses Cognito).
-        resp = requests.get(f"{PROXY_URL}/health", timeout=10)
-        assert resp.status_code == 200
+    def test_health(self):
+        resp = call("GET", "/health")
+        assert resp.status_code == 200, resp.text
         assert resp.json() == {"status": "healthy"}
 
-    def test_badge(self, auth_headers):
-        resp = requests.get(f"{PROXY_URL}/badge", timeout=10)
-        assert resp.status_code == 200
+    def test_badge(self):
+        resp = call("GET", "/badge")
+        assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body.get("schemaVersion") == 1
         assert body.get("message") == "online"
 
-    def test_metrics(self, auth_headers):
-        # /metrics is also auth-free — Prometheus scrapers can't carry a JWT.
-        resp = requests.get(f"{PROXY_URL}/metrics", timeout=10)
-        assert resp.status_code == 200
+    def test_metrics(self):
+        resp = call("GET", "/metrics")
+        assert resp.status_code == 200, resp.text
         assert "pmproxy_requests_total" in resp.text
         assert resp.headers.get("content-type", "").startswith("text/plain")
 
-    def test_clob_sampling_markets(self, auth_headers):
-        resp = requests.get(
-            f"{PROXY_URL}/clob/sampling-markets", headers=auth_headers, timeout=10,
-        )
+    def test_clob_sampling_markets(self):
+        resp = call("GET", "/clob/sampling-markets")
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert "data" in data and len(data["data"]) > 0
         assert "tokens" in data["data"][0] and "question" in data["data"][0]
 
-    def test_gamma_events(self, auth_headers):
-        resp = requests.get(
-            f"{PROXY_URL}/gamma/events",
-            params={"limit": 3},
-            headers=auth_headers,
-            timeout=10,
-        )
+    def test_gamma_events(self):
+        resp = call("GET", "/gamma/events", params={"limit": 3})
         assert resp.status_code == 200, resp.text
         events = resp.json()
         assert len(events) > 0
         assert "title" in events[0]
 
-    def test_chain_block_number(self, auth_headers):
+    def test_chain_block_number(self):
         # Exercises the publicnode upstream swap (was the v0.5.0 fix).
-        resp = requests.post(
-            f"{PROXY_URL}/chain/",
-            json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
-            headers=auth_headers,
-            timeout=10,
+        resp = call(
+            "POST",
+            "/chain/",
+            body={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
         )
         assert resp.status_code == 200, resp.text
         data = resp.json()
@@ -113,11 +114,12 @@ class TestDeployed:
         # Polygon is well past block 50M.
         assert int(data["result"], 16) > 50_000_000
 
-    def test_unauthenticated_clob_rejected(self):
-        resp = requests.get(f"{PROXY_URL}/clob/sampling-markets", timeout=10)
-        assert resp.status_code == 401
-        assert resp.json().get("error") == "missing_token"
+    def test_unsigned_request_rejected(self):
+        # The 403 comes from AWS, not pmproxy — the request never reaches the
+        # function. This is the whole security model now that Cognito is gone.
+        resp = call("GET", "/clob/sampling-markets", sign=False)
+        assert resp.status_code == 403, resp.text
 
-    def test_unknown_path_404(self, auth_headers):
-        resp = requests.get(f"{PROXY_URL}/nonsense", headers=auth_headers, timeout=10)
-        assert resp.status_code == 404
+    def test_unknown_path_404(self):
+        resp = call("GET", "/nonsense")
+        assert resp.status_code == 404, resp.text

@@ -2,6 +2,11 @@
 
 Build artifact: pmproxy/target/lambda/pmproxy-lambda/bootstrap.zip
 Built via: cd pmproxy && cargo lambda build --release --features lambda --bin pmproxy-lambda --output-format zip
+
+!! Pulumi state for this project is GONE (see README.md). Everything below was
+   reconciled by hand against the live account on 2026-08-23 so that a future
+   `pulumi up` — after state is re-imported — is a no-op rather than a prod
+   auth change. Do not "tidy" these values back toward the pre-teardown design.
 """
 
 import os
@@ -10,8 +15,6 @@ import pulumi
 import pulumi_aws as aws
 
 cfg = pulumi.Config("pmt")
-cognito_pool_id = cfg.require("cognitoPoolId")
-cognito_client_id = cfg.require("cognitoClientId")
 budget_email = cfg.get("budgetEmail") or "hunterjsb@gmail.com"
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -41,6 +44,8 @@ aws.iam.RolePolicyAttachment(
 log_group = aws.cloudwatch.LogGroup(
     "pmproxy-logs",
     name="/aws/lambda/pmproxy",
+    # LIVE DRIFT (live is wrong, not this): the rebuilt log group has no
+    # retention set, so logs never expire. Applying this value is the fix.
     retention_in_days=7,
 )
 
@@ -59,11 +64,14 @@ lambda_function = aws.lambda_.Function(
     reserved_concurrent_executions=10,
     environment=aws.lambda_.FunctionEnvironmentArgs(
         variables={
-            "PMPROXY_AUTH_ENABLED": "true",  # require Cognito JWT on /clob /gamma /chain
-            "PMPROXY_COGNITO_REGION": "eu-west-1",
-            "PMPROXY_COGNITO_POOL_ID": cognito_pool_id,
-            "PMPROXY_COGNITO_APP_CLIENT_ID": cognito_client_id,
-            "RUST_LOG": "info",
+            # Cognito Bearer is RETIRED. The Function URL is AWS_IAM, so callers
+            # SigV4-sign; a Bearer token would fight SigV4 over the Authorization
+            # header. Flipping this to "true" breaks every client.
+            # To re-enable in-process JWT auth you would also have to restore
+            # PMPROXY_COGNITO_{REGION,POOL_ID,APP_CLIENT_ID} here (pool
+            # eu-west-1_BCrjnvkqQ still exists) — the live function sets none of
+            # them today, and this map deliberately matches the live function.
+            "PMPROXY_AUTH_ENABLED": "false",
         },
     ),
     # CI deploys (.github/workflows/deploy-pmproxy.yml) own the function code via
@@ -76,34 +84,26 @@ lambda_function = aws.lambda_.Function(
 function_url = aws.lambda_.FunctionUrl(
     "pmproxy-url",
     function_name=lambda_function.name,
-    authorization_type="NONE",  # pmproxy validates Cognito JWT itself in-process
-    cors=aws.lambda_.FunctionUrlCorsArgs(
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-        max_age=86400,
-    ),
+    # AWS_IAM, not NONE. AuthType=NONE 403s account-wide (Lambda public-access
+    # block), and the account owner never flipped it — so IAM is the auth layer.
+    # Callers SigV4-sign with service "lambda" AND must send x-amz-content-sha256;
+    # a signed request missing that header gets the same bare 403.
+    # See pmtrader/polymarket/sigv4.py for the client side.
+    authorization_type="AWS_IAM",
+    # No CORS block: the live URL has none, and a browser can't SigV4 anyway.
 )
 
-aws.lambda_.Permission(
-    "pmproxy-url-public-invoke",
-    action="lambda:InvokeFunctionUrl",
-    function=lambda_function.name,
-    principal="*",
-    function_url_auth_type="NONE",
-    statement_id="FunctionURLAllowPublicAccess",
-)
+# NO anonymous lambda.Permission resources here. The live function has NO
+# resource policy at all (`aws lambda get-policy` → ResourceNotFoundException).
+# The two `principal="*"` grants that used to live here were written for
+# AuthType=NONE; re-applying them against an AWS_IAM URL would hand the world
+# an invoke grant on the proxy. They stay deleted.
 
-# Since October 2025, public Function URLs also require lambda:InvokeFunction
-# scoped via the InvokedViaFunctionUrl context key. Without this, all
-# anonymous calls return 403 AccessDeniedException. (Docs: urls-auth.html)
-aws.lambda_.Permission(
-    "pmproxy-url-public-invoke-function",
-    action="lambda:InvokeFunction",
-    function=lambda_function.name,
-    principal="*",
-    statement_id="FunctionURLAllowPublicInvokeFunction",
-)
+# LIVE DRIFT (nothing below exists in the account): the SNS topic and all five
+# alarms were destroyed in the teardown and were NOT recreated during the
+# 2026-08-21 hand rebuild. pmproxy currently runs unalarmed. These stay declared
+# because they are the intended state — re-creating them is a to-do, not a
+# reason to delete the code. The budget at the bottom DOES exist live and matches.
 
 # SNS topic for all pmproxy ops alarms. One subscription = one place to look
 # when something pages. Budget alarms (below) hit email directly without SNS,

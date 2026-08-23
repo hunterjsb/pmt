@@ -123,14 +123,14 @@ jobs:
             --query '{State:State,LastUpdateStatus:LastUpdateStatus,CodeSha256:CodeSha256}' \
             --output table
 
-      - name: Verify deployed function responds
+      # The Function URL is AuthType=AWS_IAM, so there is no unauthenticated
+      # probe to curl here — every check has to be SigV4-signed. Resolving the
+      # URL is all this step does; test_deployed.py does the signing.
+      - name: Resolve Function URL
         id: verify
         run: |
           URL=$(aws lambda get-function-url-config --function-name pmproxy --query 'FunctionUrl' --output text)
           echo "Lambda URL: $URL"
-          # /health is unauthenticated; expects JSON {"status":"healthy"}
-          curl -sf "${URL}health" | tee /dev/stderr
-          echo ""
           echo "url=${URL%/}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python for integration tests
@@ -142,14 +142,14 @@ jobs:
         working-directory: pmproxy/tests
         run: pip install -r requirements.txt
 
+      # Signs with the OIDC role's credentials, already exported by
+      # configure-aws-credentials. The role carries lambda:InvokeFunctionUrl on
+      # this function for exactly this step.
       - name: Run post-deploy verification against live Lambda
         working-directory: pmproxy/tests
         env:
           PMPROXY_URL: ${{ steps.verify.outputs.url }}
-          PMPROXY_COGNITO_CLIENT_ID: ${{ secrets.PMPROXY_COGNITO_CLIENT_ID }}
-          PMPROXY_COGNITO_REGION: ${{ secrets.PMPROXY_COGNITO_REGION }}
-          PMPROXY_USERNAME: ${{ secrets.PMPROXY_USERNAME }}
-          PMPROXY_PASSWORD: ${{ secrets.PMPROXY_PASSWORD }}
+          PMPROXY_AWS_REGION: ${{ env.AWS_REGION }}
         run: pytest test_deployed.py -v
 
       # Tag the commit + create a GitHub release for traceability, but only for

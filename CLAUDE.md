@@ -53,14 +53,24 @@ Write strategies in Python, transpile to Rust for HFT performance.
 
 ## Infra & Deployment
 
-All AWS infra is in `infra/pulumi/` (Python Pulumi, S3 backend, eu-west-1 pinned).
+AWS infra is *described* in `infra/pulumi/` (Python Pulumi, eu-west-1 pinned).
 Current live state and decisions are tracked in `.infra/INFRA.md` (gitignored).
 
-- **pmproxy** — Lambda + Function URL in eu-west-1. Code deploys via GitHub Actions (`.github/workflows/deploy-pmproxy.yml`) using OIDC-federated role `pmproxy-ci-deploy`: builds the Lambda zip, then `aws lambda update-function-code` to push the new binary. Trigger: `workflow_dispatch` or auto on `pmproxy-v*` release publish. **Config changes** (env vars, memory, role, etc.) still go through `pulumi up` locally — CI only swaps the binary, not the infra.
+- **NEVER run `pulumi up`.** The state bucket was destroyed in the 2026 teardown;
+  the stack has no state, so an apply tries to *create* resources that already
+  exist. `pulumi preview` only, until the import described in
+  `infra/pulumi/README.md` is done. Config changes go through the AWS CLI today.
+- **pmproxy** — Lambda + Function URL in eu-west-1. The URL is `AuthType=AWS_IAM`:
+  callers SigV4-sign (`pmtrader/polymarket/sigv4.py`) and must send
+  `x-amz-content-sha256`. `PMPROXY_AUTH_ENABLED=false` — Cognito Bearer is retired.
+  Code deploys via GitHub Actions (`.github/workflows/deploy-pmproxy.yml`) using
+  OIDC-federated role `pmproxy-ci-deploy`: builds the Lambda zip, then
+  `aws lambda update-function-code`. Trigger: `workflow_dispatch` or auto on
+  `pmproxy-v*` release publish. CI only swaps the binary, never the config.
 - **pmengine** — no live host. Releases via tag `pmengine-v*` produce GH artifacts only.
 - **pmtrader** — Python package, no AWS deployment.
 
-Tag-triggered workflows (`publish-pmproxy.yml`, `publish-pmengine.yml`, `publish-pmtrader.yml`) build + cut GitHub releases. `deploy-pmproxy.yml` handles Lambda deploys via Pulumi.
+Tag-triggered workflows (`publish-pmproxy.yml`, `publish-pmengine.yml`, `publish-pmtrader.yml`) build + cut GitHub releases. `deploy-pmproxy.yml` handles Lambda deploys via `aws lambda update-function-code` — not Pulumi.
 
 ## Live trading ops (crypto up/down trigger)
 
