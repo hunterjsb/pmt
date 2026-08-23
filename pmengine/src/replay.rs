@@ -100,6 +100,10 @@ struct TunablesOverride {
     decided_stale_s: f64,
     #[serde(default = "default_late_clip_mult")]
     late_clip_mult: f64,
+    #[serde(default = "default_late_terminal_agree")]
+    late_terminal_agree: bool,
+    #[serde(default = "default_latch_release_on_proof")]
+    latch_release_on_proof: bool,
 }
 fn default_distrust_net() -> f64 {
     Tunables::default().distrust_net
@@ -116,6 +120,12 @@ fn default_decided_stale_s() -> f64 {
 fn default_late_clip_mult() -> f64 {
     Tunables::default().late_clip_mult
 }
+fn default_late_terminal_agree() -> bool {
+    Tunables::default().late_terminal_agree
+}
+fn default_latch_release_on_proof() -> bool {
+    Tunables::default().latch_release_on_proof
+}
 impl From<TunablesOverride> for Tunables {
     fn from(t: TunablesOverride) -> Self {
         Tunables {
@@ -124,6 +134,8 @@ impl From<TunablesOverride> for Tunables {
             decided_k: t.decided_k,
             decided_stale_s: t.decided_stale_s,
             late_clip_mult: t.late_clip_mult,
+            late_terminal_agree: t.late_terminal_agree,
+            latch_release_on_proof: t.latch_release_on_proof,
         }
     }
 }
@@ -588,6 +600,12 @@ fn model_from_eval_record(rec: &Value, p_up: f64, p: &ArmParams, tun: &Tunables)
         // engine actually enforced back then.
         guard_bp: rec.get("guard_bp").and_then(|v| v.as_f64()).unwrap_or(p.basis_guard_bp),
         flip_proof: false,
+        // Absent on every tape written before `term_bp` shipped, and on
+        // every Binance arm forever. `None` is the honest reconstruction
+        // either way, and it makes the `late_terminal_agree` knob a no-op
+        // in evals mode rather than a gate acting on a guessed zero — this
+        // knob's A/B belongs in `--mode full`, which recomputes the read.
+        term_bp: rec.get("term_bp").and_then(|v| v.as_f64()),
     }
 }
 
@@ -790,7 +808,15 @@ fn feed_state_at(
     }
     closes.push(spot);
     let rho = lag1_autocorr(&closes, 60);
-    FeedState { spot, spot_ts, per_min, candle_open: None, closes, rho, last_err: None }
+    // `spot_hist` stays empty on this path and that is the contract, not an
+    // omission: it is the settlement stream's 1 Hz buffer, and a Binance
+    // arm has no settlement stream. `terminal_bank` falls back to its spot
+    // proxy when the buffer is empty, so a kline-fed window prices exactly
+    // as it did before the buffer existed.
+    FeedState {
+        spot, spot_ts, per_min, candle_open: None, closes, rho, last_err: None,
+        spot_hist: Vec::new(),
+    }
 }
 
 /// True TWAP-proxy settlement, scored after the window closed — no
