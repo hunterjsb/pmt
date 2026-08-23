@@ -220,7 +220,6 @@ impl OrderManager {
         Ok(count)
     }
 
-    /// Process a fill from the exchange.
     /// Process a fill event from the user-trades stream.
     ///
     /// `fee` is the realized trading fee in USDC (not basis points). Compute
@@ -271,7 +270,6 @@ impl OrderManager {
         self.orders.get(order_id)
     }
 
-    /// Get all active orders.
     /// Owned snapshot of currently-active orders, for introspection by the
     /// control plane. Cloned so the caller can serialize without holding a
     /// reference into the manager.

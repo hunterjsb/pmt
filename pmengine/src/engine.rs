@@ -302,7 +302,7 @@ impl Engine {
         let mut seen_slugs = std::collections::HashSet::new();
         let mut markets = Vec::new();
 
-        for market in event_markets.into_iter().chain(recurring_markets.into_iter()) {
+        for market in event_markets.into_iter().chain(recurring_markets) {
             if seen_slugs.insert(market.slug.clone()) {
                 markets.push(market);
             }
@@ -501,6 +501,14 @@ impl Engine {
 
             // Create and register the strategy
             let strategy = (info.factory)();
+
+            if let Some(w) = crate::config::slow_tick_warning(
+                name,
+                strategy.tick_interval_ms(),
+                self.config.tick_interval_ms,
+            ) {
+                tracing::warn!("{}", w);
+            }
 
             // Initialize order books for subscriptions and resolve their
             // condition_ids for the public-trade poller.
@@ -1118,8 +1126,10 @@ impl Engine {
 
                         tracing::info!(tick = tick_count, elapsed_ms = elapsed.as_millis(), "Tick");
 
-                        // Periodic position reconcile against the data-api (every
-                        // 30 ticks ≈ 30s). Incremental fill detection can miss
+                        // Periodic position reconcile against the data-api, every
+                        // 30 ENGINE TICKS — so ~1.5s under the launcher's 50ms
+                        // PMENGINE_TICK_INTERVAL_MS, 30s at the binary's own
+                        // 1000ms default. Incremental fill detection can miss
                         // fills — notably partials that land in the MM's
                         // cancel/replace window get attributed to an order the
                         // engine no longer tracks and are dropped. The data-api
@@ -1782,7 +1792,7 @@ impl Engine {
                                         source: "engine".to_string(),
                                     })
                                     .collect();
-                                for (_, ext) in self.external_orders.iter() {
+                                for ext in self.external_orders.values() {
                                     combined.push(crate::control::UnifiedOrderInfo {
                                         id: ext.id.clone(),
                                         token_id: ext.token_id.clone(),

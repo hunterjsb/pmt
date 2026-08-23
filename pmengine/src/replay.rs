@@ -33,18 +33,13 @@
 use crate::strategies::updown::{Action, ArmParams, ArmState, ArmView, DecideOut, TopOfBook};
 use crate::strategies::updown_model::{
     eval_model, lag1_autocorr, shape_klines, FeedState, GateReason, Kline, ModelEval, Tunables,
-    EV_EVAL, EV_FIRE, EV_GATED,
+    BINANCE_DATA, EV_EVAL, EV_FIRE, EV_GATED, KLINE_LOOKBACK_S,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-
-const BINANCE_DATA: &str = "https://data-api.binance.vision";
-/// Matches poll_binance's live reach-back so the regime autocorr has real
-/// history instead of pinning at 0.
-const KLINE_LOOKBACK_S: i64 = 2700;
 
 pub struct ReplayOpts {
     pub mode: String,

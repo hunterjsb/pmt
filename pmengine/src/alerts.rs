@@ -146,8 +146,8 @@ fn short_id() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    // Mix the low 40 bits of the time with a small counter via thread-local
-    // PID + atomic. Avoids any extra rand crate.
+    // Unix nanos mixed with a process-wide counter, so two ids minted inside
+    // the same clock tick still differ. Avoids pulling in a rand crate.
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("{:010x}", (nanos as u64).wrapping_add(c))

@@ -5,7 +5,8 @@
 //!
 //! This client:
 //! 1. Uses the SDK for L1 auth (derive-api-key) and order signing
-//! 2. Handles L2 authenticated requests (POST/DELETE order) ourselves with correct paths
+//! 2. Handles L2 authenticated POSTs (place order) ourselves with correct paths.
+//!    Cancels still go through the SDK — see `cancel_order`.
 
 use std::str::FromStr;
 
@@ -694,7 +695,7 @@ impl BookRestResponse {
                 size: l.size,
             })
             .collect();
-        bids.sort_by(|a, b| b.price.cmp(&a.price));
+        bids.sort_by_key(|l| std::cmp::Reverse(l.price));
 
         let mut asks: Vec<Level> = self
             .asks
@@ -704,7 +705,7 @@ impl BookRestResponse {
                 size: l.size,
             })
             .collect();
-        asks.sort_by(|a, b| a.price.cmp(&b.price));
+        asks.sort_by_key(|l| l.price);
 
         let timestamp: i64 = self
             .timestamp

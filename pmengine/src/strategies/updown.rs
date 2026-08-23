@@ -23,8 +23,8 @@ use crate::position::Fill;
 use crate::strategies::updown_model::{
     append_jsonl, avg_down_blocks, budget_unlocked, book_sample_due, distrust_blocks, eval_model,
     lag1_autocorr, pay_up_limit, safety_gate_blocks, shape_klines, side_safety, FeedState,
-    GateReason, ModelEval, Tunables, EV_BOOK, EV_CLEANUP, EV_EVAL, EV_EXIT, EV_FIRE, EV_GATED,
-    EV_ROLL,
+    GateReason, ModelEval, Tunables, BINANCE_DATA, EV_BOOK, EV_CLEANUP, EV_EVAL, EV_EXIT,
+    EV_FIRE, EV_GATED, EV_ROLL, KLINE_LOOKBACK_S,
 };
 #[cfg(test)]
 use crate::strategies::updown_model::MAX_SPOT_AGE_S;
@@ -36,7 +36,6 @@ use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-const BINANCE_DATA: &str = "https://data-api.binance.vision";
 /// Exit rule (the -$318 lesson: a 99%-fair entry died with no hands to act
 /// as it flipped). Dump a held side when its fair collapses below
 /// EXIT_FAIR — but only into a bid within EXIT_MAX_DISCOUNT of fair;
@@ -44,7 +43,8 @@ const BINANCE_DATA: &str = "https://data-api.binance.vision";
 const EXIT_FAIR: f64 = 0.40;
 const EXIT_MAX_DISCOUNT: f64 = 0.08;
 /// One order in flight per token; assume dead if no fill inside this window.
-/// Must outlive the engine's ~5s position-reconcile cadence: taker fills
+/// Must outlive the engine's position-reconcile cadence (every 30 engine
+/// ticks — ~1.5s at the launcher's 50ms tick): taker fills
 /// are often MISSED by the realtime fill path and only show up via
 /// reconcile (proven live), so freeing budget sooner buys fills twice.
 const INFLIGHT_TTL_S: f64 = 12.0;
@@ -791,7 +791,7 @@ impl ArmState {
         let (p_up, sig_bp) = (m.p_up, m.sig_bp);
 
         // Notional already committed. on_fill events are unreliable for
-        // taker orders (fills often only surface via the ~5s position
+        // taker orders (fills often only surface via the periodic position
         // reconcile), so the authoritative floor is the position tracker:
         // shares held x entry price. Take the max of every signal we have.
         self.inflight.retain(|_, (_, at)| now - *at < INFLIGHT_TTL_S);
@@ -1268,9 +1268,7 @@ fn poll_binance(
     let mut candle_open = None;
     let mut closes = Vec::new();
     if kind == "twap" {
-        // Reach back 45min so the regime autocorr has real history — a
-        // window-only fetch left rho pinned at 0 and the chop gate dead.
-        let start_ms = ((start as i64 - 2700) * 1000).to_string();
+        let start_ms = ((start as i64 - KLINE_LOOKBACK_S) * 1000).to_string();
         let v: serde_json::Value = client
             .get(format!("{}/api/v3/klines", BINANCE_DATA))
             .query(&[("symbol", symbol), ("interval", "1m"), ("startTime", &start_ms), ("limit", "500")])
@@ -1320,7 +1318,7 @@ fn poll_binance(
 }
 
 /// Notional the position tracker proves is already spent on an arm's pair.
-/// on_fill misses taker fills (reconcile catches them ~5s later), so this
+/// on_fill misses taker fills (the periodic reconcile catches them), so this
 /// is the authoritative budget floor: shares held x entry price, with the
 /// live ask as the honest estimate while reconcile-seeded avg is still 0.
 fn position_floor(ctx: &StrategyContext, p: &ArmParams) -> f64 {

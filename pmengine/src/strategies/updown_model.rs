@@ -63,6 +63,14 @@ pub(crate) fn append_jsonl(file_name: &str, record: serde_json::Value) {
     }
 }
 
+/// Public Binance market-data host — no key, no rate-limit headaches.
+pub(crate) const BINANCE_DATA: &str = "https://data-api.binance.vision";
+/// How far before a window's start the 1m kline fetch reaches back. The
+/// regime autocorr needs real history or rho pins at 0 and the chop gate
+/// goes dead — and replay must reach back exactly as far as the live feed
+/// did, or it reconstructs a different rho than the one that traded.
+pub(crate) const KLINE_LOOKBACK_S: i64 = 2700;
+
 /// One 1m Binance kline reduced to what the model reads: bucket epoch,
 /// open, close.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -133,9 +141,12 @@ pub(crate) struct ModelEval {
     /// this TWAP anymore.
     pub(crate) flip_proof: bool,
     pub(crate) rho: f64,
-    /// R9 safety-gate inputs, recorded on every tick (not yet gating):
+    /// R9 safety-gate inputs, recorded on every tick AND gating live (see
+    /// `safety_gate_blocks`, wired into decide()'s first-clip brake):
     /// projected full-window margin, the locked banked contribution, and the
-    /// 1σ-scale residual of the unlocked piece. safety = |banked|/cushion.
+    /// 1σ-scale residual of the unlocked piece. Per-side safety is
+    /// `side_safety` — signed, not |banked|/cushion: banked mass pointing
+    /// the wrong way has to count AGAINST that side, not for it.
     pub(crate) margin_bp: f64,
     pub(crate) banked_margin_bp: f64,
     pub(crate) cushion_bp: f64,

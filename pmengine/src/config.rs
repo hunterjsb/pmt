@@ -11,16 +11,12 @@ pub struct Config {
     pub funder_address: Option<String>,
     /// CLOB API base URL
     pub clob_url: String,
-    /// WebSocket URL for market data
-    pub ws_url: String,
     /// Maximum position size per market (in USDC)
     pub max_position_size: f64,
     /// Maximum total exposure (in USDC)
     pub max_total_exposure: f64,
     /// Strategy tick interval in milliseconds
     pub tick_interval_ms: u64,
-    /// Log level
-    pub log_level: String,
     /// Signature type (0=EOA, 1=PolyProxy, 2=GnosisSafe)
     pub signature_type: u8,
     /// On engine startup, cancel any pre-existing user orders on the
@@ -47,9 +43,6 @@ impl Config {
             .or_else(|_| env::var("PMPROXY_URL").map(|u| format!("{}/clob/", u.trim_end_matches('/'))))
             .unwrap_or_else(|_| "https://clob.polymarket.com/".to_string());
 
-        let ws_url = env::var("PMENGINE_WS_URL")
-            .unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com/ws".to_string());
-
         let max_position_size = env::var("PMENGINE_MAX_POSITION_SIZE")
             .unwrap_or_else(|_| "50".to_string())
             .parse()
@@ -65,10 +58,6 @@ impl Config {
             .parse()
             .map_err(|_| ConfigError::InvalidValue("PMENGINE_TICK_INTERVAL_MS"))?;
 
-        let log_level = env::var("PMENGINE_LOG_LEVEL")
-            .or_else(|_| env::var("RUST_LOG"))
-            .unwrap_or_else(|_| "info".to_string());
-
         let signature_type = env::var("PM_SIGNATURE_TYPE")
             .or_else(|_| env::var("PMENGINE_SIGNATURE_TYPE"))
             .unwrap_or_else(|_| "0".to_string())
@@ -83,11 +72,9 @@ impl Config {
             private_key,
             funder_address,
             clob_url,
-            ws_url,
             max_position_size,
             max_total_exposure,
             tick_interval_ms,
-            log_level,
             signature_type,
             reconcile_on_startup,
         })
@@ -99,6 +86,32 @@ impl Config {
         let bytes = hex::decode(key).map_err(|_| ConfigError::InvalidValue("PRIVATE_KEY format"))?;
         bytes.try_into().map_err(|_| ConfigError::InvalidValue("PRIVATE_KEY length"))
     }
+}
+
+/// Above this, an engine loop interval is too coarse for a strategy whose
+/// own cadence is sub-second. `updown` declares 50ms because its whole
+/// latency model (quiesce windows, flip cutoffs, inflight TTLs) was fitted
+/// at that rate — but the engine's OUTER loop is the real ceiling, and it
+/// defaults to 1000ms. The CLI always passes PMENGINE_TICK_INTERVAL_MS, so
+/// a bare `pmengine run updown` is the way this bites: the model silently
+/// runs 20x slower than it was measured at, with nothing in the log saying so.
+pub const SLOW_TICK_WARN_MS: u64 = 250;
+
+/// Warning text when the engine's loop interval throttles a strategy that
+/// asked for a much faster one. `None` when the pairing is fine.
+///
+/// Diagnostic only — no clamping, no refusal: the operator's env var stays
+/// the law, this just stops the mismatch from being invisible.
+pub fn slow_tick_warning(strategy: &str, declared_ms: u64, engine_ms: u64) -> Option<String> {
+    if engine_ms <= SLOW_TICK_WARN_MS || declared_ms >= engine_ms {
+        return None;
+    }
+    Some(format!(
+        "strategy '{}' asks for a {}ms tick but the engine loop runs at {}ms \
+         (PMENGINE_TICK_INTERVAL_MS) — its latency model assumes the faster rate; \
+         set PMENGINE_TICK_INTERVAL_MS<={} or launch via `pmt engine start`",
+        strategy, declared_ms, engine_ms, SLOW_TICK_WARN_MS
+    ))
 }
 
 #[derive(Debug)]
@@ -117,3 +130,28 @@ impl std::fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slow_tick_warning_fires_on_the_binary_default_for_updown() {
+        // The exact live footgun: `pmengine run updown` with no env var.
+        let w = slow_tick_warning("updown", 50, 1000).expect("1000ms throttles a 50ms strategy");
+        assert!(w.contains("updown") && w.contains("50ms") && w.contains("1000ms"), "{w}");
+    }
+
+    #[test]
+    fn slow_tick_warning_silent_when_the_loop_keeps_up() {
+        assert!(slow_tick_warning("updown", 50, 50).is_none(), "what the CLI passes");
+        assert!(slow_tick_warning("updown", 50, 250).is_none(), "at the threshold, not over it");
+    }
+
+    #[test]
+    fn slow_tick_warning_silent_for_strategies_that_want_a_slow_tick() {
+        // A strategy declaring 5s is not throttled by a 1s loop.
+        assert!(slow_tick_warning("market_maker", 5000, 1000).is_none());
+        assert!(slow_tick_warning("market_maker", 1000, 1000).is_none());
+    }
+}

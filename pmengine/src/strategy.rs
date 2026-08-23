@@ -9,15 +9,19 @@ use std::sync::Arc;
 
 /// Urgency level for order execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// NOTE: currently advisory only. OrderManager::place_order binds this as
+/// `_urgency` and every order goes out as a plain limit — nothing here
+/// changes order type or crosses a spread. Strategies that need to cross
+/// (updown emits High) must price the limit marketably themselves.
 pub enum Urgency {
-    /// Post-only limit order, willing to wait
+    /// Willing to wait (intent: post-only)
     Low,
     /// Standard limit order
     #[default]
     Medium,
-    /// Aggressive limit order, cross spread if needed
+    /// Wants the fill now (intent: cross the spread)
     High,
-    /// Immediate execution, use market order
+    /// Wants the fill unconditionally (intent: market order)
     Immediate,
 }
 
