@@ -120,9 +120,9 @@ def _fire_roll_records() -> list[dict]:
                                   evs={tape.EV_FIRE, tape.EV_ROLL}))
 
 
-# How many decided windows the display strip carries. Views state this number
-# rather than implying "everything" — a retention cap that isn't on screen is
-# indistinguishable from a missing trade.
+# Decided windows the display list carries. A cap, so views must SAY they are
+# capped — a retention limit that isn't on screen is indistinguishable from a
+# missing trade (watch's trades panel names it in its title).
 WINDOWS_SHOWN = 12
 
 
