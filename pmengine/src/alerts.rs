@@ -219,6 +219,50 @@ impl Notifier {
         }
     }
 
+    /// Fire a plain title/body push — no queue entry, no approve/reject
+    /// workflow. For conditions a human must SEE but cannot act on with one
+    /// tap (the startup unmanaged-position report: the window already
+    /// resolved, there is no order to approve).
+    ///
+    /// Blocking and synchronous on purpose: callers are the strategy's own
+    /// `std::thread` helpers, which have no runtime to await on — and
+    /// reqwest::blocking must not be driven from a tokio worker. Best-effort
+    /// like `notify`: failures log and are dropped.
+    pub fn notify_text_blocking(&self, title: &str, body: &str) {
+        match self {
+            Notifier::Multi(backends) => {
+                for n in backends {
+                    n.notify_text_blocking(title, body);
+                }
+            }
+            Notifier::Noop => tracing::info!(title, body, "Notification (noop notifier)"),
+            Notifier::Ntfy { topic, .. } => {
+                let res = reqwest::blocking::Client::new()
+                    .post(format!("https://ntfy.sh/{}", topic))
+                    .header("Title", title)
+                    .header("Tags", "rotating_light,robot")
+                    .header("Priority", "high")
+                    .body(body.to_string())
+                    .send();
+                if let Err(e) = res {
+                    tracing::warn!(error = %e, "ntfy text notify failed");
+                }
+            }
+            Notifier::Discord { webhook_url } => {
+                let payload = serde_json::json!({
+                    "content": format!("**{}**\n{}", title, body),
+                });
+                let res = reqwest::blocking::Client::new()
+                    .post(webhook_url)
+                    .json(&payload)
+                    .send();
+                if let Err(e) = res {
+                    tracing::warn!(error = %e, "discord text notify failed");
+                }
+            }
+        }
+    }
+
     /// Inner dispatch — never recurses into Multi (Multi is unwrapped in
     /// `notify` above). Keeping this split avoids the "recursive async fn
     /// requires boxing" error from naive recursion.
