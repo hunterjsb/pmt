@@ -52,6 +52,7 @@ import argparse
 import json
 import math
 import os
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -59,6 +60,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 H = Path.home()
+ENGINE_DIR = H / ".pmt" / "engine"
 TAPE = H / ".pmt" / "engine" / "updown-tape.jsonl"
 BOOK_TAPE = H / ".pmt" / "engine" / "book-tape.jsonl"
 ACTIVITY = H / ".pmt" / "corpus" / "activity.jsonl"
@@ -100,6 +102,23 @@ ERAS = [
 # The tape's eval/gated throttle and the strategy tick, both from the engine.
 EVAL_THROTTLE_S = 5.0
 TICK_MS_NOMINAL = 50.0
+
+# Spans where the engine was NOT RUNNING. A fire cannot be joined to a fill
+# across one of these, and a naive join reads the outage as latency. Anything
+# inside is dropped and the drop is reported rather than done silently.
+#   2026-08-23 09:25:11Z -> 09:33:06Z : axum-0.8 route-syntax panic on startup,
+#   fixed in 133806c. Bracketed by the last line of engine-20260823-033004.log
+#   and the first of engine-20260823-053306.log.
+BLACKOUTS = [
+    (1787477111.0, 1787477586.0, "axum route panic — engine headless"),
+]
+
+
+def in_blackout(t: float) -> str | None:
+    for a, b, why in BLACKOUTS:
+        if a <= t <= b:
+            return why
+    return None
 
 
 # ---------------------------------------------------------------- helpers
@@ -961,6 +980,286 @@ join, no assumption and no instrumentation.
   above {EVAL_THROTTLE_S:.0f}s is real hesitation and worth a look.""")
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_TS = re.compile(r"^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)")
+
+
+def load_engine_log_events(logdir: Path = ENGINE_DIR):
+    """Order-lifecycle events out of the engine's own rotating logs.
+
+    This is the one place the corpus records BOTH sides of an order without
+    an on-chain timestamp in the way: `updown clip firing` is logged the
+    instant the strategy decides, and `Order placed order_id=..` is logged
+    after the HTTP response carrying that id comes back. The difference is a
+    true decision->acknowledgement measurement -- no Polygon block, no
+    second-granularity truncation, no join heuristic. It is the number the
+    rest of this report had to bound instead of measure.
+
+    Only the retained logs are readable (they rotate on restart and the early
+    ones are gone), so this covers a suffix of the tape's span, not all of it.
+    """
+    ev = []
+    for f in sorted(logdir.glob("engine-*.log")):
+        try:
+            fh = f.open(errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                line = _ANSI.sub("", line)
+                m = _TS.match(line)
+                if not m:
+                    continue
+                try:
+                    t = datetime.strptime(m.group(1)[:26] + "+0000",
+                                          "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
+                except ValueError:
+                    continue
+                if "clip firing" in line:
+                    g = lambda p: (re.search(p, line) or [None, None])[1]  # noqa: E731
+                    ev.append({"t": t, "k": "fire", "slug": g(r"slug=([\w-]+)"),
+                               "side": g(r'side="(\w+)"'), "ask": g(r"ask=([\d.]+)"),
+                               "size": g(r"size=([\d.]+)"), "log": f.name})
+                elif "Order placed" in line:
+                    ev.append({"t": t, "k": "placed",
+                               "oid": (re.search(r"order_id=(0x[0-9a-f]+)", line)
+                                       or [None, None])[1], "log": f.name})
+                elif "Order cancelled" in line:
+                    ev.append({"t": t, "k": "cancelled",
+                               "oid": (re.search(r'order_id="?(0x[0-9a-f]+)', line)
+                                       or [None, None])[1], "log": f.name})
+                elif "Order execution failed" in line:
+                    ev.append({"t": t, "k": "failed", "msg": line.strip()[:200],
+                               "log": f.name})
+    ev.sort(key=lambda r: r["t"])
+    return ev
+
+
+def section_order_ack(ev):
+    hdr("7. THE ORDER PATH, MEASURED  [MEASURED — engine log, decision line to "
+        "ack line]")
+    print("""
+Everything above had to bound the order path because the only fill clock was
+a Polygon block. The engine's own log does better: it prints one line when
+the strategy decides and another when the CLOB's response comes back with an
+order id. Both are local, monotonic within a process, microsecond-stamped.
+This is the real intent->acknowledgement number.
+""".strip())
+    if not ev:
+        print("\n  no engine logs found — skipped")
+        return
+    fires = [e for e in ev if e["k"] == "fire"]
+    if not fires:
+        print("\n  no clip-firing lines in the retained logs — skipped")
+        return
+    print(f"\n  retained logs cover {ts(ev[0]['t'])} -> {ts(ev[-1]['t'])}   "
+          f"{len(fires)} clip firings, "
+          f"{len([e for e in ev if e['k']=='placed'])} orders placed")
+    print("  (logs rotate on restart; the early night is gone, so this is a "
+          "suffix of the tape's span)")
+
+    lat, noorder = [], []
+    for i, e in enumerate(fires):
+        stop = fires[i + 1]["t"] if i + 1 < len(fires) else float("inf")
+        p = next((x for x in ev if x["t"] > e["t"] and x["t"] < stop
+                  and x["k"] == "placed"), None)
+        if p:
+            lat.append(((p["t"] - e["t"]) * 1000.0, e, p["oid"]))
+        else:
+            noorder.append(e)
+
+    sub("decision -> order acknowledged (ms)")
+    print("  " + dist([x[0] for x in lat], unit="ms"))
+    print(f"""
+  Against the measured warm HTTP RTT to clob (118ms p50, net_probe), the wire
+  is roughly a QUARTER of this. The rest is local: order build, EIP-712
+  signing, L2 header construction, the SDK's own tick-size/neg-risk lookups
+  (which go DIRECT to clob, another full round trip each), and the awaited
+  cancel the delta matcher issues before a replace. None of that is network
+  distance and none of it needs a co-located host to fix.""")
+
+    sub("fires that produced NO order at all")
+    print(f"  {len(noorder)}/{len(fires)} ({100*len(noorder)/len(fires):.1f}%) "
+          f"of clip firings never reached the wire")
+    for e in noorder:
+        print(f"    {ts(e['t'])}  {e['slug']} {e['side']} ask {e['ask']} size {e['size']}")
+    print("""
+  These are mostly the delta-quote matcher declining to replace an order whose
+  price and size already match the new intent. The tape records a `fire` for
+  each one, which is why fire counts overstate orders -- the same effect r7
+  found in sizing. One of them (07:40) was a genuine HTTP 400 rejection.""")
+
+    fails = [e for e in ev if e["k"] == "failed"]
+    if fails:
+        sub("hard order failures")
+        for e in fails:
+            print(f"  {ts(e['t'])}  {e['msg'][:150]}")
+
+    sub("how long an order actually rests before it is cancelled")
+    placed, life = {}, []
+    for e in ev:
+        if e["k"] == "placed" and e.get("oid"):
+            placed[e["oid"]] = e["t"]
+        elif e["k"] == "cancelled" and e.get("oid") in placed:
+            life.append(e["t"] - placed.pop(e["oid"]))
+    if life:
+        print("  " + dist(life))
+        print(f"""
+  THIS IS NOT 12 SECONDS. The clip clock re-decides every 12s, but the delta
+  matcher keeps the standing order whenever price and size still match, so an
+  unfilled clip actually sits for a median {q(life,.5):.0f}s and a p90 of {q(life,.9):.0f}s. The
+  effective re-quote interval is therefore ~{q(life,.5):.0f}s, not 12s, and section 6's
+  retry-pricing row should be read against that.""")
+
+
+def section_specimen(slug, tape, books, fires, ev, outcomes):
+    hdr(f"8. WORKED EXAMPLE — {slug}")
+    print("""
+One window, every record we hold, in order. The point of a worked example is
+that it either shows the same mechanism the aggregates claim, or it exposes
+the aggregate as an artefact. This one does the former, harder than the
+aggregates do.
+""".strip())
+    recs = sorted([d for d in sum(tape.values(), []) if d.get("slug") == slug],
+                  key=lambda r: r["t"])
+    if not recs:
+        print(f"\n  no tape records for {slug}")
+        return
+    bl = books.get(slug, [])
+
+    def book_at(t):
+        """(last sample at or before t, first sample after t).
+
+        Both, deliberately. The engine fires off a book newer than either, and
+        showing only the stale side would understate what it knew; showing only
+        the fresh side would overstate it. The pair brackets the truth.
+        """
+        before = after = None
+        for r in bl:
+            if r["t"] <= t:
+                before = r
+            else:
+                after = r
+                break
+        return before, after
+
+    def terminal_winner():
+        """Winner from the window's own last book when the corpus has none.
+
+        outcomes.jsonl is built wallet-first, so a window we never filled has
+        no entry -- which is exactly the population a miss study cares about.
+        A settled pair quotes 0.999/0.001, so the terminal book is the market's
+        own verdict and is only trusted when it is that decisive.
+        """
+        for r in reversed(bl):
+            up = r.get("up_bid") if r.get("up_bid") is not None else r.get("up_ask")
+            dn = r.get("dn_bid") if r.get("dn_bid") is not None else r.get("dn_ask")
+            p = None
+            if up is not None and dn is not None:
+                p = (up + (1.0 - dn)) / 2.0
+            elif up is not None:
+                p = up
+            elif dn is not None:
+                p = 1.0 - dn
+            if p is None:
+                continue
+            if p >= 0.9:
+                return "up", "terminal book"
+            if p <= 0.1:
+                return "down", "terminal book"
+            return None, None
+        return None, None
+
+    sub("the moment the edge existed, and the moment we were allowed to take it")
+    evals = [r for r in recs if r["ev"] == "eval"]
+    fs = [r for r in recs if r["ev"] == "fire"]
+    best = None
+    for r in evals:
+        for s in r.get("sides", []):
+            if s["net"] > (best[1]["net"] if best else -9e9):
+                best = (r, s)
+    if best:
+        r, s = best
+        b, _ = book_at(r["t"])
+        pre = "dn" if s["side"] == "down" else "up"
+        print(f"  BEST EDGE SEEN   {ts(r['t'])}  {s['side']} ask {s['ask']} "
+              f"fair {s['fair']:.4f}  net {100*s['net']:+.2f}c"
+              + (f"   REAL DEPTH: {b.get(pre+'_ask_sz')}sh resting at "
+                 f"{b.get(pre+'_ask')}" if b else ""))
+    if fs:
+        f0 = fs[0]
+        print(f"  FIRST FIRE       {ts(f0['t'])}  {f0['side']} ask {f0['ask']} "
+              f"fair {f0['fair']:.4f}  net {100*f0['net']:+.2f}c  size {f0['size']} "
+              f"mode {f0.get('mode')}")
+        if best:
+            gap = f0["t"] - best[0]["t"]
+            lost = (best[1]["net"] - f0["net"]) * 100
+            print(f"  -> {gap:.0f}s elapsed and {lost:+.2f}c of edge evaporated "
+                  f"between the two. Nothing on the wire takes {gap:.0f} seconds.")
+
+    sub("every fire, and what the engine log says happened to it")
+    for f in fs:
+        b, nb = book_at(f["t"])
+        pre = "dn" if f["side"] == "down" else "up"
+        le = [e for e in ev if e["k"] == "fire" and abs(e["t"] - f["t"]) < 1.0]
+        placed = None
+        if le:
+            i = next(i for i, e in enumerate(ev) if e is le[0])
+            stop = next((e["t"] for e in ev[i+1:] if e["k"] == "fire"), float("inf"))
+            placed = next((e for e in ev[i+1:] if e["k"] == "placed" and e["t"] < stop),
+                          None)
+        def leg(r):
+            if not r:
+                return "?"
+            return (f"{r.get(pre+'_bid')}/{r.get(pre+'_ask')}"
+                    f"x{r.get(pre+'_ask_sz')} @{ts(r['t'])[-9:]}")
+        print(f"  {ts(f['t'])}  fire {f['side']} {f['size']}sh @ {f['ask']}   "
+              f"filled {f.get('_filled', 0):.0f}sh")
+        print(f"                book before {leg(b)}   after {leg(nb)}")
+        if placed:
+            print(f"                order placed +{1000*(placed['t']-f['t']):.0f}ms  "
+                  f"{placed['oid'][:18]}…")
+            can = next((e for e in ev if e["k"] == "cancelled"
+                        and e.get("oid") == placed["oid"]), None)
+            if can:
+                print(f"                cancelled after {can['t']-placed['t']:.1f}s "
+                      f"— it rested that whole time without crossing")
+        elif le:
+            print("                NO ORDER PLACED — delta matcher kept the "
+                  "standing clip (same price, same size)")
+
+    sub("what it cost")
+    won = outcomes.get(slug)
+    src = "validated corpus"
+    if not won:
+        won, src = terminal_winner()
+    filled = sum(f.get("_filled", 0) for f in fs)
+    if fs:
+        f0 = fs[0]
+        if won:
+            print(f"  window resolved {won.upper()} ({src}); we fired "
+                  f"{f0['side']} — {'CORRECT' if won == f0['side'] else 'wrong'}")
+            if src != "validated corpus":
+                print("  (outcomes.jsonl is wallet-first, so a window we never "
+                      "filled has no entry —\n   the miss population is precisely "
+                      "the one the corpus cannot grade on its own)")
+        print(f"  intended {sum(f['size'] for f in fs):.0f}sh, filled {filled:.0f}sh")
+        if won == f0["side"] and filled <= 0:
+            miss = f0["size"] * (1.0 - f0["ask"])
+            print(f"  MISSED WIN: {f0['size']:.0f}sh x (1.00 - {f0['ask']}) = "
+                  f"${miss:.2f} of profit not taken at the price we actually bid")
+            if best:
+                bm = f0["size"] * (1.0 - best[1]["ask"])
+                print(f"  and at the {best[1]['ask']} the book showed {f0['t']-best[0]['t']:.0f}s "
+                      f"earlier, the same clip was worth ${bm:.2f}")
+    print("""
+  THE READ. Three separate things went wrong here and none of them is network
+  latency: the entry gate would not let us take a large edge while it existed,
+  the pay-up buffer had no surplus to spend once the edge had shrunk to the
+  floor, and the delta matcher then declined to re-quote at all so the clip sat
+  at a stale price while the market walked away from it.""")
+
+
 def section_price_of_a_millisecond(books, fires, chains):
     hdr("6. WHAT A MILLISECOND IS ACTUALLY WORTH  [DERIVED — measured inputs, "
         "stated model]")
@@ -1039,9 +1338,9 @@ soften the tail the way a diffusion would).
 
     scen = [
         ("50 ms  (co-located floor)", 0.050),
-        ("120 ms (direct clob, measured)", 0.120),
-        ("160 ms (via eu-west-1 proxy)", 0.160),
-        ("250 ms (proxy + a cold hop)", 0.250),
+        ("120 ms (bare wire RTT to clob)", 0.120),
+        ("453 ms (MEASURED decision->ack)", 0.453),
+        ("630 ms (same, p90)", 0.630),
         ("1.0 s  (a stalled tick)", 1.000),
         (f"2.0 s  (REST book poll period)", 2.000),
         (f"{2.0 + legs50*0.12:.1f} s  (poll + {legs50:.0f} serial legs @120ms)",
@@ -1082,8 +1381,12 @@ soften the tail the way a diffusion would).
           f"{(max(f['t'] for f in fires) - min(f['t'] for f in fires))/3600:.1f}h")
     print()
     for tag, desc, a, b in (
-        ("a ", "NETWORK: 160ms order path -> 50ms co-located", 0.160, 0.050),
-        ("a'", "NETWORK, free: drop the eu-west-1 proxy, 160ms -> 120ms", 0.160, 0.120),
+        ("a ", "ORDER PATH: measured 453ms -> 50ms co-located (ALL of it)",
+         0.453, 0.050),
+        ("a1", "  ...the LOCAL 335ms of it (build/sign/SDK lookups/cancel), free",
+         0.453, 0.120),
+        ("a2", "  ...the WIRE 120ms of it, needs a co-located host", 0.120, 0.050),
+        ("a'", "NETWORK, free: drop the eu-west-1 proxy detour", 0.160, 0.120),
         ("b ", f"POLLING: {poll_dt:.1f}s effective book age -> 0.06s (the market "
                f"WS, measured live)", poll_dt, 0.059),
         ("c ", "RETRY PRICING: the 12s inflight TTL's own drift -> 3s", 12.0, 3.0),
@@ -1106,7 +1409,25 @@ soften the tail the way a diffusion would).
   is the only one that costs money to fix and it is the smallest.""")
 
 
-def section_budget(fires, chains):
+def order_log_stats(ev):
+    """(ack-latency ms, order rest-time s) pulled from the engine log events."""
+    fires = [e for e in ev if e["k"] == "fire"]
+    lat = []
+    for i, e in enumerate(fires):
+        stop = fires[i + 1]["t"] if i + 1 < len(fires) else float("inf")
+        p = next((x for x in ev if e["t"] < x["t"] < stop and x["k"] == "placed"), None)
+        if p:
+            lat.append((p["t"] - e["t"]) * 1000.0)
+    placed, life = {}, []
+    for e in ev:
+        if e["k"] == "placed" and e.get("oid"):
+            placed[e["oid"]] = e["t"]
+        elif e["k"] == "cancelled" and e.get("oid") in placed:
+            life.append(e["t"] - placed.pop(e["oid"]))
+    return lat, life
+
+
+def section_budget(fires, chains, ev):
     hdr("5. THE BUDGET — where the time between 'the world changed' and 'we own it' goes")
     filled = [f for f in fires if f["_lat"] is not None]
     lat = [f["_lat"] for f in filled]
@@ -1122,6 +1443,11 @@ def section_budget(fires, chains):
             pu.append((hit["_vwap"] - c[0]["ask"]) * 100)
     slip = [(f["_vwap"] - f["ask"]) * 100 for f in filled if f["_vwap"] is not None]
 
+    ack, life = order_log_stats(ev)
+    if not ack:
+        ack = [float("nan")]
+    if not life:
+        life = [float("nan")]
     spot_own = [f["_spot_age"] for f in fires if "_spot_age" in f]
     bgap = [f["_book_gap"] for f in fires if "_book_gap" in f]
 
@@ -1161,12 +1487,19 @@ def section_budget(fires, chains):
          "entry policy, not machinery"),
         ("ORDER: warm HTTP RTT to clob", clob50, clob90, "MEASURED",
          "net_probe; +40ms p50 more via the eu-west-1 proxy the engine actually uses"),
-        ("ORDER: EIP-712 sign + HMAC + SigV4", "~0.2ms", "~0.5ms", "GUESS",
-         "k256 ECDSA + 2 SHA256; local CPU, needs Phase 7 to confirm"),
+        ("ORDER: decision -> CLOB ack", f"{q(ack,.5):.0f}ms", f"{q(ack,.9):.0f}ms",
+         "MEASURED", f"engine log, section 7, n={len(ack)}; ~4x the bare wire RTT"),
+        ("ORDER: build/sign/SDK/cancel (residual)",
+         f"~{q(ack,.5)-net.get('clob.book',(118,))[0]:.0f}ms",
+         f"~{q(ack,.9)-net.get('clob.book',(118,))[0]:.0f}ms", "BOUNDED",
+         "ack minus one wire RTT; Phase 7 splits it further"),
         ("ORDER: intent -> on-chain fill", f"{q(lat,.5):.2f}s", f"{q(lat,.9):.2f}s",
          "BOUNDED", "includes ~2s Polygon inclusion + 1s timestamp truncation"),
-        ("FILL WAIT: re-quote after a miss", f"{q(gaps,.5):.2f}s", f"{q(gaps,.9):.2f}s",
+        ("FILL WAIT: clip clock re-decides", f"{q(gaps,.5):.2f}s", f"{q(gaps,.9):.2f}s",
          "MEASURED", "INFLIGHT_TTL_S = 12.0, a constant we own"),
+        ("FILL WAIT: order actually rests", f"{q(life,.5):.1f}s", f"{q(life,.9):.1f}s",
+         "MEASURED",
+         "section 7 — the delta matcher keeps it; 12s is NOT the re-quote interval"),
     ]
     print()
     print(f"  {'stage':<40} {'p50':>10} {'p90':>10}  {'label':<9} note")
@@ -1196,6 +1529,8 @@ def main() -> int:
     ap.add_argument("--refresh", action="store_true",
                     help="re-walk the wallet activity feed into the cache first")
     ap.add_argument("--since", type=float, default=0.0)
+    ap.add_argument("--specimen", default="sol-updown-5m-1787475300",
+                    help="slug to walk record-by-record as the worked example")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -1214,7 +1549,9 @@ def main() -> int:
     global _FILLS_CACHE
     _FILLS_CACHE = fills
 
-    fires = [f for f in tape.get("fire", []) if f["t"] >= args.since]
+    all_fires = [f for f in tape.get("fire", []) if f["t"] >= args.since]
+    fires = [f for f in all_fires if not in_blackout(f["t"])]
+    dropped = len(all_fires) - len(fires)
     if not fires:
         print("no fire records — nothing to measure")
         return 1
@@ -1222,6 +1559,10 @@ def main() -> int:
     print(f"# latency_report  generated {ts(__import__('time').time())}")
     print(f"# corpus [{ts(min(f['t'] for f in fires))} .. "
           f"{ts(max(f['t'] for f in fires))}]")
+    for a, b, why in BLACKOUTS:
+        note = (f"{dropped} fires dropped" if dropped
+                else "no fires fell inside it, nothing dropped")
+        print(f"# blackout excluded: {ts(a)} -> {ts(b)}  ({why}) — {note}")
 
     fires, orphans = match_fills(fires, fills)
     fires = attach_book(fires, books)
@@ -1235,8 +1576,11 @@ def main() -> int:
     section_info_freshness(books, fires, outcomes)
     section_book_age(books, fires, prints_by_slug)
     section_reaction(tape, fires)
+    ev = load_engine_log_events()
+    section_order_ack(ev)
+    section_specimen(args.specimen, tape, books, fires, ev, outcomes)
     section_price_of_a_millisecond(books, fires, chains)
-    section_budget(fires, chains)
+    section_budget(fires, chains, ev)
     return 0
 
 
