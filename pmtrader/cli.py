@@ -1791,6 +1791,129 @@ def crypto_tape(n: int, follow: bool, as_json: bool) -> None:
         proc.terminate()
 
 
+@crypto_group.command("stats")
+@click.option("--since", type=float, default=None,
+              help="Hours of tape to include (default: the v2 fleet era)")
+@click.option("--json", "as_json", is_flag=True)
+def crypto_stats(since: float | None, as_json: bool) -> None:
+    """Fleet scoreboard: est P&L, win rate, calibration, live arms, capital."""
+    import time as _t
+
+    floor = _t.time() - since * 3600 if since else 1787441100  # v2 fleet era
+    fires: dict[str, list] = {}
+    evals: dict[str, dict] = {}
+    rolls = 0
+    try:
+        with open("/var/home/hunter/.pmt/engine/updown-tape.jsonl") as fh:
+            for line in fh:
+                r = json.loads(line)
+                if r["t"] < floor:
+                    continue
+                if r["ev"] == "fire":
+                    fires.setdefault(r["slug"], []).append(r)
+                elif r["ev"] == "eval":
+                    evals[r["slug"]] = r
+                elif r["ev"] == "roll":
+                    rolls += 1
+    except FileNotFoundError:
+        raise click.UsageError("no tape yet")
+
+    now = _t.time()
+    series: dict[str, dict] = {}
+    cal: dict[float, list] = {}
+    wins = losses = 0
+    net = 0.0
+    for slug, fs in fires.items():
+        ev = evals.get(slug)
+        if not ev:
+            continue
+        sym, dur = slug.split("-")[0], slug.split("-")[2]
+        end = int(slug.rsplit("-", 1)[1]) + int(dur[:-1]) * 60
+        committed = ev["committed"]
+        if committed < 1:
+            continue
+        s = series.setdefault(f"{sym} {dur}", {"w": 0, "l": 0, "open": 0, "pnl": 0.0, "usd": 0.0})
+        s["usd"] += committed
+        if now < end + 60:
+            s["open"] += 1
+            continue
+        p_final = ev["p_up"]
+        if not (p_final > 0.995 or p_final < 0.005):
+            continue  # ambiguous close — excluded from the record
+        won_side = "up" if p_final > 0.5 else "down"
+        vwap = sum(f["size"] * f["ask"] for f in fs) / sum(f["size"] for f in fs)
+        won = fs[0]["side"] == won_side
+        pnl = committed / vwap - committed if won else -committed
+        s["w" if won else "l"] += 1
+        s["pnl"] += pnl
+        wins, losses, net = wins + won, losses + (not won), net + pnl
+        for f in fs:
+            b = min(int(f["fair"] * 20) / 20, 0.95)
+            cal.setdefault(b, [0, 0])
+            cal[b][0] += 1
+            cal[b][1] += f["side"] == won_side
+
+    status, bal = {}, {}
+    try:
+        status = _engine_post("/strategies/updown/command", {"action": "status"})
+    except Exception:
+        pass
+    try:
+        bal = _api().get_usdc_balance()
+    except Exception:
+        pass
+
+    if as_json:
+        click.echo(json.dumps({
+            "wins": wins, "losses": losses, "net_est": net, "rolls": rolls,
+            "series": series, "calibration": {str(k): v for k, v in cal.items()},
+            "arms": status.get("arms", {}), "balance": bal,
+        }, indent=2))
+        return
+
+    n = wins + losses
+    wr = f"{wins / n * 100:.0f}%" if n else "—"
+    cap = f"${bal['total']:,.2f}" if bal else "?"
+    console.print(f"[bold]{wins}W-{losses}L[/bold] ({wr}) · est P&L "
+                  f"[{'green' if net >= 0 else 'red'}]{net:+,.2f}[/] · "
+                  f"{rolls} rolls · capital {cap}")
+
+    t = Table(title="By series (est, tape-derived)")
+    for col in ("series", "record", "P&L", "notional"):
+        t.add_column(col, justify="right")
+    for k in sorted(series):
+        s = series[k]
+        rec = f"{s['w']}-{s['l']}" + (f" ({s['open']} open)" if s["open"] else "")
+        t.add_row(k, rec, f"{s['pnl']:+,.2f}", f"${s['usd']:,.0f}")
+    console.print(t)
+
+    if cal:
+        t = Table(title="Calibration: clips fired at stated fair vs realized")
+        for col in ("fair ≥", "clips", "hit rate"):
+            t.add_column(col, justify="right")
+        for b in sorted(cal):
+            tot, hit = cal[b]
+            t.add_row(f"{b:.2f}", str(tot), f"{hit}/{tot} ({hit / tot * 100:.0f}%)")
+        console.print(t)
+
+    arms = status.get("arms", {})
+    if arms:
+        t = Table(title="Live arms")
+        for col in ("window", "state", "committed", "fair", "roll"):
+            t.add_column(col, justify="right")
+        for slug, a in arms.items():
+            e = a.get("eval") or {}
+            state = e.get("state", "?")
+            if state == "gated":
+                state = (e.get("reason") or "gated")[:40]
+            fair = f"{e['p_up']:.4f}" if "p_up" in e else "—"
+            t.add_row(_tape_slug(slug), state, f"${e.get('committed', a.get('filled_usdc', 0)):,.2f}",
+                      fair, "⟳" if a.get("roll") else "·")
+        console.print(t)
+        if status.get("pending_rolls"):
+            console.print(f"[dim]pending rolls: {', '.join(status['pending_rolls'])}[/dim]")
+
+
 @cli.group("sports")
 def sports_group() -> None:
     """Live sports data: scores, game state, ESPN win probability."""
