@@ -238,3 +238,44 @@ def test_fetch_wallet_activity_dedupes_seam_rows_from_live_inserts(monkeypatch):
     rows = wallet.fetch_wallet_activity("0xabc", floor=0.0)
     assert sum(1 for a in rows if a.get("transactionHash") == "0xdup") == 1
     assert len(rows) == wallet.PAGE_SIZE + 1
+
+
+def _led_row(ts, usd, size=10.0, side="BUY", typ="TRADE", slug="btc-updown-5m-1000"):
+    return {"transactionHash": f"0x{ts}-{usd}", "type": typ, "slug": slug,
+            "side": side, "outcome": "up", "size": size, "usdcSize": usd,
+            "timestamp": ts}
+
+
+def test_ledger_resync_purges_mutated_row_versions(monkeypatch, tmp_path):
+    # v1 of a row is held; the feed later carries only the aggregated v2.
+    # The incremental path would keep both (double-counted buy); the resync
+    # must purge v1 and log it.
+    monkeypatch.setattr(wallet.Path, "home", staticmethod(lambda: tmp_path))
+    v1, v2 = _led_row(100, 20.0), _led_row(100, 60.0)
+    feed = [[v1]]
+    monkeypatch.setattr(wallet, "fetch_activity_page", lambda a, o: feed[0])
+    led = wallet.ActivityLedger()
+    led.refresh("0xabc")
+    assert [r["usdcSize"] for r in led.rows] == [20.0]
+
+    feed[0] = [v2]
+    led._resynced_at = 0.0  # force the periodic path
+    led.refresh("0xabc")
+    assert [r["usdcSize"] for r in led.rows] == [60.0], "stale v1 must be purged"
+    assert led.last_drift == 1
+    drift = (tmp_path / ".pmt" / "engine" / "ledger-drift.jsonl").read_text()
+    assert '"usdcSize": 20.0' in drift
+
+
+def test_ledger_stays_incremental_inside_resync_interval(monkeypatch):
+    calls = {"n": 0}
+    def page(addr, offset):
+        calls["n"] += 1
+        return [_led_row(100, 20.0)]
+    monkeypatch.setattr(wallet, "fetch_activity_page", page)
+    led = wallet.ActivityLedger()
+    led.refresh("0xabc")     # prime = full walk
+    n_prime = calls["n"]
+    led.refresh("0xabc")     # inside RESYNC_S: single-page incremental stop
+    assert calls["n"] == n_prime + 1
+    assert led.last_drift == 0

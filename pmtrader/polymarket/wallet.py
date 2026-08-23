@@ -8,6 +8,9 @@ not the three that used to exist.
 from __future__ import annotations
 
 import os
+import json
+import time
+from pathlib import Path
 
 import requests
 
@@ -19,6 +22,9 @@ PAGE_SIZE = 500
 # pagination over a LIVE feed keeps shifting, absorbing up to 100 fresh
 # inserts per fetch; row_key dedupe collapses the rest. docs/LESSONS.md#L25.
 PAGE_STEP = 400
+# Incremental refreshes self-heal with a full re-walk this often — see
+# ActivityLedger.refresh on why (mutable data-api rows drift the ledger).
+RESYNC_S = 300.0
 
 
 def row_key(a: dict) -> tuple:
@@ -105,14 +111,24 @@ class ActivityLedger:
         self._seen: set = set()
         self.primed = False  # False until the first (full-history) walk lands
         self.last_pages = 0  # pages fetched by the most recent refresh
+        self.last_drift = 0  # stale rows the most recent resync had to purge
+        self._resynced_at = 0.0
 
     def refresh(self, addr: str) -> int:
         """Fetch new rows into the ledger; returns how many were new.
 
-        The first call walks the full history (no early stop — nothing is
-        known yet, so every page is "all new" anyway); later calls stop at
-        the first fully-known page, which in steady state is page 2.
+        The first call walks the full history; later calls stop at the first
+        fully-known page, which in steady state is page 2. Every RESYNC_S the
+        incremental path is REPLACED by a fresh full walk: data-api rows are
+        not immutable — a row that mutates after we hold it (a partial-fill
+        aggregate growing, a reindex) leaves the incremental ledger holding
+        BOTH versions, and the accumulated drift showed up live as a wrong
+        watch P&L that a restart "fixed" (2026-08-23). The full history is a
+        handful of pages, so the periodic walk costs almost nothing and
+        bounds any such drift at RESYNC_S old.
         """
+        if not self.primed or time.time() - self._resynced_at >= RESYNC_S:
+            return self._resync(addr)
         offset = 0
         new = 0
         pages = 0
@@ -130,9 +146,54 @@ class ActivityLedger:
             new += page_new
             if len(page) < PAGE_SIZE:
                 break  # end of history
-            if self.primed and page_new == 0:
+            if page_new == 0:
                 break  # a whole page we already hold — caught up with the head
             offset += PAGE_STEP
-        self.primed = True
         self.last_pages = pages
         return new
+
+    def _resync(self, addr: str) -> int:
+        """Fresh full walk, atomically replacing the ledger's state.
+
+        Rows the old state held that the feed no longer contains (stale
+        versions of mutated rows, deletions) are purged — and logged to
+        ~/.pmt/engine/ledger-drift.jsonl so the next drift event names its
+        culprit rows instead of being argued from symptoms.
+        """
+        rows: list[dict] = []
+        seen: set = set()
+        offset = 0
+        pages = 0
+        while True:
+            page = fetch_activity_page(addr, offset)
+            pages += 1
+            for a in page:
+                k = row_key(a)
+                if k not in seen:
+                    seen.add(k)
+                    rows.append(a)
+            if len(page) < PAGE_SIZE:
+                break
+            offset += PAGE_STEP
+        stale = [a for a in self.rows if row_key(a) not in seen] if self.primed else []
+        new = len(seen - self._seen)
+        if stale:
+            _log_ledger_drift(stale)
+        self.rows, self._seen = rows, seen
+        self.primed = True
+        self.last_pages = pages
+        self.last_drift = len(stale)
+        self._resynced_at = time.time()
+        return new
+
+
+def _log_ledger_drift(stale_rows: list[dict]) -> None:
+    """Append purged-stale rows to the drift log; best-effort, never raises."""
+    try:
+        path = Path.home() / ".pmt" / "engine" / "ledger-drift.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            for a in stale_rows:
+                fh.write(json.dumps({"purged_at": time.time(), "row": a}) + "\n")
+    except OSError:
+        pass
