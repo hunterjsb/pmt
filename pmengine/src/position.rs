@@ -208,18 +208,6 @@ impl PositionTracker {
         self.positions.values().map(|p| p.notional()).sum()
     }
 
-    /// Get all positions with non-zero size.
-    pub fn active_positions(&self) -> Vec<&Position> {
-        self.positions
-            .values()
-            .filter(|p| p.size != Decimal::ZERO)
-            .collect()
-    }
-
-    /// Get all positions.
-    pub fn all_positions(&self) -> impl Iterator<Item = &Position> {
-        self.positions.values()
-    }
 }
 
 #[cfg(test)]

@@ -77,8 +77,7 @@ def test_wallet_outcomes_paying_redeem_names_winner():
 
 def test_wallet_outcomes_zero_redeem_flips_to_other_side():
     # held "Down" (row carries our real share size), paid $0 -> "up" won.
-    # A SIZE is required for the flip since 2026-08-23: size-0 dust rows
-    # can carry the winner's label and must not be flipped blind.
+    # The flip REQUIRES a size (docs/LESSONS.md#L22).
     rows = [
         {"type": "REDEEM", "slug": "btc-updown-15m-200", "outcome": "Down",
          "usdcSize": 0, "size": 120.0},
@@ -187,11 +186,9 @@ def test_gamma_resolution_tolerant_of_malformed_json():
 
 
 def test_grade_window_paying_redeem_wins_even_with_dust_redeem_seen():
-    # 2026-08-23 audit: ~17 windows carry a spurious $0 dust redeem beside
-    # the real paying one (partial-fill on the losing token). The summed
-    # paying amount must still decide the grade, not the mere presence of
-    # a $0 row -- redeem_seen is True here (the dust row) but redeemed_usd
-    # is the paying total, and that has to win the priority check.
+    # The summed PAYING amount decides the grade, not the presence of a $0
+    # row: redeem_seen is True here (the dust row) but redeemed_usd is the
+    # paying total, and that has to win the priority check. docs/LESSONS.md#L23.
     won, estimated = grade_window(52.30, True, "up", None, now=2000, end=1000)
     assert won is True and estimated is False
 
@@ -209,9 +206,8 @@ def test_grade_window_no_redeem_within_grace_is_riding():
 
 
 def test_grade_window_past_grace_no_redeem_no_longer_assumes_loss():
-    # this is the bug: silence past the grace window used to mean LOSS.
-    # With no gamma reachable it now degrades to the old heuristic but
-    # flags it estimated instead of presenting it as confirmed.
+    # With no gamma reachable this still degrades to the old assume-LOSS
+    # heuristic, but flags it `estimated` (docs/LESSONS.md#L24).
     won, estimated = grade_window(0.0, False, "up", None, now=2000, end=1000)
     assert won is False and estimated is True
 
@@ -313,9 +309,8 @@ def test_load_outcomes_missing_file_is_empty(tmp_path):
 
 
 def test_zero_size_dust_redeem_never_flips_blind():
-    # A $0 redeem with size 0 can carry the WINNER's label (live incident:
-    # -$265 loss recorded as a win). Only a sized row identifies our held
-    # loser; without one, wallet_outcomes must stay silent for the slug.
+    # Only a SIZED row identifies our held loser; without one, wallet_outcomes
+    # must stay silent for the slug (docs/LESSONS.md#L22).
     from polymarket.outcomes import wallet_outcomes
     dust_only = [{"type": "REDEEM", "slug": "btc-updown-15m-1", "usdcSize": 0,
                   "size": 0, "outcome": "Up"}]

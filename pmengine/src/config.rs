@@ -80,21 +80,11 @@ impl Config {
         })
     }
 
-    /// Normalize private key (strip 0x prefix if present)
-    pub fn private_key_bytes(&self) -> Result<[u8; 32], ConfigError> {
-        let key = self.private_key.strip_prefix("0x").unwrap_or(&self.private_key);
-        let bytes = hex::decode(key).map_err(|_| ConfigError::InvalidValue("PRIVATE_KEY format"))?;
-        bytes.try_into().map_err(|_| ConfigError::InvalidValue("PRIVATE_KEY length"))
-    }
 }
 
-/// Above this, an engine loop interval is too coarse for a strategy whose
-/// own cadence is sub-second. `updown` declares 50ms because its whole
-/// latency model (quiesce windows, flip cutoffs, inflight TTLs) was fitted
-/// at that rate — but the engine's OUTER loop is the real ceiling, and it
-/// defaults to 1000ms. The CLI always passes PMENGINE_TICK_INTERVAL_MS, so
-/// a bare `pmengine run updown` is the way this bites: the model silently
-/// runs 20x slower than it was measured at, with nothing in the log saying so.
+/// Above this, an engine loop interval is too coarse for a strategy whose own
+/// cadence is sub-second — the OUTER loop is the real ceiling, and it defaults
+/// to 1000ms against `updown`'s declared 50ms. See docs/LESSONS.md#L21.
 pub const SLOW_TICK_WARN_MS: u64 = 250;
 
 /// Warning text when the engine's loop interval throttles a strategy that

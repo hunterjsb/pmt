@@ -69,12 +69,11 @@ SYMBOLS = list(FEEDS)
 BINANCE_SYMBOL = {"btc": "BTCUSDT", "eth": "ETHUSDT", "sol": "SOLUSDT", "xrp": "XRPUSDT",
                   "doge": "DOGEUSDT", "bnb": "BNBUSDT"}
 
-# Deployed per-arm basis guards as of 2026-08-23 (R1 aligned measurement +
-# replay A/B): btc 6, eth 8, sol 10. xrp/doge stay untradeable via the
-# Binance proxy. bnb: feed added 2026-08-23 for the R1 fit; no guard until
-# its corpus is measured. THE source for these — `pmt crypto arm` resolves
-# its --basis-guard default here, and analysis/ reads it rather than
-# keeping copies (all three used to drift).
+# Deployed per-arm basis guards (R1 aligned measurement + replay A/B).
+# None = unmeasured corpus, so untradeable: xrp/doge via the Binance proxy,
+# bnb until its own corpus lands. THE single source — `pmt crypto arm` and
+# analysis/ both read it rather than keeping copies (docs/LESSONS.md#L18,
+# docs/LESSONS.md#L32).
 GUARD_BP: dict[str, float | None] = {"btc": 6.0, "eth": 8.0, "sol": 10.0,
                                      "xrp": None, "doge": None, "bnb": None}
 
@@ -201,30 +200,20 @@ def verify_feeds() -> dict[str, dict]:
     return out
 
 
-def fetch_rounds(symbol: str, hours: float = 24.0) -> list[dict]:
-    """Walk one feed's round history back `hours` (or to the phase start, whichever first).
+def _walk_phase_back(addr: str, phase: int, agg: int, cutoff: float) -> list[dict]:
+    """Decoded rounds walking aggregator ids DOWN from `agg`, newest first.
 
-    Returns oldest-first: [{"round_id", "price", "updated_at"}, ...]. `price`
-    is decimals-adjusted; `updated_at` is unix seconds.
+    Stops at the phase start (updated_at 0) or the first round older than
+    `cutoff`. Shared by the live walk (fetch_rounds, starting at the latest
+    round) and the backfill (extend_corpus_backward, starting at the corpus's
+    oldest) so their stop conditions and batch cadence can't drift apart.
     """
-    feed = FEEDS[symbol]
-    addr, dec = feed["address"], feed["decimals"]
-    scale = 10 ** dec
-    cutoff = time.time() - hours * 3600
-
-    latest = _decode_round(_eth_call(addr, SEL_LATEST_ROUND_DATA))
-    if latest["updated_at"] <= 0:
-        return []
-    phase, agg = split_round_id(latest["round_id"])
-
-    collected = [latest]
-    agg -= 1
+    collected: list[dict] = []
     while agg >= 0:
-        ids = list(range(agg, max(agg - BATCH_SIZE, -1), -1))
-        calls = [(addr, _encode_round_id_call(join_round_id(phase, i))) for i in ids]
-        raws = _eth_call_batch(calls)
+        calls = [(addr, _encode_round_id_call(join_round_id(phase, i)))
+                 for i in range(agg, max(agg - BATCH_SIZE, -1), -1)]
         done = False
-        for i, raw in zip(ids, raws):
+        for raw in _eth_call_batch(calls):
             if raw is None:
                 continue
             rd = _decode_round(raw)
@@ -237,10 +226,32 @@ def fetch_rounds(symbol: str, hours: float = 24.0) -> list[dict]:
             break
         agg -= BATCH_SIZE
         time.sleep(0.05)  # be polite to the public endpoint
+    return collected
 
+
+def _corpus_rows(rounds: list[dict], scale: int) -> list[dict]:
+    """Decoded rounds -> corpus row shape, price decimals-adjusted."""
+    return [{"round_id": r["round_id"], "price": r["answer"] / scale,
+             "updated_at": r["updated_at"]} for r in rounds]
+
+
+def fetch_rounds(symbol: str, hours: float = 24.0) -> list[dict]:
+    """Walk one feed's round history back `hours` (or to the phase start, whichever first).
+
+    Returns oldest-first: [{"round_id", "price", "updated_at"}, ...]. `price`
+    is decimals-adjusted; `updated_at` is unix seconds.
+    """
+    feed = FEEDS[symbol]
+    addr, scale = feed["address"], 10 ** feed["decimals"]
+    cutoff = time.time() - hours * 3600
+
+    latest = _decode_round(_eth_call(addr, SEL_LATEST_ROUND_DATA))
+    if latest["updated_at"] <= 0:
+        return []
+    phase, agg = split_round_id(latest["round_id"])
+    collected = [latest] + _walk_phase_back(addr, phase, agg - 1, cutoff)
     collected.reverse()
-    return [{"round_id": r["round_id"], "price": r["answer"] / scale, "updated_at": r["updated_at"]}
-            for r in collected]
+    return _corpus_rows(collected, scale)
 
 
 # ---------- corpus (append-only ground truth, never rewritten) ----------
@@ -388,30 +399,9 @@ def extend_corpus_backward(symbol: str, target_hours: float) -> int:
     if oldest["updated_at"] <= cutoff:
         return 0
     feed = FEEDS[symbol]
-    addr, scale = feed["address"], 10 ** feed["decimals"]
     phase, agg = split_round_id(oldest["round_id"])
-    agg -= 1
-    collected = []
-    while agg >= 0:
-        ids = list(range(agg, max(agg - BATCH_SIZE, -1), -1))
-        calls = [(addr, _encode_round_id_call(join_round_id(phase, i))) for i in ids]
-        raws = _eth_call_batch(calls)
-        done = False
-        for i, raw in zip(ids, raws):
-            if raw is None:
-                continue
-            rd = _decode_round(raw)
-            if rd["updated_at"] <= 0 or rd["updated_at"] < cutoff:
-                done = True  # zero updated_at = phase start; below cutoff = out of window
-                break
-            collected.append(rd)
-        if done:
-            break
-        agg -= BATCH_SIZE
-        time.sleep(0.05)  # be polite to the public endpoint
-    rows = [{"round_id": r["round_id"], "price": r["answer"] / scale, "updated_at": r["updated_at"]}
-            for r in collected]
-    return append_corpus(symbol, rows)
+    rounds = _walk_phase_back(feed["address"], phase, agg - 1, cutoff)
+    return append_corpus(symbol, _corpus_rows(rounds, 10 ** feed["decimals"]))
 
 
 def extend_all(target_hours: float, symbols: list[str]) -> dict[str, dict]:

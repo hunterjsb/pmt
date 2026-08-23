@@ -1,7 +1,8 @@
-"""Shared singletons + render helpers for cli.py and cli_crypto.py (and any
-future command-group split) — one Console instance, one lazy PolymarketAPI
-loader, one P&L color rule, so a second Rich console, a second auth path, or a
-second green/red convention never quietly diverges from the first.
+"""Shared singletons + render helpers for cli.py and every command-group split
+off it (cli_crypto, cli_sports, watch_ui) — one Console instance, one lazy
+PolymarketAPI loader, one P&L color rule, one deprecation banner, so a second
+Rich console, a second auth path, or a second green/red convention never
+quietly diverges from the first.
 """
 
 from __future__ import annotations
@@ -9,6 +10,22 @@ from __future__ import annotations
 from rich.console import Console
 
 console = Console()
+
+DEPRECATED = "[deprecated — candidate for removal, speak up if you use this]"
+
+
+def _deprecated(reason: str):
+    """Stamp the removal-candidate banner (plus why) onto a command's --help.
+
+    These commands still work — nothing here is broken. They're flagged as
+    one-offs whose moment looks past, so the operator sees the flag in
+    `--help` and can veto before anything actually gets deleted.
+    """
+    def deco(f):
+        f.__doc__ = f"{DEPRECATED}\n\n{reason}\n\n{f.__doc__ or ''}"
+        return f
+
+    return deco
 
 
 def _api():

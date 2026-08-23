@@ -170,7 +170,7 @@ def _risk_line(sb: dict, status: dict | None) -> str:
     hasn't banked-decided yet) plus notional still riding in unresolved
     windows. Shares _risk_committed with the watch header so the two reports
     can never disagree about what is at risk."""
-    from cli_crypto import _UNDECIDED_RED_USD, _UNDECIDED_YELLOW_USD, _risk_committed
+    from watch_ui import _UNDECIDED_RED_USD, _UNDECIDED_YELLOW_USD, _risk_committed
 
     committed, undecided = _risk_committed((status or {}).get("arms"))
     style = ("red" if undecided > _UNDECIDED_RED_USD else
@@ -316,7 +316,7 @@ def arms_table(arms: dict | None) -> Table:
     a whole sentence, and letting it wrap tore every other column's alignment
     apart — it goes through the same compact `margin -4.9 vs 6.0bp` renderer
     the watch dashboard uses."""
-    from cli_crypto import _gated_reason_compact
+    from watch_ui import _gated_reason_compact
 
     t = Table(box=None, pad_edge=False, padding=(0, 1))
     for col, justify, width in _ARMS_COLUMNS:

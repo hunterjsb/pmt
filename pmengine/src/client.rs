@@ -54,10 +54,8 @@ pub struct PolymarketClient {
     /// Optional SigV4 signer for pmproxy behind an AWS_IAM Function URL
     #[cfg(feature = "sigv4")]
     sigv4: Option<Arc<SigV4Signer>>,
-    /// Cached tick-size decimal places per token. Lets us round each
-    /// market's prices to its actual tick (0.001 vs 0.01 vs 0.0001)
-    /// instead of the previous hard-coded 2-decimal rounding that
-    /// silently snapped $0.9425 → $0.94 and killed quote precision.
+    /// Cached tick-size decimal places per token — every price rounds to its
+    /// own market's tick (0.0001/0.001/0.01), never a fixed 2 (docs/LESSONS.md#L3).
     tick_decimals: Arc<tokio::sync::RwLock<std::collections::HashMap<String, u32>>>,
 }
 
@@ -68,11 +66,10 @@ impl PolymarketClient {
         Self::new_internal(config, dry_run).await
     }
 
-    /// Create and authenticate a new client with optional SigV4 signing.
-    #[cfg(feature = "sigv4")]
-    pub async fn new(config: &Config, dry_run: bool) -> Result<Self, ClientError> {
-        Self::new_with_sigv4(config, dry_run, None).await
-    }
+    // NOTE: no `new()` under `sigv4`. It existed, forwarded to
+    // new_with_sigv4(.., None), and had zero callers in the only configuration
+    // that ships a binary — while reading as the obvious constructor that
+    // silently hands back an UNSIGNED client. Pick new_with_sigv4 explicitly.
 
     /// Create and authenticate a new client with SigV4 signing for pmproxy.
     #[cfg(feature = "sigv4")]
@@ -784,7 +781,6 @@ pub enum ClientError {
     AuthError(String),
     SdkError(String),
     OrderError(String),
-    WebSocketError(String),
 }
 
 impl std::fmt::Display for ClientError {
@@ -794,7 +790,6 @@ impl std::fmt::Display for ClientError {
             ClientError::AuthError(e) => write!(f, "Authentication error: {}", e),
             ClientError::SdkError(e) => write!(f, "SDK error: {}", e),
             ClientError::OrderError(e) => write!(f, "Order error: {}", e),
-            ClientError::WebSocketError(e) => write!(f, "WebSocket error: {}", e),
         }
     }
 }

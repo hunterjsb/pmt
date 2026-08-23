@@ -312,7 +312,6 @@ def simulate_cap(tape, cap):
 
 
 def counterfactual_report(tape, outs, side_price, loss_windows):
-    loss_slugs = {row["slug"] for row in loss_windows}
     print("\nCounterfactual: fleet-wide un-decided-committed cap")
     for cap in CAP_LEVELS:
         cf, blocked = simulate_cap(tape, cap)
@@ -362,7 +361,6 @@ def main():
     print("known $370 btc-15m window and its own 'brakes flagged 4/4 losses' audit)")
     print("=" * 78)
     for r in four:
-        never_banked = "never banked_decided" if r["pnl"] < 0 else ""
         print(f"  {r['slug']:32s} [{fmt_t(r['start'])}-{fmt_t(r['end'])}Z]  "
               f"side={r['side']:4s} vs winner={r['winner']:4s}  "
               f"committed=${r['committed']:7.2f}  pnl=${r['pnl']:8.2f}")

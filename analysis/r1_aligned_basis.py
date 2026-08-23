@@ -98,9 +98,7 @@ def main() -> None:
                 flag = "  <-- regime shift" if shifted else ""
                 print(f"  day1 p95={d1['p95']:.2f}bp (n={d1['n']})   day2 p95={d2['p95']:.2f}bp (n={d2['n']}){flag}")
 
-        # The deployed guards themselves — this script used to keep its own
-        # copy of them, which drifted (btc 3 vs the live 6) and quietly
-        # graded the wrong number against p95.
+        # Read the deployed guards, never a local copy (docs/LESSONS.md#L18).
         guard = ck.GUARD_BP.get(sym)
         if guard is not None and per_min_stats[sym]:
             p95 = per_min_stats[sym]["p95"]

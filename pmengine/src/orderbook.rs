@@ -127,24 +127,6 @@ impl OrderBook {
         self.asks.iter().map(|l| l.size).sum()
     }
 
-    /// Bid depth up to a price (for liquidity analysis).
-    pub fn bid_depth_to_price(&self, price: Decimal) -> Decimal {
-        self.bids
-            .iter()
-            .filter(|l| l.price >= price)
-            .map(|l| l.size)
-            .sum()
-    }
-
-    /// Ask depth up to a price (for liquidity analysis).
-    pub fn ask_depth_to_price(&self, price: Decimal) -> Decimal {
-        self.asks
-            .iter()
-            .filter(|l| l.price <= price)
-            .map(|l| l.size)
-            .sum()
-    }
-
     /// Volume-weighted average price for buying `size` units.
     /// Returns None if insufficient liquidity.
     pub fn vwap_buy(&self, size: Decimal) -> Option<Decimal> {
@@ -167,27 +149,6 @@ impl OrderBook {
         }
     }
 
-    /// Volume-weighted average price for selling `size` units.
-    /// Returns None if insufficient liquidity.
-    pub fn vwap_sell(&self, size: Decimal) -> Option<Decimal> {
-        let mut remaining = size;
-        let mut total_proceeds = Decimal::ZERO;
-
-        for level in &self.bids {
-            if remaining <= Decimal::ZERO {
-                break;
-            }
-            let fill = remaining.min(level.size);
-            total_proceeds += fill * level.price;
-            remaining -= fill;
-        }
-
-        if remaining > Decimal::ZERO {
-            None // Insufficient liquidity
-        } else {
-            Some(total_proceeds / size)
-        }
-    }
 
     /// Imbalance ratio: (bid_depth - ask_depth) / (bid_depth + ask_depth)
     /// Positive = more bids, negative = more asks.

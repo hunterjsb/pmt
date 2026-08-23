@@ -1,12 +1,8 @@
 """Capital-effectiveness metrics — what the plain W-L count refuses to say.
 
-The updown book's count win rate (~92%) flatters, structurally and not by
-accident: the payoff is bounded up (+2-8% of stake on a win, since we buy
-at 0.92-0.98 and collect $1) and unbounded down (-100% on a loss). A $10
-win and a $265 loss are one tally mark each. On top of that, the count
-ignores TIME: money parked in a 15m window and money flipped in a 5m one
-score the same, and money sitting idle overnight scores nothing at all
-even though it is capital we are choosing not to work.
+The count win rate flatters structurally: bounded up (+2-8% of stake, buying
+at 0.92-0.98 to collect $1), unbounded down (-100%), and blind to TIME — see
+docs/LESSONS.md#L27.
 
 So this module answers the question in two denominators, because "how
 effective are we being with our money" is two questions wearing one coat:

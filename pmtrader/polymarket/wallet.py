@@ -1,12 +1,8 @@
 """Polymarket data-api wallet-activity client — shared by every updown
 consumer that needs the trading wallet's trade/redeem history: the fleet
 scoreboard, `pmt crypto activity`/`window`, and outcomes/shadow's
-wallet-first resolver.
-
-Before this module, three near-identical copies of this fetch existed
-(scoreboard's inline loop, activity's page helper, outcomes/shadow's
-paginated fetch) with the same pagination and address-resolution logic
-maintained three times.
+wallet-first resolver. One copy of the pagination and address resolution,
+not the three that used to exist.
 """
 
 from __future__ import annotations
@@ -19,12 +15,9 @@ from . import hosts
 
 ACTIVITY_URL = f"{hosts.DATA}/activity"
 PAGE_SIZE = 500
-# Pages advance by less than their size: offset pagination over a LIVE feed
-# shifts rows down whenever the fleet trades mid-walk, duplicating (or,
-# on deletions, skipping) boundary rows. The overlap re-reads the seam —
-# up to 100 fresh inserts per page-fetch are absorbed — and row_key
-# dedupe collapses whatever duplicates remain. Without this the all-time
-# scoreboard drifted run-to-run while nothing had actually settled.
+# Deliberately < PAGE_SIZE: the overlap re-reads the seam that offset
+# pagination over a LIVE feed keeps shifting, absorbing up to 100 fresh
+# inserts per fetch; row_key dedupe collapses the rest. docs/LESSONS.md#L25.
 PAGE_STEP = 400
 
 

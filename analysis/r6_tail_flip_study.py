@@ -270,7 +270,6 @@ def trailing_sigma_bp(series: dict, j: int, window: int) -> float:
     prefix_lr, prefix_lr2 = series["prefix_lr"], series["prefix_lr2"]
     sum_r = prefix_lr[hi] - prefix_lr[lo]
     sum_r2 = prefix_lr2[hi] - prefix_lr2[lo]
-    mu = sum_r / count
     if count <= 1:
         return 0.0
     var = (sum_r2 - sum_r * sum_r / count) / (count - 1)

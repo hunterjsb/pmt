@@ -16,7 +16,6 @@ pub enum OrderStatus {
     PartiallyFilled,
     Filled,
     Cancelled,
-    Rejected,
 }
 
 /// Tracked order.
@@ -33,10 +32,6 @@ pub struct Order {
 }
 
 impl Order {
-    pub fn remaining(&self) -> Decimal {
-        self.size - self.filled_size
-    }
-
     pub fn is_active(&self) -> bool {
         matches!(self.status, OrderStatus::Pending | OrderStatus::Open | OrderStatus::PartiallyFilled)
     }
@@ -56,11 +51,6 @@ impl OrderManager {
             orders: HashMap::new(),
             fill_sender,
         }
-    }
-
-    /// Check if running in dry-run mode.
-    pub fn is_dry_run(&self) -> bool {
-        self.client.is_dry_run()
     }
 
     /// Execute a signal by placing/canceling orders.
@@ -153,9 +143,8 @@ impl OrderManager {
             .map(|(id, _)| id.clone())
             .collect();
 
-        // Keep going past individual failures — `?` here abandoned every
-        // order AFTER the first failed cancel, silently leaving live quotes
-        // on the book while pause/stop reported success (2026-08-23 sweep).
+        // Keep going past individual failures; never `?` out of this loop
+        // (see docs/LESSONS.md#L6).
         let count = to_cancel.len();
         let mut failed = 0usize;
         let mut last_err: Option<OrderError> = None;
@@ -281,10 +270,6 @@ impl OrderManager {
             .collect()
     }
 
-    pub fn active_orders(&self) -> Vec<&Order> {
-        self.orders.values().filter(|o| o.is_active()).collect()
-    }
-
     /// Get active orders for a token.
     pub fn active_orders_for_token(&self, token_id: &str) -> Vec<&Order> {
         self.orders
@@ -298,7 +283,6 @@ impl OrderManager {
 pub enum OrderError {
     SdkError(String),
     ChannelClosed,
-    InvalidOrder(String),
 }
 
 impl std::fmt::Display for OrderError {
@@ -306,7 +290,6 @@ impl std::fmt::Display for OrderError {
         match self {
             OrderError::SdkError(e) => write!(f, "SDK error: {}", e),
             OrderError::ChannelClosed => write!(f, "Fill channel closed"),
-            OrderError::InvalidOrder(e) => write!(f, "Invalid order: {}", e),
         }
     }
 }
