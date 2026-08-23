@@ -213,3 +213,4 @@ sandbox/
 .infra/
 logs/
 .claude/
+docs/LESSONS.md
