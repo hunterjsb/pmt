@@ -210,6 +210,9 @@ struct ArmState {
     last_eval: Option<serde_json::Value>,
     /// Throttle for eval/gated lines in the durable tape.
     last_tape_at: f64,
+    /// Throttle for the book/spot recorder — its own cadence, see
+    /// book_sample_due.
+    last_book_at: f64,
 }
 
 pub struct Updown {
@@ -307,6 +310,24 @@ fn tape(record: serde_json::Value) {
     }
 }
 
+/// Append one JSONL record to the book/spot recorder at ~/.pmt/engine/.
+/// Separate file from the eval tape — order-book history isn't
+/// backfillable, so this is the raw feed the replay harness (R4) needs;
+/// keeping it out of updown-tape.jsonl keeps that file's record types clean.
+fn book_tape(record: serde_json::Value) {
+    use std::io::Write;
+    let Ok(home) = std::env::var("HOME") else { return };
+    let dir = std::path::PathBuf::from(home).join(".pmt/engine");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("book-tape.jsonl"))
+    {
+        let _ = writeln!(f, "{}", record);
+    }
+}
+
 impl ArmState {
     /// Build without feeds (tests use this directly).
     fn with_params(p: ArmParams) -> Self {
@@ -323,6 +344,7 @@ impl ArmState {
             last_clip_ask: std::collections::HashMap::new(),
             last_eval: None,
             last_tape_at: 0.0,
+            last_book_at: 0.0,
         }
     }
 
@@ -567,6 +589,41 @@ impl ArmState {
         signals
     }
 
+    /// Book+spot snapshot for the replay corpus — book history isn't
+    /// backfillable, so record now what R4's replay harness will need.
+    /// Missing levels record as null rather than skipping the sample.
+    fn record_book(&mut self, ctx: &StrategyContext, now: f64) {
+        if now < self.p.start || !book_sample_due(now, self.last_book_at, self.p.end) {
+            return;
+        }
+        self.last_book_at = now;
+        let level = |token: &str, ask: bool| -> (Option<f64>, Option<f64>) {
+            let l = ctx
+                .order_books
+                .get(token)
+                .and_then(|b| if ask { b.best_ask() } else { b.best_bid() });
+            (l.and_then(|l| l.price.to_f64()), l.and_then(|l| l.size.to_f64()))
+        };
+        let (up_bid, up_bid_sz) = level(&self.p.token_up, false);
+        let (up_ask, up_ask_sz) = level(&self.p.token_up, true);
+        let (dn_bid, dn_bid_sz) = level(&self.p.token_down, false);
+        let (dn_ask, dn_ask_sz) = level(&self.p.token_down, true);
+        // Tiny lock scope — copy the two floats out, don't hold the feed
+        // mutex while formatting/writing JSON.
+        let (spot, spot_ts) = {
+            let f = self.feed.lock().unwrap();
+            (f.spot, f.spot_ts)
+        };
+        book_tape(serde_json::json!({
+            "t": now, "ev": "book", "slug": self.p.slug,
+            "up_bid": up_bid, "up_bid_sz": up_bid_sz,
+            "up_ask": up_ask, "up_ask_sz": up_ask_sz,
+            "dn_bid": dn_bid, "dn_bid_sz": dn_bid_sz,
+            "dn_ask": dn_ask, "dn_ask_sz": dn_ask_sz,
+            "spot": spot, "spot_age_s": now - spot_ts,
+        }));
+    }
+
     /// One decision pass for this arm. Returns (signals, finished).
     fn tick(&mut self, ctx: &StrategyContext, now: f64) -> (Vec<Signal>, bool) {
         let p = self.p.clone();
@@ -592,6 +649,8 @@ impl ArmState {
             }
             return (signals, true);
         }
+
+        self.record_book(ctx, now);
 
         // Quiesce: standing orders pulled, no new buys — with one carve-out.
         // When the TWAP is flip-proof (banked beyond even an adversarial
@@ -1170,6 +1229,14 @@ fn budget_unlocked(now: f64, end: f64, late_rem_s: f64, banked_decided: bool) ->
     (end - now) <= late_rem_s || banked_decided
 }
 
+/// Book recorder cadence: 5s normally, 1s inside the final 90s before
+/// settlement — manipulation-signature research (R4) needs the book
+/// fine-grained right where it matters and can afford coarse elsewhere.
+fn book_sample_due(now: f64, last: f64, end: f64) -> bool {
+    let interval = if end - now <= 90.0 { 1.0 } else { 5.0 };
+    now - last >= interval
+}
+
 /// Realized sigma (bp per 1m bar) over the last `window` returns.
 fn trailing_sigma_bp(closes: &[f64], window: usize) -> f64 {
     let n = closes.len().min(window + 1);
@@ -1315,6 +1382,17 @@ mod tests {
     #[test]
     fn late_rem_s_banked_decided_unlocks_regardless_of_time() {
         assert!(budget_unlocked(0.0, 900.0, 120.0, true));
+    }
+
+    #[test]
+    fn book_sample_cadence_tightens_in_the_final_90s() {
+        let end = 1000.0;
+        // Mid-window: 5s cadence.
+        assert!(!book_sample_due(603.0, 600.0, end), "3s in — not due yet");
+        assert!(book_sample_due(605.0, 600.0, end), "5s in — due");
+        // Inside the final 90s: 1s cadence.
+        assert!(book_sample_due(end - 89.0, end - 90.0, end), "1s in — due");
+        assert!(!book_sample_due(end - 89.5, end - 90.0, end), "0.5s in — not due yet");
     }
 
     #[test]
