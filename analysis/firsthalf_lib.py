@@ -16,10 +16,8 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-# The live tape is append-only and the engine is still writing to it, so a
-# re-run silently sees a different corpus (and can even flip an inferred
-# outcome as a window's terminal book matures). Point PMT_BOOK_TAPE at a
-# frozen copy to make a study reproducible.
+# Point PMT_BOOK_TAPE at a FROZEN copy for any reproducible study — the live
+# tape is append-only and still being written (docs/LESSONS.md#L33).
 BOOK_TAPE = Path(
     os.environ.get("PMT_BOOK_TAPE", Path.home() / ".pmt" / "engine" / "book-tape.jsonl")
 )

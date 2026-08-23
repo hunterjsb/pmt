@@ -88,13 +88,9 @@ impl Config {
     }
 }
 
-/// Above this, an engine loop interval is too coarse for a strategy whose
-/// own cadence is sub-second. `updown` declares 50ms because its whole
-/// latency model (quiesce windows, flip cutoffs, inflight TTLs) was fitted
-/// at that rate — but the engine's OUTER loop is the real ceiling, and it
-/// defaults to 1000ms. The CLI always passes PMENGINE_TICK_INTERVAL_MS, so
-/// a bare `pmengine run updown` is the way this bites: the model silently
-/// runs 20x slower than it was measured at, with nothing in the log saying so.
+/// Above this, an engine loop interval is too coarse for a strategy whose own
+/// cadence is sub-second — the OUTER loop is the real ceiling, and it defaults
+/// to 1000ms against `updown`'s declared 50ms. See docs/LESSONS.md#L21.
 pub const SLOW_TICK_WARN_MS: u64 = 250;
 
 /// Warning text when the engine's loop interval throttles a strategy that

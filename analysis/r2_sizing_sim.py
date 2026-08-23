@@ -323,7 +323,7 @@ def build_windows(tape: list[dict], outcomes: dict[str, str], wallet: dict[str, 
 
 
 # ---------------------------------------------------------------------------
-# calibration: WINDOW-level isotonic fit (v1's clip-level weighting bug fixed)
+# calibration: WINDOW-level isotonic fit — never clip-level (LESSONS.md#L34)
 # ---------------------------------------------------------------------------
 
 def bucket_index(fair: float, edges: tuple[float, ...] = CAL_EDGES) -> int:

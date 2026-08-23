@@ -54,10 +54,8 @@ pub struct PolymarketClient {
     /// Optional SigV4 signer for pmproxy behind an AWS_IAM Function URL
     #[cfg(feature = "sigv4")]
     sigv4: Option<Arc<SigV4Signer>>,
-    /// Cached tick-size decimal places per token. Lets us round each
-    /// market's prices to its actual tick (0.001 vs 0.01 vs 0.0001)
-    /// instead of the previous hard-coded 2-decimal rounding that
-    /// silently snapped $0.9425 → $0.94 and killed quote precision.
+    /// Cached tick-size decimal places per token — every price rounds to its
+    /// own market's tick (0.0001/0.001/0.01), never a fixed 2 (docs/LESSONS.md#L3).
     tick_decimals: Arc<tokio::sync::RwLock<std::collections::HashMap<String, u32>>>,
 }
 

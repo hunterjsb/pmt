@@ -652,9 +652,7 @@ def test_render_path_is_never_blocked_by_a_slow_fetch(monkeypatch):
 # ---------- `crypto arm` basis-guard default ----------
 
 def test_arm_basis_guard_defaults_to_the_measured_per_symbol_value():
-    # A bare arm on an alt must NOT hand the engine the flat 3bp band —
-    # that under-guards eth/sol by 2-3x, which is the shape of the
-    # 2026-08-23 losses.
+    # A bare arm on an alt must NOT get a flat band (docs/LESSONS.md#L32).
     assert cc._resolve_basis_guard(None, "BTCUSDT") == (6.0, None)
     assert cc._resolve_basis_guard(None, "ETHUSDT") == (8.0, None)
     assert cc._resolve_basis_guard(None, "SOLUSDT") == (10.0, None)

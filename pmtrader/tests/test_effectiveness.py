@@ -257,8 +257,8 @@ def test_summary_is_none_safe_on_an_empty_book():
 
 
 def test_summary_reports_the_whole_story_on_the_real_shape():
-    # 11 wins of +$0.50 on $10 clips, one -$265 window: the operator's
-    # 92% headline, and every correction to it, from one window set.
+    # The live shape that motivated the module, in one window set
+    # (docs/LESSONS.md#L27): 11 wins of +$0.50 on $10 clips, one -$265 window.
     ws = [_w(10, 0.5, True, entry_ts=3600, exit_ts=4500, end_ts=4500) for _ in range(11)]
     ws.append(_w(265, -265.0, False, entry_ts=3600, exit_ts=0, end_ts=4500))
     s = eff.summary(ws, bankroll=1000.0, now=90000.0)

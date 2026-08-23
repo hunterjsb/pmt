@@ -92,13 +92,10 @@ def wallet_outcomes(activity_rows: list[dict]) -> dict[str, str]:
         if paying is not None:
             outcome = (paying.get("outcome") or "").lower()
         else:
-            # Every redeem on this slug paid $0 -> we held the loser — but
-            # ONLY a row with real size is trustworthy as "the side we
-            # held". A size-0 $0 redeem can carry the WINNER's label
-            # instead (live 2026-08-23: btc-15m-1787457600's dust row said
-            # "Up" while we held Down — the blind flip recorded a -$265
-            # loss as a win in the corpus). No sized row -> no guess; the
-            # chainlink/gamma fallback grades it.
+            # Every redeem paid $0 -> we held the loser, but ONLY a row with
+            # real size names the side we held: a size-0 dust row can carry the
+            # WINNER's label (see docs/LESSONS.md#L22). No sized row -> no
+            # guess; the chainlink/gamma fallback grades it.
             sized = next((r for r in rows if (r.get("size") or 0.0) > 0.0), None)
             if sized is None:
                 continue

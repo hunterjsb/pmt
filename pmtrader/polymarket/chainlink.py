@@ -69,12 +69,11 @@ SYMBOLS = list(FEEDS)
 BINANCE_SYMBOL = {"btc": "BTCUSDT", "eth": "ETHUSDT", "sol": "SOLUSDT", "xrp": "XRPUSDT",
                   "doge": "DOGEUSDT", "bnb": "BNBUSDT"}
 
-# Deployed per-arm basis guards as of 2026-08-23 (R1 aligned measurement +
-# replay A/B): btc 6, eth 8, sol 10. xrp/doge stay untradeable via the
-# Binance proxy. bnb: feed added 2026-08-23 for the R1 fit; no guard until
-# its corpus is measured. THE source for these — `pmt crypto arm` resolves
-# its --basis-guard default here, and analysis/ reads it rather than
-# keeping copies (all three used to drift).
+# Deployed per-arm basis guards (R1 aligned measurement + replay A/B).
+# None = unmeasured corpus, so untradeable: xrp/doge via the Binance proxy,
+# bnb until its own corpus lands. THE single source — `pmt crypto arm` and
+# analysis/ both read it rather than keeping copies (docs/LESSONS.md#L18,
+# docs/LESSONS.md#L32).
 GUARD_BP: dict[str, float | None] = {"btc": 6.0, "eth": 8.0, "sol": 10.0,
                                      "xrp": None, "doge": None, "bnb": None}
 

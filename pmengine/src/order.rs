@@ -153,9 +153,8 @@ impl OrderManager {
             .map(|(id, _)| id.clone())
             .collect();
 
-        // Keep going past individual failures — `?` here abandoned every
-        // order AFTER the first failed cancel, silently leaving live quotes
-        // on the book while pause/stop reported success (2026-08-23 sweep).
+        // Keep going past individual failures; never `?` out of this loop
+        // (see docs/LESSONS.md#L6).
         let count = to_cancel.len();
         let mut failed = 0usize;
         let mut last_err: Option<OrderError> = None;

@@ -434,10 +434,7 @@ impl Engine {
             ),
         }
         self.risk_manager.release_orders_for_token(token_id);
-        // Unsubscribe means the engine no longer manages this token; a
-        // resolved/abandoned position must leave the exposure ledger too,
-        // or the risk manager counts every finished window forever (froze
-        // the whole fleet at the $1500 cap on 2026-08-23).
+        // Unmanaged token => its exposure must leave the ledger too (see docs/LESSONS.md#L5).
         let released = self.positions.remove(token_id);
         if released > rust_decimal::Decimal::ZERO {
             tracing::info!(token_id = %token_id, notional = %released, "Unsubscribe: released position exposure");
@@ -680,12 +677,7 @@ impl Engine {
         let tick_duration = Duration::from_millis(self.config.tick_interval_ms);
         let mut tick_timer = interval(tick_duration);
 
-        // Graceful shutdown on BOTH SIGINT and SIGTERM. Only ctrl_c was
-        // handled before, so `pmt engine kill` (SIGTERM) and the nightly
-        // systemd poweroff skipped shutdown entirely — resting orders and
-        // in-flight state were abandoned, not cancelled. At current fleet
-        // sizes that hole was worth up to PMENGINE_MAX_TOTAL_EXPOSURE, not
-        // the documented "one clip" (2026-08-23 config audit).
+        // Graceful shutdown on BOTH SIGINT and SIGTERM (see docs/LESSONS.md#L4).
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         tokio::spawn(async move {
             let mut sigterm = tokio::signal::unix::signal(
@@ -805,9 +797,8 @@ impl Engine {
         // `max_subscriptions`; the union is the desired set.
         let scanner_filters: Vec<crate::gamma::MarketFilter> =
             self.strategy_runtime.market_filters();
-        // Tokens statically declared by ANY strategy. The scanner must
-        // never unsubscribe these — they belong to a sibling strategy
-        // that doesn't drive the scanner and would silently break.
+        // Tokens statically declared by ANY strategy — the scanner must never
+        // unsubscribe these (see docs/LESSONS.md#L31).
         let static_subscriptions: std::collections::HashSet<String> =
             self.strategy_runtime.all_static_subscriptions();
         let scanner_handle = if !scanner_filters.is_empty() {
@@ -941,8 +932,7 @@ impl Engine {
                             Ok(t) => t,
                             Err(e) => {
                                 // warn, not debug: this poller feeds the
-                                // print-flow corpus — its silent failure is
-                                // how 22k tape rows recorded zeros unnoticed.
+                                // print-flow corpus (see docs/LESSONS.md#L7).
                                 tracing::warn!(
                                     condition_id = %cid,
                                     error = %e,
@@ -1079,20 +1069,11 @@ impl Engine {
 
             tracing::info!("Entering event loop");
 
-            // Warmup: wait for order books to sync before trading.
-            //
-            // Three exit conditions, any one is sufficient:
-            //   1. `--skip-warmup` is set (operator override).
-            //   2. WebSocket has streamed `WARMUP_WS_UPDATES` book diffs —
-            //      proves the WS path is alive. Doesn't fire under US IPs
-            //      where Polymarket's WS is geoblocked.
-            //   3. Wall-clock timeout: at least `WARMUP_DEADLINE` has
-            //      elapsed since we entered the loop. The REST poller
-            //      will have populated whatever books it could; any
-            //      missing book is handled by the strategy's own
-            //      `if book is None: continue` guard. Without this,
-            //      a scanner that adds an illiquid market (no orders →
-            //      no book) would gate warmup forever.
+            // Warmup: wait for books to sync. Any ONE of three exits is
+            // sufficient — `--skip-warmup`, WARMUP_WS_UPDATES streamed diffs
+            // (never fires under a geoblocked WS), or WARMUP_DEADLINE wall
+            // clock. A still-missing book is the strategy's own `if book is
+            // None` guard's problem. See docs/LESSONS.md#L35.
             const WARMUP_WS_UPDATES: u64 = 100;
             const WARMUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
             let warmup_started_at = std::time::Instant::now();

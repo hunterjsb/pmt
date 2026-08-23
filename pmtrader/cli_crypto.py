@@ -257,7 +257,7 @@ def _tape_slug(slug: str) -> str:
 _BRAKE_COLOR = {  # brake kind -> style name (Rich tag as-is; ANSI parses out "bold")
     "safety": "yellow", "distrust": "red", "avg_down": "magenta", "latched": "red bold",
 }
-_SAFETY_STRONG = 0.3  # theta ~0.3 blocked the 2026-08-23 post-brake replay losses — display cue only
+_SAFETY_STRONG = 0.3  # display cue only; mirrors the deployed theta (docs/LESSONS.md#L13)
 
 
 def _side_safety(sides: list[dict]) -> tuple[float | None, float | None]:
@@ -560,10 +560,8 @@ def _tape_scoreboard(floor: float, sliding_floor: float | None = None) -> dict:
     the SAME aggregation below, so the two never drift.
     """
     # Ground truth: every updown trade + redemption on the proxy wallet.
-    # Bug found in the existing code: an unset addr used to fall through
-    # this silently and report a clean "0W-0L" — indistinguishable from a
-    # genuinely empty trading history. Every sibling command (activity/
-    # window/outcomes) already raises for this; match them.
+    # funder_address() RAISES on an unset addr, like every sibling command —
+    # never fall through to a clean-looking "0W-0L" (docs/LESSONS.md#L26).
     addr = wallet.funder_address()
     return score_activity(wallet.fetch_wallet_activity(addr, floor), floor,
                           sliding_floor=sliding_floor)
@@ -1028,9 +1026,7 @@ def _poll_key(timeout: float = 0.0) -> str | None:
     """The waiting keypress (lowercased) or None. `timeout` is the select
     wait in seconds; 0 (the default) polls without blocking at all.
 
-    os.read on the raw fd, NOT sys.stdin.read — the TextIOWrapper's
-    buffering can demand more bytes than the tty has and block the whole
-    dashboard on a single keypress (operator-reported: h/q dead in watch).
+    os.read on the raw fd, NEVER sys.stdin.read — see docs/LESSONS.md#L30.
     """
     if not sys.stdin.isatty():
         return None
@@ -1069,9 +1065,7 @@ def _wait_key(timeout: float) -> str | None:
 #   worker — one daemon thread owning every network call, each on its own
 #            cadence, publishing whole result objects into a WatchState.
 #
-# Before the split these were one loop: a key was polled once per second and
-# then the same loop went off to walk the entire wallet history inline, so a
-# keypress could wait out a multi-second HTTP walk before anything read it.
+# Why it is split at all: docs/LESSONS.md#L28.
 
 _SB_EMPTY_SLIDING = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "estimated": 0}
 _SB_EMPTY = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "series": {}, "cal": {},
@@ -1145,14 +1139,9 @@ class WatchFetcher:
     # -- individual fetches: each may raise; tick() belts them --
 
     def fetch_status(self) -> None:
-        # engine.post() prints its own red error before sys.exit()ing. Let it:
-        # inside Live's alternate screen that print is routed through Live's
-        # io redirect and painted over by the next frame — exactly as it was
-        # when this call ran on the main thread. Do NOT wrap it in
-        # contextlib.redirect_stdout to hush it: that swaps sys.stdout for the
-        # whole PROCESS, and Rich resolves sys.stdout at write time, so the
-        # render thread sees a non-tty and stops painting — the dashboard
-        # comes up entirely blank.
+        # engine.post() prints its own red error before sys.exit()ing. Let it —
+        # Live's alternate screen paints over it on the next frame. Do NOT hush
+        # it with contextlib.redirect_stdout: docs/LESSONS.md#L29.
         status = _engine_post("/strategies/updown/command", {"action": "status"})
         self.state.update(status=status if isinstance(status, dict) else {})
 
@@ -1264,9 +1253,8 @@ def crypto_watch(since: float | None) -> None:
         pass
 
     # All network lives on the worker; the loop below only ever reads this
-    # snapshot. The first paint therefore happens immediately, with the data
-    # age showing "—" until the first wallet walk lands, instead of the
-    # operator staring at a blank terminal through a multi-second fetch.
+    # snapshot, so the first paint is immediate (data age "—" until the first
+    # wallet walk lands). See docs/LESSONS.md#L28.
     state = WatchState()
     stop = threading.Event()
     fetcher = WatchFetcher(state, floor)
