@@ -1,7 +1,14 @@
 """Tests for the Python to Rust transpiler."""
 
 import ast
-from pmstrat.transpile import transpile, RustCodeGen, MatchUnwrap
+from pmstrat.transpile import (
+    transpile,
+    RustCodeGen,
+    MatchUnwrap,
+    generate_mod_rs,
+    regenerate_mod_rs,
+    scan_strategy_file,
+)
 from pmstrat.dsl import strategy
 from pmstrat import Hold
 
@@ -213,3 +220,113 @@ def test_transpile_liquidity():
 
     # liquidity should be accessible
     assert "market.liquidity" in result.rust_code
+
+
+# ---------------------------------------------------------------------------
+# mod.rs registry generation
+# ---------------------------------------------------------------------------
+
+# A minimal strategy file: pub struct + impl Strategy.
+_STRATEGY_RS = """//! Auto-generated from Python strategy: {name}
+
+pub struct {struct} {{
+    id: String,
+    tokens: Vec<String>,
+}}
+
+impl Strategy for {struct} {{
+    fn id(&self) -> &str {{ &self.id }}
+}}
+"""
+
+# A helper module: types only, no Strategy impl.
+_HELPER_RS = """//! Pure pricing helpers for a sibling strategy.
+
+pub(crate) struct FeedState {
+    pub last: i64,
+}
+
+pub(crate) fn eval_model(_s: &FeedState) -> i64 { 0 }
+"""
+
+
+def _write_strategies_dir(tmp_path):
+    """Build a strategies dir shaped like pmengine's: two plain strategies,
+    one strategy that asks for pub(crate), and one helper module."""
+    d = tmp_path / "strategies"
+    d.mkdir()
+    (d / "alert_test.rs").write_text(
+        _STRATEGY_RS.format(name="alert_test", struct="AlertTest")
+    )
+    (d / "updown.rs").write_text(
+        "//! Multi-arm crypto trigger.\n"
+        "// The replay harness drives this module directly.\n"
+        "// pmstrat: pub(crate)\n\n"
+        + _STRATEGY_RS.format(name="updown", struct="Updown")
+    )
+    (d / "updown_model.rs").write_text(_HELPER_RS)
+    return d
+
+
+def test_generate_mod_rs_declares_helper_modules(tmp_path):
+    """A .rs file with no `impl Strategy` is a helper: it still gets a
+    `pub(crate) mod` line, but no re-export and no registry entry."""
+    d = _write_strategies_dir(tmp_path)
+
+    content = generate_mod_rs(d)
+
+    assert "pub(crate) mod updown_model;" in content
+    assert "pub use updown_model" not in content
+    assert 'm.insert("updown_model"' not in content
+
+
+def test_generate_mod_rs_honors_pub_crate_marker(tmp_path):
+    """`// pmstrat: pub(crate)` in a strategy file widens its mod line."""
+    d = _write_strategies_dir(tmp_path)
+
+    content = generate_mod_rs(d)
+
+    assert "pub(crate) mod updown;" in content
+    # Unmarked strategies stay private.
+    assert "\nmod alert_test;" in content
+    assert "pub(crate) mod alert_test;" not in content
+    # Strategies are still re-exported and registered.
+    assert "pub use updown::Updown;" in content
+    assert 'm.insert("updown", StrategyInfo' in content
+
+
+def test_generate_mod_rs_round_trips(tmp_path):
+    """Regenerating over an existing mod.rs reproduces it byte for byte —
+    no hand-maintained lines to lose, so a regen can't silently drop them."""
+    d = _write_strategies_dir(tmp_path)
+
+    regenerate_mod_rs(d)
+    first = (d / "mod.rs").read_text()
+    regenerate_mod_rs(d)
+    second = (d / "mod.rs").read_text()
+
+    assert first == second
+    # And a mod.rs deleted outright comes back identical.
+    (d / "mod.rs").unlink()
+    regenerate_mod_rs(d)
+    assert (d / "mod.rs").read_text() == first
+
+
+def test_helper_with_pub_struct_is_not_registered(tmp_path):
+    """A helper that grows a plain `pub struct` must not become a bogus
+    strategy — registration requires an `impl Strategy for` that struct."""
+    d = tmp_path / "strategies"
+    d.mkdir()
+    (d / "market_maker.rs").write_text(
+        _STRATEGY_RS.format(name="market_maker", struct="MarketMaker")
+    )
+    (d / "updown_oracle.rs").write_text(
+        "//! Chainlink poller.\n\npub struct OracleState {\n    pub round: u64,\n}\n"
+    )
+
+    assert scan_strategy_file(d / "updown_oracle.rs") is None
+
+    content = generate_mod_rs(d)
+    assert "pub(crate) mod updown_oracle;" in content
+    assert "OracleState" not in content
+    assert 'm.insert("updown_oracle"' not in content

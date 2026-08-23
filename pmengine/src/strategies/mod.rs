@@ -1,5 +1,13 @@
 //! Auto-generated strategy registry - DO NOT EDIT MANUALLY
 //! Regenerate with: pmstrat transpile --all
+//!
+//! Every .rs file in this directory gets a `mod` line here. A file with a
+//! `pub struct X` that carries `impl Strategy for X` is a strategy: declared
+//! `mod x;`, re-exported, and registered below. Anything else is a helper
+//! module, declared `pub(crate) mod x;` so the rest of the crate can reach it.
+//! A strategy file that needs crate-wide visibility of its own module says so
+//! in the file with a `// pmstrat: pub(crate)` marker line — nothing here is
+//! hand-maintained.
 
 mod alert_test;
 mod dynamic_market_maker;
@@ -9,19 +17,9 @@ mod momentum_fade;
 mod order_test;
 mod spread_watcher;
 mod sure_bets;
-// pub(crate): the replay harness (src/replay.rs) drives updown's decision
-// core directly. If regeneration ever reverts this, the build breaks loudly.
 pub(crate) mod updown;
-// Helper module for updown (Chainlink oracle poller + dynamic basis guard),
-// not a strategy — it has no plain `pub struct`, so `scan_strategy_file`
-// skips it and `pmstrat transpile --all` won't emit this line on its own.
-// Hand-added; re-add by hand if this file is ever regenerated.
-pub(crate) mod updown_oracle;
-// Helper module for updown (pure pricing model + gate predicates), not a
-// strategy — it has no plain `pub struct`, so `scan_strategy_file` skips it
-// and `pmstrat transpile --all` won't emit this line on its own. Hand-added;
-// re-add by hand if this file is ever regenerated.
 pub(crate) mod updown_model;
+pub(crate) mod updown_oracle;
 
 use std::collections::HashMap;
 use crate::strategy::Strategy;
