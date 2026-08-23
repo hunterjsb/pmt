@@ -1,0 +1,218 @@
+{
+ "book": [],
+ "era": [
+   "post-rtds"
+ ],
+ "evals": [
+  {"ev":"roll","size":100.0,"slug":"xrp-updown-5m-1787485200","t":1787485200.014088},
+  {"banked_bp":0.0,"cushion_bp":37.53047350023627,"dn_ask":null,"ev":"gated","guard_bp":12.0,"margin_bp":7.0805788004668635,"reason":"basis guard: projected margin +7.1bp inside 12.0bp noise band [banked +0.0bp cushion 37.5bp]","slug":"xrp-updown-5m-1787485200","t":1787485204.450279,"up_ask":null},
+  {"banked_bp":0.0,"cushion_bp":37.31186263778668,"dn_ask":0.35,"ev":"gated","guard_bp":12.0,"margin_bp":8.535405233118798,"reason":"basis guard: projected margin +8.5bp inside 12.0bp noise band [banked +0.0bp cushion 37.3bp]","slug":"xrp-updown-5m-1787485200","t":1787485209.4900413,"up_ask":0.75},
+  {"banked_bp":0.0,"banked_decided":false,"committed":-0.0,"cushion_bp":37.09089889967488,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":12.435440982963009,"p_up":0.6898085300389429,"rho":0.0,"sides":[{"ask":0.75,"brake":"safety","fair":0.6898085300389429,"net":-0.07769146996105707,"safety":0.0,"side":"up"},{"ask":0.33,"brake":"safety","fair":0.31019146996105706,"net":-0.04290853003894295,"safety":-0.0,"side":"down"}],"sig_bp":19.924151950854384,"slug":"xrp-updown-5m-1787485200","t":1787485214.5400038},
+  {"banked_bp":0.0,"cushion_bp":36.86620445653063,"dn_ask":0.32,"ev":"gated","guard_bp":12.0,"margin_bp":10.483906070872797,"reason":"basis guard: projected margin +10.5bp inside 12.0bp noise band [banked +0.0bp cushion 36.9bp]","slug":"xrp-updown-5m-1787485200","t":1787485219.6298234,"up_ask":0.71},
+  {"banked_bp":0.0,"cushion_bp":36.64305535885414,"dn_ask":0.27,"ev":"gated","guard_bp":12.0,"margin_bp":11.88051840685489,"reason":"basis guard: projected margin +11.9bp inside 12.0bp noise band [banked +0.0bp cushion 36.6bp]","slug":"xrp-updown-5m-1787485200","t":1787485224.6393237,"up_ask":0.81},
+  {"banked_bp":0.0,"banked_decided":false,"committed":-0.0,"cushion_bp":36.418294308451834,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":14.327316167510595,"p_up":0.7211715577271778,"rho":0.0,"sides":[{"ask":0.78,"brake":"safety","fair":0.7211715577271778,"net":-0.07422844227282224,"safety":0.0,"side":"up"},{"ask":0.3,"brake":"safety","fair":0.2788284422728222,"net":-0.042171557727177775,"safety":-0.0,"side":"down"}],"sig_bp":19.924151950854384,"slug":"xrp-updown-5m-1787485200","t":1787485229.639362},
+  {"banked_bp":0.0,"cushion_bp":36.18586104824319,"dn_ask":0.36,"ev":"gated","guard_bp":12.0,"margin_bp":11.30531152195191,"reason":"basis guard: projected margin +11.3bp inside 12.0bp noise band [banked +0.0bp cushion 36.2bp]","slug":"xrp-updown-5m-1787485200","t":1787485234.7618918,"up_ask":0.72},
+  {"banked_bp":0.0,"cushion_bp":35.95550838092263,"dn_ask":0.36,"ev":"gated","guard_bp":12.0,"margin_bp":9.396079118559886,"reason":"basis guard: projected margin +9.4bp inside 12.0bp noise band [banked +0.0bp cushion 36.0bp]","slug":"xrp-updown-5m-1787485200","t":1787485239.7902305,"up_ask":0.74},
+  {"banked_bp":0.0,"cushion_bp":35.71958847208555,"dn_ask":0.33,"ev":"gated","guard_bp":12.0,"margin_bp":8.578364917555259,"reason":"basis guard: projected margin +8.6bp inside 12.0bp noise band [banked +0.0bp cushion 35.7bp]","slug":"xrp-updown-5m-1787485200","t":1787485244.8902164,"up_ask":0.72},
+  {"banked_bp":0.0,"cushion_bp":35.48134033730484,"dn_ask":0.48,"ev":"gated","guard_bp":12.0,"margin_bp":7.91522335698458,"reason":"basis guard: projected margin +7.9bp inside 12.0bp noise band [banked +0.0bp cushion 35.5bp]","slug":"xrp-updown-5m-1787485200","t":1787485249.9893086,"up_ask":0.59},
+  {"banked_bp":-0.0,"cushion_bp":35.24535009164922,"dn_ask":0.54,"ev":"gated","guard_bp":12.0,"margin_bp":-1.773956992686676,"reason":"basis guard: projected margin -1.8bp inside 12.0bp noise band [banked -0.0bp cushion 35.2bp]","slug":"xrp-updown-5m-1787485200","t":1787485254.9893303,"up_ask":0.5},
+  {"banked_bp":-0.0,"cushion_bp":35.000217733398934,"dn_ask":0.66,"ev":"gated","guard_bp":12.0,"margin_bp":-4.536970660686812,"reason":"basis guard: projected margin -4.5bp inside 12.0bp noise band [banked -0.0bp cushion 35.0bp]","slug":"xrp-updown-5m-1787485200","t":1787485260.1295724,"up_ask":0.39},
+  {"banked_bp":1.3404172013475633,"cushion_bp":30.505136109009776,"dn_ask":0.6,"ev":"gated","guard_bp":12.0,"margin_bp":-4.421784890368263,"reason":"basis guard: projected margin -4.4bp inside 12.0bp noise band [banked +1.3bp cushion 30.5bp]","slug":"xrp-updown-5m-1787485200","t":1787485265.1398354,"up_ask":0.46},
+  {"banked_bp":1.3637736697433356,"cushion_bp":30.22362393890104,"dn_ask":0.63,"ev":"gated","guard_bp":12.0,"margin_bp":-5.352063149950403,"reason":"basis guard: projected margin -5.4bp inside 12.0bp noise band [banked +1.4bp cushion 30.2bp]","slug":"xrp-updown-5m-1787485200","t":1787485270.1897144,"up_ask":0.39},
+  {"banked_bp":1.388201718003616,"cushion_bp":29.936014327544417,"dn_ask":0.69,"ev":"gated","guard_bp":12.0,"margin_bp":-9.96110501848224,"reason":"basis guard: projected margin -10.0bp inside 12.0bp noise band [banked +1.4bp cushion 29.9bp]","slug":"xrp-updown-5m-1787485200","t":1787485275.289477,"up_ask":0.38},
+  {"banked_bp":1.4130175986358455,"cushion_bp":29.650685338712353,"dn_ask":0.75,"ev":"gated","guard_bp":12.0,"margin_bp":-7.122971947229884,"reason":"basis guard: projected margin -7.1bp inside 12.0bp noise band [banked +1.4bp cushion 29.7bp]","slug":"xrp-updown-5m-1787485200","t":1787485280.2896574,"up_ask":0.33},
+  {"banked_bp":1.438738726296081,"cushion_bp":29.361930098264875,"dn_ask":0.73,"ev":"gated","guard_bp":12.0,"margin_bp":-8.263617939787693,"reason":"basis guard: projected margin -8.3bp inside 12.0bp noise band [banked +1.4bp cushion 29.4bp]","slug":"xrp-updown-5m-1787485200","t":1787485285.2901938,"up_ask":0.34},
+  {"banked_bp":1.4656799046114666,"cushion_bp":29.06677998630074,"dn_ask":0.66,"ev":"gated","guard_bp":12.0,"margin_bp":-5.409537904734751,"reason":"basis guard: projected margin -5.4bp inside 12.0bp noise band [banked +1.5bp cushion 29.1bp]","slug":"xrp-updown-5m-1787485200","t":1787485290.3397317,"up_ask":0.4},
+  {"banked_bp":1.4936512977650538,"cushion_bp":28.76791105394048,"dn_ask":0.69,"ev":"gated","guard_bp":12.0,"margin_bp":-6.876287187190799,"reason":"basis guard: projected margin -6.9bp inside 12.0bp noise band [banked +1.5bp cushion 28.8bp]","slug":"xrp-updown-5m-1787485200","t":1787485295.3896203,"up_ask":0.39},
+  {"banked_bp":1.5245615090548916,"cushion_bp":28.446209729507917,"dn_ask":0.78,"ev":"gated","guard_bp":12.0,"margin_bp":-5.941359514687328,"reason":"basis guard: projected margin -5.9bp inside 12.0bp noise band [banked +1.5bp cushion 28.4bp]","slug":"xrp-updown-5m-1787485200","t":1787485300.7545483,"up_ask":0.32},
+  {"banked_bp":1.554759337595118,"cushion_bp":28.14021734838754,"dn_ask":0.76,"ev":"gated","guard_bp":12.0,"margin_bp":-8.220734238747474,"reason":"basis guard: projected margin -8.2bp inside 12.0bp noise band [banked +1.6bp cushion 28.1bp]","slug":"xrp-updown-5m-1787485200","t":1787485305.7898293,"up_ask":0.32},
+  {"banked_bp":1.5859541358300384,"cushion_bp":27.83233666530581,"dn_ask":0.93,"ev":"gated","guard_bp":12.0,"margin_bp":-9.270873393441017,"reason":"basis guard: projected margin -9.3bp inside 12.0bp noise band [banked +1.6bp cushion 27.8bp]","slug":"xrp-updown-5m-1787485200","t":1787485310.789996,"up_ask":0.14},
+  {"banked_bp":1.6184264893319764,"banked_decided":false,"committed":-0.0,"cushion_bp":27.52030974302545,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-17.526757005181803,"p_up":0.12906217137828802,"rho":0.0,"sides":[{"ask":0.08,"brake":"safety","fair":0.12906217137828802,"net":0.04346217137828801,"safety":0.06,"side":"up"},{"ask":0.94,"brake":"safety","fair":0.870937828621712,"net":-0.07326217137828797,"safety":-0.06,"side":"down"}],"sig_bp":20.33904693564856,"slug":"xrp-updown-5m-1787485200","t":1787485315.790183},
+  {"banked_bp":1.6525981408601678,"banked_decided":false,"committed":-0.0,"cushion_bp":27.20084302164775,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-17.7155013056407,"p_up":0.1215917498251935,"rho":0.0,"sides":[{"ask":0.1,"brake":"safety","fair":0.1215917498251935,"net":0.01459174982519349,"safety":0.06,"side":"up"},{"ask":0.95,"brake":"safety","fair":0.8784082501748065,"net":-0.07509174982519345,"safety":-0.06,"side":"down"}],"sig_bp":20.33904693564856,"slug":"xrp-updown-5m-1787485200","t":1787485320.8398397},
+  {"banked_bp":-1.6952677677172272,"banked_decided":false,"committed":-0.0,"cushion_bp":23.46051567402063,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-14.632652319885864,"p_up":0.10062437680103188,"rho":0.0,"sides":[{"ask":0.16,"brake":"safety","fair":0.10062437680103188,"net":-0.07057562319896814,"safety":-0.07,"side":"up"},{"ask":0.92,"brake":"safety","fair":0.8993756231989681,"net":-0.026224376801031905,"safety":0.07,"side":"down"}],"sig_bp":19.6789197686803,"slug":"xrp-updown-5m-1787485200","t":1787485325.839934},
+  {"banked_bp":-1.7247791126259857,"banked_decided":false,"committed":-0.0,"cushion_bp":23.1582372430475,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-13.779608013868572,"p_up":0.10822583588868262,"rho":0.0,"sides":[{"ask":0.18,"brake":"safety","fair":0.10822583588868262,"net":-0.08437416411131737,"safety":-0.07,"side":"up"},{"ask":0.89,"brake":"safety","fair":0.8917741641113174,"net":-0.005925835888682633,"safety":0.07,"side":"down"}],"sig_bp":19.6789197686803,"slug":"xrp-updown-5m-1787485200","t":1787485330.8730764},
+  {"banked_bp":-1.7555441054596337,"banked_decided":false,"committed":-0.0,"cushion_bp":22.850738238409207,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-13.5088650883175,"p_up":0.10637289699454044,"rho":0.0,"sides":[{"ask":0.2,"brake":"safety","fair":0.10637289699454044,"net":-0.10762710300545957,"safety":-0.08,"side":"up"},{"ask":0.87,"brake":"safety","fair":0.8936271030054596,"net":0.01452710300545956,"safety":0.08,"side":"down"}],"sig_bp":19.6789197686803,"slug":"xrp-updown-5m-1787485200","t":1787485335.9398746},
+  {"banked_bp":-1.788190422564617,"banked_decided":false,"committed":-0.0,"cushion_bp":22.53262435110659,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-13.95681213428812,"p_up":0.09236825320993192,"rho":0.0,"sides":[{"ask":0.15,"brake":"safety","fair":0.09236825320993192,"net":-0.06813174679006807,"safety":-0.08,"side":"up"},{"ask":0.93,"brake":"safety","fair":0.907631746790068,"net":-0.027268253209931963,"safety":0.08,"side":"down"}],"sig_bp":19.6789197686803,"slug":"xrp-updown-5m-1787485200","t":1787485341.125853},
+  {"banked_bp":-1.8212629994412088,"banked_decided":false,"committed":-0.0,"cushion_bp":22.218629148115102,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-14.043308232649654,"p_up":0.08447914586877614,"rho":0.0,"sides":[{"ask":0.19,"brake":"safety","fair":0.08447914586877614,"net":-0.11882085413122388,"safety":-0.08,"side":"up"},{"ask":0.89,"brake":"safety","fair":0.915520854131224,"net":0.01782085413122385,"safety":0.08,"side":"down"}],"sig_bp":19.6789197686803,"slug":"xrp-updown-5m-1787485200","t":1787485346.1899688},
+  {"banked_bp":-1.8551401603002151,"banked_decided":false,"committed":-0.0,"cushion_bp":21.905297790697137,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-12.824189453617407,"p_up":0.0975313916522974,"rho":0.0,"sides":[{"ask":0.17,"brake":"safety","fair":0.0975313916522974,"net":-0.08436860834770261,"safety":-0.08,"side":"up"},{"ask":0.91,"brake":"safety","fair":0.9024686083477026,"net":-0.013831391652297437,"safety":0.08,"side":"down"}],"sig_bp":19.6789197686803,"slug":"xrp-updown-5m-1787485200","t":1787485351.1900797},
+  {"banked_bp":-1.8903010017071835,"banked_decided":false,"committed":-0.0,"cushion_bp":21.588640347182498,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-12.873859758580908,"p_up":0.08951676524223551,"rho":0.0,"sides":[{"ask":0.12,"brake":"safety","fair":0.08951676524223551,"net":-0.03888323475776449,"safety":-0.09,"side":"up"},{"ask":0.95,"brake":"safety","fair":0.9104832347577644,"net":-0.043016765242235466,"safety":0.09,"side":"down"}],"sig_bp":19.6789197686803,"slug":"xrp-updown-5m-1787485200","t":1787485356.190121},
+  {"banked_bp":-1.927194006128495,"banked_decided":false,"committed":-0.0,"cushion_bp":21.265381189009048,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-14.22745224585742,"p_up":0.06214213224588771,"rho":0.0,"sides":[{"ask":0.09,"brake":"safety","fair":0.06214213224588771,"net":-0.03415786775411228,"safety":-0.09,"side":"up"},{"ask":0.95,"brake":"safety","fair":0.9378578677541124,"net":-0.015642132245887674,"safety":0.09,"side":"down"}],"sig_bp":19.6789197686803,"slug":"xrp-updown-5m-1787485200","t":1787485361.2403333},
+  {"banked_bp":-1.9659397527863665,"banked_decided":false,"committed":-0.0,"cushion_bp":20.9354181202355,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-13.2271045377641,"p_up":0.06922232768927428,"rho":0.0,"sides":[{"ask":0.13,"brake":"safety","fair":0.06922232768927428,"net":-0.06987767231072572,"safety":-0.09,"side":"up"},{"ask":0.95,"brake":"safety","fair":0.9307776723107256,"net":-0.022722327689274235,"safety":0.09,"side":"down"}],"sig_bp":19.6789197686803,"slug":"xrp-updown-5m-1787485200","t":1787485366.3401012},
+  {"banked_bp":-2.0058748812792135,"banked_decided":false,"committed":-0.0,"cushion_bp":20.605135822488535,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-13.47676618792648,"p_up":0.0584912953889577,"rho":0.0,"sides":[{"ask":0.09,"brake":"safety","fair":0.0584912953889577,"net":-0.0378087046110423,"safety":-0.1,"side":"up"},{"ask":0.95,"brake":"safety","fair":0.9415087046110424,"net":-0.011991295388957657,"safety":0.1,"side":"down"}],"sig_bp":19.6789197686803,"slug":"xrp-updown-5m-1787485200","t":1787485371.390237},
+  {"banked_bp":-2.047464762782343,"banked_decided":false,"committed":-0.0,"cushion_bp":20.271326008063724,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-13.130303925495967,"p_up":0.056045520508402946,"rho":0.0,"sides":[{"ask":0.2,"brake":"safety","fair":0.056045520508402946,"net":-0.15795447949159708,"safety":-0.1,"side":"up"},{"ask":0.89,"brake":"safety","fair":0.943954479491597,"net":0.04625447949159704,"safety":0.1,"side":"down"}],"sig_bp":19.6789197686803,"slug":"xrp-updown-5m-1787485200","t":1787485376.4402144},
+  {"banked_bp":-2.0919835921468404,"cushion_bp":19.92502107246786,"dn_ask":0.95,"ev":"gated","guard_bp":12.0,"margin_bp":-9.761637771378284,"reason":"basis guard: projected margin -9.8bp inside 12.0bp noise band [banked -2.1bp cushion 19.9bp]","slug":"xrp-updown-5m-1787485200","t":1787485381.6233318,"up_ask":0.09},
+  {"ask":0.95,"committed":-0.0,"elapsed_frac":0.6078007666269938,"ev":"fire","fair":0.9789667735773,"mode":"safe","net":0.02546677357730004,"rho":-0.10326314439871938,"side":"down","size":10.0,"slug":"xrp-updown-5m-1787485200","t":1787485382.34023},
+  {"banked_bp":-6.001998693596804,"banked_decided":false,"committed":9.7,"cushion_bp":17.713195619848534,"ev":"eval","fleet_room":330.8,"guard_bp":12.0,"margin_bp":-14.534931438490162,"p_up":0.005464931588930355,"rho":-0.10326314439871938,"sides":[{"ask":0.04,"fair":0.005464931588930355,"net":-0.03733506841106965,"safety":-0.34,"side":"up"},{"ask":0.97,"fair":0.9945350684110696,"net":0.02243506841106967,"safety":0.34,"side":"down"}],"sig_bp":18.630623431474355,"slug":"xrp-updown-5m-1787485200","t":1787485386.6402109},
+  {"banked_bp":-6.108169448066353,"banked_decided":false,"committed":9.8,"cushion_bp":17.42640055980962,"ev":"eval","fleet_room":330.7,"guard_bp":12.0,"margin_bp":-17.444256870667864,"p_up":0.0006478780093092107,"rho":-0.10326314439871938,"sides":[{"ask":0.05,"fair":0.0006478780093092107,"net":-0.052852121990690795,"safety":-0.35,"side":"up"},{"ask":0.98,"fair":0.9993521219906908,"net":0.017952121990690805,"safety":0.35,"side":"down"}],"sig_bp":18.630623431474355,"slug":"xrp-updown-5m-1787485200","t":1787485391.7393212},
+  {"ask":0.98,"committed":9.8,"elapsed_frac":0.6479657260576884,"ev":"fire","fair":0.9993601422401984,"mode":"safe","net":0.01796014224019855,"rho":-0.10326314439871938,"side":"down","size":10.0,"slug":"xrp-updown-5m-1787485200","t":1787485394.3897178},
+  {"banked_bp":-6.216365039737428,"banked_decided":false,"committed":9.9,"cushion_bp":17.143104194508584,"ev":"eval","fleet_room":330.3,"guard_bp":12.0,"margin_bp":-17.593584621006244,"p_up":0.0003094463959439908,"rho":-0.10326314439871938,"sides":[{"ask":0.02,"fair":0.0003094463959439908,"net":-0.02109055360405601,"safety":-0.36,"side":"up"},{"ask":0.99,"fair":0.999690553604056,"net":0.008990553604056017,"safety":0.36,"side":"down"}],"sig_bp":18.630623431474355,"slug":"xrp-updown-5m-1787485200","t":1787485396.7564871},
+  {"banked_bp":-6.328822944040616,"banked_decided":false,"committed":9.9,"cushion_bp":16.85796701985533,"ev":"eval","fleet_room":330.3,"guard_bp":12.0,"margin_bp":-15.978880569090803,"p_up":0.0004996355891315751,"rho":-0.10326314439871938,"sides":[{"ask":0.02,"fair":0.0004996355891315751,"net":-0.020900364410868427,"safety":-0.38,"side":"up"},{"ask":0.99,"fair":0.9995003644108684,"net":0.008800364410868433,"safety":0.38,"side":"down"}],"sig_bp":18.630623431474355,"slug":"xrp-updown-5m-1787485200","t":1787485401.789488},
+  {"banked_bp":-6.4446467869729345,"banked_decided":false,"committed":19.503,"cushion_bp":16.57394483014302,"ev":"eval","fleet_room":330.497,"guard_bp":12.0,"margin_bp":-16.00398151770377,"p_up":0.00023219438506427712,"rho":-0.10326314439871938,"sides":[{"ask":0.02,"fair":0.00023219438506427712,"net":-0.021167805614935725,"safety":-0.39,"side":"up"},{"ask":0.99,"fair":0.9997678056149356,"net":0.00906780561493573,"safety":0.39,"side":"down"}],"sig_bp":18.630623431474355,"slug":"xrp-updown-5m-1787485200","t":1787485406.7895155},
+  {"banked_bp":-6.566011511440329,"banked_decided":false,"committed":19.503,"cushion_bp":16.28654630534468,"ev":"eval","fleet_room":330.497,"guard_bp":12.0,"margin_bp":-15.875960379739816,"p_up":0.00010563158949428164,"rho":-0.10326314439871938,"sides":[{"ask":0.02,"fair":0.00010563158949428164,"net":-0.02129436841050572,"safety":-0.4,"side":"up"},{"ask":0.99,"fair":0.9998943684105056,"net":0.009194368410505726,"safety":0.4,"side":"down"}],"sig_bp":18.630623431474355,"slug":"xrp-updown-5m-1787485200","t":1787485411.8394785},
+  {"banked_bp":-6.690767582442345,"banked_decided":false,"committed":19.503,"cushion_bp":16.0017085007041,"ev":"eval","fleet_room":330.497,"guard_bp":12.0,"margin_bp":-16.52248104567766,"p_up":0.00001807603856551765,"rho":-0.10326314439871938,"sides":[{"ask":0.02,"fair":0.00001807603856551765,"net":-0.021381923961434485,"safety":-0.42,"side":"up"},{"ask":0.99,"fair":0.9999819239614344,"net":0.00928192396143449,"safety":0.42,"side":"down"}],"sig_bp":18.630623431474355,"slug":"xrp-updown-5m-1787485200","t":1787485416.8396003},
+  {"banked_bp":-6.820366662451833,"banked_decided":false,"committed":19.503,"cushion_bp":15.716877447759751,"ev":"eval","fleet_room":330.497,"guard_bp":12.0,"margin_bp":-15.531593311234326,"p_up":0.000014585507936870634,"rho":-0.10326314439871938,"sides":[{"ask":0.02,"fair":0.000014585507936870634,"net":-0.02138541449206313,"safety":-0.43,"side":"up"},{"ask":0.99,"fair":0.9999854144920632,"net":0.009285414492063136,"safety":0.43,"side":"down"}],"sig_bp":18.630623431474355,"slug":"xrp-updown-5m-1787485200","t":1787485421.8401153},
+  {"banked_bp":-6.956433392781356,"banked_decided":false,"committed":19.503,"cushion_bp":15.429646021403215,"ev":"eval","fleet_room":330.497,"guard_bp":12.0,"margin_bp":-13.585682682354385,"p_up":0.00003732963773184217,"rho":-0.10326314439871938,"sides":[{"ask":0.02,"fair":0.00003732963773184217,"net":-0.02136267036226816,"safety":-0.45,"side":"up"},{"ask":0.99,"fair":0.9999626703622682,"net":0.009262670362268166,"safety":0.45,"side":"down"}],"sig_bp":18.630623431474355,"slug":"xrp-updown-5m-1787485200","t":1787485426.8896816},
+  {"banked_bp":-7.096624187993307,"banked_decided":false,"committed":19.503,"cushion_bp":15.146045482919916,"ev":"eval","fleet_room":330.497,"guard_bp":12.0,"margin_bp":-13.777983610785416,"p_up":5.962182721530596e-6,"rho":-0.10326314439871938,"sides":[{"ask":0.03,"fair":5.962182721530596e-6,"net":-0.032094037817278466,"safety":-0.47,"side":"up"},{"ask":0.99,"fair":0.9999940378172784,"net":0.009294037817278476,"safety":0.47,"side":"down"}],"sig_bp":18.630623431474355,"slug":"xrp-updown-5m-1787485200","t":1787485431.8897684},
+  {"banked_bp":-7.251278183767066,"banked_decided":false,"committed":19.8,"cushion_bp":14.847353524435416,"ev":"eval","fleet_room":330.2,"guard_bp":12.0,"margin_bp":-13.437462558821831,"p_up":1.1904034163956467e-6,"rho":-0.10326314439871938,"sides":[{"ask":0.03,"fair":1.1904034163956467e-6,"net":-0.0320988095965836,"safety":-0.49,"side":"up"},{"ask":0.99,"fair":0.9999988095965836,"net":0.009298809596583612,"safety":0.49,"side":"down"}],"sig_bp":18.630623431474355,"slug":"xrp-updown-5m-1787485200","t":1787485437.18142},
+  {"banked_bp":-11.226071129511196,"banked_decided":false,"committed":19.8,"cushion_bp":13.949004079720522,"ev":"eval","fleet_room":330.2,"guard_bp":12.0,"margin_bp":-15.693894893825666,"p_up":4.440892098500626e-16,"rho":-0.12184683670956777,"sides":[{"ask":0.02,"fair":4.440892098500626e-16,"net":-0.02139999999999956,"safety":-0.8,"side":"up"},{"ask":0.99,"fair":0.9999999999999996,"net":0.009299999999999564,"safety":0.8,"side":"down"}],"sig_bp":17.736669639848003,"slug":"xrp-updown-5m-1787485200","t":1787485442.2397451},
+  {"ask":0.98,"committed":19.6,"elapsed_frac":0.8142991431554158,"ev":"fire","fair":1.0,"mode":"safe","net":0.018600000000000016,"rho":-0.12184683670956777,"side":"down","size":5.0,"slug":"xrp-updown-5m-1787485200","t":1787485444.289743},
+  {"banked_bp":-11.417809836030704,"banked_decided":false,"committed":19.8,"cushion_bp":13.730537717641944,"ev":"eval","fleet_room":325.3,"guard_bp":12.0,"margin_bp":-14.576452945069818,"p_up":0.0,"rho":-0.12184683670956777,"sides":[{"ask":0.02,"fair":0.0,"net":-0.0214,"safety":-0.83,"side":"up"},{"ask":0.99,"fair":1.0,"net":0.009300000000000008,"safety":0.83,"side":"down"}],"sig_bp":17.736669639848003,"slug":"xrp-updown-5m-1787485200","t":1787485447.240018},
+  {"banked_bp":-11.62022861236058,"banked_decided":false,"committed":19.839599999999997,"cushion_bp":13.512134335358107,"ev":"eval","fleet_room":325.2604,"guard_bp":12.0,"margin_bp":-14.213687494040173,"p_up":0.0,"rho":-0.12184683670956777,"sides":[{"ask":0.02,"fair":0.0,"net":-0.0214,"safety":-0.86,"side":"up"},{"ask":0.99,"fair":1.0,"net":0.009300000000000008,"safety":0.86,"side":"down"}],"sig_bp":17.736669639848003,"slug":"xrp-updown-5m-1787485200","t":1787485452.3397558},
+  {"banked_bp":-11.827875302112346,"banked_decided":false,"committed":19.7394,"cushion_bp":13.301121583604926,"ev":"eval","fleet_room":330.2606,"guard_bp":12.0,"margin_bp":-14.334888318853212,"p_up":0.0,"rho":-0.12184683670956777,"sides":[{"ask":0.01,"fair":0.0,"net":-0.0107,"safety":-0.89,"side":"up"}],"sig_bp":17.736669639848003,"slug":"xrp-updown-5m-1787485200","t":1787485457.3898342},
+  {"banked_bp":-12.056971823639069,"banked_decided":false,"committed":19.7394,"cushion_bp":13.083673157387423,"ev":"eval","fleet_room":330.2606,"guard_bp":12.0,"margin_bp":-14.964853759587005,"p_up":0.0,"rho":-0.12184683670956777,"sides":[{"ask":0.01,"fair":0.0,"net":-0.0107,"safety":-0.92,"side":"up"}],"sig_bp":17.736669639848003,"slug":"xrp-updown-5m-1787485200","t":1787485462.7597568},
+  {"banked_bp":-12.282026350268714,"banked_decided":false,"committed":19.7394,"cushion_bp":12.885906485671631,"ev":"eval","fleet_room":330.2606,"guard_bp":12.0,"margin_bp":-14.566405364700996,"p_up":0.0,"rho":-0.12184683670956777,"sides":[{"ask":0.01,"fair":0.0,"net":-0.0107,"safety":-0.95,"side":"up"}],"sig_bp":17.736669639848003,"slug":"xrp-updown-5m-1787485200","t":1787485467.8398771},
+  {"banked_bp":-12.514233610287269,"banked_decided":false,"committed":19.7394,"cushion_bp":12.698620772802556,"ev":"eval","fleet_room":330.2606,"guard_bp":12.0,"margin_bp":-14.320428499355886,"p_up":0.0,"rho":-0.12184683670956777,"sides":[{"ask":0.01,"fair":0.0,"net":-0.0107,"safety":-0.99,"side":"up"}],"sig_bp":17.736669639848003,"slug":"xrp-updown-5m-1787485200","t":1787485472.8899312},
+  {"banked_bp":-12.755390881569388,"banked_decided":true,"committed":19.7394,"cushion_bp":12.522689161361477,"ev":"eval","fleet_room":350.0,"guard_bp":12.0,"margin_bp":-14.207377578959736,"p_up":0.0,"rho":-0.12184683670956777,"sides":[{"ask":0.01,"fair":0.0,"net":-0.0107,"safety":-1.02,"side":"up"}],"sig_bp":17.736669639848003,"slug":"xrp-updown-5m-1787485200","t":1787485477.9399948},
+  {"ev":"cleanup","slug":"xrp-updown-5m-1787485200","t":1787485500.1081052}
+ ],
+ "expect": {
+   "fires": {
+     "by_mode": {
+       "safe": 2
+     },
+     "by_side": {
+       "down": 2
+     },
+     "count": 2,
+     "first_t": 1787485386.6402109,
+     "max_committed": 19.5,
+     "notional": 19.5
+   },
+   "gates": {
+     "at": [
+       {
+         "reason": "basis guard: projected margin +7.1bp inside 12.0bp noise band [banked +0.0bp cushion 37.5bp]",
+         "t": 1787485204.450279
+       },
+       {
+         "reason": "basis guard: projected margin -9.8bp inside 12.0bp noise band [banked -2.1bp cushion 19.9bp]",
+         "t": 1787485381.6233318
+       }
+     ],
+     "by_class": {
+       "basis guard": 21
+     },
+     "total": 21
+   },
+   "generated_at": "2026-08-23T13:19:26Z",
+   "generated_by": "pmengine 0.4.0 replay --fixtures --bless",
+   "outcome": "down",
+   "pnl": {
+     "sign": "pos",
+     "value": 0.47
+   }
+ },
+ "fixture_version": 1,
+ "invariants": [],
+ "klines": [],
+ "lessons_ref": null,
+ "mode": "evals",
+ "outcome": {
+   "buy": 0.0,
+   "buy_shares": 0.0,
+   "buy_side": null,
+   "pnl": 0.0,
+   "redeem": 0.0,
+   "redeem_outcome": null,
+   "redeem_seen": false,
+   "sell": 0.0,
+   "source": "wallet",
+   "winner": "down"
+ },
+ "params": {
+   "basis_guard_bp": 12.0,
+   "clip_cooldown_s": 2.0,
+   "clip_usdc": 10.0,
+   "early_frac": 0.2,
+   "early_min_edge": 0.08,
+   "end": 1787485500.0,
+   "fee_rate": 0.07,
+   "feed": "rtds",
+   "kind": "twap",
+   "late_rem_s": 120.0,
+   "maker_bid": false,
+   "manip_push_bp": 25.0,
+   "max_price": 0.985,
+   "min_edge": 0.015,
+   "min_elapsed_frac": 0.0,
+   "min_fair": 0.97,
+   "p_cap": 1.0,
+   "pay_up_max": 0.0,
+   "quiesce_secs": 20.0,
+   "rho_block": -0.25,
+   "roll": false,
+   "settle_rule": "range_avg",
+   "side_filter": null,
+   "sigma_bp_per_min": 12.462577378959107,
+   "size_usdc": 100.0,
+   "slug": "xrp-updown-5m-1787485200",
+   "start": 1787485200.0,
+   "symbol": "XRPUSDT",
+   "theta": 0.3,
+   "token_down": "xrp-updown-5m-1787485200-down",
+   "token_up": "xrp-updown-5m-1787485200-up"
+ },
+ "params_provenance": {
+   "basis_guard_bp": "tape: lowest recorded guard_bp (the static param)",
+   "clip_cooldown_s": "inherited: arm store at freeze time",
+   "clip_usdc": "tape: largest fired clip, rounded up to $5",
+   "early_frac": "inherited: arm store at freeze time",
+   "early_min_edge": "inherited: arm store at freeze time",
+   "end": "slug",
+   "fee_rate": "inherited: arm store at freeze time",
+   "feed": "inherited: arm store at freeze time",
+   "kind": "inherited: arm store at freeze time",
+   "late_rem_s": "inherited: arm store at freeze time",
+   "maker_bid": "inherited: arm store at freeze time",
+   "manip_push_bp": "inherited: arm store at freeze time",
+   "max_price": "inherited: arm store at freeze time",
+   "min_edge": "inherited: arm store at freeze time",
+   "min_elapsed_frac": "inherited: arm store at freeze time",
+   "min_fair": "inherited: arm store at freeze time",
+   "p_cap": "inherited: arm store at freeze time",
+   "pay_up_max": "NOT RECOVERABLE — the fire record has no `limit` (issue #5 gap 2); 0 replays at the recorded ask",
+   "quiesce_secs": "inherited: arm store at freeze time",
+   "rho_block": "inherited: arm store at freeze time",
+   "roll": "forced false — a fixture is one window, never a chain",
+   "settle_rule": "inherited: arm store at freeze time",
+   "side_filter": "inherited: arm store at freeze time",
+   "sigma_bp_per_min": "inherited: arm store at freeze time",
+   "size_usdc": "tape: this window's roll record",
+   "slug": "slug",
+   "start": "slug",
+   "symbol": "slug",
+   "theta": "tape: `safety` brake recorded, so theta was live at the freeze-time value",
+   "token_down": "synthesized (replay uses them as keys only)",
+   "token_up": "synthesized (replay uses them as keys only)"
+ },
+ "provenance": {
+   "book": {
+     "records": 125,
+     "sha256": "df5bbf88cd9c2f1ffc575079878d59de4975ab7cd708064f6fb0117f5261663a",
+     "source": "/home/hunter/.pmt/engine/book-tape.jsonl"
+   },
+   "evals": {
+     "records": 60,
+     "sha256": "1b9b672dc74db4545f5a9b8898303bc1d1a17ef1f11c5a8616c13ba1522d3489",
+     "source": "/home/hunter/.pmt/engine/updown-tape.jsonl"
+   },
+   "frozen_at": "2026-08-23T13:19:26Z",
+   "klines": null,
+   "outcome": {
+     "graded": "wallet",
+     "source": "~/.pmt/corpus/outcomes.jsonl + activity.jsonl"
+   },
+   "tape_schema": {
+     "eval_guard_bp": true,
+     "eval_margin_fields": true,
+     "fire_limit": false,
+     "gated_structured": true
+   }
+ },
+ "slug": "xrp-updown-5m-1787485200",
+ "teaches": "first stream-fed (rtds) window: momentum entries on the settlement stream, wallet-graded win",
+ "window_utc": [
+   "2026-08-23T11:40:00Z",
+   "2026-08-23T11:45:00Z"
+ ]
+}
