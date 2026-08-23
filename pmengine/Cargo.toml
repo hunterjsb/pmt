@@ -80,6 +80,14 @@ name = "pmengine"
 path = "src/main.rs"
 required-features = ["ec2"]
 
+# Read-only live check on the market WebSocket: subscribes real tokens through
+# the engine's own feed path and prints event rate + book age. WS behaviour has
+# no unit test; this is the manual verification that stands in for one.
+[[bin]]
+name = "pmengine-wsprobe"
+path = "src/bin/wsprobe.rs"
+required-features = ["ec2"]
+
 [profile.release]
 opt-level = 3
 lto = true

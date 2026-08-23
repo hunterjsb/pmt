@@ -1349,6 +1349,36 @@ def engine_logs(n: int, follow: bool) -> None:
         subprocess.run(["tail", "-n", str(n), logs[-1]])
 
 
+def _ws_feed_row(s: dict) -> str:
+    """WebSocket line for `pmt engine status`.
+
+    Older engines don't report these fields; absent means "this build predates
+    the WS feed", not "the feed is down".
+    """
+    if "ws_connected" not in s:
+        return "[dim]n/a[/dim]"
+    tokens = s.get("ws_tokens", 0)
+    if s["ws_connected"]:
+        return f"[green]WS live[/green] · {tokens} tok · {s.get('ws_events', 0):,} events"
+    if not tokens:
+        return "[dim]idle (no tokens subscribed)[/dim]"
+    down = s.get("ws_down_for_ms")
+    down_s = f" for {int(down) // 1000}s" if down else ""
+    return f"[red bold]WS DOWN{down_s}[/red bold] · REST fallback"
+
+
+def _book_age_row(s: dict) -> str:
+    """Book freshness — the number the WS work exists to move."""
+    if "book_age_p50_ms" not in s:
+        return "[dim]n/a[/dim]"
+    p50, p90 = s.get("book_age_p50_ms"), s.get("book_age_p90_ms")
+    if p50 is None:
+        return "[dim]no books yet[/dim]"
+    colour = "green" if p50 < 500 else ("yellow" if p50 < 2000 else "red")
+    src = f"{s.get('books_from_ws', 0)} ws / {s.get('books_from_rest', 0)} rest"
+    return f"[{colour}]p50 {p50}ms[/{colour}] · p90 {p90}ms · {src}"
+
+
 @engine.command("status")
 def engine_status() -> None:
     """One-line health snapshot of the running engine."""
@@ -1363,6 +1393,8 @@ def engine_status() -> None:
     t.add_row("dry_run", str(s["dry_run"]))
     t.add_row("balance", f"${float(s['balance_usdc']):,.2f} USDC")
     t.add_row("subscribed tokens", str(s["subscribed_tokens"]))
+    t.add_row("market feed", _ws_feed_row(s))
+    t.add_row("book age", _book_age_row(s))
     t.add_row("strategies", str(s["strategies"]))
     t.add_row("open orders", str(s["open_orders"]))
     t.add_row("exposure", f"${float(s['total_exposure_usd']):,.2f}")
