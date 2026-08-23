@@ -88,6 +88,29 @@ def crypto_updown(ref: str, as_json: bool) -> None:
     console.print(f"[bold]{r['verdict']}[/bold]")
 
 
+def _resolve_basis_guard(explicit: float | None, symbol: str) -> tuple[float, str | None]:
+    """(guard_bp, warning) for an arm on `symbol` (a Binance pair, 'ETHUSDT').
+
+    An explicit `--basis-guard` always wins. Otherwise the MEASURED
+    per-symbol guard, so a bare arm can't quietly under-guard an alt — the
+    flat 3bp default did exactly that, and thin-margin alt windows inside
+    the real basis are what the two 2026-08-23 losses were. A symbol with
+    no measured corpus falls back to the flat band and says so out loud.
+    """
+    if explicit is not None:
+        return explicit, None
+    from polymarket.chainlink import guard_bp_for
+    from polymarket.constants import BASIS_NOISE_BP
+
+    measured = guard_bp_for(symbol)
+    if measured is not None:
+        return measured, None
+    return BASIS_NOISE_BP, (
+        f"no measured basis guard for {symbol} — falling back to {BASIS_NOISE_BP:.1f}bp. "
+        f"Measure it (`pmt crypto basis --aligned`) or pass --basis-guard explicitly."
+    )
+
+
 @crypto_group.command("arm")
 @click.argument("ref")
 @click.option("--size", type=float, required=True, help="Max notional (USDC) the trigger may spend")
@@ -103,11 +126,14 @@ def crypto_updown(ref: str, as_json: bool) -> None:
               help="Auto-rearm the next window in the series at close (same budget)")
 @click.option("--clip", type=float, default=25.0, show_default=True,
               help="Max notional per individual fire (position builds in clips)")
-@click.option("--basis-guard", type=float, default=3.0, show_default=True,
+@click.option("--basis-guard", type=float, default=None,
               help="twap only: |projected margin| below this many bp is oracle "
-                   "noise, no trade. BTC is fine at 3; alts (ETH/SOL) need ~6 — "
-                   "both 2026-08-23 losses were thin-margin windows inside the "
-                   "real Chainlink-vs-Binance basis")
+                   "noise, no trade. Defaults to the MEASURED per-symbol guard "
+                   "(polymarket.chainlink.GUARD_BP: btc 6, eth 8, sol 10); a "
+                   "symbol with no measured corpus falls back to 3bp with a "
+                   "warning. Both 2026-08-23 losses were thin-margin windows "
+                   "inside the real Chainlink-vs-Binance basis, and a flat 3 "
+                   "under-guards the alts by 2-3x")
 @click.option("--theta", type=float, default=0.0, show_default=True,
               help="R9 safety gate: first clip needs banked-evidence safety "
                    "(|banked|/cushion, sign-matched to the side) at least this "
@@ -126,7 +152,7 @@ def crypto_updown(ref: str, as_json: bool) -> None:
                    "max ask a non-flip-proof clip pays. 1.0 disables")
 def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
                side: str | None, quiesce: float, min_fair: float, min_elapsed: float,
-               roll: bool, clip: float, basis_guard: float, theta: float,
+               roll: bool, clip: float, basis_guard: float | None, theta: float,
                pay_up: float, p_cap: float) -> None:
     """Arm the pmengine updown trigger on a market.
 
@@ -143,6 +169,9 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         raise click.UsageError(str(e))
     if r["rem_s"] <= 0:
         raise click.UsageError("window already over")
+    guard_bp, guard_warning = _resolve_basis_guard(basis_guard, r["symbol"])
+    if guard_warning:
+        console.print(f"[yellow]warning:[/yellow] {guard_warning}")
     payload = {
         "action": "arm", "slug": r["slug"], "kind": r["kind"], "symbol": r["symbol"],
         "token_up": r["tokens"]["up"], "token_down": r["tokens"]["down"],
@@ -150,7 +179,7 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         "sigma_bp_per_min": r["sigma_bp_per_min"], "fee_rate": r["fee_rate"],
         "size_usdc": size, "min_edge": min_edge, "max_price": max_price,
         "quiesce_secs": quiesce, "min_fair": min_fair, "min_elapsed_frac": min_elapsed,
-        "roll": roll, "clip_usdc": clip, "basis_guard_bp": basis_guard,
+        "roll": roll, "clip_usdc": clip, "basis_guard_bp": guard_bp,
         "theta": theta, "pay_up_max": pay_up, "p_cap": p_cap,
     }
     if side:
@@ -159,8 +188,8 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
     rolling = " · rolling" if roll else ""
     console.print(f"[green]armed[/green] {reply.get('armed')}  "
                   f"[dim]{r['kind']} · {r['rem_s']:.0f}s left · size ${size:.0f} · "
-                  f"min edge {min_edge * 100:.0f}¢ · σ {r['sigma_bp_per_min']:.2f}bp/min"
-                  f"{rolling}[/dim]")
+                  f"min edge {min_edge * 100:.0f}¢ · σ {r['sigma_bp_per_min']:.2f}bp/min · "
+                  f"guard {guard_bp:.1f}bp{rolling}[/dim]")
     console.print(f"[dim]market now: {r['verdict']}[/dim]")
 
 
@@ -292,10 +321,21 @@ def _brake_ansi(sides: list[dict]) -> str:
 _MARGIN_RE = re.compile(r"projected margin ([+-]?\d+\.?\d*)bp inside (\d+\.?\d*)bp")
 
 
-def _gated_reason_compact(reason: str | None) -> str:
-    """`margin -4.9 vs 6.0bp` from the basis-guard message (the only gated
-    reason with real structure); the elapsed-percent gate and anything else
-    fall back to the raw (truncated) reason so nothing gets swallowed."""
+def _gated_reason_compact(reason: str | None, e: dict | None = None) -> str:
+    """`margin -4.9 vs 6.0bp` for a basis-guard gate; the elapsed-percent
+    gate and anything else fall back to the raw (truncated) reason so
+    nothing gets swallowed.
+
+    The engine emits `margin_bp`/`guard_bp` as structured fields on the
+    gated eval — prefer those. The regex is the legacy path only: an eval
+    from an engine built before those fields shipped. It parses the same
+    sentence the fields are formatted from, so the two can't disagree, but
+    a reword breaks the regex and not the fields.
+    """
+    if e:
+        margin, thresh = e.get("margin_bp"), e.get("guard_bp")
+        if margin is not None and thresh is not None:
+            return f"margin {margin:+.1f} vs {thresh:.1f}bp"
     reason = reason or ""
     m = _MARGIN_RE.search(reason)
     if m:
@@ -463,13 +503,13 @@ def crypto_tape(n: int, follow: bool, as_json: bool) -> None:
 
 
 _GAMMA_CACHE: dict[str, tuple[float, dict]] = {}
-_GAMMA_TTL_S = 120  # watch redraws every ~30s; a slug's resolution doesn't flip that often
+_GAMMA_TTL_S = 120  # watch's scoreboard refreshes every 10s; a slug's resolution doesn't flip that often
 
 
 def _gamma_resolution_cached(slug: str) -> dict | None:
     """outcomes.gamma_resolution(), cached ~120s per slug so the watch
-    dashboard's 30s refresh doesn't hammer gamma. None on any fetch/parse
-    failure — callers must degrade gracefully, never guess."""
+    dashboard's 10s scoreboard refresh doesn't hammer gamma. None on any
+    fetch/parse failure — callers must degrade gracefully, never guess."""
     import time as _t
 
     import requests
@@ -837,7 +877,7 @@ def build_arms_table(arms: dict | None, now: float) -> Table:
         e = e if isinstance(e, dict) else {}
         state = e.get("state", "?")
         if state == "gated":
-            state = f"[yellow]gated[/yellow]  {_gated_reason_compact(e.get('reason'))}"
+            state = f"[yellow]gated[/yellow]  {_gated_reason_compact(e.get('reason'), e)}"
         elif state == "armed":
             sides = e.get("sides") or []
             badges = "  ".join(x for x in (_safety_rich(sides, e.get("p_up")),

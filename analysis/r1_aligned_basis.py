@@ -33,9 +33,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pmtrader"))
 
 from polymarket import chainlink as ck  # noqa: E402  (needs sys.path patch above)
 
-# 2026-08-23 live per-arm guards (ROADMAP.md) — what the aligned p95/p99 below gets checked against.
-GUARD_BP_LIVE = {"btc": 3.0, "eth": 8.0, "sol": 10.0, "xrp": None, "doge": None}
-
 
 def extend_all(target_hours: float, symbols: list[str]) -> None:
     for sym, r in ck.extend_all(target_hours, symbols).items():
@@ -101,7 +98,10 @@ def main() -> None:
                 flag = "  <-- regime shift" if shifted else ""
                 print(f"  day1 p95={d1['p95']:.2f}bp (n={d1['n']})   day2 p95={d2['p95']:.2f}bp (n={d2['n']}){flag}")
 
-        guard = GUARD_BP_LIVE.get(sym)
+        # The deployed guards themselves — this script used to keep its own
+        # copy of them, which drifted (btc 3 vs the live 6) and quietly
+        # graded the wrong number against p95.
+        guard = ck.GUARD_BP.get(sym)
         if guard is not None and per_min_stats[sym]:
             p95 = per_min_stats[sym]["p95"]
             verdict = "covers p95" if guard >= p95 else "TOO TIGHT vs p95"

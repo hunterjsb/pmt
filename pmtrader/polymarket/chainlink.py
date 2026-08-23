@@ -69,13 +69,30 @@ SYMBOLS = list(FEEDS)
 BINANCE_SYMBOL = {"btc": "BTCUSDT", "eth": "ETHUSDT", "sol": "SOLUSDT", "xrp": "XRPUSDT",
                   "doge": "DOGEUSDT", "bnb": "BNBUSDT"}
 
-# Live per-arm basis guards (ROADMAP.md 2026-08-23): BTC 3bp, alts 6bp, XRP
-# off pending this exact data. DOGE isn't in the live fleet yet — no guard set.
-# Deployed per-arm guards as of 2026-08-23 (R1 aligned measurement + replay
-# A/B): btc 6, eth 8, sol 10. xrp/doge stay untradeable via Binance proxy.
-# bnb: feed added 2026-08-23 for the R1 fit; no guard until its corpus is measured.
+# Deployed per-arm basis guards as of 2026-08-23 (R1 aligned measurement +
+# replay A/B): btc 6, eth 8, sol 10. xrp/doge stay untradeable via the
+# Binance proxy. bnb: feed added 2026-08-23 for the R1 fit; no guard until
+# its corpus is measured. THE source for these — `pmt crypto arm` resolves
+# its --basis-guard default here, and analysis/ reads it rather than
+# keeping copies (all three used to drift).
 GUARD_BP: dict[str, float | None] = {"btc": 6.0, "eth": 8.0, "sol": 10.0,
                                      "xrp": None, "doge": None, "bnb": None}
+
+_CHAINLINK_KEY = {v: k for k, v in BINANCE_SYMBOL.items()}
+
+
+def guard_bp_for(binance_symbol: str) -> float | None:
+    """Measured basis guard (bp) for a Binance pair like 'ETHUSDT'.
+
+    None when the symbol has no measured corpus yet (xrp/doge/bnb) or isn't
+    an updown pair at all — the caller decides what to do without one.
+    `pmt crypto arm` is the reason this exists: a bare arm used to hand the
+    engine a flat 3bp for every symbol, which under-guards the alts by 2-3x
+    and structurally reproduces an incident we already paid for.
+    """
+    key = _CHAINLINK_KEY.get(binance_symbol.upper())
+    return GUARD_BP.get(key) if key else None
+
 
 CORPUS_DIR = Path.home() / ".pmt" / "corpus"
 
@@ -171,14 +188,6 @@ def description(address: str) -> str:
 
 def decimals(address: str) -> int:
     return _decode_uint(_eth_call(address, SEL_DECIMALS))
-
-
-def latest_round_data(address: str) -> dict:
-    return _decode_round(_eth_call(address, SEL_LATEST_ROUND_DATA))
-
-
-def get_round_data(address: str, round_id: int) -> dict:
-    return _decode_round(_eth_call(address, _encode_round_id_call(round_id)))
 
 
 def verify_feeds() -> dict[str, dict]:
