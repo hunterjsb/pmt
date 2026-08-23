@@ -264,12 +264,42 @@ pub(crate) fn eval_model(
                 .per_min
                 .get(&(p.start as i64 - 60))
                 .ok_or("range-start reference not printed yet")?;
-            return eval_terminal(p, now, spot, ref_px, sig_frac, sig_bp, rho, effective_guard_bp);
+            eval_terminal(p, now, spot, ref_px, sig_frac, sig_bp, rho, effective_guard_bp)
+        } else if p.settle_rule == "hybrid" {
+            let ref_px = *f
+                .per_min
+                .get(&(p.start as i64 - 60))
+                .ok_or("range-start reference not printed yet")?;
+            eval_hybrid(p, f, now, spot, ref_px, sig_frac, sig_bp, rho, effective_guard_bp)
         } else {
             let ref_px = *f
                 .per_min
                 .get(&(p.start as i64 - 60))
                 .ok_or("range-start reference not printed yet")?;
+            eval_range_avg(p, f, now, spot, ref_px, sig_frac, sig_bp, rho, effective_guard_bp)
+        }
+    }
+}
+
+/// The original whole-range-average model. Its "banked mass" is settlement
+/// arithmetic only under a range-avg rule — under the true terminal rule it
+/// is a MOMENTUM PROXY, one that measurably works at 5m and lies with
+/// duration (docs/LESSONS.md). Kept verbatim as both the live 5m spec and
+/// the evidence half of the hybrid spec.
+#[allow(clippy::too_many_arguments)]
+fn eval_range_avg(
+    p: &ArmParams,
+    f: &FeedState,
+    now: f64,
+    spot: f64,
+    ref_px: f64,
+    sig_frac: f64,
+    sig_bp: f64,
+    rho: f64,
+    effective_guard_bp: f64,
+) -> Result<ModelEval, GateReason> {
+    {
+        {
             let banked: Vec<f64> = f
                 .per_min
                 .iter()
@@ -364,6 +394,67 @@ pub(crate) fn settle_tw_secs(window_secs: f64) -> f64 {
     if window_secs <= 300.0 { 30.0 } else { 60.0 }
 }
 
+/// What the terminal rule has actually locked at `rem` seconds out:
+/// (banked_bp, cushion_bp, horizon_min). Before the settlement window
+/// opens nothing is locked and the cushion is 1σ diffusion to the TWAP's
+/// center of mass (~tw/2 before the wire) plus the oracle guard. Inside
+/// the forming TWAP the elapsed share locks at ~spot (the minute-grain
+/// feed can't resolve finer; spot is the live stream's best proxy) and
+/// the cushion is residual diffusion of the unformed share.
+fn terminal_lock(rem: f64, tw: f64, margin_bp: f64, sig_frac: f64,
+                 effective_guard_bp: f64) -> (f64, f64, f64) {
+    if rem > tw {
+        let h = ((rem - tw / 2.0) / 60.0).max(0.02);
+        (0.0, effective_guard_bp + sig_frac * h.sqrt() * 1e4, h)
+    } else {
+        let locked_frac = ((tw - rem) / tw).clamp(0.0, 1.0);
+        let h = (rem / 60.0).max(0.02);
+        let banked = margin_bp * locked_frac;
+        let cushion = effective_guard_bp
+            + sig_frac * (h / 3.0).sqrt() * 1e4 * (1.0 - locked_frac);
+        (banked, cushion, h)
+    }
+}
+
+/// Hybrid spec: evidence from momentum, risk from settlement arithmetic.
+/// The range-avg proxy supplies p_up / margin / banked evidence (what the
+/// wallet proved at 5m), while cushion, banked_decided and flip_proof come
+/// from the TERMINAL rule — so the theta gate divides momentum evidence by
+/// what can genuinely still be undone at the wire, and the brakes' "decided"
+/// waivers only open on real lock (range history called 13.2% of 15m
+/// windows decided on mass the terminal rule hadn't banked at all).
+#[allow(clippy::too_many_arguments)]
+fn eval_hybrid(
+    p: &ArmParams,
+    f: &FeedState,
+    now: f64,
+    spot: f64,
+    ref_px: f64,
+    sig_frac: f64,
+    sig_bp: f64,
+    rho: f64,
+    effective_guard_bp: f64,
+) -> Result<ModelEval, GateReason> {
+    let rem = (p.end - now).max(0.0);
+    let tw = settle_tw_secs(p.end - p.start);
+    if rem <= 0.0 {
+        // At/past the wire only the terminal read is the settlement.
+        return eval_terminal(p, now, spot, ref_px, sig_frac, sig_bp, rho, effective_guard_bp);
+    }
+    let r = eval_range_avg(p, f, now, spot, ref_px, sig_frac, sig_bp, rho, effective_guard_bp)?;
+    let term_margin_bp = (spot / ref_px - 1.0) * 1e4;
+    let (t_banked, t_cushion, _) =
+        terminal_lock(rem, tw, term_margin_bp, sig_frac, effective_guard_bp);
+    let banked_decided = t_banked.abs() > t_cushion && (t_banked > 0.0) == (r.p_up > 0.5);
+    let flip_proof = banked_decided
+        && t_banked.abs() > effective_guard_bp + p.manip_push_bp * (rem / tw).min(1.0);
+    Ok(ModelEval {
+        p_up: r.p_up, sig_bp, banked_decided, flip_proof, rho,
+        margin_bp: r.margin_bp, banked_margin_bp: r.banked_margin_bp,
+        cushion_bp: t_cushion, guard_bp: effective_guard_bp,
+    })
+}
+
 /// Terminal-rule pricing: these markets settle on the 60s-TWAP stream's
 /// value at range END vs its value at range start — NOT the whole-range
 /// average (verified 2026-08-23 against 3,193 resolutions; see
@@ -400,24 +491,8 @@ fn eval_terminal(
         });
     }
 
-    let (banked_margin_bp, cushion_bp, horizon_min) = if rem > tw {
-        // Settlement window not open: diffuse to its center (~tw/2 before
-        // the wire). Nothing locked; cushion is 1σ of that terminal move
-        // plus the oracle guard.
-        let h = ((rem - tw / 2.0) / 60.0).max(0.02);
-        (0.0, effective_guard_bp + sig_frac * h.sqrt() * 1e4, h)
-    } else {
-        // Inside the forming TWAP: elapsed share locks at ~spot (the
-        // stream barely wanders inside <60s except by jump — the minute-
-        // grain feed can't resolve finer, and spot is the live stream's
-        // best proxy). Residual = diffusion of the unformed share.
-        let locked_frac = ((tw - rem) / tw).clamp(0.0, 1.0);
-        let h = (rem / 60.0).max(0.02);
-        let banked = margin_bp * locked_frac;
-        let cushion = effective_guard_bp
-            + sig_frac * (h / 3.0).sqrt() * 1e4 * (1.0 - locked_frac);
-        (banked, cushion, h)
-    };
+    let (banked_margin_bp, cushion_bp, horizon_min) =
+        terminal_lock(rem, tw, margin_bp, sig_frac, effective_guard_bp);
 
     if margin_bp.abs() < effective_guard_bp {
         return Err(GateReason {
@@ -842,6 +917,38 @@ mod tests {
         let m = eval_model(&p, &f, now, p.basis_guard_bp).unwrap();
         assert!((m.banked_margin_bp - 50.0 * 0.75).abs() < 1.0, "3/4 locked");
         assert!(m.banked_decided, "+37bp locked vs a small residual cushion");
+    }
+
+    #[test]
+    fn hybrid_prices_like_the_proxy_but_cushions_like_the_terminal_rule() {
+        let mut p = params("s"); // 900s window, now=1400 -> rem 100 > tw 60
+        let (mut f, now) = feed_with(105.0, 105.0);
+        f.spot_ts = now;
+        let range = eval_model(&p, &f, now, p.basis_guard_bp).unwrap();
+        p.settle_rule = "hybrid".into();
+        let hybrid = eval_model(&p, &f, now, p.basis_guard_bp).unwrap();
+        // evidence half identical to the proxy...
+        assert_eq!(hybrid.p_up, range.p_up);
+        assert_eq!(hybrid.margin_bp, range.margin_bp);
+        assert_eq!(hybrid.banked_margin_bp, range.banked_margin_bp);
+        // ...but the cushion is honest terminal diffusion, far wider than
+        // the proxy's banked-shrunk cushion, and nothing is truly locked
+        // yet so the decided/flip waivers stay shut.
+        assert!(hybrid.cushion_bp > range.cushion_bp);
+        assert!(!hybrid.banked_decided, "no lock before the settlement window");
+        assert!(!hybrid.flip_proof);
+        assert!(range.banked_decided, "the proxy would have called this decided");
+    }
+
+    #[test]
+    fn hybrid_locks_only_inside_the_forming_twap() {
+        let mut p = params("s");
+        p.settle_rule = "hybrid".into();
+        let (mut f, _) = feed_with(105.0, 100.5); // +50bp terminal margin
+        let now = p.end - 15.0; // 45s of the 60s TWAP formed
+        f.spot_ts = now;
+        let m = eval_model(&p, &f, now, p.basis_guard_bp).unwrap();
+        assert!(m.banked_decided, "3/4 of +50bp locked beats the residual cushion");
     }
 
     #[test]
