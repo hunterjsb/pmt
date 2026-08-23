@@ -9,6 +9,8 @@ from polymarket.outcomes import (
     chainlink_outcome,
     ck_settlement_width_s,
     extract_updown_slugs,
+    gamma_resolution,
+    grade_window,
     load_outcomes,
     merge_outcomes,
     parse_updown_slug,
@@ -154,6 +156,88 @@ def test_chainlink_outcome_boundary_exactly_10min_is_still_ok():
     window = {"slug": "s", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
     winner, reason = chainlink_outcome(window, rounds)
     assert winner == "up" and reason is None
+
+
+# ---------- (c) gamma resolution + live grading priority ----------
+
+def test_gamma_resolution_resolved_up():
+    markets = [{"outcomes": '["Up", "Down"]', "outcomePrices": '["1", "0"]', "closed": True}]
+    assert gamma_resolution(markets) == {"resolved": True, "winner": "up"}
+
+
+def test_gamma_resolution_resolved_down():
+    markets = [{"outcomes": '["Up", "Down"]', "outcomePrices": '["0", "1"]', "closed": True}]
+    assert gamma_resolution(markets) == {"resolved": True, "winner": "down"}
+
+
+def test_gamma_resolution_still_trading_is_not_resolved():
+    # closed=False and prices mid-range -- market hasn't settled yet
+    markets = [{"outcomes": '["Up", "Down"]', "outcomePrices": '["0.62", "0.38"]', "closed": False}]
+    assert gamma_resolution(markets) == {"resolved": False, "winner": None}
+
+
+def test_gamma_resolution_empty_response_is_unknown_slug():
+    assert gamma_resolution([]) == {"resolved": False, "winner": None}
+
+
+def test_gamma_resolution_tolerant_of_malformed_json():
+    markets = [{"outcomes": "not json", "outcomePrices": '["1", "0"]'}]
+    assert gamma_resolution(markets) == {"resolved": False, "winner": None}
+
+
+def test_grade_window_paying_redeem_wins_even_with_dust_redeem_seen():
+    # 2026-08-23 audit: ~17 windows carry a spurious $0 dust redeem beside
+    # the real paying one (partial-fill on the losing token). The summed
+    # paying amount must still decide the grade, not the mere presence of
+    # a $0 row -- redeem_seen is True here (the dust row) but redeemed_usd
+    # is the paying total, and that has to win the priority check.
+    won, estimated = grade_window(52.30, True, "up", None, now=2000, end=1000)
+    assert won is True and estimated is False
+
+
+def test_grade_window_zero_redeem_confirms_loss_without_gamma():
+    # an actual $0 redemption is ground truth from the wallet -- no need
+    # to ask gamma at all.
+    won, estimated = grade_window(0.0, True, "up", None, now=2000, end=1000)
+    assert won is False and estimated is False
+
+
+def test_grade_window_no_redeem_within_grace_is_riding():
+    won, estimated = grade_window(0.0, False, "up", None, now=1250, end=1000)  # 250s < 300s
+    assert won is None and estimated is False
+
+
+def test_grade_window_past_grace_no_redeem_no_longer_assumes_loss():
+    # this is the bug: silence past the grace window used to mean LOSS.
+    # With no gamma reachable it now degrades to the old heuristic but
+    # flags it estimated instead of presenting it as confirmed.
+    won, estimated = grade_window(0.0, False, "up", None, now=2000, end=1000)
+    assert won is False and estimated is True
+
+
+def test_grade_window_gamma_confirms_slow_win_past_grace():
+    gamma = {"resolved": True, "winner": "up"}
+    won, estimated = grade_window(0.0, False, "up", gamma, now=2000, end=1000)
+    assert won is True and estimated is False
+
+
+def test_grade_window_gamma_confirms_loss_past_grace():
+    gamma = {"resolved": True, "winner": "down"}
+    won, estimated = grade_window(0.0, False, "up", gamma, now=2000, end=1000)
+    assert won is False and estimated is False
+
+
+def test_grade_window_gamma_not_yet_resolved_is_riding():
+    gamma = {"resolved": False, "winner": None}
+    won, estimated = grade_window(0.0, False, "up", gamma, now=2000, end=1000)
+    assert won is None and estimated is False
+
+
+def test_grade_window_gamma_resolved_but_fired_side_unknown_is_riding():
+    # resolved, but we can't tell which side we held -- never guess
+    gamma = {"resolved": True, "winner": "up"}
+    won, estimated = grade_window(0.0, False, None, gamma, now=2000, end=1000)
+    assert won is None and estimated is False
 
 
 # ---------- priority merge ----------

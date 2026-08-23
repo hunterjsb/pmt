@@ -1743,6 +1743,13 @@ def crypto_trigger(as_json: bool) -> None:
                 body += f"   p↑{e['p_up']:.4f} ρ{e.get('rho', 0):+.2f} {e.get('mode', '')}"
             if e.get("banked_decided"):
                 body += " [cyan]BANKED[/cyan]"
+            sides = e.get("sides") or []
+            saf = _safety_rich(sides, e.get("p_up"))
+            if saf:
+                body += f"  {saf}"
+            brakes = _brake_rich(sides)
+            if brakes:
+                body += f"  {brakes}"
             committed = e.get("committed", a.get("filled_usdc", 0))
             body += f"  ${committed:,.2f}/${e.get('budget', 0):,.0f}"
         else:
@@ -1762,6 +1769,72 @@ def _tape_slug(slug: str) -> str:
         return slug
     start = _t.strftime("%H:%M", _t.localtime(int(m.group(3))))
     return f"{m.group(1)} {m.group(2)} {start}"
+
+
+_BRAKE_COLOR = {  # brake kind -> style name (Rich tag as-is; ANSI parses out "bold")
+    "safety": "yellow", "distrust": "red", "avg_down": "magenta", "latched": "red bold",
+}
+_SAFETY_STRONG = 0.3  # theta ~0.3 blocked the 2026-08-23 post-brake replay losses — display cue only
+
+
+def _side_safety(sides: list[dict]) -> tuple[float | None, float | None]:
+    """(up, down) safety values from an eval's `sides` list."""
+    by_side = {s.get("side"): s.get("safety") for s in sides}
+    return by_side.get("up"), by_side.get("down")
+
+
+def _safety_text(sides: list[dict]) -> str:
+    """`saf +x/-x`, "·" for a side with no book right now, "" if neither side evaluated."""
+    up_s, dn_s = _side_safety(sides)
+    if up_s is None and dn_s is None:
+        return ""
+    return "saf " + "/".join(f"{v:+.2f}" if v is not None else "·" for v in (up_s, dn_s))
+
+
+def _safety_is_strong(sides: list[dict], p_up: float | None) -> bool:
+    """True once the model's favored side clears the theta band."""
+    up_s, dn_s = _side_safety(sides)
+    fav = up_s if (p_up or 0) >= 0.5 else dn_s
+    return fav is not None and abs(fav) >= _SAFETY_STRONG
+
+
+def _brake_sides(sides: list[dict]) -> list[tuple[str, str]]:
+    """[(side, brake_kind), ...] for sides currently braked (fire blocked)."""
+    return [(s["side"], s["brake"]) for s in sides if s.get("brake")]
+
+
+def _safety_rich(sides: list[dict], p_up: float | None) -> str:
+    txt = _safety_text(sides)
+    if not txt:
+        return ""
+    style = "green" if _safety_is_strong(sides, p_up) else "dim"
+    return f"[{style}]{txt}[/{style}]"
+
+
+def _brake_rich(sides: list[dict]) -> str:
+    return " ".join(f"[{_BRAKE_COLOR.get(b, 'white')}]{side}:{b}[/]"
+                     for side, b in _brake_sides(sides))
+
+
+def _click_fg_bold(style: str) -> tuple[str | None, bool]:
+    parts = style.split()
+    return next((p for p in parts if p != "bold"), None), "bold" in parts
+
+
+def _safety_ansi(sides: list[dict], p_up: float | None) -> str:
+    txt = _safety_text(sides)
+    if not txt:
+        return ""
+    strong = _safety_is_strong(sides, p_up)
+    return click.style(txt, fg="green" if strong else None, dim=not strong)
+
+
+def _brake_ansi(sides: list[dict]) -> str:
+    parts = []
+    for side, b in _brake_sides(sides):
+        fg, bold = _click_fg_bold(_BRAKE_COLOR.get(b, "white"))
+        parts.append(click.style(f"{side}:{b}", fg=fg, bold=bold))
+    return "  ".join(parts)
 
 
 def _tape_render(line: str) -> str | None:
@@ -1791,7 +1864,8 @@ def _tape_render(line: str) -> str | None:
         label = click.style(f"EXIT {r['side'].upper():<4}", fg="red", bold=True)
         return f"{head} {label} {r['size']:g}sh @ bid {r['bid']:.2f}  fair {r['fair']:.4f}"
     if ev == "eval":
-        best = max(r.get("sides") or [], key=lambda s: s["net"], default=None)
+        sides = r.get("sides") or []
+        best = max(sides, key=lambda s: s["net"], default=None)
         book = (
             f"{best['side']} @ {best['ask']:.2f} {best['net'] * 100:+.1f}¢"
             if best
@@ -1802,9 +1876,13 @@ def _tape_render(line: str) -> str | None:
             f"{head} eval  p↑{r['p_up']:.4f}  {book}"
             f"  ρ{r['rho']:+.2f}  {money(r['committed'])} in"
         )
-        return click.style(body, dim=True) + banked
+        extras = "  ".join(x for x in (_safety_ansi(sides, r.get("p_up")), _brake_ansi(sides)) if x)
+        return click.style(body, dim=True) + banked + ("  " + extras if extras else "")
     if ev == "gated":
-        return click.style(f"{head} gated  {r.get('reason', '?')}", fg="yellow", dim=True)
+        def ask(v: float | None) -> str:
+            return f"{v:.2f}" if v is not None else "—"
+        asks = f"  up {ask(r['up_ask'])}/dn {ask(r['dn_ask'])}" if "up_ask" in r else ""
+        return click.style(f"{head} gated  {r.get('reason', '?')}{asks}", fg="yellow", dim=True)
     if ev == "roll":
         return click.style(f"{head} ROLL  next window armed (${r['size']:g})", fg="cyan")
     if ev == "cleanup":
@@ -1842,6 +1920,34 @@ _TAPE_PATH = "/var/home/hunter/.pmt/engine/updown-tape.jsonl"
 _BOOK_TAPE_PATH = "/var/home/hunter/.pmt/engine/book-tape.jsonl"
 _V2_ERA = 1787441100
 
+_GAMMA_CACHE: dict[str, tuple[float, dict]] = {}
+_GAMMA_TTL_S = 120  # watch redraws every ~30s; a slug's resolution doesn't flip that often
+
+
+def _gamma_resolution_cached(slug: str) -> dict | None:
+    """outcomes.gamma_resolution(), cached ~120s per slug so the watch
+    dashboard's 30s refresh doesn't hammer gamma. None on any fetch/parse
+    failure — callers must degrade gracefully, never guess."""
+    import time as _t
+
+    import requests
+
+    from polymarket import hosts, outcomes
+
+    now = _t.time()
+    hit = _GAMMA_CACHE.get(slug)
+    if hit and now - hit[0] < _GAMMA_TTL_S:
+        return hit[1]
+    try:
+        r = requests.get(f"{hosts.GAMMA}/markets", params={"slug": slug},
+                          headers=hosts.UA, timeout=8)
+        r.raise_for_status()
+        result = outcomes.gamma_resolution(r.json())
+    except Exception:
+        return None
+    _GAMMA_CACHE[slug] = (now, result)
+    return result
+
 
 def _tape_scoreboard(floor: float) -> dict:
     """W-L / realized P&L graded by the WALLET (data-api activity), not the
@@ -1854,12 +1960,18 @@ def _tape_scoreboard(floor: float) -> dict:
 
     import requests
 
-    from polymarket import hosts
+    from polymarket import hosts, outcomes
 
     now = _t.time()
     # Ground truth: every updown trade + redemption on the proxy wallet.
     win_by_slug: dict[str, dict] = {}
     addr = os.environ.get("PM_FUNDER_ADDRESS", "")
+    if not addr:
+        # Bug found in the existing code: an unset addr used to fall through
+        # this loop silently and report a clean "0W-0L" — indistinguishable
+        # from a genuinely empty trading history. Every sibling command
+        # (activity/window/outcomes) already raises for this; match them.
+        raise ValueError("PM_FUNDER_ADDRESS not set")
     offset = 0
     while addr:
         rows = requests.get(
@@ -1871,13 +1983,14 @@ def _tape_scoreboard(floor: float) -> dict:
             slug = a.get("slug") or ""
             if "-updown-" not in slug or a["timestamp"] < floor:
                 continue
-            w = win_by_slug.setdefault(slug, {"buy": 0.0, "sell": 0.0,
-                                              "redeem": 0.0, "won": None})
+            w = win_by_slug.setdefault(slug, {"buy": 0.0, "sell": 0.0, "redeem": 0.0,
+                                              "redeem_seen": False, "won": None})
             usd = a.get("usdcSize") or 0.0
             if a["type"] == "TRADE":
                 w["buy" if a.get("side") == "BUY" else "sell"] += usd
             elif a["type"] == "REDEEM":
                 w["redeem"] += usd
+                w["redeem_seen"] = True
                 if usd > 0.5:
                     w["won"] = (a.get("outcome") or "").lower()
         if len(rows) < 500 or (rows and rows[-1]["timestamp"] < floor):
@@ -1901,7 +2014,7 @@ def _tape_scoreboard(floor: float) -> dict:
 
     series: dict[str, dict] = {}
     cal: dict[float, list] = {}
-    wins = losses = 0
+    wins = losses = estimated = 0
     net = 0.0
     for slug, w in win_by_slug.items():
         parts = slug.split("-")
@@ -1909,22 +2022,33 @@ def _tape_scoreboard(floor: float) -> dict:
         end = int(slug.rsplit("-", 1)[1]) + int(dur[:-1]) * 60
         if w["buy"] + w["sell"] + w["redeem"] < 1:
             continue
-        s = series.setdefault(f"{sym} {dur}", {"w": 0, "l": 0, "open": 0, "pnl": 0.0, "usd": 0.0})
+        s = series.setdefault(f"{sym} {dur}",
+                               {"w": 0, "l": 0, "open": 0, "pnl": 0.0, "usd": 0.0, "est": 0})
         s["usd"] += w["buy"]
-        # Redemption usually lands 1-2min after close; before that it's open.
-        if w["redeem"] == 0 and now < end + 300:
+        fired = fires.get(slug, [{}])[0].get("side")
+        # Redemption is silent (no row at all) or slow far more often than a
+        # loss actually is — a gamma round-trip is only worth it once the
+        # grace window has passed with no redeem of either kind.
+        gamma = (_gamma_resolution_cached(slug)
+                 if w["redeem"] <= 0.5 and not w["redeem_seen"] and now >= end + 300
+                 else None)
+        won, is_est = outcomes.grade_window(w["redeem"], w["redeem_seen"], fired, gamma, now, end)
+        if won is None:
             s["open"] += 1
             continue
         pnl = w["redeem"] + w["sell"] - w["buy"]
-        won = w["redeem"] > 0.5
         s["w" if won else "l"] += 1
         s["pnl"] += pnl
+        s["est"] += is_est
         wins, losses, net = wins + won, losses + (not won), net + pnl
-        # Winning outcome: the paying redeem row names it; else infer from
-        # our fired side (right if we won, flipped if we lost).
-        fired = fires.get(slug, [{}])[0].get("side")
+        estimated += is_est
+        # Winning outcome for calibration: the paying redeem row names it
+        # directly; else gamma's own read if we cross-checked one; else
+        # infer from our fired side (right if we won, flipped if we lost).
         if w["won"]:
             won_side = w["won"]
+        elif gamma and gamma.get("winner"):
+            won_side = gamma["winner"]
         elif fired:
             won_side = fired if won else ("down" if fired == "up" else "up")
         else:
@@ -1935,7 +2059,7 @@ def _tape_scoreboard(floor: float) -> dict:
             cal[b][0] += 1
             cal[b][1] += f["side"] == won_side
     return {"wins": wins, "losses": losses, "net": net, "rolls": rolls,
-            "series": series, "cal": cal}
+            "series": series, "cal": cal, "estimated": estimated}
 
 
 @crypto_group.command("stats")
@@ -1953,7 +2077,7 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
         console.print(f"[red]data-api unreachable: {e}[/red]")
         sys.exit(1)
     wins, losses, net, rolls = sb["wins"], sb["losses"], sb["net"], sb["rolls"]
-    series, cal = sb["series"], sb["cal"]
+    series, cal, estimated = sb["series"], sb["cal"], sb["estimated"]
 
     status, bal = {}, {}
     try:
@@ -1970,7 +2094,8 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
     if as_json:
         click.echo(json.dumps({
             "wins": wins, "losses": losses, "net_est": net, "rolls": rolls,
-            "series": series, "calibration": {str(k): v for k, v in cal.items()},
+            "estimated": estimated, "series": series,
+            "calibration": {str(k): v for k, v in cal.items()},
             "arms": status.get("arms", {}), "balance": bal,
         }, indent=2))
         return
@@ -1978,16 +2103,18 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
     n = wins + losses
     wr = f"{wins / n * 100:.0f}%" if n else "—"
     cap = f"${bal['total']:,.2f}" if bal else "?"
+    est = f" · [dim]{estimated} ~graded (gamma unreachable)[/dim]" if estimated else ""
     console.print(f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L "
                   f"[{'green' if net >= 0 else 'red'}]{net:+,.2f}[/] · "
-                  f"{rolls} rolls · capital {cap}")
+                  f"{rolls} rolls · capital {cap}{est}")
 
     t = Table(title="By series (wallet-graded)")
     for col in ("series", "record", "P&L", "notional"):
         t.add_column(col, justify="right")
     for k in sorted(series):
         s = series[k]
-        rec = f"{s['w']}-{s['l']}" + (f" ({s['open']} open)" if s["open"] else "")
+        rec = (f"{s['w']}-{s['l']}" + (f" ({s['open']} open)" if s["open"] else "")
+               + (f" [dim]~{s['est']}[/dim]" if s["est"] else ""))
         t.add_row(k, rec, f"{s['pnl']:+,.2f}", f"${s['usd']:,.0f}")
     console.print(t)
 
@@ -2058,7 +2185,7 @@ def crypto_watch(since: float | None) -> None:
     try:
         sb = _tape_scoreboard(floor)
     except Exception:
-        sb = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "series": {}, "cal": {}}
+        sb = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "series": {}, "cal": {}, "estimated": 0}
         sb_stale = True
     status: dict = {}
     bal: dict = {}
@@ -2071,10 +2198,11 @@ def crypto_watch(since: float | None) -> None:
         cap = f"${bal['total']:,.2f}" if bal else "…"
         color = "green" if net >= 0 else "red"
         stale = " · [yellow dim]stats stale[/]" if sb_stale else ""
+        est = f" · [dim]{sb['estimated']} ~graded[/dim]" if sb.get("estimated") else ""
         err = f" · [red dim]{tick_err}[/]" if tick_err else ""
         return Panel(
             f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L [{color}]{net:+,.2f}[/] · "
-            f"{sb['rolls']} rolls · capital {cap}{stale}{err} · [dim]{_t.strftime('%H:%M:%S')}[/dim]",
+            f"{sb['rolls']} rolls · capital {cap}{stale}{est}{err} · [dim]{_t.strftime('%H:%M:%S')}[/dim]",
             title="updown fleet", border_style="cyan")
 
     def arms_table() -> Table:
@@ -2087,6 +2215,12 @@ def crypto_watch(since: float | None) -> None:
             state = e.get("state", "?")
             if state == "gated":
                 state = (e.get("reason") or "gated")[:48]
+            elif state == "armed":
+                sides = e.get("sides") or []
+                badges = "  ".join(x for x in (_safety_rich(sides, e.get("p_up")),
+                                                _brake_rich(sides)) if x)
+                if badges:
+                    state = f"[green]armed[/green]  {badges}"
             fair = f"{e['p_up']:.4f}" if "p_up" in e else "—"
             t.add_row(_tape_slug(slug), state,
                       f"${e.get('committed', a.get('filled_usdc', 0)):,.2f}",
@@ -2331,7 +2465,20 @@ def crypto_window(slug: str) -> None:
     elif now < end + 300:
         outcome_label = "[dim]pending[/dim]"
     else:
-        outcome_label = "[dim]?[/dim]"
+        # No redeem row at all past the grace window — Polymarket doesn't
+        # reliably auto-redeem a slow WIN, so silence isn't a loss; ask gamma.
+        from polymarket import outcomes
+
+        bought = next(((a.get("outcome") or "").lower() for a in rows
+                       if a.get("type") == "TRADE" and a.get("side") == "BUY"), None)
+        gamma = _gamma_resolution_cached(slug)
+        won, is_est = outcomes.grade_window(redeem, False, bought, gamma, now, end)
+        if won is None:
+            outcome_label = "[yellow]riding[/yellow]" if gamma is not None else "[dim]?[/dim]"
+        elif is_est:
+            outcome_label = "[dim]~LOSS[/dim]"  # gamma unreachable — old assume-LOSS heuristic
+        else:
+            outcome_label = "[bold]WIN[/bold]" if won else "[bold red]LOSS[/bold red]"
 
     fmt = "%H:%M:%S"
     console.print(f"[bold]{slug}[/bold]  {_t.strftime(fmt, _t.localtime(start))}"
