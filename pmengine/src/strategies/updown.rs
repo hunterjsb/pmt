@@ -189,6 +189,12 @@ struct ModelEval {
     /// this TWAP anymore.
     flip_proof: bool,
     rho: f64,
+    /// R9 safety-gate inputs, recorded on every tick (not yet gating):
+    /// projected full-window margin, the locked banked contribution, and the
+    /// 1σ-scale residual of the unlocked piece. safety = |banked|/cushion.
+    margin_bp: f64,
+    banked_margin_bp: f64,
+    cushion_bp: f64,
 }
 
 /// Everything one hunted window owns: params, feeds, budget, clip clocks.
@@ -484,7 +490,10 @@ impl ArmState {
             let open = f.candle_open.ok_or("candle open not printed yet")?;
             let t_min = ((p.end - now) / 60.0).max(0.005);
             let z = (spot / open).ln() / (sig_frac * t_min.sqrt());
-            Ok(ModelEval { p_up: norm_cdf(z), sig_bp, banked_decided: false, flip_proof: false, rho })
+            Ok(ModelEval {
+                p_up: norm_cdf(z), sig_bp, banked_decided: false, flip_proof: false, rho,
+                margin_bp: (spot / open - 1.0) * 1e4, banked_margin_bp: 0.0, cushion_bp: 0.0,
+            })
         } else {
             let ref_px = *f
                 .per_min
@@ -506,14 +515,24 @@ impl ArmState {
             let window = banked_s + rem;
             if window <= 0.0 || rem <= 0.0 {
                 let p_up = if banked_avg >= ref_px { 1.0 } else { 0.0 };
-                return Ok(ModelEval { p_up, sig_bp, banked_decided: true, flip_proof: true, rho });
+                let m = (banked_avg / ref_px - 1.0) * 1e4;
+                return Ok(ModelEval {
+                    p_up, sig_bp, banked_decided: true, flip_proof: true, rho,
+                    margin_bp: m, banked_margin_bp: m, cushion_bp: p.basis_guard_bp,
+                });
             }
             let proj = (banked_avg * banked_s + spot * rem) / window;
             let margin_bp = (proj / ref_px - 1.0) * 1e4;
+            // Banked-decided inputs, computed before the guard so gated ticks
+            // still record them — the R9 safety-gate sweep needs the corpus
+            // to know what |banked|/cushion was while the flat guard held.
+            let banked_margin_bp = (banked_avg / ref_px - 1.0) * 1e4 * (banked_s / window);
+            let cushion_bp = p.basis_guard_bp
+                + sig_bp * ((rem / 60.0).max(0.02) / 3.0).sqrt() * (rem / window);
             if margin_bp.abs() < p.basis_guard_bp {
                 return Err(format!(
-                    "basis guard: projected margin {:+.1}bp inside {:.1}bp noise band",
-                    margin_bp, p.basis_guard_bp
+                    "basis guard: projected margin {:+.1}bp inside {:.1}bp noise band [banked {:+.1}bp cushion {:.1}bp]",
+                    margin_bp, p.basis_guard_bp, banked_margin_bp, cushion_bp
                 ));
             }
             let breakeven = (ref_px * window - banked_avg * banked_s) / rem;
@@ -522,9 +541,6 @@ impl ArmState {
             // Banked-decided: the banked contribution alone survives a full
             // reversion of the remaining path to the reference, with basis
             // noise + one sigma of remaining-average cushion on top.
-            let banked_margin_bp = (banked_avg / ref_px - 1.0) * 1e4 * (banked_s / window);
-            let cushion_bp = p.basis_guard_bp
-                + sig_bp * ((rem / 60.0).max(0.02) / 3.0).sqrt() * (rem / window);
             let banked_decided =
                 banked_margin_bp.abs() > cushion_bp && (banked_margin_bp > 0.0) == (p_up > 0.5);
             // Flip-proof: survives basis noise PLUS a full-remaining-window
@@ -532,7 +548,10 @@ impl ArmState {
             let flip_proof = banked_decided
                 && banked_margin_bp.abs()
                     > p.basis_guard_bp + p.manip_push_bp * (rem / window);
-            Ok(ModelEval { p_up, sig_bp, banked_decided, flip_proof, rho })
+            Ok(ModelEval {
+                p_up, sig_bp, banked_decided, flip_proof, rho,
+                margin_bp, banked_margin_bp, cushion_bp,
+            })
         }
     }
 
@@ -855,6 +874,8 @@ impl ArmState {
             "state": "armed", "t": now, "p_up": p_up, "sig_bp": sig_bp,
             "rho": m.rho, "mode": if unlocked { "safe" } else { "spec" },
             "chop_blocked": chop_blocked, "banked_decided": m.banked_decided,
+            "margin_bp": m.margin_bp, "banked_bp": m.banked_margin_bp,
+            "cushion_bp": m.cushion_bp,
             "committed": committed, "budget": budget, "room": room,
             "inflight": inflight_usdc, "sides": evals,
         }));
@@ -863,6 +884,8 @@ impl ArmState {
             tape(serde_json::json!({
                 "t": now, "ev": "eval", "slug": p.slug, "p_up": p_up,
                 "sig_bp": sig_bp, "rho": m.rho, "banked_decided": m.banked_decided,
+                "margin_bp": m.margin_bp, "banked_bp": m.banked_margin_bp,
+                "cushion_bp": m.cushion_bp,
                 "committed": committed, "sides": evals,
             }));
         }

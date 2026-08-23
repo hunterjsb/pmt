@@ -56,7 +56,14 @@ diagrams by p-bucket × ρ-regime × time-to-expiry become the gate on any size 
 R3 → R5/R6/R1 → R7/R8/R9.
 
 - **R1 Oracle basis per symbol** — measured Chainlink-vs-Binance distribution → per-symbol
-  guards with confidence, XRP verdict. Needs Phase 0 rounds data.
+  guards with confidence, XRP verdict. First measurement (2026-08-23, `pmt crypto basis`,
+  point-in-time rounds vs 1m closes, 24h): p95 |basis| ≈ BTC 8.8 / ETH 13.6 / SOL 26.8 /
+  XRP 49.2 / DOGE 37.4 bp. CAVEAT: this method bakes in up to a minute of pure timing noise
+  (all symbols' worst outliers cluster in one flash-move minute), so it over-states true
+  settlement basis — treat as an upper bound. Refinement: TWAP-vs-TWAP join (average Chainlink
+  rounds over the settlement window vs Binance TWAP of the same span). Even as upper bounds:
+  alt guards were raised (ETH 6→8, SOL 6→10), XRP/DOGE look structurally untradeable with a
+  Binance proxy, BTC 3bp stands on its live record pending the aligned measurement.
 - **R2 Calibration gate + fractional Kelly** — clip size from quarter-Kelly on post-fee,
   post-haircut edge; hard per-window %-of-bankroll cap; no size increases until each p-bucket
   shows calibration over ≥30 decided windows. (Current reality check: stated fair ≥0.95 hits 92%.)
@@ -68,7 +75,11 @@ R3 → R5/R6/R1 → R7/R8/R9.
   wallet says 5m is 30-1 and 15m 5-1 including the −$370. Hypothesis: our 5m edge is real
   (flip-proof + manip cushion already defend it) and the 15m loss was a sizing/brake failure,
   now fixed — but the corpus decides: look for the reversing near-settlement flow spike
-  signature in OUR recorded books before moving capital either way.
+  signature in OUR recorded books before moving capital either way. Regime note: settlement
+  moved to Chainlink TWAP ~2026-08-07 (30s on 5m, 60s on 15m/4h) — the study's pure
+  last-print snapshot attack is largely closed; a push now has to be sustained across the
+  averaging window. R4 must therefore split pre/post-change nights, and residual near-close
+  risk is mostly path vol of the unfinished average, not single-print manipulation.
 - **R5 Session + fast-ρ regimes** — add a 5–15m ρ estimate beside the 60m one; in negative-ρ
   regimes allow banked-decided entries only; attribute P&L by session (Asia chop vs London/NY)
   and gate accordingly.
@@ -81,11 +92,24 @@ R3 → R5/R6/R1 → R7/R8/R9.
   manipulation fingerprint the 5m literature documents.
 - **R9 Entry gate: banked evidence, not clock %** — the 50% `min_elapsed` gate is unswept
   folklore with a known cliff failure (the −$370 window fired at the first legal tick, when
-  BTC still moves >10bp in the remaining time 29% of the time). Sweep `min_elapsed` per
-  duration on the corpus, then test the principled replacement: require the banked margin to
-  carry a minimum fraction of the decided-cushion before the first clip — a gate that opens
-  later in hot regimes and earlier in dead ones, which the clock only crudely approximates.
-  Our edge is banked-mass arithmetic; the entry gate should measure banked mass.
+  BTC still moves >10bp in the remaining time 29% of the time). Our edge is banked-mass
+  arithmetic; the entry gate should measure banked mass. Spec (2026-08-23 deep-research pass):
+  - `safety = |banked_margin_bp| / max(cushion_bp, ε)` — a dimensionless path-moneyness score
+    from quantities `fair_p_up` already computes (the σ√(T/3) cushion is the standard
+    Asian-average residual-risk term; the live 45m σ floor feeds it, so safety adapts to
+    regime without retuning). Side agreement: sign(banked) must match the side considered.
+  - First clip requires `safety ≥ θ` (θ=1 ≡ today's banked_decided); everything else
+    (edge, basis, ρ, brakes, budget unlock, quiesce) unchanged. Sweep θ over
+    {0.6, 0.75, 1.0, 1.25, 1.5} against a `min_elapsed` sweep {0, 0.2, 0.3, 0.4, 0.5} as the
+    baseline to beat — same corpus, conservative fills.
+  - Couples with R3, not substitutes: low-safety entries get the ~0.70 max-price cap;
+    high-safety/banked entries may buy near 1.0 (residual path risk is small there).
+  - Sub-A/B: duration-aware banked lag — settlement moved to Chainlink TWAP ~2026-08-07
+    (30s on 5m, 60s on 15m/4h); our banked cut is a flat now−30s. Align per duration so
+    "banked" never includes mass still inside the settlement TWAP.
+  - **Instrumented 2026-08-23**: eval tape now records margin_bp / banked_bp / cushion_bp
+    every tick (guard-gated ticks carry them in the gate reason) — the θ sweep has corpus
+    data from tonight forward.
 
 ## Phase 3 — Strategy expansion (each gated by Phase 1)
 
