@@ -12,6 +12,11 @@ mod sure_bets;
 // pub(crate): the replay harness (src/replay.rs) drives updown's decision
 // core directly. If regeneration ever reverts this, the build breaks loudly.
 pub(crate) mod updown;
+// Helper module for updown (Chainlink oracle poller + dynamic basis guard),
+// not a strategy — it has no plain `pub struct`, so `scan_strategy_file`
+// skips it and `pmstrat transpile --all` won't emit this line on its own.
+// Hand-added; re-add by hand if this file is ever regenerated.
+pub(crate) mod updown_oracle;
 
 use std::collections::HashMap;
 use crate::strategy::Strategy;
