@@ -10,7 +10,11 @@ Rich console and one lazy PolymarketAPI loader across both files.
 from __future__ import annotations
 
 import json
+import re
+import select
 import sys
+import termios
+import tty
 
 import click
 from rich.table import Table
@@ -284,15 +288,107 @@ def _brake_ansi(sides: list[dict]) -> str:
     return "  ".join(parts)
 
 
-def _tape_render(line: str) -> str | None:
+_MARGIN_RE = re.compile(r"projected margin ([+-]?\d+\.?\d*)bp inside (\d+\.?\d*)bp")
+
+
+def _gated_reason_compact(reason: str | None) -> str:
+    """`margin -4.9 vs 6.0bp` from the basis-guard message (the only gated
+    reason with real structure); the elapsed-percent gate and anything else
+    fall back to the raw (truncated) reason so nothing gets swallowed."""
+    reason = reason or ""
+    m = _MARGIN_RE.search(reason)
+    if m:
+        margin, thresh = float(m.group(1)), float(m.group(2))
+        return f"margin {margin:+.1f} vs {thresh:.1f}bp"
+    return reason[:60] if reason else "gated"
+
+
+def _evidence_style(banked: float, cushion: float, banked_decided: bool) -> str:
+    """green once banked evidence alone clears the cushion (banked-decided),
+    yellow once it clears the same theta=0.3 partial band as the per-side
+    safety badge (_SAFETY_STRONG — same banked/cushion ratio, different
+    field: this is the eval-level total, not one side's signed view), dim
+    below that."""
+    if banked_decided:
+        return "green"
+    if cushion <= 0:
+        return "dim"
+    ratio = abs(banked) / cushion
+    if ratio >= 1.0:
+        return "green"
+    if ratio >= _SAFETY_STRONG:
+        return "yellow"
+    return "dim"
+
+
+def _evidence_markup(e: dict) -> str:
+    """`+5.2/9.3bp` (banked vs cushion) from an eval, colored by
+    _evidence_style; '—' when either field is missing (a partial eval right
+    after an engine restart, or a gated eval that never reached the model)."""
+    banked, cushion = e.get("banked_bp"), e.get("cushion_bp")
+    if banked is None or cushion is None:
+        return "[dim]—[/dim]"
+    style = _evidence_style(banked, cushion, bool(e.get("banked_decided")))
+    return f"[{style}]{banked:+.1f}/{cushion:.1f}bp[/{style}]"
+
+
+def _countdown_style(rem_s: float) -> str:
+    if rem_s < 60:
+        return "bold red"
+    if rem_s < 300:
+        return "white"
+    return "dim"
+
+
+def _countdown_markup(slug: str, now: float) -> str:
+    """`m:ss` to window end, parsed straight from the slug — no eval needed,
+    so it still renders through an engine restart. '—' for an unparseable slug."""
+    w = updown_slugs.parse_updown_slug(slug)
+    if w is None:
+        return "[dim]—[/dim]"
+    rem = w["end"] - now
+    if rem <= 0:
+        return "[dim]0:00[/dim]"
+    m, s = divmod(int(rem), 60)
+    style = _countdown_style(rem)
+    return f"[{style}]{m}:{s:02d}[/{style}]"
+
+
+def _mode_text(e: dict) -> str:
+    """One unified regime label: `safe`/`spec` from an armed eval's own
+    `mode` field, or `flip`/`quiesce` when that's the eval's `state` itself
+    (the pre-model quiesce-window states carry no `mode` field of their own)."""
+    state = e.get("state")
+    if state in ("flip", "quiesce"):
+        return state
+    return e.get("mode") or "—"
+
+
+_TAPE_TAG_WIDTH = 9  # "FIRE DOWN"/"FLIP DOWN"/etc — the widest natural tag, unpadded
+
+
+def _tape_tag(text: str) -> str:
+    """Left-pad an event tag to a fixed width so the fields after it land at
+    the same column regardless of event type (FIRE/EXIT/eval/gated/ROLL)."""
+    return f"{text:<{_TAPE_TAG_WIDTH}}"
+
+
+def _tape_head(r: dict) -> str:
+    """`HH:MM:SS  slug-padded-to-14` — the fixed-width prefix shared by every
+    tape-line renderer, so eval/fire/gated/roll/exit lines all column-align.
+    14 is the widest current display() form (e.g. "doge 60m 23:40")."""
     import time as _t
 
+    ts = _t.strftime("%H:%M:%S", _t.localtime(r.get("t", 0)))
+    return f"{ts}  {_tape_slug(r.get('slug', '')):<14}"
+
+
+def _tape_render(line: str) -> str | None:
     try:
         r = json.loads(line)
     except ValueError:
         return None
-    ts = _t.strftime("%H:%M:%S", _t.localtime(r.get("t", 0)))
-    head = f"{ts}  {_tape_slug(r.get('slug', '')):<13}"
+    head = _tape_head(r)
 
     def money(v: float) -> str:
         return f"${v:,.2f}".rstrip("0").rstrip(".")
@@ -300,7 +396,7 @@ def _tape_render(line: str) -> str | None:
     ev = r.get("ev")
     if ev == tape.EV_FIRE:
         tag = {"flip": "FLIP", "spec": "SPEC"}.get(r.get("mode", "safe"), "FIRE")
-        label = click.style(f"{tag} {r['side'].upper():<4}", fg="green", bold=True)
+        label = click.style(_tape_tag(f"{tag} {r['side'].upper()}"), fg="green", bold=True)
         pct = f"  {r['elapsed_frac'] * 100:.0f}% thru" if "elapsed_frac" in r else ""
         return (
             f"{head} {label} {r['size']:g}sh @ {r['ask']:.2f}"
@@ -308,7 +404,7 @@ def _tape_render(line: str) -> str | None:
             f"  ρ{r['rho']:+.2f}  {money(r['committed'])} in{pct}"
         )
     if ev == tape.EV_EXIT:
-        label = click.style(f"EXIT {r['side'].upper():<4}", fg="red", bold=True)
+        label = click.style(_tape_tag(f"EXIT {r['side'].upper()}"), fg="red", bold=True)
         return f"{head} {label} {r['size']:g}sh @ bid {r['bid']:.2f}  fair {r['fair']:.4f}"
     if ev == tape.EV_EVAL:
         sides = r.get("sides") or []
@@ -320,7 +416,7 @@ def _tape_render(line: str) -> str | None:
         )
         banked = click.style("  BANKED", fg="cyan") if r.get("banked_decided") else ""
         body = (
-            f"{head} eval  p↑{r['p_up']:.4f}  {book}"
+            f"{head} {_tape_tag('eval')} p↑{r['p_up']:.4f}  {book}"
             f"  ρ{r['rho']:+.2f}  {money(r['committed'])} in"
         )
         extras = "  ".join(x for x in (_safety_ansi(sides, r.get("p_up")), _brake_ansi(sides)) if x)
@@ -329,9 +425,11 @@ def _tape_render(line: str) -> str | None:
         def ask(v: float | None) -> str:
             return f"{v:.2f}" if v is not None else "—"
         asks = f"  up {ask(r['up_ask'])}/dn {ask(r['dn_ask'])}" if "up_ask" in r else ""
-        return click.style(f"{head} gated  {r.get('reason', '?')}{asks}", fg="yellow", dim=True)
+        return click.style(f"{head} {_tape_tag('gated')} {r.get('reason', '?')}{asks}",
+                            fg="yellow", dim=True)
     if ev == tape.EV_ROLL:
-        return click.style(f"{head} ROLL  next window armed (${r['size']:g})", fg="cyan")
+        return click.style(f"{head} {_tape_tag('ROLL')} next window armed (${r['size']:g})",
+                            fg="cyan")
     if ev == tape.EV_CLEANUP:
         return click.style(f"{head} ── window closed ──", dim=True)
     return line.rstrip()
@@ -401,7 +499,17 @@ def _funder_or_usage_error() -> str:
         raise click.UsageError(str(e))
 
 
-def _tape_scoreboard(floor: float) -> dict:
+def _impute_win_pnl(buy_usd: float, sell_usd: float, buy_shares: float) -> float:
+    """A gamma-confirmed WIN whose real $1/share redeem row hasn't posted yet
+    (Polymarket's auto-redeemer can lag minutes): impute the payout as
+    shares*$1 — what it will actually pay — so the $ figure tracks the W/L
+    figure instead of showing a fake loss until the real redeem row lands
+    and naturally replaces this estimate on a later scan.
+    """
+    return buy_shares * 1.0 + sell_usd - buy_usd
+
+
+def _tape_scoreboard(floor: float, sliding_floor: float | None = None) -> dict:
     """W-L / realized P&L graded by the WALLET (data-api activity), not the
     model's own final read — a model that's confidently wrong (XRP basis,
     2026-08-23) would otherwise grade its own loss as a win. The tape only
@@ -411,6 +519,13 @@ def _tape_scoreboard(floor: float) -> dict:
     transactions — filtering by row timestamp let a window's redeem into the
     range while its buys fell outside, printing phantom profit (caught live
     2026-08-23: +$78 shown vs -$17 true).
+
+    `sliding_floor`, if given, additionally derives a "sliding" aggregate
+    (recent-window W-L/P&L, keyed "sliding" in the result) from windows with
+    start >= sliding_floor — computed in the SAME pass over the SAME wallet
+    walk (typically called with floor=0, i.e. all-time, from the watch
+    dashboard) so a side-by-side sliding/all-time P&L costs one wallet walk
+    instead of two.
     """
     import time as _t
 
@@ -429,10 +544,13 @@ def _tape_scoreboard(floor: float) -> dict:
         if not updown_slugs.is_updown(slug) or updown_slugs.window_start(slug) < floor:
             continue
         w = win_by_slug.setdefault(slug, {"buy": 0.0, "sell": 0.0, "redeem": 0.0,
-                                          "redeem_seen": False, "won": None})
+                                          "redeem_seen": False, "won": None,
+                                          "buy_shares": 0.0})
         usd = a.get("usdcSize") or 0.0
         if a["type"] == "TRADE":
             w["buy" if a.get("side") == "BUY" else "sell"] += usd
+            if a.get("side") == "BUY":
+                w["buy_shares"] += a.get("size") or 0.0
         elif a["type"] == "REDEEM":
             w["redeem"] += usd
             w["redeem_seen"] = True
@@ -440,25 +558,32 @@ def _tape_scoreboard(floor: float) -> dict:
                 w["won"] = (a.get("outcome") or "").lower()
 
     fires: dict[str, list] = {}
-    rolls = 0
+    rolls = rolls_sliding = 0
     for r in tape.iter_records(tape.UPDOWN_TAPE, evs={tape.EV_FIRE, tape.EV_ROLL}):
         if r.get("ev") == tape.EV_FIRE:
             if updown_slugs.window_start(r.get("slug", "")) >= floor:
                 fires.setdefault(r["slug"], []).append(r)
         elif r.get("t", 0) >= floor:
             rolls += 1
+            if sliding_floor is not None and r.get("t", 0) >= sliding_floor:
+                rolls_sliding += 1
 
     series: dict[str, dict] = {}
     cal: dict[float, list] = {}
+    window_list: list[dict] = []
     wins = losses = estimated = 0
-    net = 0.0
+    riding_n = 0
+    net = riding_usd = 0.0
+    wins_s = losses_s = estimated_s = 0
+    net_s = 0.0
     for slug, w in win_by_slug.items():
         parsed = updown_slugs.parse(slug)
         if parsed is None:
             continue  # not a real updown slug (defensive; upstream already filtered)
-        sym, _dur_s, _start, end, series_k = parsed
+        sym, _dur_s, start, end, series_k = parsed
         if w["buy"] + w["sell"] + w["redeem"] < 1:
             continue
+        in_sliding = sliding_floor is not None and start >= sliding_floor
         s = series.setdefault(series_k,
                                {"w": 0, "l": 0, "open": 0, "pnl": 0.0, "usd": 0.0, "est": 0})
         s["usd"] += w["buy"]
@@ -472,13 +597,31 @@ def _tape_scoreboard(floor: float) -> dict:
         won, is_est = outcomes.grade_window(w["redeem"], w["redeem_seen"], fired, gamma, now, end)
         if won is None:
             s["open"] += 1
+            # Still riding — its bought notional is speculative exposure the
+            # risk header's "riding N windows $W" needs, distinct from a live
+            # arm's committed budget (this window may have already rolled off).
+            riding_n += 1
+            riding_usd += w["buy"]
             continue
-        pnl = w["redeem"] + w["sell"] - w["buy"]
+        pnl_est = is_est
+        if won and w["redeem"] <= 0.5 and not w["redeem_seen"]:
+            # Gamma confirmed the win before Polymarket's redeemer posted the
+            # real payout row — impute it so the $ figure doesn't lag the W/L
+            # figure by however long the slow auto-redeem takes.
+            pnl = _impute_win_pnl(w["buy"], w["sell"], w["buy_shares"])
+            pnl_est = True
+        else:
+            pnl = w["redeem"] + w["sell"] - w["buy"]
         s["w" if won else "l"] += 1
         s["pnl"] += pnl
-        s["est"] += is_est
+        s["est"] += pnl_est
         wins, losses, net = wins + won, losses + (not won), net + pnl
-        estimated += is_est
+        estimated += pnl_est
+        if in_sliding:
+            wins_s, losses_s, net_s = wins_s + won, losses_s + (not won), net_s + pnl
+            estimated_s += pnl_est
+        window_list.append({"slug": slug, "won": won, "pnl": pnl,
+                             "est": bool(pnl_est), "end_ts": end})
         # Winning outcome for calibration: the paying redeem row names it
         # directly; else gamma's own read if we cross-checked one; else
         # infer from our fired side (right if we won, flipped if we lost).
@@ -495,8 +638,16 @@ def _tape_scoreboard(floor: float) -> dict:
             cal.setdefault(b, [0, 0])
             cal[b][0] += 1
             cal[b][1] += f["side"] == won_side
-    return {"wins": wins, "losses": losses, "net": net, "rolls": rolls,
-            "series": series, "cal": cal, "estimated": estimated}
+    # Recent-windows strip wants newest-first, capped small — this is a
+    # display list, not the ledger (pmt crypto window/outcomes for the rest).
+    windows = sorted(window_list, key=lambda r: r["end_ts"], reverse=True)[:12]
+    result = {"wins": wins, "losses": losses, "net": net, "rolls": rolls,
+              "series": series, "cal": cal, "estimated": estimated,
+              "riding_n": riding_n, "riding_usd": riding_usd, "windows": windows}
+    if sliding_floor is not None:
+        result["sliding"] = {"wins": wins_s, "losses": losses_s, "net": net_s,
+                              "rolls": rolls_sliding, "estimated": estimated_s}
+    return result
 
 
 @crypto_group.command("stats")
@@ -535,13 +686,17 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
             "estimated": estimated, "series": series,
             "calibration": {str(k): v for k, v in cal.items()},
             "arms": status.get("arms", {}), "balance": bal,
+            "windows": sb["windows"],
         }, indent=2))
         return
 
     n = wins + losses
     wr = f"{wins / n * 100:.0f}%" if n else "—"
     cap = f"${bal['total']:,.2f}" if bal else "?"
-    est = f" · [dim]{estimated} ~graded (gamma unreachable)[/dim]" if estimated else ""
+    # "estimated" now covers two distinct cases sharing one dim-~ convention:
+    # gamma unreachable (old assume-LOSS heuristic) AND a gamma-confirmed win
+    # whose real redeem hasn't posted yet (pnl imputed) — see _tape_scoreboard.
+    est = f" · [dim]{estimated} ~estimated (gamma unreachable or pending redeem)[/dim]" if estimated else ""
     from datetime import datetime, timezone
     if floor <= 0:
         floor_label = "all time"
@@ -588,13 +743,164 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
             console.print(f"[dim]pending rolls: {', '.join(status['pending_rolls'])}[/dim]")
 
 
+_UNDECIDED_YELLOW_USD = 300.0  # R7 speculative-exposure threshold zone
+_UNDECIDED_RED_USD = 500.0
+
+
+def _risk_committed(arms: dict | None) -> tuple[float, float]:
+    """(committed, undecided) USDC summed across a /status reply's arms.
+
+    committed = every arm's filled_usdc. undecided = the slice of that still
+    sitting in arms whose last eval hasn't banked-decided (including a
+    missing eval entirely, e.g. right after an engine restart) — that's
+    speculative exposure that could still flip.
+    """
+    committed = undecided = 0.0
+    for a in (arms or {}).values():
+        if not isinstance(a, dict):
+            continue
+        filled = a.get("filled_usdc") or 0.0
+        committed += filled
+        e = a.get("eval")
+        if not (isinstance(e, dict) and e.get("banked_decided")):
+            undecided += filled
+    return committed, undecided
+
+
+def build_risk_header(status: dict | None, bal: dict | None, sb: dict | None) -> str:
+    """`capital $X · committed $Y ($Z un-decided) · riding N windows $W` —
+    the one-line risk summary between the scoreboard and the arms table.
+    Reads only already-cached data (status/bal/sb) — never fetches."""
+    committed, undecided = _risk_committed((status or {}).get("arms"))
+    cap = f"${bal['total']:,.2f}" if bal else "…"
+    riding_n = (sb or {}).get("riding_n", 0)
+    riding_usd = (sb or {}).get("riding_usd", 0.0)
+    color = ("red" if undecided > _UNDECIDED_RED_USD else
+             "yellow" if undecided > _UNDECIDED_YELLOW_USD else "")
+    undecided_s = f"${undecided:,.2f} un-decided"
+    if color:
+        undecided_s = f"[{color}]{undecided_s}[/{color}]"
+    return (f"capital {cap} · committed ${committed:,.2f} ({undecided_s}) · "
+            f"riding {riding_n} windows ${riding_usd:,.2f}")
+
+
+def _window_chip(w: dict) -> str:
+    """`✓ btc5 +12` / `✗ eth15 -44` for one resolved window; dim for a
+    ~estimated (gamma-unreachable, or gamma-confirmed-win-pending-redeem)
+    read rather than the win/loss color, since it's a lower-confidence read."""
+    parsed = updown_slugs.parse(w.get("slug", ""))
+    label = f"{parsed[0]}{parsed[1] // 60}" if parsed else (w.get("slug", "?")[:8])
+    mark = "✓" if w.get("won") else "✗"
+    text = f"{mark} {label} {w.get('pnl', 0.0):+.0f}"
+    style = "dim" if w.get("est") else ("green" if w.get("won") else "red")
+    return f"[{style}]{text}[/{style}]"
+
+
+def build_windows_strip(windows: list[dict] | None) -> str:
+    """Chip row of the last resolved windows, newest first (caller supplies
+    an already-sorted/capped list — see _tape_scoreboard's "windows")."""
+    chips = [_window_chip(w) for w in (windows or [])]
+    return "  ".join(chips) if chips else "[dim]no resolved windows yet[/dim]"
+
+
+# Fixed widths (+ ellipsis overflow below) so the arms table's geometry never
+# jitters as state/reason text length changes tick to tick.
+_ARMS_COLUMNS = (
+    ("window", "left", 14),
+    ("T-", "right", 6),
+    ("state", "left", 34),
+    ("evidence", "right", 15),
+    ("p_up", "right", 6),
+    ("mode", "left", 8),
+    ("rho", "right", 6),
+    ("committed", "right", 12),
+    ("roll", "right", 4),
+)
+
+
+def build_arms_table(arms: dict | None, now: float) -> Table:
+    """Live-arms table: countdown, state (compact gate reason for a gated
+    arm, safety/brake badges for an armed one), banked-vs-cushion evidence,
+    model read (p_up/mode/rho), committed $, roll flag. Every cell tolerates
+    a missing/partial eval — an engine restart mid-watch leaves last_eval
+    None or half-built.
+    """
+    t = Table(expand=True, pad_edge=False)
+    for col, justify, width in _ARMS_COLUMNS:
+        t.add_column(col, justify=justify, width=width, no_wrap=True, overflow="ellipsis")
+    arms = arms or {}
+    for slug, a in arms.items():
+        if not isinstance(a, dict):
+            a = {}
+        e = a.get("eval")
+        e = e if isinstance(e, dict) else {}
+        state = e.get("state", "?")
+        if state == "gated":
+            state = f"[yellow]gated[/yellow]  {_gated_reason_compact(e.get('reason'))}"
+        elif state == "armed":
+            sides = e.get("sides") or []
+            badges = "  ".join(x for x in (_safety_rich(sides, e.get("p_up")),
+                                            _brake_rich(sides)) if x)
+            state = f"[green]armed[/green]  {badges}" if badges else "[green]armed[/green]"
+        p_up = f"{e['p_up']:.2f}" if "p_up" in e else "—"
+        rho = f"{e['rho']:+.2f}" if "rho" in e else "—"
+        committed = e.get("committed", a.get("filled_usdc"))
+        committed_s = f"${committed:,.2f}" if committed is not None else "—"
+        t.add_row(_tape_slug(slug), _countdown_markup(slug, now), state,
+                  _evidence_markup(e), p_up, _mode_text(e), rho, committed_s,
+                  "⟳" if a.get("roll") else "·")
+    if not arms:
+        t.add_row("—", "—", "[red]engine unreachable or no arms[/red]",
+                   "—", "—", "—", "—", "—", "—")
+    return t
+
+
+def _cbreak_stdin() -> tuple[int, list] | None:
+    """Put stdin in cbreak (no line buffering, no echo) so a single 'q'
+    keypress is visible without Enter — SIGINT stays enabled (cbreak, unlike
+    raw mode, leaves ISIG alone), so Ctrl-C still works. None when stdin
+    isn't a real tty (piped input, a test harness) — termios would just raise.
+    """
+    if not sys.stdin.isatty():
+        return None
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    return fd, old
+
+
+def _restore_stdin(saved: tuple[int, list] | None) -> None:
+    """Undo _cbreak_stdin — must run even on an exception, or the shell is
+    left echo-less after the dashboard exits."""
+    if saved is None:
+        return
+    fd, old = saved
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        pass
+
+
+def _quit_requested() -> bool:
+    """Non-blocking: True if 'q' is waiting on stdin this tick."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], 0)
+        return bool(ready) and sys.stdin.read(1).lower() == "q"
+    except Exception:
+        return False
+
+
 @crypto_group.command("watch")
 @click.option("--since", type=float, default=None,
-              help="Scoreboard floor: hours-ago if small, raw unix epoch if "
-                   "large (default: last 6h — a live dashboard cares about "
-                   "the recent pulse, not the full ledger)")
+              help="Sliding-window floor for the header's recent P&L: "
+                   "hours-ago if small, raw unix epoch if large (default: "
+                   "last 6h — a live dashboard cares about the recent pulse). "
+                   "All-time P&L, and the riding/recent-windows figures, "
+                   "always walk the full wallet history regardless of this.")
 def crypto_watch(since: float | None) -> None:
-    """Full-screen live dashboard: scoreboard + arms + streaming tape."""
+    """Full-screen live dashboard: risk header + scoreboard + arms + streaming tape."""
     import time as _t
     from collections import deque
     from datetime import datetime, timezone
@@ -605,6 +911,7 @@ def crypto_watch(since: float | None) -> None:
     from rich.text import Text
 
     WATCH_DEFAULT_LOOKBACK_H = 6.0  # sliding recent window — it's a live dashboard, not the ledger
+    SB_REFRESH_TICKS = 10  # was 30s; stale P&L was the operator's top live pain
 
     def _safe_render(raw: str) -> str | None:
         # A line can be truncated mid-write by a concurrently-crashing
@@ -629,56 +936,65 @@ def crypto_watch(since: float | None) -> None:
     except OSError:
         pass
 
+    _SB_EMPTY_SLIDING = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "estimated": 0}
+    _SB_EMPTY = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "series": {}, "cal": {},
+                 "estimated": 0, "riding_n": 0, "riding_usd": 0.0, "windows": [],
+                 "sliding": dict(_SB_EMPTY_SLIDING)}
+
     # The dashboard must outlive every upstream hiccup: stale numbers with a
     # marker, never a traceback to the terminal.
     sb_stale = False
+    sb_fetched_at: float | None = None
     try:
-        sb = _tape_scoreboard(floor)
+        # Always walk the FULL wallet history (floor 0) and derive both the
+        # sliding (recent-pulse) and all-time P&L from that one pass — one
+        # walk serves both header figures instead of fetching twice.
+        sb = _tape_scoreboard(0.0, sliding_floor=floor)
+        sb_fetched_at = _t.time()
     except Exception:
-        sb = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "series": {}, "cal": {}, "estimated": 0}
+        sb = dict(_SB_EMPTY)
         sb_stale = True
     status: dict = {}
     bal: dict = {}
     tick_err: str | None = None
 
     def header() -> Panel:
-        wins, losses, net = sb["wins"], sb["losses"], sb["net"]
+        sliding = sb.get("sliding") or _SB_EMPTY_SLIDING
+        wins, losses, net, rolls = sliding["wins"], sliding["losses"], sliding["net"], sliding["rolls"]
         n = wins + losses
         wr = f"{wins / n * 100:.0f}%" if n else "—"
         cap = f"${bal['total']:,.2f}" if bal else "…"
         color = "green" if net >= 0 else "red"
         stale = " · [yellow dim]stats stale[/]" if sb_stale else ""
-        est = f" · [dim]{sb['estimated']} ~graded[/dim]" if sb.get("estimated") else ""
+        est = (f" · [dim]{sliding.get('estimated', 0)} ~estimated[/dim]"
+               if sliding.get("estimated") else "")
         err = f" · [red dim]{tick_err}[/]" if tick_err else ""
+        all_net = sb.get("net", 0.0)
+        all_color = "green" if all_net >= 0 else "red"
+        all_time = (f" · [dim]all-time {sb.get('wins', 0)}W-{sb.get('losses', 0)}L "
+                    f"[{all_color}]{all_net:+,.2f}[/{all_color}][/dim]")
+        if sb_fetched_at is None:
+            age = "[dim]—[/dim]"
+        else:
+            age_s = _t.time() - sb_fetched_at
+            age_style = "yellow" if age_s > 30 else "dim"
+            age = f"[{age_style}]{age_s:.0f}s ago[/{age_style}]"
         return Panel(
             f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L [{color}]{net:+,.2f}[/] · "
-            f"{sb['rolls']} rolls · capital {cap} · [dim]{floor_label}[/dim]{stale}{est}{err} · "
+            f"{rolls} rolls · capital {cap} · [dim]{floor_label}[/dim] · {age}"
+            f"{all_time}{stale}{est}{err} · "
             f"[dim]{_t.strftime('%H:%M:%S')}[/dim]",
             title="updown fleet", border_style="cyan")
 
+    def risk_panel() -> Text:
+        return Text.from_markup(build_risk_header(status, bal, sb))
+
     def arms_table() -> Table:
-        t = Table(expand=True, pad_edge=False)
-        for col in ("window", "state", "committed", "fair", "roll"):
-            t.add_column(col, justify="left" if col == "state" else "right")
-        arms = status.get("arms") or {}
-        for slug, a in arms.items():
-            e = a.get("eval") or {}
-            state = e.get("state", "?")
-            if state == "gated":
-                state = (e.get("reason") or "gated")[:48]
-            elif state == "armed":
-                sides = e.get("sides") or []
-                badges = "  ".join(x for x in (_safety_rich(sides, e.get("p_up")),
-                                                _brake_rich(sides)) if x)
-                if badges:
-                    state = f"[green]armed[/green]  {badges}"
-            fair = f"{e['p_up']:.4f}" if "p_up" in e else "—"
-            t.add_row(_tape_slug(slug), state,
-                      f"${e.get('committed', a.get('filled_usdc', 0)):,.2f}",
-                      fair, "⟳" if a.get("roll") else "·")
-        if not arms:
-            t.add_row("—", "[red]engine unreachable or no arms[/red]", "", "", "")
-        return t
+        return build_arms_table(status.get("arms"), _t.time())
+
+    def strip_panel() -> Panel:
+        return Panel(Text.from_markup(build_windows_strip(sb.get("windows"))),
+                     title="recent windows", border_style="dim")
 
     def tape_panel(height: int) -> Panel:
         shown = list(lines)[-max(height - 2, 1):]
@@ -687,17 +1003,22 @@ def crypto_watch(since: float | None) -> None:
     layout = Layout()
     layout.split_column(
         Layout(name="head", size=3),
+        Layout(name="risk", size=1),
         Layout(name="arms", size=10),
+        Layout(name="strip", size=3),
         Layout(name="tape", ratio=1),
     )
 
     tick = 0
+    saved_term = _cbreak_stdin()
     try:
         with Live(layout, refresh_per_second=4, screen=True) as live:
             while True:
+                if _quit_requested():
+                    break
                 # Final belt: nothing reachable from this tick — engine,
                 # data-api, disk — may tear the dashboard down. Note it in
-                # the header and keep ticking; only Ctrl+C stops this.
+                # the header and keep ticking; only Ctrl+C or 'q' stops this.
                 try:
                     try:
                         with open(tape.UPDOWN_TAPE) as fh:
@@ -717,10 +1038,15 @@ def crypto_watch(since: float | None) -> None:
                             # engine.post() sys.exit()s on failure — SystemExit
                             # isn't an Exception, so it must be named explicitly.
                             status = {}
-                    if tick % 30 == 0 and tick > 0:
+                    # Single-threaded tick loop: a refresh runs to completion
+                    # before the next tick starts, so a slow scoreboard walk
+                    # delays tick advancement rather than ever queuing a
+                    # second overlapping fetch.
+                    if tick % SB_REFRESH_TICKS == 0 and tick > 0:
                         try:
-                            sb = _tape_scoreboard(floor)
+                            sb = _tape_scoreboard(0.0, sliding_floor=floor)
                             sb_stale = False
+                            sb_fetched_at = _t.time()
                         except Exception:
                             sb_stale = True
                     # Balance is a slow call — after first paint, then per minute.
@@ -731,8 +1057,10 @@ def crypto_watch(since: float | None) -> None:
                             pass
                     layout["arms"].size = max(len(status.get("arms") or {}), 1) + 4
                     layout["head"].update(header())
+                    layout["risk"].update(risk_panel())
                     layout["arms"].update(arms_table())
-                    h = live.console.size.height - 3 - layout["arms"].size
+                    layout["strip"].update(strip_panel())
+                    h = live.console.size.height - 3 - 1 - 3 - layout["arms"].size
                     layout["tape"].update(tape_panel(h))
                     tick_err = None
                 except KeyboardInterrupt:
@@ -747,6 +1075,8 @@ def crypto_watch(since: float | None) -> None:
                 _t.sleep(1)
     except KeyboardInterrupt:
         pass
+    finally:
+        _restore_stdin(saved_term)
 
 
 @crypto_group.command("activity")
