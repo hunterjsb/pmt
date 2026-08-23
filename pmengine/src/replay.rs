@@ -94,6 +94,12 @@ struct TunablesOverride {
     distrust_net: f64,
     #[serde(default = "default_avg_down_tol")]
     avg_down_tol: f64,
+    #[serde(default = "default_decided_k")]
+    decided_k: f64,
+    #[serde(default = "default_decided_stale_s")]
+    decided_stale_s: f64,
+    #[serde(default = "default_late_clip_mult")]
+    late_clip_mult: f64,
 }
 fn default_distrust_net() -> f64 {
     Tunables::default().distrust_net
@@ -101,9 +107,24 @@ fn default_distrust_net() -> f64 {
 fn default_avg_down_tol() -> f64 {
     Tunables::default().avg_down_tol
 }
+fn default_decided_k() -> f64 {
+    Tunables::default().decided_k
+}
+fn default_decided_stale_s() -> f64 {
+    Tunables::default().decided_stale_s
+}
+fn default_late_clip_mult() -> f64 {
+    Tunables::default().late_clip_mult
+}
 impl From<TunablesOverride> for Tunables {
     fn from(t: TunablesOverride) -> Self {
-        Tunables { distrust_net: t.distrust_net, avg_down_tol: t.avg_down_tol }
+        Tunables {
+            distrust_net: t.distrust_net,
+            avg_down_tol: t.avg_down_tol,
+            decided_k: t.decided_k,
+            decided_stale_s: t.decided_stale_s,
+            late_clip_mult: t.late_clip_mult,
+        }
     }
 }
 
@@ -912,7 +933,7 @@ pub(crate) fn replay_full_window_with(
         // guard runs live), so pass the operator's param unchanged: replay
         // output must match the exact static-guard behavior this window
         // ran under live.
-        let model = eval_model(p, &feed, now, p.basis_guard_bp);
+        let model = eval_model(p, &feed, now, p.basis_guard_bp, &arm.tunables);
         let view = view_from_book_record(rec, &sim, p);
         let out = arm.decide(&view, model, now);
         trace.extend(out.tape.iter().cloned());
@@ -1175,9 +1196,12 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
             let spot = rec["spot"].as_f64().unwrap_or(0.0);
             let spot_age = rec["spot_age_s"].as_f64().unwrap_or(0.0);
             let start = a.p.start as i64;
+            // Copied out before the feed's &mut borrow so the model read and
+            // the decide() that consumes it run on ONE tunables value.
+            let tun = a.arm.tunables;
             let Some(src) = a.feed_src.as_mut() else { continue };
             let feed = src.state_at(start, spot, now - spot_age, now);
-            let model = eval_model(&a.p, &feed, now, a.p.basis_guard_bp);
+            let model = eval_model(&a.p, &feed, now, a.p.basis_guard_bp, &tun);
             let view = view_from_book_record(rec, &a.sim, &a.p);
             Some(a.arm.decide_fleet(&view, model, now, &mut fleet_room))
         } else {
@@ -1329,7 +1353,11 @@ mod tests {
             replay_evals_window(&p, None, std::slice::from_ref(&rec), None, &RealTally::default());
         assert_eq!(blocked["sim"]["fires"], 0, "distrust brake holds under default tunables");
 
-        let old_policy = Tunables { distrust_net: f64::INFINITY, avg_down_tol: f64::INFINITY };
+        let old_policy = Tunables {
+            distrust_net: f64::INFINITY,
+            avg_down_tol: f64::INFINITY,
+            ..Tunables::default()
+        };
         let fired = replay_evals_window(&p, Some(old_policy), &[rec], None, &RealTally::default());
         assert_eq!(fired["sim"]["fires"], 1, "lifted tunables reproduce the old policy's fire");
     }
