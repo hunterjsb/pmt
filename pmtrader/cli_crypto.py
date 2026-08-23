@@ -363,8 +363,6 @@ def crypto_tape(n: int, follow: bool, as_json: bool) -> None:
         proc.terminate()
 
 
-_V2_ERA = 1787441100
-
 _GAMMA_CACHE: dict[str, tuple[float, dict]] = {}
 _GAMMA_TTL_S = 120  # watch redraws every ~30s; a slug's resolution doesn't flip that often
 
@@ -504,13 +502,13 @@ def _tape_scoreboard(floor: float) -> dict:
 @crypto_group.command("stats")
 @click.option("--since", type=float, default=None,
               help="Windows starting after this point: hours-ago if small, "
-                   "raw unix epoch if large (default: the v2 fleet era). "
-                   "NOTE an hours-ago floor SLIDES — pin an epoch for any "
-                   "number you intend to compare across runs")
+                   "raw unix epoch if large (default: all time — the full "
+                   "ledger of record). NOTE an hours-ago floor SLIDES — pin "
+                   "an epoch for any number you intend to compare across runs")
 @click.option("--json", "as_json", is_flag=True)
 def crypto_stats(since: float | None, as_json: bool) -> None:
     """Fleet scoreboard: realized P&L (wallet-graded), win rate, calibration, live arms, capital."""
-    floor = _shadow_parse_since(since) if since else _V2_ERA
+    floor = _shadow_parse_since(since) if since else 0.0
     try:
         sb = _tape_scoreboard(floor)
     except Exception as e:
@@ -545,10 +543,13 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
     cap = f"${bal['total']:,.2f}" if bal else "?"
     est = f" · [dim]{estimated} ~graded (gamma unreachable)[/dim]" if estimated else ""
     from datetime import datetime, timezone
-    floor_s = datetime.fromtimestamp(floor, tz=timezone.utc).strftime("%m-%d %H:%MZ")
+    if floor <= 0:
+        floor_label = "all time"
+    else:
+        floor_label = f"windows since {datetime.fromtimestamp(floor, tz=timezone.utc).strftime('%m-%d %H:%MZ')}"
     console.print(f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L "
                   f"[{'green' if net >= 0 else 'red'}]{net:+,.2f}[/] · "
-                  f"{rolls} rolls · capital {cap} · [dim]windows since {floor_s}[/dim]{est}")
+                  f"{rolls} rolls · capital {cap} · [dim]{floor_label}[/dim]{est}")
 
     t = Table(title="By series (wallet-graded)")
     for col in ("series", "record", "P&L", "notional"):
@@ -590,16 +591,20 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
 @crypto_group.command("watch")
 @click.option("--since", type=float, default=None,
               help="Scoreboard floor: hours-ago if small, raw unix epoch if "
-                   "large (default: the v2 fleet era)")
+                   "large (default: last 6h — a live dashboard cares about "
+                   "the recent pulse, not the full ledger)")
 def crypto_watch(since: float | None) -> None:
     """Full-screen live dashboard: scoreboard + arms + streaming tape."""
     import time as _t
     from collections import deque
+    from datetime import datetime, timezone
 
     from rich.layout import Layout
     from rich.live import Live
     from rich.panel import Panel
     from rich.text import Text
+
+    WATCH_DEFAULT_LOOKBACK_H = 6.0  # sliding recent window — it's a live dashboard, not the ledger
 
     def _safe_render(raw: str) -> str | None:
         # A line can be truncated mid-write by a concurrently-crashing
@@ -609,7 +614,9 @@ def crypto_watch(since: float | None) -> None:
         except Exception:
             return None
 
-    floor = _shadow_parse_since(since) if since else _V2_ERA
+    floor = _shadow_parse_since(since) if since else (_t.time() - WATCH_DEFAULT_LOOKBACK_H * 3600)
+    floor_label = ("all time" if floor <= 0 else
+                   datetime.fromtimestamp(floor, tz=timezone.utc).strftime("since %m-%d %H:%MZ"))
     lines: deque = deque(maxlen=200)
     offset = 0
     try:
@@ -645,7 +652,8 @@ def crypto_watch(since: float | None) -> None:
         err = f" · [red dim]{tick_err}[/]" if tick_err else ""
         return Panel(
             f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L [{color}]{net:+,.2f}[/] · "
-            f"{sb['rolls']} rolls · capital {cap}{stale}{est}{err} · [dim]{_t.strftime('%H:%M:%S')}[/dim]",
+            f"{sb['rolls']} rolls · capital {cap} · [dim]{floor_label}[/dim]{stale}{est}{err} · "
+            f"[dim]{_t.strftime('%H:%M:%S')}[/dim]",
             title="updown fleet", border_style="cyan")
 
     def arms_table() -> Table:
