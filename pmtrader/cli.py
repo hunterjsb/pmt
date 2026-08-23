@@ -1659,9 +1659,16 @@ def crypto_updown(ref: str, as_json: bool) -> None:
                    "(|banked|/cushion, sign-matched to the side) at least this "
                    "high. 0 disables; ~0.3 blocked both 2026-08-23 post-brake "
                    "losses in replay; 1.0 = require banked-decided to enter")
+@click.option("--pay-up", type=float, default=0.0, show_default=True,
+              help="Fill-chase buffer: a clip's limit may sit up to this many "
+                   "cents above the decision ask, funded only by surplus edge "
+                   "over --min-edge (marketable limits fill at the book, so "
+                   "it costs nothing unless the book moved). 0 disables; the "
+                   "2026-08-23 audit measured 32%% of taker notional unfilled")
 def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
                side: str | None, quiesce: float, min_fair: float, min_elapsed: float,
-               roll: bool, clip: float, basis_guard: float, theta: float) -> None:
+               roll: bool, clip: float, basis_guard: float, theta: float,
+               pay_up: float) -> None:
     """Arm the pmengine updown trigger on a market.
 
     Prices the market (semantics, vol, fee) and hands the parameters to the
@@ -1685,7 +1692,7 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         "size_usdc": size, "min_edge": min_edge, "max_price": max_price,
         "quiesce_secs": quiesce, "min_fair": min_fair, "min_elapsed_frac": min_elapsed,
         "roll": roll, "clip_usdc": clip, "basis_guard_bp": basis_guard,
-        "theta": theta,
+        "theta": theta, "pay_up_max": pay_up,
     }
     if side:
         payload["side_filter"] = side

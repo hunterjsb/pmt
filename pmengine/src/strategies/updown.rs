@@ -125,6 +125,14 @@ pub(crate) struct ArmParams {
     /// mean-reverting chop: speculative clips are disabled entirely.
     #[serde(default = "d_rho_block")]
     pub rho_block: f64,
+    /// Fill-chasing fix (2026-08-23 audit: 32% of intended taker notional
+    /// never crossed — the book ticks away between decision and arrival,
+    /// and each re-quote chases it upward). A clip's limit may sit this
+    /// many cents ABOVE the decision ask, funded only by surplus edge over
+    /// the edge floor — a marketable limit fills at the book, so the
+    /// buffer costs nothing unless the book actually moved. 0 = off.
+    #[serde(default)]
+    pub pay_up_max: f64,
     /// R9 safety gate: the FIRST clip of a window requires
     /// safety = signed_banked_bp / cushion_bp >= theta on the fired side.
     /// 0 disables (clock-gate-only entry, the pre-R9 behavior). θ=1 is
@@ -509,15 +517,21 @@ impl ArmState {
 
     fn start_feeds(&mut self) {
         self.spawn_ws_spot();
+        // Ships dark: the dynamic guard's oracle poller runs only when
+        // PMENGINE_DYNAMIC_GUARD=1 — a routine engine restart must never
+        // be the thing that activates an unproven subsystem. Without the
+        // poller, live_guard_bp floors to the static param (no samples).
         // Pushed into feed_handles like the other threads — stop_feed's
         // existing join loop covers its teardown, no separate lifecycle.
-        self.feed_handles.push(updown_oracle::spawn_poller(
-            self.oracle.clone(),
-            self.feed.clone(),
-            self.feed_stop.clone(),
-            self.p.symbol.clone(),
-            self.p.end,
-        ));
+        if std::env::var("PMENGINE_DYNAMIC_GUARD").ok().as_deref() == Some("1") {
+            self.feed_handles.push(updown_oracle::spawn_poller(
+                self.oracle.clone(),
+                self.feed.clone(),
+                self.feed_stop.clone(),
+                self.p.symbol.clone(),
+                self.p.end,
+            ));
+        }
         let feed = self.feed.clone();
         let stop = self.feed_stop.clone();
         let symbol = self.p.symbol.clone();
@@ -741,7 +755,29 @@ impl ArmState {
         if now < self.p.start || !book_sample_due(now, self.last_book_at, self.p.end) {
             return;
         }
+        let prev_sample = self.last_book_at;
         self.last_book_at = now;
+        // Signed print flow since the previous sample — the VPIN/R8 input.
+        // Polymarket prints are NOT backfillable; second-precision trade
+        // timestamps mean a print on a sample boundary can count twice
+        // (replay dedupes on (t, side, size) if it matters).
+        let flow = |token: &str| -> (i64, f64, f64) {
+            let window = ((now - prev_sample).ceil() as i64 + 1).clamp(1, 60);
+            let mut n = 0i64;
+            let (mut buys, mut sells) = (0.0, 0.0);
+            for tr in ctx.recent_trades(token, window) {
+                let sz = tr.size.to_f64().unwrap_or(0.0);
+                n += 1;
+                if tr.side.eq_ignore_ascii_case("buy") {
+                    buys += sz;
+                } else {
+                    sells += sz;
+                }
+            }
+            (n, buys, sells)
+        };
+        let (up_tn, up_tbuy, up_tsell) = flow(&self.p.token_up);
+        let (dn_tn, dn_tbuy, dn_tsell) = flow(&self.p.token_down);
         let level = |token: &str, ask: bool| -> (Option<f64>, Option<f64>) {
             let l = ctx
                 .order_books
@@ -765,6 +801,8 @@ impl ArmState {
             "up_ask": up_ask, "up_ask_sz": up_ask_sz,
             "dn_bid": dn_bid, "dn_bid_sz": dn_bid_sz,
             "dn_ask": dn_ask, "dn_ask_sz": dn_ask_sz,
+            "up_tn": up_tn, "up_tbuy": up_tbuy, "up_tsell": up_tsell,
+            "dn_tn": dn_tn, "dn_tbuy": dn_tbuy, "dn_tsell": dn_tsell,
             "spot": spot, "spot_age_s": now - spot_ts,
         }));
     }
@@ -855,10 +893,13 @@ impl ArmState {
                                     }));
                                     self.last_clip.insert(token.clone(), now);
                                     self.inflight.insert(token.clone(), (size * ask, now));
+                                    let limit = pay_up_limit(
+                                        ask, net, p.min_edge, p.pay_up_max, p.max_price,
+                                    );
                                     actions.push(Action::Cancel(token.clone()));
                                     actions.push(Action::Buy {
                                         token: token.clone(),
-                                        price: ask,
+                                        price: limit,
                                         size,
                                     });
                                 }
@@ -1016,8 +1057,9 @@ impl ArmState {
             self.last_clip.insert(token.clone(), now);
             self.last_clip_ask.insert(token.clone(), ask);
             self.inflight.insert(token.clone(), (size * ask, now));
+            let limit = pay_up_limit(ask, net, edge_req, p.pay_up_max, p.max_price);
             actions.push(Action::Cancel(token.clone()));
-            actions.push(Action::Buy { token: token.clone(), price: ask, size });
+            actions.push(Action::Buy { token: token.clone(), price: limit, size });
         }
 
         self.last_eval = Some(serde_json::json!({
@@ -1453,6 +1495,13 @@ fn position_floor(ctx: &StrategyContext, p: &ArmParams) -> f64 {
         .sum()
 }
 
+/// Marketable-limit price for a clip: the decision ask plus a chase
+/// buffer funded ONLY by surplus edge above the floor — a fill at the
+/// worst case limit still clears edge_req. max_price stays the hard cap.
+fn pay_up_limit(ask: f64, net: f64, edge_req: f64, pay_up_max: f64, max_price: f64) -> f64 {
+    (ask + (net - edge_req).max(0.0).min(pay_up_max)).min(max_price)
+}
+
 /// Signed safety for one side: banked evidence divided by the residual
 /// noise cushion, positive only when the banked margin points the side's
 /// way. safety >= 1 on the fired side ≈ banked_decided.
@@ -1729,6 +1778,28 @@ mod tests {
             2
         );
         assert_eq!(arm.last_eval.as_ref().unwrap()["state"], "quiesce");
+    }
+
+    #[test]
+    fn pay_up_limit_spends_only_surplus_edge() {
+        assert_eq!(pay_up_limit(0.90, 0.05, 0.015, 0.02, 0.985), 0.92, "full 2c buffer");
+        assert_eq!(pay_up_limit(0.90, 0.02, 0.015, 0.02, 0.985), 0.905, "surplus only");
+        assert_eq!(pay_up_limit(0.90, 0.015, 0.015, 0.02, 0.985), 0.90, "no surplus, no chase");
+        assert_eq!(pay_up_limit(0.90, 0.05, 0.015, 0.0, 0.985), 0.90, "disabled by default");
+        assert_eq!(pay_up_limit(0.98, 0.05, 0.015, 0.02, 0.985), 0.985, "max_price caps");
+    }
+
+    #[test]
+    fn decide_pay_up_raises_the_limit_not_the_sizing() {
+        let mut p = params("s");
+        p.pay_up_max = 0.02;
+        let mut arm = armed(p);
+        let out = arm.decide(&view_with_up_ask(0.90, 500.0), Ok(locked_up_model()), 1400.0);
+        let b = buys(&out);
+        assert_eq!(b.len(), 1);
+        let Action::Buy { price, size, .. } = b[0] else { unreachable!() };
+        assert!(*price > 0.90 + 1e-9, "limit chases above the ask");
+        assert_eq!(*size, 27.0, "sizing still on the decision ask (25/0.90)");
     }
 
     #[test]
