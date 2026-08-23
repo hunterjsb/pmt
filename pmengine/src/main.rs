@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use pmengine::{Config, Engine, GammaClient};
 use rust_decimal_macros::dec;
 use std::path::PathBuf;
@@ -51,63 +51,77 @@ enum Commands {
     List,
 
     /// Offline backtest: replay recorded tape data through updown's decide() core
-    Replay {
-        /// "evals" replays the recorded eval tape; "full" rebuilds the model from
-        /// the book/spot tape + Binance klines.
-        #[arg(long, default_value = "evals")]
-        mode: String,
+    ///
+    /// Boxed: this is by far the widest variant, and an un-boxed one makes
+    /// every other subcommand carry its footprint.
+    Replay(Box<ReplayArgs>),
+}
 
-        /// Eval tape path — drives evals mode, and sources the real-fire
-        /// comparison in either mode (default ~/.pmt/engine/updown-tape.jsonl).
-        #[arg(long)]
-        tape: Option<PathBuf>,
+#[derive(Args, Debug)]
+pub struct ReplayArgs {
+    /// "evals" replays the recorded eval tape; "full" rebuilds the model from
+    /// the book/spot tape + Binance klines.
+    #[arg(long, default_value = "evals")]
+    mode: String,
 
-        /// Book/spot tape path, full mode only (default ~/.pmt/engine/book-tape.jsonl).
-        #[arg(long)]
-        book_tape: Option<PathBuf>,
+    /// Eval tape path — drives evals mode, and sources the real-fire
+    /// comparison in either mode (default ~/.pmt/engine/updown-tape.jsonl).
+    #[arg(long)]
+    tape: Option<PathBuf>,
 
-        /// Slug or slug prefix to replay — every matching window in the tape, time order.
-        /// Required unless --fixtures is given.
-        #[arg(long)]
-        slug: Option<String>,
+    /// Book/spot tape path, full mode only (default ~/.pmt/engine/book-tape.jsonl).
+    #[arg(long)]
+    book_tape: Option<PathBuf>,
 
-        /// Characterization mode: replay committed fixtures (a directory or one
-        /// file) instead of a live tape. Offline and self-contained — no ~/.pmt,
-        /// no network — and asserts each fixture's recorded expectations.
-        #[arg(long)]
-        fixtures: Option<PathBuf>,
+    /// Slug or slug prefix to replay — every matching window in the tape, time order.
+    /// Required unless --fixtures is given.
+    #[arg(long)]
+    slug: Option<String>,
 
-        /// --fixtures only: restrict the run to one fixture by slug.
-        #[arg(long)]
-        only: Option<String>,
+    /// Characterization mode: replay committed fixtures (a directory or one
+    /// file) instead of a live tape. Offline and self-contained — no ~/.pmt,
+    /// no network — and asserts each fixture's recorded expectations.
+    #[arg(long)]
+    fixtures: Option<PathBuf>,
 
-        /// --fixtures only: rewrite ONE fixture's expectations from this run.
-        /// Deliberate act — the diff is printed, and the commit message has to
-        /// say what moved and why.
-        #[arg(long)]
-        bless: bool,
+    /// --fixtures only: restrict the run to one fixture by slug.
+    #[arg(long)]
+    only: Option<String>,
 
-        /// JSON array of arm params (+ optional "tunables" override) to run, one per slug.
-        #[arg(long)]
-        params: Option<PathBuf>,
+    /// --fixtures only: rewrite ONE fixture's expectations from this run.
+    /// Deliberate act — the diff is printed, and the commit message has to
+    /// say what moved and why.
+    #[arg(long)]
+    bless: bool,
 
-        /// Optional JSONL {"slug":..,"winner":"up"|"down"} — wallet truth overrides
-        /// the TWAP-proxy settlement.
-        #[arg(long)]
-        outcomes: Option<PathBuf>,
+    /// JSON array of arm params (+ optional "tunables" override) to run, one per slug.
+    #[arg(long)]
+    params: Option<PathBuf>,
 
-        /// Also write the report as JSONL here.
-        #[arg(long)]
-        out: Option<PathBuf>,
+    /// Optional JSONL {"slug":..,"winner":"up"|"down"} — wallet truth overrides
+    /// the TWAP-proxy settlement.
+    #[arg(long)]
+    outcomes: Option<PathBuf>,
 
-        /// R7 fleet cap (USDC) on total UN-DECIDED committed notional across
-        /// every matched window. Passing this switches to the interleaved
-        /// driver: all matched slugs step in one global timestamp order
-        /// sharing one pool, instead of window-by-window. `--fleet-cap 0`
-        /// runs that same interleaved driver uncapped — the A/B baseline.
-        #[arg(long)]
-        fleet_cap: Option<f64>,
-    },
+    /// RTDS recorder corpus for full-mode replay of `--feed rtds` arms:
+    /// a directory of rtds-YYYYMMDD.jsonl or one file
+    /// (default ~/.pmt/corpus/rtds). Read only when a matched window is
+    /// stream-fed; the settlement stream serves no history, so this
+    /// corpus is the only place a stream-fed window's market data exists.
+    #[arg(long)]
+    rtds_corpus: Option<PathBuf>,
+
+    /// Also write the report as JSONL here.
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// R7 fleet cap (USDC) on total UN-DECIDED committed notional across
+    /// every matched window. Passing this switches to the interleaved
+    /// driver: all matched slugs step in one global timestamp order
+    /// sharing one pool, instead of window-by-window. `--fleet-cap 0`
+    /// runs that same interleaved driver uncapped — the A/B baseline.
+    #[arg(long)]
+    fleet_cap: Option<f64>,
 }
 
 /// Load .env file, searching in current directory and parent directories up to 3 levels.
@@ -189,9 +203,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Run { strategies, dry_run, max_ticks, skip_warmup }) => {
             run_strategies(strategies, dry_run, max_ticks, skip_warmup).await
         }
-        Some(Commands::Replay {
-            mode, tape, book_tape, slug, fixtures, only, bless, params, outcomes, out, fleet_cap,
-        }) => {
+        Some(Commands::Replay(args)) => {
+            let ReplayArgs {
+                mode, tape, book_tape, slug, fixtures, only, bless, params, outcomes, out,
+                fleet_cap, rtds_corpus,
+            } = *args;
             // reqwest::blocking builds its own mini tokio runtime; calling
             // it straight from #[tokio::main]'s worker thread panics on
             // drop (nested runtime). A plain OS thread sidesteps that —
@@ -205,6 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let slug = slug.ok_or("replay needs --slug (or --fixtures)")?;
                     pmengine::replay::run(pmengine::replay::ReplayOpts {
                         mode, tape, book_tape, slug, params, outcomes, out, fleet_cap,
+                        rtds_corpus,
                     })
                 }
             })
@@ -228,6 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("  pmengine run sure_bets market_maker --max-ticks 10");
             eprintln!("  pmengine list");
             eprintln!("  pmengine replay --mode evals --slug btc-updown-15m");
+            eprintln!("  pmengine replay --mode full --slug xrp-updown-5m --params arms.json");
             eprintln!("  pmengine replay --fixtures fixtures");
             Ok(())
         }

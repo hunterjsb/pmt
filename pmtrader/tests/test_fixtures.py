@@ -12,6 +12,7 @@ import pytest
 
 from polymarket.fixtures import (
     BOOK_KEYS,
+    FIXTURE_KEYS,
     FIXTURE_VERSION,
     FixtureError,
     build_fixture,
@@ -19,6 +20,8 @@ from polymarket.fixtures import (
     build_params,
     kline_slice,
     render_fixture,
+    rtds_slice,
+    rtds_symbol,
     secret_scan,
     sha256_records,
     slice_tape,
@@ -204,11 +207,117 @@ def test_build_params_keeps_a_pre_r9_window_pre_r9():
 
 
 def test_build_params_never_invents_a_pay_up_chase():
-    # The fire record has no `limit`, so a chase is unprovable — 0 replays the
-    # clip at the ask it recorded.
+    # A slice cut before the fire record carried `limit` cannot prove a
+    # chase — 0 replays the clip at the ask it recorded.
     p, prov = build_params(SLUG, _tape(), LIVE_ARM)
     assert p["pay_up_max"] == 0.0
     assert "NOT RECOVERABLE" in prov["pay_up_max"]
+
+
+def test_build_params_reads_the_chase_off_a_tape_that_records_the_limit():
+    # With `limit` on the record, the largest limit-over-ask is a tight
+    # lower bound on the armed budget — the clip_usdc rule applied to the
+    # pay-up budget. This is what closes fixtures/README.md gap 2.
+    recs = _tape()
+    for r in recs:
+        if r["ev"] == "fire":
+            r["limit"] = r["ask"]
+    recs[-1]["limit"] = 0.955          # chased 1.5c above a 0.94 ask
+    p, prov = build_params(SLUG, recs, LIVE_ARM)
+    assert p["pay_up_max"] == pytest.approx(0.015)
+    assert prov["pay_up_max"].startswith("tape:")
+
+
+def test_build_params_records_a_recorded_window_that_simply_never_chased():
+    # `limit == ask` on every clip is EVIDENCE of no chase, not absence of
+    # evidence — and the provenance has to say which of the two it is.
+    recs = _tape()
+    for r in recs:
+        if r["ev"] == "fire":
+            r["limit"] = r["ask"]
+    p, prov = build_params(SLUG, recs, LIVE_ARM)
+    assert p["pay_up_max"] == 0.0
+    assert "no clip chased" in prov["pay_up_max"]
+    assert "NOT RECOVERABLE" not in prov["pay_up_max"]
+
+
+# ---------- the rtds slice ----------
+
+def test_rtds_symbol_mirrors_the_rust_mapping():
+    assert rtds_symbol("XRPUSDT") == "xrp/usd"
+    assert rtds_symbol("ETHUSD") == "eth/usd"
+    assert rtds_symbol("DOGEUSDC") == "doge/usd"
+    assert rtds_symbol("USDT") is None
+
+
+def _rtds_rows(lo, hi, symbol="xrp/usd", value=2.5):
+    """1 Hz chainlink plus a 30s and 60s TWAP print every second."""
+    rows = []
+    for ts in range(lo, hi):
+        for topic, w in (("crypto_prices_chainlink", None),
+                         ("crypto_prices_twap_thirty", 30),
+                         ("crypto_prices_twap_sixty", 60)):
+            rows.append({"t_recv": ts + 0.2, "topic": topic, "symbol": symbol,
+                         "ts": ts * 1000, "value": value,
+                         "full_accuracy_value": str(int(value * 1e18)),
+                         "window_s": w})
+    return rows
+
+
+def test_rtds_slice_thins_history_to_one_close_a_minute_and_keeps_the_window_dense():
+    start, end = 1_787_442_300, 1_787_442_600
+    rows = _rtds_rows(start - 7200, end + 120)
+    kept, coverage = rtds_slice(rows, "xrp/usd", start, end)
+    spot = [r for r in kept if r["topic"] == "crypto_prices_chainlink"]
+    dense = [r for r in spot if r["ts"] // 1000 >= start - 300]
+    sparse = [r for r in spot if r["ts"] // 1000 < start - 300]
+
+    # Inside the dense lead: every print, because spot_ts is receive-time
+    # freshness and a thinned slice would gate on staleness that never was.
+    assert len(dense) == 300 + (end - start) + 120
+    # Before it: exactly one a minute — the close the router would bank.
+    minutes = {r["ts"] // 1000 // 60 for r in sparse}
+    assert len(sparse) == len(minutes) == (7200 - 300) // 60
+    assert coverage == (start - 7200 + 0.2, end + 120 - 1 + 0.2)
+
+
+def test_rtds_slice_keeps_only_prints_that_could_ever_be_a_mark():
+    start, end = 1_787_442_300, 1_787_442_600
+    kept, _ = rtds_slice(_rtds_rows(start - 7200, end + 120), "xrp/usd", start, end)
+    for topic in ("crypto_prices_twap_thirty", "crypto_prices_twap_sixty"):
+        marks = [r for r in kept if r["topic"] == topic]
+        # Within MARK_TOL_S of the minute, and nothing else: a print at :31
+        # can never bank as a mark, so it is weight with no effect.
+        assert {r["ts"] // 1000 % 60 for r in marks} == {0, 1, 2}
+    # BOTH widths survive. A 5m arm reads the 30s and a 15m arm the 60s, and
+    # keeping both means a settle_tw_secs re-spec cannot orphan the slice.
+    assert any(r["topic"] == "crypto_prices_twap_sixty" for r in kept)
+
+
+def test_rtds_slice_drops_the_recorder_field_replay_never_reads():
+    start, end = 1_787_442_300, 1_787_442_600
+    kept, _ = rtds_slice(_rtds_rows(start - 7200, end + 120), "xrp/usd", start, end)
+    assert all("window_s" not in r for r in kept), "the topic already names the width"
+    assert all(set(r) <= set(("t_recv", "topic", "symbol", "ts", "value",
+                              "full_accuracy_value")) for r in kept)
+
+
+def test_rtds_slice_takes_one_symbol_and_reports_an_absent_one():
+    start, end = 1_787_442_300, 1_787_442_600
+    rows = _rtds_rows(start - 7200, end + 120) + _rtds_rows(start, end, symbol="doge/usd")
+    kept, _ = rtds_slice(rows, "xrp/usd", start, end)
+    assert {r["symbol"] for r in kept} == {"xrp/usd"}
+    # A symbol the corpus never carried reports no coverage at all, which is
+    # what the freezer refuses on.
+    assert rtds_slice(rows, "sol/usd", start, end) == ([], None)
+
+
+def test_rtds_slice_coverage_reports_a_corpus_that_misses_the_window():
+    start, end = 1_787_442_300, 1_787_442_600
+    # Recorder died 100s before the close.
+    kept, coverage = rtds_slice(_rtds_rows(start - 600, end - 100), "xrp/usd", start, end)
+    assert kept, "what it does have is still returned"
+    assert coverage[1] < end, "and the caller can see the hole"
 
 
 def test_build_params_synthesizes_tokens_and_kills_the_roll_chain():
@@ -281,6 +390,10 @@ def test_build_fixture_shape_matches_the_rust_reader():
     assert fx["window_utc"] == ["2026-08-23T01:45:00Z", "2026-08-23T02:00:00Z"]
     assert fx["expect"] is None  # unblessed until pmengine writes it
     assert fx["mode"] == "evals"
+    # Additive: a Binance fixture carries an empty rtds slice and every
+    # fixture frozen before the stream existed still loads.
+    assert fx["rtds"] == []
+    assert list(fx) == [k for k in FIXTURE_KEYS], "serde field order"
 
 
 def test_render_fixture_round_trips_and_keeps_records_one_per_line():

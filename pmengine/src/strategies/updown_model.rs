@@ -117,7 +117,11 @@ pub(crate) fn shape_klines(v: &serde_json::Value) -> Vec<Kline> {
 
 /// Shared state an arm's Binance feed threads keep warm. In replay the
 /// corpus loader builds one of these per recorded sample instead.
-#[derive(Default)]
+///
+/// `Clone` so a stream-fed replay can lift the snapshot a decision tick saw
+/// out from under the hub's mutex: the RTDS timeline advances one shared
+/// `FeedState` sample by sample, and `eval_model` takes a plain reference.
+#[derive(Default, Clone)]
 pub(crate) struct FeedState {
     pub(crate) spot: f64,
     pub(crate) spot_ts: f64,
@@ -173,8 +177,16 @@ pub(crate) struct ModelEval {
 /// silently, with no compiler or test anywhere in the loop. The numbers now
 /// travel as fields; `reason` stays the same human sentence so the durable
 /// tape's `reason` key and every existing consumer of it keep working.
-/// `None` on the numeric fields = a gate that has no margin to report
-/// (stale feed, reference print missing).
+/// `None` on a numeric field = this gate has no such number to report (a
+/// missing reference print has no margin; a basis gate has no feed age).
+///
+/// Every number a refusal sentence turns on now has a field. The last
+/// holdout was the staleness gate: its sentence is either a bare "feed
+/// stale" or the feed's own error prose ("rtds sample lag 12.3s"), so the
+/// age it actually compared against `MAX_SPOT_AGE_S` reached the tape in
+/// neither form — a gate class worth thousands of ticks a night that no
+/// study could measure without regexing a nested error string, which is
+/// exactly the pattern this struct exists to end.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GateReason {
     pub(crate) reason: String,
@@ -182,10 +194,12 @@ pub(crate) struct GateReason {
     pub(crate) banked_bp: Option<f64>,
     pub(crate) cushion_bp: Option<f64>,
     pub(crate) guard_bp: Option<f64>,
+    /// Seconds since the last spot print, on the gates that turn on it.
+    pub(crate) spot_age_s: Option<f64>,
 }
 
 impl GateReason {
-    /// A gate with no numbers behind it — stale feed, missing print.
+    /// A gate with no numbers behind it — a missing reference print.
     pub(crate) fn plain(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
@@ -193,7 +207,14 @@ impl GateReason {
             banked_bp: None,
             cushion_bp: None,
             guard_bp: None,
+            spot_age_s: None,
         }
+    }
+
+    /// The staleness gate: how far past `MAX_SPOT_AGE_S` the feed had
+    /// drifted when it refused.
+    pub(crate) fn stale(reason: impl Into<String>, spot_age_s: f64) -> Self {
+        Self { spot_age_s: Some(spot_age_s), ..Self::plain(reason) }
     }
 }
 
@@ -234,11 +255,15 @@ pub(crate) fn eval_model(
     effective_guard_bp: f64,
 ) -> Result<ModelEval, GateReason> {
     {
-        if now - f.spot_ts > MAX_SPOT_AGE_S {
-            return Err(GateReason::plain(match &f.last_err {
-                Some(e) => format!("feed stale: {}", e),
-                None => "feed stale".to_string(),
-            }));
+        let spot_age_s = now - f.spot_ts;
+        if spot_age_s > MAX_SPOT_AGE_S {
+            return Err(GateReason::stale(
+                match &f.last_err {
+                    Some(e) => format!("feed stale: {}", e),
+                    None => "feed stale".to_string(),
+                },
+                spot_age_s,
+            ));
         }
         let spot = f.spot;
         // Floor = live 45m trailing sigma once the feed holds real history
@@ -341,6 +366,7 @@ fn eval_range_avg(
                     banked_bp: Some(banked_margin_bp),
                     cushion_bp: Some(cushion_bp),
                     guard_bp: Some(effective_guard_bp),
+                    spot_age_s: None,
                 });
             }
             let breakeven = (ref_px * window - banked_avg * banked_s) / rem;
@@ -533,6 +559,7 @@ fn eval_terminal(
             banked_bp: Some(banked_margin_bp),
             cushion_bp: Some(cushion_bp),
             guard_bp: Some(effective_guard_bp),
+            spot_age_s: None,
         });
     }
 
@@ -889,15 +916,40 @@ mod tests {
     }
 
     #[test]
-    fn non_basis_gates_report_no_numbers() {
+    fn the_stale_gate_reports_the_age_it_refused_on_and_no_margin() {
+        // A stale feed has no margin — but it does have the one number the
+        // gate actually turned on, and that number was prose-only or
+        // absent until it became a field. On the rtds feed the sentence is
+        // the stream's own error ("rtds sample lag 12.3s"), so a consumer
+        // measuring staleness had a nested string to regex or nothing.
         let p = params("s");
         let (f, _) = feed_with(100.05, 100.05);
-        let g = eval_model(&p, &f, 1400.0 + MAX_SPOT_AGE_S + 1.0, p.basis_guard_bp).unwrap_err();
+        let now = 1400.0 + MAX_SPOT_AGE_S + 1.0;
+        let g = eval_model(&p, &f, now, p.basis_guard_bp).unwrap_err();
         assert!(g.reason.contains("stale"), "{}", g.reason);
         assert_eq!(
             (g.margin_bp, g.banked_bp, g.cushion_bp, g.guard_bp),
             (None, None, None, None),
             "a stale feed has no margin to report"
+        );
+        let age = g.spot_age_s.expect("but it does report the age");
+        assert!(age > MAX_SPOT_AGE_S, "and the age is past the threshold: {age}");
+        assert!((age - (now - f.spot_ts)).abs() < 1e-9, "measured, not approximated");
+    }
+
+    #[test]
+    fn a_missing_reference_print_reports_no_numbers_at_all() {
+        // The gate class that genuinely has nothing to say: not a margin,
+        // not an age. Its fields stay null rather than inventing a zero.
+        let mut p = params("s");
+        p.start = 9_000_000.0;
+        p.end = 9_000_900.0;
+        let (f, _) = feed_with(100.0, 100.0);
+        let g = eval_model(&p, &f, f.spot_ts + 1.0, p.basis_guard_bp).unwrap_err();
+        assert!(g.reason.contains("range-start reference"), "{}", g.reason);
+        assert_eq!(
+            (g.margin_bp, g.banked_bp, g.cushion_bp, g.guard_bp, g.spot_age_s),
+            (None, None, None, None, None)
         );
     }
 

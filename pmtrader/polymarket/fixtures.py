@@ -51,12 +51,39 @@ BOOK_KEYS = (
     "dn_bid", "dn_bid_sz", "dn_ask", "dn_ask_sz",
 )
 
+# --- RTDS recorder slice (feed="rtds" windows) ---------------------------
+# The klines' counterpart for a stream-fed arm. Unlike klines this can NEVER
+# be re-fetched: the settlement stream serves no history, so the slice in the
+# fixture is the only surviving record of that window's market data.
+
+# Must match updown_rtds.rs::HISTORY_WARMUP_S (CLOSES_CAP minutes). Replay
+# warms the hub from exactly this far back, and a short slice silently
+# reconstructs a different rho and slow sigma than the one that traded.
+RTDS_LOOKBACK_S = 7200
+# Keep every 1 Hz spot print from this far before the window. Inside it the
+# arm is evaluating, and `spot_ts` is receive-time freshness: thin the prints
+# here and the replay gates on a staleness that never happened.
+RTDS_DENSE_LEAD_S = 300
+# Past the close: the final settlement mark prints AT the close, and its
+# in-tolerance substitute up to MARK_TOL_S after.
+RTDS_TAIL_S = 120
+# How late a TWAP print may be and still bank as that minute's mark
+# (updown_rtds.rs::MARK_TOL_S). Prints outside it can never become a mark,
+# so they are weight with no effect on any number replay reads.
+RTDS_MARK_TOL_S = 2
+
+RTDS_TOPIC_SPOT = "crypto_prices_chainlink"
+# The recorder row minus `window_s`, which nothing in the shaping path reads
+# (the topic already names the width). Same principle as BOOK_KEYS: a fixture
+# carries the decision's inputs, not the recorder's whole row.
+RTDS_KEYS = ("t_recv", "topic", "symbol", "ts", "value", "full_accuracy_value")
+
 # Serde field order in fixtures.rs::Fixture. Matching it means the first
 # `--bless` rewrites values, not the whole file.
 FIXTURE_KEYS = (
     "fixture_version", "slug", "mode", "teaches", "lessons_ref", "era",
     "window_utc", "params", "params_provenance", "outcome", "evals", "book",
-    "klines", "invariants", "expect", "provenance",
+    "klines", "rtds", "invariants", "expect", "provenance",
 )
 OUTCOME_KEYS = (
     "winner", "source", "buy", "buy_shares", "buy_side", "sell", "redeem",
@@ -116,6 +143,73 @@ def kline_slice(rows: Iterable[dict], start: int, end: int) -> tuple[list[dict],
         have[t] = {"t": t, "o": o, "c": c}
     missing = [m for m in range(lo, hi, 60) if m not in have]
     return [have[t] for t in sorted(have)], missing
+
+
+def rtds_symbol(binance_symbol: str) -> str | None:
+    """`"XRPUSDT"` -> `"xrp/usd"`. Mirror of updown_rtds.rs::rtds_symbol."""
+    s = binance_symbol.lower()
+    for quote in ("usdt", "usdc", "busd", "usd"):
+        if s.endswith(quote):
+            base = s[: -len(quote)]
+            return f"{base}/usd" if base else None
+    return None
+
+
+def rtds_slice(rows: Iterable[dict], symbol: str, start: int,
+               end: int) -> tuple[list[dict], tuple[float, float] | None]:
+    """(rows, coverage) — the recorder slice a stream-fed window replays on.
+
+    `coverage` is the (first, last) receive time actually present, or None
+    when the symbol has no rows at all. The caller refuses on it; this
+    function only reports, so the rule stays testable without a corpus.
+
+    Thinning is the whole design problem: a day's stream for one symbol is
+    ~65k rows at 1 Hz across three topics, and a fixture is a file a human
+    reads a diff of. What survives is exactly what changes a number replay
+    reads, decided by the live router's own rules:
+
+      * **spot, inside the window** — every print. `spot_ts` is receive-time
+        freshness and the arm evaluates on it continuously.
+      * **spot, before the window** — one print a minute, chosen by the
+        router's OWN banking rule (first arrival whose minute is new), so
+        the reconstructed `closes` vector is identical to the live one.
+      * **TWAP marks** — only prints within MARK_TOL_S of a minute
+        boundary. Nothing else can ever become a mark; the other 57 prints
+        a minute are read by nobody.
+      * **both widths** — a 5m arm reads the 30s TWAP and a 15m arm the
+        60s one, and keeping both means the slice does not depend on having
+        got the arm's settlement width right when it was cut.
+    """
+    lo, hi = start - RTDS_LOOKBACK_S, end + RTDS_TAIL_S
+    dense_from = start - RTDS_DENSE_LEAD_S
+
+    mine = [r for r in rows if r.get("symbol") == symbol
+            and isinstance(r.get("ts"), (int, float))
+            and isinstance(r.get("t_recv"), (int, float))]
+    if not mine:
+        return [], None
+    coverage = (min(r["t_recv"] for r in mine), max(r["t_recv"] for r in mine))
+
+    # Receive order, because that is the order the router sees.
+    mine.sort(key=lambda r: r["t_recv"])
+    kept: list[dict] = []
+    last_close_min = -1
+    for r in mine:
+        ts_s = int(r["ts"]) // 1000
+        if not (lo <= ts_s < hi):
+            continue
+        if r.get("topic") == RTDS_TOPIC_SPOT:
+            if ts_s >= dense_from:
+                kept.append(r)
+                continue
+            minute = ts_s // 60 * 60
+            if minute <= last_close_min:
+                continue
+            last_close_min = minute
+            kept.append(r)
+        elif ts_s - ts_s // 60 * 60 <= RTDS_MARK_TOL_S:
+            kept.append(r)
+    return [{k: r[k] for k in RTDS_KEYS if k in r} for r in kept], coverage
 
 
 # ---------- wallet truth ----------
@@ -267,8 +361,27 @@ def build_params(slug: str, tape_recs: list[dict], live_arm: dict,
     else:
         prov["theta"] = "tape: `safety` brake recorded, so theta was live at the freeze-time value"
 
-    p["pay_up_max"] = 0.0
-    prov["pay_up_max"] = "NOT RECOVERABLE — the fire record has no `limit` (issue #5 gap 2); 0 replays at the recorded ask"
+    # The chase, if this window's tape is new enough to have recorded it.
+    # `limit - ask` is what a clip actually spent above the book, so the
+    # largest one is a tight lower bound on the budget — the same reasoning
+    # clip_usdc uses, and the same caveat: a window where no clip ever hit
+    # the cap reads back a smaller budget than was armed. Windows cut before
+    # the `limit` field shipped have no evidence at all and stay at 0, which
+    # replays every clip at the ask it recorded.
+    chases = [r["limit"] - r["ask"] for r in tape_recs
+              if r.get("ev") == "fire"
+              and isinstance(r.get("limit"), (int, float))
+              and isinstance(r.get("ask"), (int, float))]
+    if any(c > 1e-9 for c in chases):
+        p["pay_up_max"] = round(max(chases), 6)
+        prov["pay_up_max"] = "tape: largest recorded limit-over-ask chase (a lower bound on the armed budget)"
+    else:
+        p["pay_up_max"] = 0.0
+        prov["pay_up_max"] = (
+            "tape: no clip chased above its ask"
+            if chases
+            else "NOT RECOVERABLE — this slice predates the fire record's `limit` field; 0 replays at the recorded ask"
+        )
 
     for k, v in (overrides or {}).items():
         p[k] = v
@@ -313,7 +426,8 @@ def build_fixture(slug: str, mode: str, params: dict, params_prov: dict,
                   outcome: dict, evals: list[dict], book: list[dict],
                   klines: list[dict], teaches: str, lessons_ref: str | None,
                   eras: list[str], invariants: list[str], provenance: dict,
-                  expect: dict | None = None) -> dict:
+                  expect: dict | None = None,
+                  rtds: list[dict] | None = None) -> dict:
     w = parse_updown_slug(slug)
     return {
         "fixture_version": FIXTURE_VERSION,
@@ -329,6 +443,7 @@ def build_fixture(slug: str, mode: str, params: dict, params_prov: dict,
         "evals": evals,
         "book": book,
         "klines": klines,
+        "rtds": list(rtds or []),
         "invariants": list(invariants),
         "expect": expect,
         "provenance": provenance,

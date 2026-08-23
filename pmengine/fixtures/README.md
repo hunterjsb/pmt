@@ -23,18 +23,58 @@ outside the file — no network, no corpus, no home directory.
 
 | key | what it holds |
 |---|---|
-| `mode` | `evals` or `full`. Load-bearing: `full` needs `book` + `klines`, and a fixture that claims it without them fails to load. |
+| `mode` | `evals` or `full`. Load-bearing: `full` needs `book` plus the market data the arm's `feed` actually read (`klines`, or `rtds`), and a fixture that claims it without them fails to load. |
 | `params` | Exactly one `--params` array entry: `ArmParams` as armed, plus an optional replay-only `tunables` override. |
 | `params_provenance` | Per field: tape-derived, slug-derived, inherited from the arm store at freeze time, or an operator override. A reconstruction says so. |
 | `outcome` | The wallet's verdict and accounting. `source` must be `wallet`. |
 | `evals` | The `updown-tape.jsonl` slice for this slug, verbatim — eval / fire / gated / roll / cleanup. Drives `evals` mode; sources the live-fire comparison in either. |
 | `book` | The `book-tape.jsonl` slice, trimmed to the fields replay reads (top-of-book per side + spot/spot age). Print flow and per-side source/age diagnostics are dropped: a fixture carries the decision's inputs, not the night's whole telemetry. |
-| `klines` | 1m klines over `[start - 2700, end)` — the model's whole lookback. This is the offline seam: `--mode full`'s only network call is the kline fetch, and a fixture hands them in instead. |
+| `klines` | 1m klines over `[start - 2700, end)` — the model's whole lookback, for a `feed = "binance"` arm. This is the offline seam: `--mode full`'s only network call is the kline fetch, and a fixture hands them in instead. |
+| `rtds` | The klines' counterpart for a `feed = "rtds"` arm: recorder rows over `[start - 7200, end + 120)`. Which of the two a full-mode fixture must carry follows `params.feed`, exactly as it does live — see *Stream-fed fixtures*. |
 | `invariants` | Curator intent (see the vocabulary below). **`--bless` never rewrites these**, which is what stops a careless regeneration from laundering a real behaviour change. |
 | `expect` | Generated from the current engine's replay at curation time, then hand-checked against the wallet record. |
 | `provenance` | sha256 + record count per slice, the freeze timestamp, the curator's note, and which tape schema generation this slice carries. |
 
-Sizes: 16–154 KB each, 1.4 MB for the thirteen.
+Sizes: 16–318 KB each, 1.7 MB for the fourteen. The stream-fed one is the big
+end of that range and always will be: a 1 Hz stream is simply more data than
+one row a minute.
+
+### Stream-fed fixtures
+
+An arm on `--feed rtds` never read a Binance kline. Its model was rebuilt from
+the Chainlink settlement stream — the series the market resolves on — so a
+fixture that froze klines for it would replay the window against the venue the
+arm was deliberately moved off, and produce a confident answer to a question
+nobody asked. `params.feed` decides which slice is load-bearing, and **the
+loader refuses a `full` fixture on `feed = "rtds"` that has no `rtds` slice**,
+the same way it refuses one on `binance` with no klines.
+
+Two things make this slice different from every other one in a fixture:
+
+* **It can never be re-cut.** The stream serves no history, no snapshot and no
+  backfill. Klines can be refetched from Binance forever; a dropped RTDS sample
+  is gone. The slice in the file is the only surviving record that this
+  window's market data existed.
+* **The recorder is a SECOND subscriber.** `pmt crypto rtds record` holds its
+  own socket, so its drops are not the engine's drops. Two of the 45 xrp
+  windows on 2026-08-23 are missing, in the corpus only, the settlement print
+  at `start` that keys the range-start reference — and the live tape proves the
+  engine had it (it recorded projected margins all through both windows).
+  Those windows replay as "range-start reference not printed yet" on every
+  tick. That is the corpus being honest about a hole, not the replay being
+  wrong, and it is why a stream-fed fixture is only worth freezing on a window
+  whose slice actually covers `[start, end]` — which the freezer and the loader
+  both check.
+
+What the slice keeps, and why (`fixtures.py::rtds_slice`): every 1 Hz spot
+print from `start - 300` (inside the window `spot_ts` is receive-time
+freshness, and thinning it makes the replay gate on a staleness that never
+happened); before that, one print a minute, picked by the live router's own
+banking rule so the reconstructed `closes` vector is identical; TWAP prints
+only within `MARK_TOL_S` of a minute boundary, since nothing else can ever
+become a mark. **Both** settlement widths are kept even though one arm reads
+one of them — that way a `settle_tw_secs` re-spec cannot orphan a slice that
+can never be re-cut.
 
 ### Wallet-graded only
 
@@ -106,17 +146,26 @@ exposure by design (see *Known gaps*).
 | `sol-updown-5m-1787468100` | 06:55 | full | **The quiet, guard-dominated 5m** — the shape of most of the fleet's night: 39 gated ticks against 16 evals at the 10bp sol band, $4.86 of risk actually taken. Also the suite's clearest instance of the instant-fill sim over-stating a thin book. | 5 fires, $103.25, +$3.49 | $4.86 → $5.00, **+$0.14** |
 | `eth-updown-15m-1787468400` | 07:00 | full | **The brake-latch save, and its edge.** 52 latched reads let exactly ONE $45 clip through on a window the model kept wanting more of. Today's engine lets none through — the latch is one tick from refusing this class entirely. | **0 fires** | $45.14 → $46.00, **+$0.86** |
 | `btc-updown-15m-1787470200` | 07:30 | full | **The disciplined end of the same policy that lost $370 at 01:45Z.** Latch on for 50 reads, 28 gated ticks, 4 safe DOWN clips, winner DOWN. | 8 fires, $152.12, +$4.54 | $54.59 → $56.00, **+$1.41** |
+| `xrp-updown-5m-1787485200` | 11:40 | full | **The first stream-fed window in the suite** — and the only fixture whose market data is the Chainlink settlement stream itself rather than Binance klines. 21 ticks gated at the 12bp xrp band, 2 safe DOWN clips, wallet-graded DOWN. Rebuilt from the raw 1 Hz corpus it reproduces the evals-mode fire count, notional and P&L exactly, and every gated tick's `margin_bp`/`guard_bp` to the printed decimal. The regression test for `--feed rtds`: a shaping change in `updown_rtds` moves this window and nothing else in the catalog. | 2 fires, $19.50, +$0.47 | wallet-graded DOWN; the money is not in the local corpus (see below) |
 
-Deliberately included: one window with **no book tape**, three **wallet losses**,
-two windows today's engine **refuses entirely**, and one where the sim is **known
-to be wrong** in a documented direction. A suite made only of clean wins teaches
+Deliberately included: one window with **no book tape**, one with **no klines at
+all** (it never read them), three **wallet losses**, two windows today's engine
+**refuses entirely**, and one where the sim is **known to be wrong** in a
+documented direction. A suite made only of clean wins teaches
 nothing.
+
+**The xrp fixture's outcome accounting is zeroed, and that is not a bug in the
+fixture.** Its `winner` is wallet truth — `outcomes.jsonl` graded it off a real
+redeem — but `activity.jsonl`, the raw row dump the accounting is summed from,
+was last refreshed at 08:41Z and this window closed at 11:45Z. So `buy`,
+`redeem` and `pnl` read `0.00`. Re-run `pmt crypto activity` and `--regen` it to
+fill them in; until then `sim_notional_ge_wallet` is vacuously true here and is
+deliberately NOT declared on this fixture.
 
 ### Windows that could NOT be frozen
 
 | window | why not |
 |---|---|
-| `xrp-updown-5m-1787485200` (11:40Z) — the RTDS stream-fed win | Not wallet-graded. `outcomes.jsonl`'s newest wallet row is 09:40Z; the grader has not run since this window settled. Re-run `pmt crypto outcomes`, then it can be frozen unchanged. |
 | `btc-updown-15m-1787446800` (01:00Z) — the no-fill ghost (32 fires, $698 of intent, $0 bought) | No graded outcome row at all. |
 | `btc-updown-15m-1787457600` (04:00Z) — the corpus-corruption window (L22's size-0 dust redeem) | **chainlink**-graded. With no *sized* redeem row the wallet cannot name the side we held, which is precisely L22's fix — so the window that taught the grader its lesson is the window the rule now excludes. Its grading behaviour belongs in a `pmtrader` test over `outcomes.wallet_outcomes`, not here. |
 | `btc-updown-5m-1787461800` (05:10Z) — basis guard SAVED, 43 ticks gated, zero fires | Zero fires ⇒ no redeem ⇒ no wallet grade. Structural, not fixable. |
@@ -134,22 +183,40 @@ nothing.
    intentional. `sim_notional_ge_wallet` pins the direction on the fixtures where
    it matters; an "improvement" that makes the sim fill less has to move those
    expectations and explain itself.
-2. **No recorded window can prove a pay-up chase.** The fire record carries `ask`
-   but never the limit `pay_up_limit()` submitted, so `pay_up_max` is frozen at
-   `0` in every fixture and the two payup-era fixtures are era markers, not chase
-   evidence. Landing the one-line `limit` field on the fire record unblocks it.
+2. **No window frozen SO FAR can prove a pay-up chase.** The fire record now
+   carries `limit` — the marketable price actually submitted — beside the `ask`
+   it chased from, and `build_params` reads the largest limit-over-ask back out
+   as a lower bound on `pay_up_max` (the `clip_usdc` rule, applied to the
+   pay-up budget). Every fixture in the catalog was cut from tape written
+   before that field existed, so all fourteen still carry `pay_up_max: 0` and
+   say so in their provenance; `provenance.tape_schema.fire_limit` is the flag
+   that separates "no chase happened" from "no chase was recordable". A window
+   frozen from here on can tell the two apart.
 3. **Old gated tape lines carry no structured numbers.** `margin_bp` /
    `banked_bp` / `cushion_bp` / `guard_bp` only reach the tape in the last era;
    before that the numbers survive only inside the reason prose, which
-   `gate_from_record` refuses to parse. Every fixture's
-   `provenance.tape_schema` records which generation its slice carries — a
-   gate-heavy fixture cut before those fields shipped pins less than it looks
-   like it does.
+   `gate_from_record` refuses to parse. The staleness gate's `spot_age_s` is
+   newer still — until it landed, the one number that gate turns on lived only
+   in prose, and on the rtds feed only inside a NESTED error string ("feed
+   stale: rtds sample lag 12.3s"). Every fixture's `provenance.tape_schema`
+   records which generation its slice carries (`gated_structured`,
+   `gated_spot_age`) — a gate-heavy fixture cut before those fields shipped
+   pins less than it looks like it does.
 4. **`evals` mode is blind to exits and to quiesce-window flip clips** (the eval
    tape records no bids and stops at quiesce), and it trusts the recorded model
-   read as-is. `full` mode rebuilds the model from the book tape and klines and
-   therefore reconstructs — not replays — the model's numbers. Two fixtures are
-   frozen in `evals` mode on purpose; the mode is in the manifest.
+   read as-is. `full` mode rebuilds the model from the book tape and the arm's
+   own market data, and therefore reconstructs — not replays — the model's
+   numbers. Two fixtures are frozen in `evals` mode on purpose; the mode is in
+   the manifest.
+5. **A replayed RTDS hub is warmed to the estimators' full depth, not to
+   whatever the live hub happened to hold.** `HISTORY_WARMUP_S` is
+   `CLOSES_CAP` minutes — the steady state a hub reaches after two hours of
+   uptime. An arm that armed onto a freshly-started hub read a shorter closes
+   vector, so its `sig_bp` (and the `cushion_bp` derived from it) was
+   different, and nothing recorded how deep that hub actually was. This shows
+   up as a cushion that moves while `margin_bp` and `guard_bp` reproduce
+   exactly — which is the harmless direction, since the guard gates on margin.
+   Replay warns on stderr when the corpus cannot even reach the full depth.
 
 ---
 
@@ -186,7 +253,8 @@ field:
 | `basis_guard_bp` | the lowest `guard_bp` the window recorded — the static param the live dynamic guard raises *from* (L17) |
 | `clip_usdc` | the largest clip that actually fired, rounded up to $5. The sizer caps at `clip_usdc`, so the biggest fire is a tight lower bound; every window in this catalog lands exactly on 25 or 50. |
 | `theta` | `0` unless the tape shows a `safety` brake, which only exists when θ > 0 — that is how a pre-R9 window stays pre-R9 |
-| `pay_up_max` | `0`, always. Not recoverable (gap 2). |
+| `pay_up_max` | the largest recorded `limit - ask` — a lower bound on the armed budget. `0` when no clip chased, and `0` marked NOT RECOVERABLE when the slice predates the `limit` field (gap 2) |
+| `feed` | the arm store's, or the prior fixture's on a `--regen`. It decides which market-data slice the fixture must carry |
 | everything else | inherited from the arm store at freeze time — a reconstruction, marked as one |
 
 `--param KEY=VALUE` pins a value the tape cannot prove; it is recorded as an

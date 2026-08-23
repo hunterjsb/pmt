@@ -79,6 +79,13 @@ const MARK_TOL_S: i64 = 2;
 /// (`SIGMA_SLOW_WINDOW`) and 60 (`lag1_autocorr`) samples; 120 covers both
 /// with room and costs nothing.
 const CLOSES_CAP: usize = 120;
+/// How far before a window's first decision a REPLAY has to start feeding
+/// the corpus for the hub to hold the history a live arm inherited at
+/// registration: `CLOSES_CAP` minutes, the depth of the deepest estimator.
+/// Short of it, rho and the slow sigma are reconstructed off a shorter tape
+/// than the one that traded — the exact silent drift the harness exists to
+/// stop, so replay warns when the corpus cannot reach back this far.
+pub(crate) const HISTORY_WARMUP_S: f64 = CLOSES_CAP as f64 * 60.0;
 /// Per-symbol TWAP marks retained in the hub (minutes). Long enough that a
 /// mid-window arm on a multi-hour market can still be seeded with its
 /// range-start reference.
@@ -188,22 +195,74 @@ fn parse_e18(raw: &str) -> Option<f64> {
 /// value, full_accuracy_value, window_s}}`.
 fn parse_sample(raw: &str) -> Option<Sample> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let topic = Topic::parse(v.get("topic")?.as_str()?)?;
-    let payload = v.get("payload")?;
-    let symbol = payload.get("symbol")?.as_str()?;
+    sample_fields(v.get("topic")?.as_str()?, v.get("payload")?)
+}
+
+/// The price fields a topic's update carries, whatever wrapper they arrived
+/// in — the live envelope's `payload` object, or a recorder-corpus row,
+/// which is that same payload flattened beside its receive time.
+///
+/// ONE extractor for both on purpose. The replay harness exists to judge
+/// the live decision core, so a corpus line that shaped into a different
+/// `Sample` than the socket would have shaped is the harness lying about
+/// the thing it is measuring. The only concession to the two shapes is the
+/// timestamp key: the envelope calls it `timestamp`, the recorder `ts`.
+fn sample_fields(topic: &str, fields: &serde_json::Value) -> Option<Sample> {
+    let topic = Topic::parse(topic)?;
+    let symbol = fields.get("symbol")?.as_str()?;
     if symbol.is_empty() {
         return None;
     }
-    let ts_ms = payload.get("timestamp").and_then(value_as_i64)?;
-    let value = payload
+    let ts_ms = fields
+        .get("timestamp")
+        .or_else(|| fields.get("ts"))
+        .and_then(value_as_i64)?;
+    let value = fields
         .get("full_accuracy_value")
         .and_then(|f| f.as_str())
         .and_then(parse_e18)
-        .or_else(|| payload.get("value").and_then(|v| v.as_f64()))?;
+        .or_else(|| fields.get("value").and_then(|v| v.as_f64()))?;
     if !value.is_finite() || value <= 0.0 {
         return None;
     }
     Some(Sample { topic, symbol: symbol.to_string(), ts_ms, value })
+}
+
+// ---------- the recorder corpus (replay) --------------------------------
+
+/// One line of `~/.pmt/corpus/rtds/rtds-YYYYMMDD.jsonl` — a print the
+/// recorder saw, shaped by the same code the live socket shapes with.
+///
+/// The feed has no history and no backfill, so this corpus is the only
+/// record that a stream-fed window ever existed. Replaying it through
+/// `route_sample` (rather than reconstructing a FeedState beside it) is
+/// what keeps the offline harness and the live arm on one implementation.
+pub(crate) struct CorpusSample {
+    /// The recorder's arrival clock. Replay's stand-in for the engine's own
+    /// receive stamp — different process, same wire, and the only receive
+    /// time the corpus preserves. `spot_ts` is stamped from it exactly as
+    /// the live router stamps from `unix_now()`.
+    pub(crate) t_recv: f64,
+    sample: Sample,
+}
+
+impl CorpusSample {
+    pub(crate) fn symbol(&self) -> &str {
+        &self.sample.symbol
+    }
+}
+
+/// One recorder row -> a `CorpusSample`. None for a row that isn't a price
+/// update on a topic we track, or that carries no usable receive time.
+pub(crate) fn parse_corpus_record(v: &serde_json::Value) -> Option<CorpusSample> {
+    let sample = sample_fields(v.get("topic")?.as_str()?, v)?;
+    let t_recv = v.get("t_recv")?.as_f64()?;
+    t_recv.is_finite().then_some(CorpusSample { t_recv, sample })
+}
+
+/// `parse_corpus_record` straight off a JSONL line.
+pub(crate) fn parse_corpus_line(raw: &str) -> Option<CorpusSample> {
+    parse_corpus_record(&serde_json::from_str::<serde_json::Value>(raw).ok()?)
 }
 
 /// The stream has sent `timestamp` as both a number and a string; accept
@@ -379,6 +438,40 @@ impl RtdsHub {
         start: f64,
         feed: Arc<Mutex<FeedState>>,
     ) -> RtdsSub {
+        let sub = self.add_consumer(symbol, settle_tw_s, start, feed);
+        self.ensure_started();
+        sub
+    }
+
+    /// Register WITHOUT opening a socket — the replay driver's entry point.
+    /// Same seeding, same consumer, same fan-out; the samples arrive from a
+    /// recorded corpus through `replay_sample` instead of from the wire. An
+    /// offline backtest that quietly dialled the live stream would be both
+    /// a network call from a harness that must never make one and a feed of
+    /// today's prices into a window that closed hours ago.
+    pub(crate) fn register_offline(
+        &self,
+        symbol: &str,
+        settle_tw_s: f64,
+        start: f64,
+        feed: Arc<Mutex<FeedState>>,
+    ) -> RtdsSub {
+        self.add_consumer(symbol, settle_tw_s, start, feed)
+    }
+
+    /// Route one recorded sample exactly as a connected session would,
+    /// stamped with the receive time the recorder saw.
+    pub(crate) fn replay_sample(&self, s: &CorpusSample) {
+        route_sample(&self.inner, &s.sample, s.t_recv);
+    }
+
+    fn add_consumer(
+        &self,
+        symbol: &str,
+        settle_tw_s: f64,
+        start: f64,
+        feed: Arc<Mutex<FeedState>>,
+    ) -> RtdsSub {
         let twap = twap_topic_for(settle_tw_s);
         seed_feed(&self.inner, symbol, twap, start, &feed);
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
@@ -396,7 +489,6 @@ impl RtdsHub {
             let mut h = self.inner.health.lock().unwrap();
             h.consumers = n;
         }
-        self.ensure_started();
         RtdsSub { inner: self.inner.clone(), id }
     }
 

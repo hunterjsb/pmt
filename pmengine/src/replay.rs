@@ -10,12 +10,16 @@
 //!     stops recording once quiesce starts), and the recorded
 //!     p_up/rho/banked_decided/margin are trusted as-is rather than
 //!     recomputed — a bad live model read replays as a bad read here too.
-//!   - `full`: rebuilds FeedState from the book/spot recorder plus cached
-//!     Binance 1m klines and calls `eval_model` itself, so it exercises
-//!     the whole pipeline decide() sits behind. Only place in this module
+//!   - `full`: rebuilds FeedState from the book/spot recorder plus the
+//!     arm's own market-data source and calls `eval_model` itself, so it
+//!     exercises the whole pipeline decide() sits behind. Which source is
+//!     the arm's `feed` param, exactly as it is live: `binance` reshapes
+//!     cached 1m klines, `rtds` replays the settlement stream out of the
+//!     recorder corpus (see `replay::rtds`). Only place in this module
 //!     that touches the network (`--mode full` klines fetch), and it's
 //!     cached to `~/.pmt/corpus/klines-1m-{SYMBOL}.jsonl` so a re-run of
-//!     the same window doesn't refetch.
+//!     the same window doesn't refetch; the rtds path never fetches at all,
+//!     because the stream serves no history to fetch.
 //!
 //! Settlement (which side actually won) needs a ground truth per window.
 //! `full` mode already has the true klines on hand (cache is fetched with
@@ -30,18 +34,24 @@
 //! No wall-clock reads: every `now` used for a decide() call comes from a
 //! record's own `t` field, so a replay run is deterministic and repeatable.
 
-use crate::strategies::updown::{Action, ArmParams, ArmState, ArmView, DecideOut, TopOfBook};
+use crate::strategies::updown::{
+    Action, ArmParams, ArmState, ArmView, DecideOut, TopOfBook, FEED_RTDS,
+};
 use crate::strategies::updown_model::{
     eval_model, lag1_autocorr, shape_klines, FeedState, GateReason, Kline, ModelEval, Tunables,
     BINANCE_DATA, EV_EVAL, EV_FIRE, EV_GATED, KLINE_LOOKBACK_S,
 };
+use crate::strategies::updown_rtds;
+use rtds::{RtdsCorpus, RtdsTimeline};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub mod fixtures;
+pub(crate) mod rtds;
 
 pub struct ReplayOpts {
     pub mode: String,
@@ -51,6 +61,11 @@ pub struct ReplayOpts {
     pub params: Option<PathBuf>,
     pub outcomes: Option<PathBuf>,
     pub out: Option<PathBuf>,
+    /// RTDS recorder corpus (directory of `rtds-YYYYMMDD.jsonl`, or one
+    /// file) — the market data for `feed = "rtds"` arms in full mode.
+    /// Defaults to `~/.pmt/corpus/rtds`; loaded only when a matched window
+    /// is actually stream-fed.
+    pub rtds_corpus: Option<PathBuf>,
     /// R7: `Some(cap)` switches to the interleaved fleet driver (every
     /// matched window stepped in one global timestamp order, sharing one
     /// un-decided pool). `Some(0.0)` is that same driver with no cap — the
@@ -553,6 +568,7 @@ fn gate_from_record(rec: &Value) -> GateReason {
         banked_bp: num("banked_bp"),
         cushion_bp: num("cushion_bp"),
         guard_bp: num("guard_bp"),
+        spot_age_s: num("spot_age_s"),
     }
 }
 
@@ -742,19 +758,112 @@ fn feed_state_at(
 
 /// True TWAP-proxy settlement, scored after the window closed — no
 /// look-ahead concern here, the outcome already happened. Same math the
-/// model banks on: avg of the window's final per-minute values vs the
-/// range-start reference.
-fn settle_winner(rows: &BTreeMap<i64, Kline>, start: i64, end: i64) -> Option<String> {
-    let ref_px = rows.get(&(start - 60)).map(|r| r.mid())?;
+/// model banks on: avg of the window's per-minute marks vs the range-start
+/// reference.
+///
+/// Takes the marks rather than the klines so both feeds settle through one
+/// function: a kline mid IS the per-minute mark on a Binance-fed arm, and
+/// on a stream-fed one the marks are the settlement TWAP prints themselves.
+fn settle_from_marks(marks: &BTreeMap<i64, f64>, start: i64, end: i64) -> Option<String> {
+    let ref_px = *marks.get(&(start - 60))?;
     let (mut sum, mut n) = (0.0, 0usize);
-    for r in rows.range(start..end).map(|(_, r)| r) {
-        sum += r.mid();
+    for v in marks.range(start..end).map(|(_, v)| *v) {
+        sum += v;
         n += 1;
     }
     if n == 0 {
         return None;
     }
     Some(if sum / n as f64 >= ref_px { "up".to_string() } else { "down".to_string() })
+}
+
+fn settle_winner(rows: &BTreeMap<i64, Kline>, start: i64, end: i64) -> Option<String> {
+    let marks: BTreeMap<i64, f64> = rows.iter().map(|(t, r)| (*t, r.mid())).collect();
+    settle_from_marks(&marks, start, end)
+}
+
+// --- full mode's market-data source --------------------------------------
+
+/// Where `--mode full` gets the FeedState it hands to `eval_model`.
+///
+/// The arm's own `feed` param picks it, exactly as it picks which threads
+/// `start_feeds` spawns live. That is the whole discipline: a window is
+/// replayed off the series it traded on, never off a convenient stand-in.
+/// Replaying a stream-fed arm against Binance klines reconstructs a model
+/// read that never happened — different venue, different basis, and the
+/// cross-venue gap this feed exists to delete put right back in.
+pub(crate) enum FullFeed {
+    /// `feed = "binance"`: 1m klines reshaped per tick by `feed_state_at`.
+    /// `Arc` because a fleet run shares one symbol's cache across every
+    /// window on it, and the cache is megabytes.
+    Klines(Arc<BTreeMap<i64, Kline>>),
+    /// `feed = "rtds"`: the settlement stream replayed through the live hub.
+    Rtds(Box<RtdsTimeline>),
+}
+
+impl FullFeed {
+    /// The model's inputs as of `now`. `spot`/`spot_ts` come off the book
+    /// record for a Binance arm — the recorder stamped them from that arm's
+    /// own feed thread — and are ignored for a stream-fed one, whose spot
+    /// is a chainlink print like every other number it reads.
+    fn state_at(&mut self, start: i64, spot: f64, spot_ts: f64, now: f64) -> FeedState {
+        match self {
+            FullFeed::Klines(rows) => feed_state_at(rows, start, spot, spot_ts, now),
+            FullFeed::Rtds(tl) => tl.state_at(now),
+        }
+    }
+
+    fn settle(&mut self, start: i64, end: i64) -> Option<String> {
+        match self {
+            FullFeed::Klines(rows) => settle_winner(rows, start, end),
+            FullFeed::Rtds(tl) => settle_from_marks(&tl.settle_marks(end as f64), start, end),
+        }
+    }
+}
+
+/// The rtds symbols a set of matched windows needs, or empty when every one
+/// of them is Binance-fed — which is the signal not to load the corpus at
+/// all. A hundred megabytes read for a run that has no use for it is the
+/// difference between a replay that feels instant and one that doesn't.
+fn rtds_symbols_needed<'a>(
+    windows: impl Iterator<Item = &'a ArmParams>,
+) -> BTreeSet<String> {
+    windows
+        .filter(|p| p.feed == FEED_RTDS)
+        // A symbol the stream never carried yields nothing here; the
+        // timeline refuses it by name a moment later, which is the message
+        // that actually helps.
+        .filter_map(|p| updown_rtds::rtds_symbol(&p.symbol))
+        .collect()
+}
+
+/// Load the corpus iff some matched window is stream-fed.
+fn load_rtds_corpus(
+    opts: &ReplayOpts,
+    wanted: &BTreeSet<String>,
+) -> Result<Option<RtdsCorpus>, String> {
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    let path = opts.rtds_corpus.clone().unwrap_or_else(rtds::default_corpus_dir);
+    RtdsCorpus::load(&path, wanted).map(Some)
+}
+
+/// This window's feed source. Fails closed on a stream-fed arm with no
+/// corpus behind it rather than falling back to klines: a silent fallback
+/// would replay the window off the very venue the arm was moved away from.
+fn full_feed_for(p: &ArmParams, corpus: Option<&RtdsCorpus>) -> Result<FullFeed, String> {
+    if p.feed != FEED_RTDS {
+        return Ok(FullFeed::Klines(Arc::new(klines_for_window(
+            &p.symbol,
+            p.start as i64,
+            p.end as i64,
+        )?)));
+    }
+    let corpus = corpus.ok_or_else(|| {
+        format!("{}: feed 'rtds' needs an RTDS recorder corpus (--rtds-corpus)", p.slug)
+    })?;
+    RtdsTimeline::new(p, corpus).map(|tl| FullFeed::Rtds(Box::new(tl)))
 }
 
 fn view_from_book_record(rec: &Value, sim: &FillSim, p: &ArmParams) -> ArmView {
@@ -770,25 +879,15 @@ fn view_from_book_record(rec: &Value, sim: &FillSim, p: &ArmParams) -> ArmView {
     }
 }
 
-fn replay_full_window(
-    p: &ArmParams,
-    tun: Option<Tunables>,
-    recs: &[Value],
-    outcome_override: Option<String>,
-    real: &RealTally,
-) -> Result<Value, String> {
-    let rows = klines_for_window(&p.symbol, p.start as i64, p.end as i64)?;
-    Ok(replay_full_window_with(&rows, p, tun, recs, outcome_override, real).0)
-}
-
-/// Full-mode replay over klines the caller already holds — the offline seam.
+/// Full-mode replay over a feed source the caller already holds — the
+/// offline seam.
 ///
 /// `klines_for_window` is this module's ONLY network path; a fixture run
-/// never reaches it, because the fixture carries its own kline slice and
-/// hands it in here. That is a structural guarantee, not an env var CI
-/// might forget to set (issue #5, Phase 3).
+/// never reaches it, because the fixture carries its own kline (or rtds)
+/// slice and hands the built source in here. That is a structural
+/// guarantee, not an env var CI might forget to set (issue #5, Phase 3).
 pub(crate) fn replay_full_window_with(
-    rows: &BTreeMap<i64, Kline>,
+    feed_src: &mut FullFeed,
     p: &ArmParams,
     tun: Option<Tunables>,
     recs: &[Value],
@@ -807,7 +906,7 @@ pub(crate) fn replay_full_window_with(
         let now = rec["t"].as_f64().unwrap_or(0.0);
         let spot = rec["spot"].as_f64().unwrap_or(0.0);
         let spot_age = rec["spot_age_s"].as_f64().unwrap_or(0.0);
-        let feed = feed_state_at(rows, p.start as i64, spot, now - spot_age, now);
+        let feed = feed_src.state_at(p.start as i64, spot, now - spot_age, now);
         // Static guard only — replay has no recorded oracle-sample corpus
         // (yet; oracle-tape.jsonl starts accumulating once the dynamic
         // guard runs live), so pass the operator's param unchanged: replay
@@ -820,7 +919,8 @@ pub(crate) fn replay_full_window_with(
         apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate);
     }
 
-    let outcome = outcome_override.or_else(|| settle_winner(rows, p.start as i64, p.end as i64));
+    let outcome =
+        outcome_override.or_else(|| feed_src.settle(p.start as i64, p.end as i64));
     let pnl = outcome.as_deref().map(|w| settle_pnl(&sim, p, w));
     (build_report(&p.slug, "full", &sim, real, outcome, pnl), trace)
 }
@@ -839,6 +939,8 @@ fn run_full(opts: &ReplayOpts) -> Result<(), String> {
     }
     let outcomes = load_outcomes(opts.outcomes.as_deref())?;
     let real_by_slug = load_real_tally(&tape_path);
+    let matched = || windows.iter().filter_map(|(s, _)| params_map.get(s)).map(|(p, _)| p);
+    let corpus = load_rtds_corpus(opts, &rtds_symbols_needed(matched()))?;
 
     let mut reports = Vec::new();
     for (slug, recs) in &windows {
@@ -847,10 +949,25 @@ fn run_full(opts: &ReplayOpts) -> Result<(), String> {
             continue;
         };
         let real = real_by_slug.get(slug).cloned().unwrap_or_default();
-        match replay_full_window(&p, tun, recs, outcomes.get(slug).cloned(), &real) {
-            Ok(report) => reports.push(report),
-            Err(e) => eprintln!("[replay] skipping '{}': {}", slug, e),
-        }
+        // A feed the window cannot be replayed against skips that window
+        // loudly and leaves the rest of the run alone — same as a kline
+        // hole does. Silence is what the refusal messages exist to avoid.
+        let mut feed_src = match full_feed_for(&p, corpus.as_ref()) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[replay] skipping '{}': {}", slug, e);
+                continue;
+            }
+        };
+        let (report, _) = replay_full_window_with(
+            &mut feed_src,
+            &p,
+            tun,
+            recs,
+            outcomes.get(slug).cloned(),
+            &real,
+        );
+        reports.push(report);
     }
     finalize(&opts.slug, "full", &reports, opts.out.as_deref())
 }
@@ -889,6 +1006,11 @@ struct FleetArm {
     /// Decide passes where the fleet cap — not this arm's own budget or a
     /// window brake — is what stopped a clip.
     fleet_blocks: usize,
+    /// Full mode only. Per arm, never per symbol: a stream-fed timeline
+    /// carries its own hub consumer and its own cursor through the corpus,
+    /// so two windows on one symbol are two timelines. The Binance side
+    /// shares its cache through the `Arc` instead.
+    feed_src: Option<FullFeed>,
 }
 
 impl FleetArm {
@@ -949,10 +1071,9 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
     let outcomes = load_outcomes(opts.outcomes.as_deref())?;
     let real_by_slug = load_real_tally(&tape_path);
 
-    // Build one arm per matched window, dropping any we cannot run before
-    // the interleave starts — a half-built fleet would misprice the pool.
-    let mut arms: Vec<FleetArm> = Vec::new();
-    let mut recs_by_arm: Vec<&Vec<Value>> = Vec::new();
+    // One arm per matched window, with its params resolved up front so the
+    // shared feed sources below can be sized off the real fleet.
+    let mut pending: Vec<(&String, &Vec<Value>, ArmParams, Option<Tunables>)> = Vec::new();
     for (slug, recs) in &windows {
         let (p, tun) = match params_map.get(slug).cloned() {
             Some(v) => v,
@@ -968,6 +1089,56 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
                 synth_params(slug)?
             }
         };
+        pending.push((slug, recs, p, tun));
+    }
+
+    // Full mode needs its feeds before the interleave starts, and the
+    // Binance side wants each symbol's cache read ONCE over the union of
+    // its windows: the cache file is megabytes and re-parsing it a few
+    // hundred times is the whole runtime otherwise. The corpus is read once
+    // too, and only if some arm on it is stream-fed.
+    let mut klines: HashMap<String, Arc<BTreeMap<i64, Kline>>> = HashMap::new();
+    let mut corpus: Option<RtdsCorpus> = None;
+    if full {
+        corpus = load_rtds_corpus(opts, &rtds_symbols_needed(pending.iter().map(|e| &e.2)))?;
+        let mut spans: HashMap<String, (i64, i64)> = HashMap::new();
+        for (_, _, p, _) in pending.iter().filter(|e| e.2.feed != FEED_RTDS) {
+            let e = spans.entry(p.symbol.clone()).or_insert((i64::MAX, i64::MIN));
+            e.0 = e.0.min(p.start as i64);
+            e.1 = e.1.max(p.end as i64);
+        }
+        for (symbol, (lo, hi)) in spans {
+            let mut rows = load_kline_cache(&kline_cache_path(&symbol)?);
+            ensure_klines(&symbol, lo - KLINE_LOOKBACK_S, hi, &mut rows)?;
+            klines.insert(symbol, Arc::new(rows));
+        }
+    }
+
+    // Drop any window we cannot run BEFORE the interleave — a half-built
+    // fleet would misprice the pool every arm is rationed against.
+    let mut arms: Vec<FleetArm> = Vec::new();
+    let mut recs_by_arm: Vec<&Vec<Value>> = Vec::new();
+    for (slug, recs, p, tun) in pending {
+        let feed_src = if !full {
+            None
+        } else {
+            let built = if p.feed == FEED_RTDS {
+                full_feed_for(&p, corpus.as_ref())
+            } else {
+                klines
+                    .get(&p.symbol)
+                    .cloned()
+                    .map(FullFeed::Klines)
+                    .ok_or_else(|| format!("{}: no kline cache for {}", p.slug, p.symbol))
+            };
+            match built {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!("[replay] skipping '{}': {}", slug, e);
+                    continue;
+                }
+            }
+        };
         let mut arm = ArmState::with_params(p.clone());
         arm.subscribed = true;
         if let Some(t) = tun {
@@ -980,29 +1151,12 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
             last_p_up: None,
             real: real_by_slug.get(slug).cloned().unwrap_or_default(),
             fleet_blocks: 0,
+            feed_src,
         });
         recs_by_arm.push(recs);
     }
     if arms.is_empty() {
         return Err(format!("no window could be replayed for '{}'", opts.slug));
-    }
-
-    // Full mode needs klines; fetch each symbol ONCE over the union of its
-    // windows instead of per window — the cache file is megabytes and
-    // re-parsing it a few hundred times is the whole runtime otherwise.
-    let mut klines: HashMap<String, BTreeMap<i64, Kline>> = HashMap::new();
-    if full {
-        let mut spans: HashMap<String, (i64, i64)> = HashMap::new();
-        for a in &arms {
-            let e = spans.entry(a.p.symbol.clone()).or_insert((i64::MAX, i64::MIN));
-            e.0 = e.0.min(a.p.start as i64);
-            e.1 = e.1.max(a.p.end as i64);
-        }
-        for (symbol, (lo, hi)) in spans {
-            let mut rows = load_kline_cache(&kline_cache_path(&symbol)?);
-            ensure_klines(&symbol, lo - KLINE_LOOKBACK_S, hi, &mut rows)?;
-            klines.insert(symbol, rows);
-        }
     }
 
     let ordered = interleave(&recs_by_arm);
@@ -1018,10 +1172,11 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
 
         let a = &mut arms[i];
         let out = if full {
-            let Some(rows) = klines.get(&a.p.symbol) else { continue };
             let spot = rec["spot"].as_f64().unwrap_or(0.0);
             let spot_age = rec["spot_age_s"].as_f64().unwrap_or(0.0);
-            let feed = feed_state_at(rows, a.p.start as i64, spot, now - spot_age, now);
+            let start = a.p.start as i64;
+            let Some(src) = a.feed_src.as_mut() else { continue };
+            let feed = src.state_at(start, spot, now - spot_age, now);
             let model = eval_model(&a.p, &feed, now, a.p.basis_guard_bp);
             let view = view_from_book_record(rec, &a.sim, &a.p);
             Some(a.arm.decide_fleet(&view, model, now, &mut fleet_room))
@@ -1053,15 +1208,13 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
 
     let mode = if full { "full" } else { "evals" };
     let mut reports = Vec::new();
-    for a in &arms {
-        let outcome = outcomes.get(&a.p.slug).cloned().or_else(|| {
-            if full {
-                klines
-                    .get(&a.p.symbol)
-                    .and_then(|rows| settle_winner(rows, a.p.start as i64, a.p.end as i64))
-            } else {
-                a.last_p_up.map(|p| if p >= 0.5 { "up".into() } else { "down".into() })
-            }
+    for a in &mut arms {
+        let (start, end) = (a.p.start as i64, a.p.end as i64);
+        let outcome = outcomes.get(&a.p.slug).cloned().or_else(|| match &mut a.feed_src {
+            // Full mode settles off the arm's own feed — kline mids for a
+            // Binance arm, the settlement TWAP prints for a stream-fed one.
+            Some(src) => src.settle(start, end),
+            None => a.last_p_up.map(|p| if p >= 0.5 { "up".into() } else { "down".into() }),
         });
         let pnl = outcome.as_deref().map(|w| settle_pnl(&a.sim, &a.p, w));
         let mut r = build_report(&a.p.slug, mode, &a.sim, &a.real, outcome, pnl);
@@ -1143,10 +1296,19 @@ mod tests {
         let g = gate_from_record(&modern);
         assert_eq!(g.margin_bp, Some(-4.9));
         assert_eq!(g.guard_bp, Some(6.0));
+        assert_eq!(g.spot_age_s, None, "a basis gate has no feed age");
+        // A stale line from the current generation round-trips its age.
+        let stale = serde_json::json!({
+            "ev": "gated", "reason": "feed stale: rtds sample lag 12.3s", "spot_age_s": 12.3,
+        });
+        assert_eq!(
+            gate_from_record(&stale),
+            GateReason::stale("feed stale: rtds sample lag 12.3s", 12.3)
+        );
         // Pre-structured line: reason survives, numbers are simply absent —
-        // no regex, no guessing.
-        let old = serde_json::json!({"ev": "gated", "reason": "feed stale"});
-        assert_eq!(gate_from_record(&old), GateReason::plain("feed stale"));
+        // no regex, no guessing, including on the age the sentence carries.
+        let old = serde_json::json!({"ev": "gated", "reason": "feed stale: rtds sample lag 12.3s"});
+        assert_eq!(gate_from_record(&old), GateReason::plain("feed stale: rtds sample lag 12.3s"));
     }
 
     #[test]
@@ -1328,6 +1490,7 @@ mod tests {
             outcomes: None,
             out: Some(out.to_path_buf()),
             fleet_cap: Some(cap),
+            rtds_corpus: None,
         }
     }
 

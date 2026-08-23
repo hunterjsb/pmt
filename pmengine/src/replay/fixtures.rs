@@ -29,9 +29,12 @@
 //! lookalike — and asserts against the decision tape those emit, i.e. the
 //! engine's own account of what it did.
 
+use super::rtds::RtdsTimeline;
 use super::{
     params_from_value, real_tally_from, replay_evals_window_traced, replay_full_window_with,
+    FullFeed,
 };
+use crate::strategies::updown::FEED_RTDS;
 use crate::strategies::updown_model::Kline;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -168,9 +171,20 @@ pub struct Fixture {
     /// window that predates the recorder.
     #[serde(default)]
     pub book: Vec<Value>,
-    /// 1m klines covering [start - KLINE_LOOKBACK_S, end). Full mode only.
+    /// 1m klines covering [start - KLINE_LOOKBACK_S, end). Full mode on a
+    /// `feed = "binance"` arm only.
     #[serde(default)]
     pub klines: Vec<KlineRow>,
+    /// RTDS recorder rows for this window's symbol — the market data a
+    /// `feed = "rtds"` arm actually read, and the klines' counterpart on
+    /// that feed. Additive: a Binance fixture has none and never will, and
+    /// every fixture frozen before the stream existed loads unchanged.
+    ///
+    /// The settlement stream serves NO history, so unlike klines this
+    /// cannot be re-fetched by anyone, ever. The slice in the file is the
+    /// only surviving record that this window's market data existed.
+    #[serde(default)]
+    pub rtds: Vec<Value>,
     /// Named checks from the vocabulary in `check_invariant`. An unknown
     /// name is a hard error — never a silent pass.
     #[serde(default)]
@@ -219,6 +233,7 @@ fn validate(fx: &Fixture) -> Result<(), String> {
     if fx.evals.is_empty() {
         return Err("no tape records — nothing to replay".to_string());
     }
+    let (p, _) = params_from_value(&fx.params)?;
     match fx.mode.as_str() {
         "evals" => {}
         "full" => {
@@ -229,7 +244,22 @@ fn validate(fx: &Fixture) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            if fx.klines.is_empty() {
+            // Full mode rebuilds the model from the arm's OWN market data,
+            // and which slice that is follows `feed` exactly as it does
+            // live. A stream-fed fixture carrying klines instead would
+            // replay against the venue the arm was moved off — the one
+            // wrong answer that still looks like an answer.
+            if p.feed == FEED_RTDS {
+                if fx.rtds.is_empty() {
+                    return Err(
+                        "mode 'full' on a feed='rtds' arm with no rtds slice — the model \
+                         has to be rebuilt from the settlement stream this window traded \
+                         on, klines are a different venue, and the stream serves no \
+                         history to fetch. Re-freeze with a corpus that covers the window."
+                            .to_string(),
+                    );
+                }
+            } else if fx.klines.is_empty() {
                 return Err(
                     "mode 'full' with no klines — full mode rebuilds the model from \
                      them, and fetching is not an option offline"
@@ -242,7 +272,7 @@ fn validate(fx: &Fixture) -> Result<(), String> {
     for inv in &fx.invariants {
         known_invariant(inv)?;
     }
-    params_from_value(&fx.params).map(|_| ())
+    Ok(())
 }
 
 /// Every `*.json` under a directory (sorted, non-recursive), or the single
@@ -302,12 +332,19 @@ pub fn replay_fixture(fx: &Fixture) -> Result<FixtureRun, String> {
     let (report, trace) = match fx.mode.as_str() {
         "evals" => replay_evals_window_traced(&p, tun, &fx.evals, winner, &real),
         "full" => {
-            let rows: BTreeMap<i64, Kline> = fx
-                .klines
-                .iter()
-                .map(|k| (k.t, Kline { t: k.t, o: k.o, c: k.c }))
-                .collect();
-            replay_full_window_with(&rows, &p, tun, &fx.book, winner, &real)
+            // The offline seam: the fixture hands in its own market data,
+            // so neither branch can reach a network or a corpus.
+            let mut feed_src = if p.feed == FEED_RTDS {
+                FullFeed::Rtds(Box::new(RtdsTimeline::from_records(&p, &fx.rtds)?))
+            } else {
+                FullFeed::Klines(std::sync::Arc::new(
+                    fx.klines
+                        .iter()
+                        .map(|k| (k.t, Kline { t: k.t, o: k.o, c: k.c }))
+                        .collect::<BTreeMap<i64, Kline>>(),
+                ))
+            };
+            replay_full_window_with(&mut feed_src, &p, tun, &fx.book, winner, &real)
         }
         other => return Err(format!("unknown mode '{}'", other)),
     };
@@ -878,6 +915,7 @@ mod tests {
             ],
             book: vec![],
             klines: vec![],
+            rtds: vec![],
             invariants: vec![
                 "fires_eq:1".to_string(),
                 "all_fires_side:up".to_string(),
@@ -1012,6 +1050,35 @@ mod tests {
         assert!(validate(&fx).unwrap_err().contains("no klines"));
         fx.klines = vec![KlineRow { t: 1380, o: 1.0, c: 1.0 }];
         validate(&fx).unwrap();
+    }
+
+    #[test]
+    fn a_stream_fed_full_fixture_without_its_rtds_slice_is_refused_at_load() {
+        // The trap: a `feed = "rtds"` window frozen with klines would load,
+        // replay, and produce a confident answer — off the Binance series
+        // the arm was deliberately moved away from. The refusal has to
+        // happen at LOAD, before anyone reads a number out of it.
+        let mut fx = blessed("s");
+        fx.mode = "full".to_string();
+        fx.params["feed"] = serde_json::json!("rtds");
+        fx.params["symbol"] = serde_json::json!("XRPUSDT");
+        fx.book = vec![serde_json::json!({"t": 1400.0, "ev": "book", "slug": "s"})];
+        // Klines do not stand in for the stream, however many there are.
+        fx.klines = vec![KlineRow { t: 1380, o: 1.0, c: 1.0 }];
+        let err = validate(&fx).unwrap_err();
+        assert!(err.contains("no rtds slice"), "got: {}", err);
+        assert!(err.contains("klines are a different venue"), "got: {}", err);
+
+        fx.rtds = vec![serde_json::json!({
+            "t_recv": 1380.2, "topic": "crypto_prices_chainlink", "symbol": "xrp/usd",
+            "ts": 1_380_000i64, "value": 2.5,
+        })];
+        validate(&fx).unwrap();
+
+        // And the mirror stays true: a Binance arm still needs its klines.
+        fx.params["feed"] = serde_json::json!("binance");
+        fx.klines = vec![];
+        assert!(validate(&fx).unwrap_err().contains("no klines"));
     }
 
     #[test]
