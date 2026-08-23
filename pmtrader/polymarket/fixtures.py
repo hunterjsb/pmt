@@ -214,19 +214,37 @@ def rtds_slice(rows: Iterable[dict], symbol: str, start: int,
 
 # ---------- wallet truth ----------
 
-def wallet_accounting(activity_rows: Iterable[dict], slug: str) -> dict:
+def wallet_accounting(activity_rows: Iterable[dict], slug: str,
+                      window_end: float | None = None) -> dict:
     """What the money did on one window, from wallet activity rows.
 
     Mirrors cli_crypto_stats.score_activity's aggregation over the same rows. The
     `winner` is NOT derived here — it comes from the graded outcomes corpus,
     which already applies L22/L23's dust-redeem rules; this only accounts.
+
+    Pass `window_end` to make a STALE DUMP fatal instead of silent. Zero matching
+    rows has two causes that look identical in the output — "this window was
+    never traded" and "the dump stops before this window ever happened" — and
+    for months the second one was written into fixtures as $0 buy / $0 redeem /
+    $0 pnl beside `source: "wallet"`, a provably impossible pair (a wallet grade
+    requires a redeem). With `window_end` set, a dump whose newest row predates
+    the window's close is refused by name; without it the old permissive
+    behaviour is unchanged, because `pmt crypto window` and the scoreboard
+    legitimately ask about windows a deliberately-floored walk does not reach.
     """
     acct = {"buy": 0.0, "buy_shares": 0.0, "buy_side": None, "sell": 0.0,
             "redeem": 0.0, "redeem_seen": False, "redeem_outcome": None, "pnl": 0.0}
     sides: dict[str, float] = {}
+    matched = 0
+    newest = 0.0
     for a in activity_rows:
+        try:
+            newest = max(newest, float(a.get("timestamp") or 0))
+        except (TypeError, ValueError):
+            pass
         if a.get("slug") != slug:
             continue
+        matched += 1
         usd = a.get("usdcSize") or 0.0
         if a.get("type") == "TRADE":
             if a.get("side") == "BUY":
@@ -241,6 +259,14 @@ def wallet_accounting(activity_rows: Iterable[dict], slug: str) -> dict:
             acct["redeem_seen"] = True
             if usd > 0.5:
                 acct["redeem_outcome"] = (a.get("outcome") or "").lower()
+    if window_end is not None and matched == 0 and newest < window_end:
+        raise FixtureError(
+            f"{slug}: the wallet activity dump stops at "
+            f"{_utc(newest)} but this window closes at {_utc(window_end)}, so it "
+            f"cannot say what the money did — every number would be a zero that "
+            f"means 'not recorded', not 'not traded'. Refresh it first:\n"
+            f"    pmt crypto activity --refresh"
+        )
     if sides:
         acct["buy_side"] = max(sides, key=lambda k: sides[k])
     acct["pnl"] = round(acct["redeem"] + acct["sell"] - acct["buy"], 6)
@@ -455,14 +481,62 @@ def _utc(epoch: float) -> str:
     return _dt.datetime.fromtimestamp(epoch, _dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def render_fixture(obj: dict) -> str:
+def replace_top_level_block(text: str, key: str, value: object) -> str:
+    """Swap one top-level key's value in rendered fixture text, byte-for-byte
+    everywhere else. Raises KeyError if the key is not present.
+
+    Re-rendering a whole fixture from Python cannot be byte-stable against a
+    file the Rust `--bless` wrote: the two disagree on key order AND on float
+    formatting (Rust `0.00001807603856551765` vs Python `1.807603856551765e-05`
+    — same double, different text). Both are value-preserving and both are pure
+    noise in a data repo's diff. An edit that only needs to move one block
+    should move one block.
+    """
+    lines = text.split("\n")
+    # Two renderers are in the wild: render_fixture's one-space top level, and
+    # a plain json.dumps(indent=2) two-space one (the 17:15Z cohort). Take the
+    # indent from the file instead of assuming either.
+    indent = ""
+    for ln in lines[1:]:
+        if ln.lstrip().startswith('"'):
+            indent = ln[:len(ln) - len(ln.lstrip())]
+            break
+    open_line = f'{indent}{json.dumps(key)}: '
+    start = next((i for i, ln in enumerate(lines) if ln.startswith(open_line)), None)
+    if start is None:
+        raise KeyError(key)
+    # Nested content is indented deeper, so the block ends at the next line
+    # that opens another top-level key or closes the object.
+    end = start + 1
+    while end < len(lines) and not (
+            lines[end].startswith(f'{indent}"') or lines[end] == "}"):
+        end += 1
+    trailing = "," if lines[end - 1].rstrip().endswith(",") else ""
+    body = json.dumps(value, indent=len(indent) or 2).replace("\n", "\n" + indent)
+    return "\n".join(lines[:start] + [f"{open_line}{body}{trailing}"] + lines[end:])
+
+
+def render_fixture(obj: dict, order: Iterable[str] | None = None) -> str:
     """Mirror of fixtures.rs::render_fixture — top-level keys pretty, record
     arrays one per line.
 
     Same renderer on both sides so `--bless` (which rewrites the file from
     Rust) produces a diff of the numbers that moved, not of the whole file.
+
+    KEY ORDER IS NOT ACTUALLY SHARED, though. This renderer emits FIXTURE_KEYS
+    order; the Rust bless emits its serde struct order, which lands
+    alphabetical. A fresh freeze is written here and then immediately rewritten
+    by `--bless`, so every COMMITTED fixture is in the Rust order and rendering
+    one back through this function reorders the whole file — 222 lines of churn
+    on a one-field edit. Pass `order` (e.g. `list(loaded)`) to keep the order
+    the file already had, which is what any edit-in-place path wants.
     """
-    keys = [k for k in FIXTURE_KEYS if k in obj] + [k for k in obj if k not in FIXTURE_KEYS]
+    if order is not None:
+        order = list(order)
+        keys = [k for k in order if k in obj] + [k for k in obj if k not in order]
+    else:
+        keys = ([k for k in FIXTURE_KEYS if k in obj]
+                + [k for k in obj if k not in FIXTURE_KEYS])
     lines = ["{"]
     for i, k in enumerate(keys):
         val = obj[k]

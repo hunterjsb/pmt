@@ -7,13 +7,24 @@ not the three that used to exist.
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 
 import requests
 
 from . import hosts
 
 ACTIVITY_URL = f"{hosts.DATA}/activity"
+
+# The on-disk dump the fixture freezer grades money against. Its only writer
+# used to be `analysis/latency_report.py --refresh`, which left this repo on
+# 2026-08-23 with the rest of the research record — taking the sole refresh
+# path with it and freezing the dump at 08:41Z. Seven fixtures were frozen
+# afterwards and every one recorded $0 buy/$0 redeem/$0 pnl on a window that
+# really traded. The writer belongs next to the walk it depends on, in the
+# repo that has pmtrader and the .env on hand.
+ACTIVITY_DUMP = Path.home() / ".pmt" / "corpus" / "activity.jsonl"
 PAGE_SIZE = 500
 # Deliberately < PAGE_SIZE: the overlap re-reads the seam that offset
 # pagination over a LIVE feed keeps shifting, absorbing up to 100 fresh
@@ -113,3 +124,44 @@ def fetch_wallet_activity(addr: str, floor: float = 0.0) -> list[dict]:
             break
         offset += PAGE_STEP
     return rows
+
+
+def refresh_activity_dump(path: Path | str = ACTIVITY_DUMP,
+                          addr: str | None = None) -> int:
+    """Re-walk the wallet activity feed into the on-disk dump. Network read only.
+
+    A full rewrite, never an append: the feed MUTATES IN PLACE (see the comment
+    above `fetch_wallet_activity`), so the only correct dump is a whole fresh
+    one. Written to a temp file and renamed, so a reader mid-refresh sees the
+    old dump rather than a truncated one. Returns the row count written.
+    """
+    rows = fetch_wallet_activity(addr or funder_address())
+    rows.sort(key=lambda r: r.get("timestamp") or 0)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w") as f:
+        for r in rows:
+            f.write(json.dumps(r, sort_keys=True) + "\n")
+    tmp.replace(path)
+    return len(rows)
+
+
+def activity_dump_coverage(path: Path | str = ACTIVITY_DUMP) -> float:
+    """Newest row timestamp in the dump; 0.0 if it is missing or empty.
+
+    How far forward the dump can answer at all. Anything asking it about a
+    window that closed after this is asking a question the file cannot hold.
+    """
+    newest = 0.0
+    try:
+        with Path(path).open() as f:
+            for line in f:
+                try:
+                    ts = float(json.loads(line).get("timestamp") or 0)
+                except (ValueError, TypeError):
+                    continue
+                newest = max(newest, ts)
+    except OSError:
+        return 0.0
+    return newest

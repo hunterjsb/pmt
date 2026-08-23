@@ -20,6 +20,7 @@ from polymarket.fixtures import (
     build_params,
     kline_slice,
     render_fixture,
+    replace_top_level_block,
     rtds_slice,
     rtds_symbol,
     secret_scan,
@@ -126,6 +127,74 @@ def test_wallet_accounting_sums_one_window_only():
     # A $0 redeem names nothing (L22) — the winner comes from the graded corpus.
     assert a["redeem_outcome"] is None
     assert a["pnl"] == -115.0
+
+
+def test_wallet_accounting_refuses_a_dump_that_stops_before_the_window():
+    """The zeroed-fixture defect: seven windows that really traded were frozen
+    with $0 buy/$0 redeem/$0 pnl because the dump had not been refreshed since
+    08:41Z. With window_end set, a short dump is named instead of answered."""
+    stale = [{"slug": "other-updown-5m-1", "type": "TRADE", "side": "BUY",
+              "usdcSize": 999.0, "timestamp": 1000}]
+    with pytest.raises(FixtureError, match="cannot say what the money did"):
+        wallet_accounting(stale, SLUG, window_end=5000)
+    with pytest.raises(FixtureError, match="pmt crypto activity --refresh"):
+        wallet_accounting(stale, SLUG, window_end=5000)
+
+
+def test_wallet_accounting_allows_a_covered_but_untraded_window():
+    """A dump that REACHES past the window and saw nothing is a real answer —
+    zeros mean 'not traded' there, and build_outcome's wallet-grade check is
+    what refuses it downstream."""
+    covered = [{"slug": "other-updown-5m-1", "type": "TRADE", "side": "BUY",
+                "usdcSize": 999.0, "timestamp": 9000}]
+    a = wallet_accounting(covered, SLUG, window_end=5000)
+    assert a["buy"] == 0.0 and a["pnl"] == 0.0 and a["redeem_seen"] is False
+
+
+def test_wallet_accounting_without_window_end_keeps_the_permissive_behaviour():
+    """`pmt crypto window` and the scoreboard ask about windows a floored walk
+    deliberately does not reach; only the freezer opts into the guard."""
+    stale = [{"slug": "other-updown-5m-1", "type": "TRADE", "usdcSize": 1.0,
+              "timestamp": 1000}]
+    assert wallet_accounting(stale, SLUG)["pnl"] == 0.0
+
+
+def test_replace_top_level_block_touches_only_that_block():
+    """The accounting repair must not reformat recorded market data. Python and
+    the Rust bless disagree on key order AND float text (0.0000180... vs
+    1.80...e-05), so re-rendering churns hundreds of value-identical lines."""
+    text = (
+        '{\n'
+        ' "evals": [\n'
+        '  {"p_up":0.00001807603856551765,"t":1.0}\n'
+        ' ],\n'
+        ' "outcome": {\n'
+        '   "buy": 0.0,\n'
+        '   "winner": "up"\n'
+        ' },\n'
+        ' "slug": "x"\n'
+        '}\n'
+    )
+    out = replace_top_level_block(text, "outcome", {"buy": 12.5, "winner": "up"})
+    assert '"p_up":0.00001807603856551765' in out   # untouched, not re-serialized
+    assert '"buy": 12.5' in out
+    assert '"buy": 0.0' not in out
+    assert out.splitlines()[-1] == "}"
+    assert json.loads(out)["outcome"] == {"buy": 12.5, "winner": "up"}
+
+
+def test_replace_top_level_block_handles_the_two_space_renderer():
+    """The 17:15Z cohort was written by a plain json.dumps(indent=2), not by
+    render_fixture — the repair has to read the indent off the file."""
+    text = ('{\n  "outcome": {\n    "buy": 0.0\n  },\n  "slug": "x"\n}\n')
+    out = replace_top_level_block(text, "outcome", {"buy": 3.0})
+    assert json.loads(out) == {"outcome": {"buy": 3.0}, "slug": "x"}
+    assert '\n  "slug": "x"' in out
+
+
+def test_replace_top_level_block_raises_on_a_missing_key():
+    with pytest.raises(KeyError):
+        replace_top_level_block('{\n "slug": "x"\n}\n', "outcome", {})
 
 
 def test_build_outcome_refuses_a_derived_label():
