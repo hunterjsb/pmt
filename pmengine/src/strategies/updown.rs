@@ -133,6 +133,14 @@ pub(crate) struct ArmParams {
     /// buffer costs nothing unless the book actually moved. 0 = off.
     #[serde(default)]
     pub pay_up_max: f64,
+    /// R6 tail honesty: the model's fair is capped here unless the TWAP is
+    /// flip-proof — every symbol jumps >3σ roughly hourly, so a Gaussian
+    /// p_up of 0.99+ is fiction exactly where being wrong costs 100%. With
+    /// min_edge 1.5¢ a cap of 0.98 makes ~0.945 the highest ask a
+    /// non-flip-proof clip can pay. 1.0 = off (wallet calibration check:
+    /// stated fair ≥0.95 realizes ~92%).
+    #[serde(default = "d_p_cap")]
+    pub p_cap: f64,
     /// R9 safety gate: the FIRST clip of a window requires
     /// safety = signed_banked_bp / cushion_bp >= theta on the fired side.
     /// 0 disables (clock-gate-only entry, the pre-R9 behavior). θ=1 is
@@ -171,6 +179,7 @@ fn d_late_frac() -> f64 { 0.6 }
 fn d_late_rem() -> f64 { 120.0 }
 fn d_rho_block() -> f64 { -0.25 }
 fn d_manip_push() -> f64 { 25.0 }
+fn d_p_cap() -> f64 { 1.0 }
 /// Flip-proof buys stay live until this close to resolution.
 const FLIP_BUY_CUTOFF_S: f64 = 8.0;
 
@@ -984,6 +993,10 @@ impl ArmState {
             let Some((ask, ask_size)) = top.ask else {
                 continue;
             };
+            // R6 cap: fair used for edge and gating, not display honesty —
+            // eval keeps fair_raw when the cap actually bit.
+            let fair_raw = fair;
+            let fair = if m.flip_proof { fair } else { fair.min(p.p_cap) };
             let fee = p.fee_rate * ask.min(1.0 - ask);
             let net = fair - ask - fee;
             let safety = side_safety(side == "up", m.banked_margin_bp, m.cushion_bp);
@@ -1020,6 +1033,9 @@ impl ArmState {
                 "side": side, "fair": fair, "ask": ask, "net": net,
                 "safety": (safety * 100.0).round() / 100.0,
             });
+            if fair < fair_raw {
+                eval["fair_raw"] = serde_json::json!(fair_raw);
+            }
             if let Some(b) = brake {
                 eval["brake"] = serde_json::json!(b);
             }
@@ -1778,6 +1794,33 @@ mod tests {
             2
         );
         assert_eq!(arm.last_eval.as_ref().unwrap()["state"], "quiesce");
+    }
+
+    #[test]
+    fn decide_p_cap_blocks_sure_things_unless_flip_proof() {
+        let mut p = params("s");
+        p.p_cap = 0.98;
+        let mut arm = armed(p);
+        // fair 1.0 at ask 0.97: uncapped net ~0.028 fires; capped net
+        // ~0.008 sits under min_edge 0.015 — the "sure thing" is refused.
+        let m = ModelEval { flip_proof: false, ..locked_up_model() };
+        let out = arm.decide(&view_with_up_ask(0.97, 500.0), Ok(m), 1400.0);
+        assert!(buys(&out).is_empty());
+        let eval = &arm.last_eval.as_ref().unwrap()["sides"][0];
+        assert_eq!(eval["fair"], 0.98);
+        assert_eq!(eval["fair_raw"], 1.0);
+        // flip-proof is exempt: the TWAP is beyond reach, the price is real.
+        let m = ModelEval { flip_proof: true, ..locked_up_model() };
+        let out = arm.decide(&view_with_up_ask(0.97, 500.0), Ok(m), 1400.1);
+        assert_eq!(buys(&out).len(), 1);
+    }
+
+    #[test]
+    fn p_cap_default_is_inert() {
+        let mut arm = armed(params("s"));
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.0);
+        assert_eq!(buys(&out).len(), 1);
+        assert!(arm.last_eval.as_ref().unwrap()["sides"][0].get("fair_raw").is_none());
     }
 
     #[test]

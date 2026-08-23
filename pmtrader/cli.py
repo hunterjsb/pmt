@@ -1665,10 +1665,15 @@ def crypto_updown(ref: str, as_json: bool) -> None:
                    "over --min-edge (marketable limits fill at the book, so "
                    "it costs nothing unless the book moved). 0 disables; the "
                    "2026-08-23 audit measured 32%% of taker notional unfilled")
+@click.option("--p-cap", type=float, default=1.0, show_default=True,
+              help="R6 tail honesty: cap the model's fair unless flip-proof — "
+                   "Gaussian p_up 0.99+ is fiction in the tails (>3-sigma "
+                   "jumps ~hourly). With min_edge 1.5c, 0.98 makes ~0.945 the "
+                   "max ask a non-flip-proof clip pays. 1.0 disables")
 def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
                side: str | None, quiesce: float, min_fair: float, min_elapsed: float,
                roll: bool, clip: float, basis_guard: float, theta: float,
-               pay_up: float) -> None:
+               pay_up: float, p_cap: float) -> None:
     """Arm the pmengine updown trigger on a market.
 
     Prices the market (semantics, vol, fee) and hands the parameters to the
@@ -1692,7 +1697,7 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         "size_usdc": size, "min_edge": min_edge, "max_price": max_price,
         "quiesce_secs": quiesce, "min_fair": min_fair, "min_elapsed_frac": min_elapsed,
         "roll": roll, "clip_usdc": clip, "basis_guard_bp": basis_guard,
-        "theta": theta, "pay_up_max": pay_up,
+        "theta": theta, "pay_up_max": pay_up, "p_cap": p_cap,
     }
     if side:
         payload["side_filter"] = side
