@@ -278,9 +278,11 @@ def test_header_line_carries_every_headline_number():
     ws = [_w(10, 0.5, True, entry_ts=3600, exit_ts=4500, end_ts=4500) for _ in range(11)]
     ws.append(_w(265, -265.0, False, entry_ts=3600, exit_ts=0, end_ts=4500))
     line = eff.header_line(eff.summary(ws, bankroll=1000.0, now=90000.0))
-    for token in ("$W ", "need ", "PF ", "$ret ", "RoRC ", "growth ", "util "):
+    for token in ("$W ", "W 92%", "need ", "PF ", "$ret ", "RoRC ", "growth ", "util "):
         assert token in line
-    assert "29%" in line          # money-weighted win rate, not 92%
+    assert "$W 29%" in line       # money-weighted win rate beside the count's 92%
+    # "need" is a fraction-of-trades bar, so it must sit on the COUNT rate
+    assert "W 92% (need" in line
 
 
 def test_header_line_dashes_undefined_metrics_instead_of_zeroing_them():

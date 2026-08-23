@@ -350,9 +350,13 @@ def header_line(s: dict) -> str:
     be = s.get("breakeven_win_rate")
     rorc = s.get("rorc") or {}
     bgr = s.get("bgr") or {}
+    # "need" hangs off the COUNT rate, not the dollar-weighted one: the
+    # break-even identity is a fraction-of-trades threshold, so pairing it
+    # with $W would compare two different denominators.
     parts = [
-        f"$W {_fmt_pct(s.get('mww_rate'), 0, signed=False)}"
-        + (f" (need {be * 100:.0f}%)" if be is not None else ""),
+        f"$W {_fmt_pct(s.get('mww_rate'), 0, signed=False)}",
+        f"W {_fmt_pct(s.get('win_rate'), 0, signed=False)}"
+        + (f" (need {be * 100:.1f}%)" if be is not None else ""),
         f"PF {pf:.2f}" if pf is not None else "PF —",
         f"$ret {_fmt_pct(s.get('return_on_notional'), 2)}",
         f"RoRC {_fmt_pct(rorc.get('per_hour'), 2)}/h",
