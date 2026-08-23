@@ -1954,11 +1954,24 @@ def _gamma_resolution_cached(slug: str) -> dict | None:
     return result
 
 
+def _slug_window_start(slug: str) -> float:
+    """Window-start epoch from an updown slug's trailing token, 0 if absent."""
+    try:
+        return float(slug.rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return 0.0
+
+
 def _tape_scoreboard(floor: float) -> dict:
     """W-L / realized P&L graded by the WALLET (data-api activity), not the
     model's own final read — a model that's confidently wrong (XRP basis,
     2026-08-23) would otherwise grade its own loss as a win. The tape only
     contributes fire records (stated fairs) for the calibration table.
+
+    The floor selects WINDOWS (slug start epoch >= floor), never individual
+    transactions — filtering by row timestamp let a window's redeem into the
+    range while its buys fell outside, printing phantom profit (caught live
+    2026-08-23: +$78 shown vs -$17 true).
     """
     import os
     import time as _t
@@ -1986,7 +1999,7 @@ def _tape_scoreboard(floor: float) -> dict:
         ).json() or []
         for a in rows:
             slug = a.get("slug") or ""
-            if "-updown-" not in slug or a["timestamp"] < floor:
+            if "-updown-" not in slug or _slug_window_start(slug) < floor:
                 continue
             w = win_by_slug.setdefault(slug, {"buy": 0.0, "sell": 0.0, "redeem": 0.0,
                                               "redeem_seen": False, "won": None})
@@ -2008,11 +2021,10 @@ def _tape_scoreboard(floor: float) -> dict:
         with open(_TAPE_PATH) as fh:
             for line in fh:
                 r = json.loads(line)
-                if r["t"] < floor:
-                    continue
                 if r["ev"] == "fire":
-                    fires.setdefault(r["slug"], []).append(r)
-                elif r["ev"] == "roll":
+                    if _slug_window_start(r["slug"]) >= floor:
+                        fires.setdefault(r["slug"], []).append(r)
+                elif r["ev"] == "roll" and r["t"] >= floor:
                     rolls += 1
     except FileNotFoundError:
         pass
@@ -2069,13 +2081,14 @@ def _tape_scoreboard(floor: float) -> dict:
 
 @crypto_group.command("stats")
 @click.option("--since", type=float, default=None,
-              help="Hours of tape to include (default: the v2 fleet era)")
+              help="Windows starting after this point: hours-ago if small, "
+                   "raw unix epoch if large (default: the v2 fleet era). "
+                   "NOTE an hours-ago floor SLIDES — pin an epoch for any "
+                   "number you intend to compare across runs")
 @click.option("--json", "as_json", is_flag=True)
 def crypto_stats(since: float | None, as_json: bool) -> None:
     """Fleet scoreboard: realized P&L (wallet-graded), win rate, calibration, live arms, capital."""
-    import time as _t
-
-    floor = _t.time() - since * 3600 if since else _V2_ERA
+    floor = _shadow_parse_since(since) if since else _V2_ERA
     try:
         sb = _tape_scoreboard(floor)
     except Exception as e:
@@ -2109,9 +2122,11 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
     wr = f"{wins / n * 100:.0f}%" if n else "—"
     cap = f"${bal['total']:,.2f}" if bal else "?"
     est = f" · [dim]{estimated} ~graded (gamma unreachable)[/dim]" if estimated else ""
+    from datetime import datetime, timezone
+    floor_s = datetime.fromtimestamp(floor, tz=timezone.utc).strftime("%m-%d %H:%MZ")
     console.print(f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L "
                   f"[{'green' if net >= 0 else 'red'}]{net:+,.2f}[/] · "
-                  f"{rolls} rolls · capital {cap}{est}")
+                  f"{rolls} rolls · capital {cap} · [dim]windows since {floor_s}[/dim]{est}")
 
     t = Table(title="By series (wallet-graded)")
     for col in ("series", "record", "P&L", "notional"):
@@ -2152,7 +2167,8 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
 
 @crypto_group.command("watch")
 @click.option("--since", type=float, default=None,
-              help="Hours of tape history for the scoreboard")
+              help="Scoreboard floor: hours-ago if small, raw unix epoch if "
+                   "large (default: the v2 fleet era)")
 def crypto_watch(since: float | None) -> None:
     """Full-screen live dashboard: scoreboard + arms + streaming tape."""
     import time as _t
@@ -2171,7 +2187,7 @@ def crypto_watch(since: float | None) -> None:
         except Exception:
             return None
 
-    floor = _t.time() - since * 3600 if since else _V2_ERA
+    floor = _shadow_parse_since(since) if since else _V2_ERA
     lines: deque = deque(maxlen=200)
     offset = 0
     try:
