@@ -560,6 +560,26 @@ def table(rows: dict, hours: float, title: str, keyname: str = "gate",
                  f"{money(fl['missed'])} | {money(fl['avoided'])} | "
                  f"**{money(net)}** | {money(net/hours)} | "
                  f"{money(fl['net_median'])} | {money(fl['net_best'])} |")
+    if keyname == "gate" and any(k in rows for k in BLIND_GATES):
+        d = collections.Counter()
+        df = collections.defaultdict(float)
+        for k in keys:
+            if k in BLIND_GATES or k not in rows:
+                continue
+            for f in ("episodes", "priced", "wins"):
+                d[f] += rows[k][f]
+            for f in ("missed", "avoided", "net_best", "net_median"):
+                df[f] += rows[k][f]
+        dnet = df["missed"] - df["avoided"]
+        dhit = f"{d['wins']/d['priced']*100:.0f}%" if d["priced"] else "—"
+        lines.append(f"| **DIRECTIONAL ONLY** | {d['episodes']} | {d['priced']} | {dhit} | "
+                     f"{money(df['missed'])} | {money(df['avoided'])} | "
+                     f"**{money(dnet)}** | {money(dnet/hours)} | "
+                     f"{money(df['net_median'])} | {money(df['net_best'])} |")
+        lines += ["", "_`feed_stale` and `reference_wait` are directionless — the arm was "
+                  "blind, so the counterfactual has to price BOTH sides and its ~50% hit "
+                  "rate is an artifact of that, not a reading. Their real unit is the "
+                  "exposure table below; DIRECTIONAL ONLY is the line to read._"]
     lines.append("")
     return "\n".join(lines)
 
@@ -695,6 +715,132 @@ def ladder_table(rows, title, label, extra=False) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------- blind gates
+
+BLIND_GATES = ("feed_stale", "reference_wait")
+
+
+def blind_exposure(tape, since: float) -> str:
+    """feed_stale and reference_wait are DIRECTIONLESS: the arm was blind, so
+    it had no side to want. Pricing them as a counterfactual clip means
+    pricing both sides, and both sides at these books is a coin flip by
+    construction — which is exactly what the ledger shows (49-50% hit). The
+    signed net there measures the book's two-sided cost, not a missed edge,
+    so the honest unit for these two is EXPOSURE: windows touched, ticks
+    held, and how deep into a window the gate was still holding.
+    """
+    rows = collections.defaultdict(lambda: collections.defaultdict(list))
+    windows = collections.defaultdict(set)
+    for r in tape:
+        if r["t"] < since:
+            continue
+        p = parse_slug(r["slug"])
+        if not p:
+            continue
+        windows[p[0]].add(r["slug"])
+        if r.get("ev") != "gated":
+            continue
+        fam = window_family(r.get("reason") or "")
+        if fam in BLIND_GATES:
+            rows[fam][r["slug"]].append(r["t"])
+
+    out = ["**blind gates — exposure, not P&L**", "",
+           "| gate | symbol | windows touched | of armed | ticks | median last-tick "
+           "(% elapsed) | windows held past 90% |", "|---|---|---:|---:|---:|---:|---:|"]
+    writeoffs = []
+    for fam in BLIND_GATES:
+        per_sym = collections.defaultdict(list)
+        for slug, ts in rows[fam].items():
+            per_sym[parse_slug(slug)[0]].append((slug, ts))
+        for sym in sorted(per_sym):
+            hits = per_sym[sym]
+            fracs = []
+            deep = 0
+            ticks = 0
+            for slug, ts in hits:
+                _s, _d, start, end = parse_slug(slug)
+                frac = (max(ts) - start) / max(end - start, 1e-9)
+                fracs.append(frac)
+                ticks += len(ts)
+                if frac > 0.90:
+                    deep += 1
+                    writeoffs.append((fam, slug, len(ts), frac))
+            out.append(f"| {fam} | {sym} | {len(hits)} | {len(windows[sym])} | {ticks} | "
+                       f"{statistics.median(fracs)*100:.0f}% | {deep} |")
+    out.append("")
+    if writeoffs:
+        out += ["Windows a blind gate held past 90% elapsed — the quiesce boundary is "
+                "93.3% on a 5m window, so these were shut for their whole tradeable "
+                "life:", ""]
+        for fam, slug, n, frac in sorted(writeoffs, key=lambda x: -x[3])[:12]:
+            out.append(f"- `{slug}` — {fam}, {n} ticks, still gated at "
+                       f"{frac*100:.0f}% elapsed")
+        out.append("")
+    return "\n".join(out)
+
+
+def cold_feed_defect(tape, since: float) -> str:
+    """`spot_age_s` is `now - f.spot_ts` (updown_model.rs eval_model). A feed
+    that has NEVER printed leaves spot_ts at 0.0, so the field carries an
+    absolute epoch instead of an age and the gate's prose collapses two
+    different failures into one sentence: a feed that stopped, and a feed
+    that never started. Counting the epoch-valued records isolates the
+    second class."""
+    cold = [r for r in tape if r.get("ev") == "gated" and r["t"] >= since
+            and (r.get("spot_age_s") or 0) > 1e6]
+    sane = [r.get("spot_age_s") for r in tape if r.get("ev") == "gated"
+            and r["t"] >= since and 0 < (r.get("spot_age_s") or 0) <= 1e6]
+    if not cold:
+        return ""
+    at_roll = sum(1 for r in cold if (r["t"] - parse_slug(r["slug"])[2]) < 30.0)
+    syms = collections.Counter(parse_slug(r["slug"])[0] for r in cold)
+    lines = ["**telemetry defect: `spot_age_s` carries an epoch on a never-printed feed**", "",
+             f"- {len(cold)} gated ticks report `spot_age_s` > 1e6 (an absolute epoch, "
+             f"not an age) — `now - spot_ts` with `spot_ts` still 0.0.",
+             f"- {at_roll} of {len(cold)} land in the first 30s of a window: the roll "
+             f"chain arms the next window before its feed thread's first print.",
+             f"- symbols: {', '.join(f'{k} {v}' for k, v in syms.most_common())} "
+             f"— every one of them binance-fed.",
+             f"- the {len(sane)} well-formed readings median "
+             f"{statistics.median(sane):.1f}s, p90 "
+             f"{sorted(sane)[int(0.9*len(sane))]:.1f}s.", ""]
+    return "\n".join(lines)
+
+
+def guard_band(tape, since: float) -> str:
+    """How much armed time sits in the last bp under each arm's guard — the
+    denominator behind "what would 1bp buy". Bands are measured against the
+    guard THAT TICK enforced (`guard_bp`), so a live oracle raise is respected
+    rather than averaged away."""
+    bands = collections.defaultdict(collections.Counter)
+    guards = collections.defaultdict(collections.Counter)
+    for r in tape:
+        if r.get("ev") != "gated" or r["t"] < since:
+            continue
+        if not (r.get("reason") or "").startswith("basis guard"):
+            continue
+        g, m = r.get("guard_bp"), r.get("margin_bp")
+        if g is None or m is None:
+            continue
+        sym = parse_slug(r["slug"])[0]
+        guards[sym][g] += 1
+        d = g - abs(m)
+        b = ("0-1bp under" if d < 1 else "1-2bp under" if d < 2 else
+             "2-3bp under" if d < 3 else "3-6bp under" if d < 6 else "6bp+ under")
+        bands[sym][b] += 1
+    order = ["0-1bp under", "1-2bp under", "2-3bp under", "3-6bp under", "6bp+ under"]
+    out = ["**basis-guard margin distance — where the gated ticks actually sit**", "",
+           "| symbol | guard (bp) | " + " | ".join(order) + " | total |",
+           "|---|---|" + "---:|" * (len(order) + 1)]
+    for sym in sorted(bands):
+        tot = sum(bands[sym].values())
+        g = "/".join(f"{k:.0f}" for k, _ in guards[sym].most_common(2))
+        cells = " | ".join(f"{bands[sym][b]} ({bands[sym][b]/tot*100:.0f}%)" for b in order)
+        out.append(f"| {sym} | {g} | {cells} | {tot} |")
+    out.append("")
+    return "\n".join(out)
+
+
 # ------------------------------------------------------------------ clusters
 
 def phase_bucket(p: float) -> str:
@@ -709,12 +855,109 @@ def cluster(eps, keyfn, title, hours, keyname, order=None) -> str:
     return table(rollup(eps, keyfn), hours, title, keyname, order=order)
 
 
+def ask_bucket(a: float) -> str:
+    for hi, name in ((0.20, "0.00-0.20"), (0.50, "0.20-0.50"), (0.80, "0.50-0.80"),
+                     (0.95, "0.80-0.95")):
+        if a < hi:
+            return name
+    return "0.95-1.00"
+
+
+ASK_BUCKETS = ("0.00-0.20", "0.20-0.50", "0.50-0.80", "0.80-0.95", "0.95-1.00")
+
+
+def by_entry_price(eps, hours, fams=("basis_guard", "theta", "min_fair", "latch")) -> str:
+    """The stratification the aggregate hides: a gate refusing a $0.10 side and
+    a gate refusing a $0.90 side are two different policies wearing one name.
+    A cheap refusal risks one clip to win nine; a dear one risks nine to win
+    one, and the same hit rate means opposite things at the two ends."""
+    out = ["**refusals by entry price — where each gate is actually right**", "",
+           "| gate | entry ask | eps | hit | missed wins | avoided losses | net |",
+           "|---|---|---:|---:|---:|---:|---:|"]
+    for fam in fams:
+        pool = [e for e in eps if e["family"] == fam and e["status"] == "priced"]
+        if not pool:
+            continue
+        r = rollup(pool, lambda e: ask_bucket(e["entry_ask"]))
+        for b in ASK_BUCKETS:
+            if b not in r:
+                continue
+            v = r[b]
+            out.append(f"| {fam} | {b} | {v['episodes']} | {v['hit']*100:.0f}% | "
+                       f"{money(v['missed'])} | {money(v['avoided'])} | "
+                       f"**{money(v['net'])}** |")
+    out.append("")
+    return "\n".join(out)
+
+
 def specimen(eps: list[dict], fam: str, n: int = 3, worst=True) -> list[dict]:
     """The n episodes of a family with the largest |net| — the windows a
     finding has to be able to point at."""
     pool = [e for e in eps if e["family"] == fam and e["status"] == "priced"]
     pool.sort(key=lambda e: e["pnl"], reverse=worst)
     return pool[:n]
+
+
+def deployment(tape, activity, arms, since: float) -> str:
+    """The denominator every shadow number needs: what the fleet ACTUALLY did.
+
+    An opportunity-cost ledger prices one clip per refused side, so it will
+    always dwarf the book — the useful question is by how much, and whether
+    the thing standing between the arm and the money is a gate at all. The
+    second table answers that: `sized(r)` is
+    `min(clip_usdc/ask, ask_size, room/ask)`, and on a window's FIRST clip
+    the early room (0.2 x size_usdc) exceeds clip_usdc on every live arm, so
+    a first clip that lands under its clip_usdc was truncated by `ask_size`
+    — the book's displayed depth — and by nothing else.
+    """
+    per = collections.defaultdict(lambda: {"buy": 0.0, "sell": 0.0, "redeem": 0.0})
+    for a in activity:
+        slug = a.get("slug") or ""
+        p_ = parse_slug(slug)
+        if not p_ or p_[2] < since:
+            continue
+        u = a.get("usdcSize") or 0.0
+        if a.get("type") == "TRADE" and a.get("side") == "BUY":
+            per[slug]["buy"] += u
+        elif a.get("type") == "TRADE" and a.get("side") == "SELL":
+            per[slug]["sell"] += u
+        elif a.get("type") == "REDEEM":
+            per[slug]["redeem"] += u
+    traded = {k: v for k, v in per.items() if v["buy"] > 0}
+    pnl = {k: v["redeem"] + v["sell"] - v["buy"] for k, v in traded.items()}
+    notional = sum(v["buy"] for v in traded.values())
+    armed = {r["slug"] for r in tape if r["t"] >= since}
+    fired = {r["slug"] for r in tape if r["t"] >= since and r.get("ev") == "fire"}
+    tot = sum(pnl.values())
+    out = ["**what the fleet actually deployed (the shadow ledger's denominator)**", "",
+           f"- armed windows: **{len(armed)}** · fired at least one clip: **{len(fired)}** "
+           f"({len(fired)/max(len(armed),1)*100:.0f}%) · wallet-traded: **{len(traded)}**",
+           f"- deployed notional **${notional:,.0f}**, realized **{money(tot)}** "
+           f"({tot/max(notional,1)*100:+.2f}%), "
+           f"{sum(1 for v in pnl.values() if v > 0)}/{len(pnl)} windows up",
+           f"- mean **${notional/max(len(traded),1):,.0f}** of notional per traded window", ""]
+
+    first = {}
+    for r in sorted((r for r in tape if r.get("ev") == "fire" and r["t"] >= since),
+                    key=lambda x: x["t"]):
+        first.setdefault((r["slug"], r["side"]), r)
+    by = collections.defaultdict(list)
+    for (slug, _side), r in first.items():
+        p_ = parse_slug(slug)
+        by[(p_[0], p_[1])].append(r["size"] * r["ask"])
+    out += ["**first clips: what the BOOK let through, not what the gates did**", "",
+            "| arm | first clips | clip_usdc | early room (0.2 x size) | median first clip | "
+            "% of clip |", "|---|---:|---:|---:|---:|---:|"]
+    for k in sorted(by):
+        arm = arms.get(k)
+        if not arm:
+            continue
+        med = statistics.median(by[k])
+        out.append(f"| {k[0]} {k[1]} | {len(by[k])} | ${arm['clip_usdc']:.0f} | "
+                   f"${arm['size_usdc']*EARLY_FRAC:.0f} | ${med:.1f} | "
+                   f"{med/arm['clip_usdc']*100:.0f}% |")
+    out.append("")
+    return "\n".join(out)
 
 
 # ------------------------------------------------------------------- fifteen
@@ -884,10 +1127,12 @@ def fill_report(unf: list[dict], hours: float) -> str:
     limit above the ask is the chase actually submitted. Pre-pay-up fires
     have limit == ask (or no limit field at all).
     """
-    groups = {"pay-up off": [e for e in unf if not e["last"].get("limit")
-                             or e["last"]["limit"] <= e["last"]["ask"] + 1e-9],
-              "pay-up on": [e for e in unf if e["last"].get("limit")
-                            and e["last"]["limit"] > e["last"]["ask"] + 1e-9]}
+    groups = {
+        "chased (limit > ask)": [e for e in unf if e["last"].get("limit")
+                                 and e["last"]["limit"] > e["last"]["ask"] + 1e-9],
+        "not chased": [e for e in unf if not e["last"].get("limit")
+                       or e["last"]["limit"] <= e["last"]["ask"] + 1e-9],
+    }
     lines = ["**unfilled fires — the pay-up test**", "",
              "| cohort | (slug,side) fires | fully filled | intended $ | filled $ | "
              "fill rate | unfilled $ | net of the gap |",
@@ -905,6 +1150,56 @@ def fill_report(unf: list[dict], hours: float) -> str:
     return "\n".join(lines)
 
 
+def trace(tape, winners, arms, slug: str) -> str:
+    """Every tape record for one window, with the gate each eval side was
+    charged to — a finding has to survive being pointed at a window."""
+    rolls = roll_sizes(tape)
+    p = parse_slug(slug)
+    if not p:
+        return f"not an updown slug: {slug}"
+    sym, dur, start, end = p
+    arm = arms.get((sym, dur)) or {}
+    min_fair = arm.get("min_fair", 0.97)
+    if dur == "15m" and start < FIFTEEN_SHUT_AT:
+        min_fair = 0.97
+    size_usdc = size_for(slug, rolls, arms, {})
+    out = [f"### {slug}",
+           f"window {utc(start)} - {utc(end)} · size ${size_usdc} · "
+           f"clip ${arm.get('clip_usdc', '?')} · guard {arm.get('basis_guard_bp', '?')}bp · "
+           f"theta {arm.get('theta', '?')} · min_fair {min_fair} · "
+           f"feed {arm.get('feed', '?')} · winner **{winners.get(slug, 'ungraded')}**", "",
+           "```"]
+    for r in tape:
+        if r["slug"] != slug:
+            continue
+        el = (r["t"] - start) / max(end - start, 1e-9) * 100
+        ev = r.get("ev")
+        if ev == "gated":
+            out.append(f"{utc(r['t'])} {el:5.1f}%  GATED  {r.get('reason')}"
+                       + (f"  up_ask={r.get('up_ask')} dn_ask={r.get('dn_ask')}"
+                          if r.get("up_ask") or r.get("dn_ask") else ""))
+        elif ev == "eval":
+            bits = []
+            for sd in r.get("sides") or []:
+                if sd.get("side") not in ("up", "down"):
+                    continue
+                fam, _ctx = side_family(r, sd, size_usdc, min_fair, arm.get("theta"))
+                bits.append(f"{sd['side']}: ask={sd.get('ask')} fair="
+                            f"{(sd.get('fair') or 0):.3f} net={(sd.get('net') or 0):+.3f} "
+                            f"safety={sd.get('safety')} -> {fam}")
+            out.append(f"{utc(r['t'])} {el:5.1f}%  EVAL   rho={r.get('rho')} "
+                       f"bd={r.get('banked_decided')} margin={r.get('margin_bp')} | "
+                       + " | ".join(bits))
+        elif ev == "fire":
+            out.append(f"{utc(r['t'])} {el:5.1f}%  FIRE   {r.get('side')} ask={r.get('ask')} "
+                       f"limit={r.get('limit')} size={r.get('size')} "
+                       f"(${r.get('size', 0)*r.get('ask', 0):.0f}) mode={r.get('mode')}")
+        elif ev in ("roll", "cleanup", "exit"):
+            out.append(f"{utc(r['t'])} {el:5.1f}%  {ev.upper()}  {json.dumps(r)}")
+    out += ["```", ""]
+    return "\n".join(out)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -914,6 +1209,8 @@ def main() -> int:
     ap.add_argument("--arms", default=".work/arms-state.json")
     ap.add_argument("--json", dest="json_out", default=None,
                     help="dump the full per-episode ledger here")
+    ap.add_argument("--trace", action="append", default=None,
+                    help="dump every record for these slugs, gate-attributed, then stop")
     ap.add_argument("--self-check", action="store_true",
                     help="prove the assumed thresholds against every real fire, then stop")
     args = ap.parse_args()
@@ -922,6 +1219,11 @@ def main() -> int:
     winners = load_winners(args.outcomes)
     activity = json.load(open(args.activity))
     arms = load_arms(args.arms)
+
+    if args.trace:
+        for slug in args.trace:
+            print(trace(tape, winners, arms, slug))
+        return 0
 
     bad, skipped = self_check(tape, arms)
     if args.self_check:
@@ -971,6 +1273,15 @@ def main() -> int:
                   "basis guard by window phase", hours, "phase",
                   order=["early (0-33%)", "mid (33-66%)", "late (66-100%)"]))
     print(cluster(eps, lambda e: e["dur"], "by duration", hours, "duration"))
+    print(by_entry_price(eps, hours))
+
+    print("## deployment (stream era)\n")
+    print(deployment(tape, activity, arms, STREAM_ERA))
+
+    print("## data-quality gates (stream era)\n")
+    print(blind_exposure(tape, STREAM_ERA))
+    print(cold_feed_defect(tape, STREAM_ERA))
+    print(guard_band(tape, STREAM_ERA))
 
     print("## relaxation ladders (stream era — where an A/B should aim)\n")
     print(ladder_table(guard_ladder(tape, winners, clip_of, STREAM_ERA, arms),
