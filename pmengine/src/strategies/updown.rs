@@ -22,8 +22,9 @@
 use crate::position::Fill;
 use crate::strategies::updown_model::{
     append_jsonl, avg_down_blocks, budget_unlocked, book_sample_due, distrust_blocks, eval_model,
-    lag1_autocorr, pay_up_limit, safety_gate_blocks, side_safety, FeedState, ModelEval, Tunables,
-    EV_BOOK, EV_CLEANUP, EV_EVAL, EV_EXIT, EV_FIRE, EV_GATED, EV_ROLL,
+    lag1_autocorr, pay_up_limit, safety_gate_blocks, shape_klines, side_safety, FeedState,
+    GateReason, ModelEval, Tunables, EV_BOOK, EV_CLEANUP, EV_EVAL, EV_EXIT, EV_FIRE, EV_GATED,
+    EV_ROLL,
 };
 #[cfg(test)]
 use crate::strategies::updown_model::MAX_SPOT_AGE_S;
@@ -497,7 +498,7 @@ impl ArmState {
     }
 
     /// Model fair P(UP) plus regime/decidedness context. Errors = gated.
-    fn fair_p_up(&self, now: f64) -> Result<ModelEval, String> {
+    fn fair_p_up(&self, now: f64) -> Result<ModelEval, GateReason> {
         let f = self.feed.lock().unwrap();
         let effective_guard_bp = {
             let mut o = self.oracle.lock().unwrap();
@@ -644,7 +645,7 @@ impl ArmState {
     pub(crate) fn decide(
         &mut self,
         view: &ArmView,
-        model: Result<ModelEval, String>,
+        model: Result<ModelEval, GateReason>,
         now: f64,
     ) -> DecideOut {
         let p = self.p.clone();
@@ -761,15 +762,25 @@ impl ArmState {
         let m = match model {
             Ok(v) => v,
             Err(gate) => {
-                self.last_eval =
-                    Some(serde_json::json!({"state": "gated", "reason": gate, "t": now}));
+                // The numbers ride ALONGSIDE the prose, never instead of it:
+                // `reason` reads exactly as it always has for old consumers,
+                // while margin/banked/cushion/guard arrive as fields so
+                // nobody has to regex a sentence apart. Non-basis gates
+                // (stale feed) write them as null.
+                self.last_eval = Some(serde_json::json!({
+                    "state": "gated", "reason": gate.reason, "t": now,
+                    "margin_bp": gate.margin_bp, "banked_bp": gate.banked_bp,
+                    "cushion_bp": gate.cushion_bp, "guard_bp": gate.guard_bp,
+                }));
                 if now - self.last_tape_at >= 5.0 {
                     self.last_tape_at = now;
                     // Asks recorded even while gated: the 2026-08-23 audit
                     // couldn't price what the basis guard cost because
                     // fully-gated windows logged no book data at all.
                     tape_out.push(serde_json::json!({
-                        "t": now, "ev": EV_GATED, "slug": p.slug, "reason": gate,
+                        "t": now, "ev": EV_GATED, "slug": p.slug, "reason": gate.reason,
+                        "margin_bp": gate.margin_bp, "banked_bp": gate.banked_bp,
+                        "cushion_bp": gate.cushion_bp, "guard_bp": gate.guard_bp,
                         "up_ask": view.up.ask.map(|(px, _)| px),
                         "dn_ask": view.dn.ask.map(|(px, _)| px),
                     }));
@@ -1268,14 +1279,9 @@ fn poll_binance(
             .map_err(|e| format!("klines: {}", e))?
             .json()
             .map_err(|e| format!("klines json: {}", e))?;
-        for k in v.as_array().unwrap_or(&Vec::new()) {
-            let t = k[0].as_i64().unwrap_or(0) / 1000;
-            let o: f64 = k[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let c: f64 = k[4].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            if o > 0.0 && c > 0.0 {
-                per_min.push((t, (o + c) / 2.0));
-                closes.push(c);
-            }
+        for k in shape_klines(&v) {
+            per_min.push((k.t, k.mid()));
+            closes.push(k.c);
         }
     } else {
         // Fast-vol input for close_open markets (twap reuses its klines).
@@ -1320,7 +1326,7 @@ fn poll_binance(
 fn position_floor(ctx: &StrategyContext, p: &ArmParams) -> f64 {
     [&p.token_up, &p.token_down]
         .iter()
-        .filter_map(|t| ctx.positions.get(*t).map(|pos| (*t, pos)))
+        .filter_map(|t| ctx.positions.get(t).map(|pos| (*t, pos)))
         .map(|(t, pos)| {
             let size = pos.size.to_f64().unwrap_or(0.0);
             let avg = pos.avg_entry_price.to_f64().unwrap_or(0.0);
@@ -1447,6 +1453,47 @@ mod tests {
         let m = ModelEval { p_up: 0.99, banked_decided: false, ..locked_up_model() };
         let out = arm.decide(&view_with_up_ask(0.50, 500.0), Ok(m), 1400.0);
         assert_eq!(buys(&out).len(), 1, "old policy fires where the brake now holds");
+    }
+
+    #[test]
+    fn decide_gated_record_emits_numbers_alongside_the_reason() {
+        // Both halves of the contract in one test: the durable tape and the
+        // status `last_eval` carry margin/banked/cushion/guard as FIELDS,
+        // and `reason` still reads exactly as it always did so old
+        // consumers (and old tape lines) are unaffected.
+        let mut arm = armed(params("s"));
+        let gate = GateReason {
+            reason: "basis guard: projected margin -4.9bp inside 6.0bp noise band \
+                     [banked +1.0bp cushion 9.0bp]"
+                .to_string(),
+            margin_bp: Some(-4.9),
+            banked_bp: Some(1.0),
+            cushion_bp: Some(9.0),
+            guard_bp: Some(6.0),
+        };
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Err(gate), 1400.0);
+        assert!(out.actions.is_empty(), "a gate never trades");
+        let rec = out.tape.iter().find(|r| r["ev"] == EV_GATED).expect("gated tape record");
+        assert!(rec["reason"].as_str().unwrap().starts_with("basis guard"));
+        assert_eq!(rec["margin_bp"], -4.9);
+        assert_eq!(rec["banked_bp"], 1.0);
+        assert_eq!(rec["cushion_bp"], 9.0);
+        assert_eq!(rec["guard_bp"], 6.0);
+        assert_eq!(rec["up_ask"], 0.94, "asks still recorded while gated");
+        let e = arm.last_eval.as_ref().unwrap();
+        assert_eq!(e["state"], "gated");
+        assert_eq!(e["margin_bp"], -4.9);
+        assert_eq!(e["guard_bp"], 6.0);
+    }
+
+    #[test]
+    fn decide_gated_record_nulls_the_numbers_for_a_non_basis_gate() {
+        let mut arm = armed(params("s"));
+        let out = arm.decide(&ArmView::default(), Err(GateReason::plain("feed stale")), 1400.0);
+        let rec = out.tape.iter().find(|r| r["ev"] == EV_GATED).expect("gated tape record");
+        assert_eq!(rec["reason"], "feed stale");
+        assert!(rec["margin_bp"].is_null(), "no margin behind a stale feed");
+        assert!(rec["guard_bp"].is_null());
     }
 
     #[test]
@@ -1666,7 +1713,8 @@ mod tests {
     fn twap_thin_margin_trips_basis_guard() {
         let (arm, now) = armed_with_feed(100.001, 100.001); // ~0.1bp
         let err = arm.fair_p_up(now).unwrap_err();
-        assert!(err.contains("basis guard"), "{}", err);
+        assert!(err.reason.contains("basis guard"), "{}", err.reason);
+        assert!(err.margin_bp.is_some(), "the gate carries its margin as a field");
     }
 
     #[test]
@@ -1681,14 +1729,16 @@ mod tests {
             }
         }
         let err = arm.fair_p_up(now).unwrap_err();
-        assert!(err.contains("basis guard"), "{}", err);
+        assert!(err.reason.contains("basis guard"), "{}", err.reason);
+        assert_eq!(err.guard_bp, Some(9.0), "the raised guard is reported structurally");
     }
 
     #[test]
     fn twap_stale_feed_refuses() {
         let (arm, _) = armed_with_feed(101.0, 101.0);
         let err = arm.fair_p_up(1400.0 + MAX_SPOT_AGE_S + 1.0).unwrap_err();
-        assert!(err.contains("stale"), "{}", err);
+        assert!(err.reason.contains("stale"), "{}", err.reason);
+        assert_eq!(err.margin_bp, None, "a stale feed has no margin to report");
     }
 
     #[test]

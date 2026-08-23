@@ -35,12 +35,10 @@ import re
 import statistics
 from collections.abc import Iterable, Iterator
 
+from .constants import FEE_RATE, taker_fee
 from .tape import EV_EVAL, EV_FIRE, EV_GATED
 from .updown_slugs import is_updown
 
-FEE_RATE = 0.07  # crypto_fees_v2 exponent-1 — same shape as crypto.taker_fee(),
-                  # fixed at the live rate since this module never fetches a
-                  # market's actual feeSchedule (pure/no-network by design).
 DEFAULT_CLIP_USDC = 25.0   # crypto arm's --clip default
 DEFAULT_MIN_FAIR = 0.97    # crypto arm's --min-fair default (the safety gate)
 DEFAULT_MIN_EDGE = 0.015   # crypto arm's --min-edge default
@@ -53,23 +51,32 @@ _MARGIN_RE = re.compile(r"projected margin ([+-]?\d+(?:\.\d+)?)bp")
 
 
 def fee(ask: float) -> float:
-    """Per-share taker fee at the live 0.07 rate — mirrors crypto.taker_fee()."""
-    return FEE_RATE * min(ask, 1.0 - ask)
+    """Per-share taker fee at the live rate. This module never fetches a
+    market's actual feeSchedule (pure/no-network by design), so it prices
+    at the constant."""
+    return taker_fee(ask, FEE_RATE)
 
 
-def basis_guard_side(reason: str) -> str | None:
-    """Side implied by a `gated` reason's signed projected margin
+def basis_guard_side(reason: str, margin_bp: float | None = None) -> str | None:
+    """Side implied by a basis-guard gate's signed projected margin
     (positive margin => up favored, negative => down). None if `reason`
     isn't a basis-guard line at all — 'feed stale', the pre-R9 clock-gated
     'window N% elapsed' lines, or anything else this ledger doesn't model —
-    or a basis-guard line with no parseable margin.
+    or a basis-guard line with no margin available.
+
+    `margin_bp` is the engine's structured field and wins when present.
+    The regex is the legacy path for tape lines written before that field
+    shipped; it parses the very sentence the field is formatted from, so
+    they cannot disagree — but a reword breaks the regex and not the field.
     """
     if not reason.startswith("basis guard"):
         return None
-    m = _MARGIN_RE.search(reason)
-    if not m:
-        return None
-    return "up" if float(m.group(1)) >= 0 else "down"
+    if margin_bp is None:
+        m = _MARGIN_RE.search(reason)
+        if not m:
+            return None
+        margin_bp = float(m.group(1))
+    return "up" if margin_bp >= 0 else "down"
 
 
 def shadow_value(ask: float, clip_notional: float, won: bool) -> float:
@@ -119,7 +126,7 @@ def iter_ticks(lines: Iterable[str], since: float = 0.0) -> Iterator[dict]:
             continue
         ev = r.get("ev")
         if ev == EV_GATED:
-            side = basis_guard_side(r.get("reason") or "")
+            side = basis_guard_side(r.get("reason") or "", r.get("margin_bp"))
             if side is None:
                 continue
             ask = r.get("up_ask") if side == "up" else r.get("dn_ask")

@@ -63,6 +63,43 @@ pub(crate) fn append_jsonl(file_name: &str, record: serde_json::Value) {
     }
 }
 
+/// One 1m Binance kline reduced to what the model reads: bucket epoch,
+/// open, close.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Kline {
+    pub(crate) t: i64,
+    pub(crate) o: f64,
+    pub(crate) c: f64,
+}
+
+impl Kline {
+    /// (open+close)/2 — the per-minute mark that proxies the Chainlink 60s
+    /// TWAP. Every banked minute in the model is one of these.
+    pub(crate) fn mid(&self) -> f64 {
+        (self.o + self.c) / 2.0
+    }
+}
+
+/// Shape a raw Binance `/api/v3/klines` array into `Kline`s, dropping rows
+/// that don't parse or price at zero.
+///
+/// The live feed poller and the replay corpus fetcher each did this parse
+/// inline — same field offsets, same zero filter, two copies. A drift in
+/// either would have silently de-synced replay from the code it exists to
+/// judge, so both call this now.
+pub(crate) fn shape_klines(v: &serde_json::Value) -> Vec<Kline> {
+    let mut out = Vec::new();
+    for k in v.as_array().unwrap_or(&Vec::new()) {
+        let t = k[0].as_i64().unwrap_or(0) / 1000;
+        let o: f64 = k[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let c: f64 = k[4].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        if o > 0.0 && c > 0.0 {
+            out.push(Kline { t, o, c });
+        }
+    }
+    out
+}
+
 /// Shared state an arm's Binance feed threads keep warm. In replay the
 /// corpus loader builds one of these per recorded sample instead.
 #[derive(Default)]
@@ -110,6 +147,45 @@ pub(crate) struct ModelEval {
     pub(crate) guard_bp: f64,
 }
 
+/// Why an eval refused, as data rather than prose.
+///
+/// The basis guard used to format margin/banked/cushion into the error
+/// STRING and two Python consumers (`cli_crypto._MARGIN_RE`,
+/// `shadow._MARGIN_RE`) regexed them back out — any reword broke both
+/// silently, with no compiler or test anywhere in the loop. The numbers now
+/// travel as fields; `reason` stays the same human sentence so the durable
+/// tape's `reason` key and every existing consumer of it keep working.
+/// `None` on the numeric fields = a gate that has no margin to report
+/// (stale feed, reference print missing).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GateReason {
+    pub(crate) reason: String,
+    pub(crate) margin_bp: Option<f64>,
+    pub(crate) banked_bp: Option<f64>,
+    pub(crate) cushion_bp: Option<f64>,
+    pub(crate) guard_bp: Option<f64>,
+}
+
+impl GateReason {
+    /// A gate with no numbers behind it — stale feed, missing print.
+    pub(crate) fn plain(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            margin_bp: None,
+            banked_bp: None,
+            cushion_bp: None,
+            guard_bp: None,
+        }
+    }
+}
+
+/// Lets `?` on a plain `&str` gate (`ok_or("...")?`) build a GateReason.
+impl From<&str> for GateReason {
+    fn from(reason: &str) -> Self {
+        Self::plain(reason)
+    }
+}
+
 /// Replay-only policy knobs. Live arms always run the defaults — the brake
 /// constants are the law in production and are NOT reachable from the arm
 /// command. The A/B harness needs the pre-brake policy expressible to
@@ -138,13 +214,13 @@ pub(crate) fn eval_model(
     f: &FeedState,
     now: f64,
     effective_guard_bp: f64,
-) -> Result<ModelEval, String> {
+) -> Result<ModelEval, GateReason> {
     {
         if now - f.spot_ts > MAX_SPOT_AGE_S {
-            return Err(match &f.last_err {
+            return Err(GateReason::plain(match &f.last_err {
                 Some(e) => format!("feed stale: {}", e),
                 None => "feed stale".to_string(),
-            });
+            }));
         }
         let spot = f.spot;
         // Floor = live 45m trailing sigma once the feed holds real history
@@ -202,10 +278,16 @@ pub(crate) fn eval_model(
             let cushion_bp = effective_guard_bp
                 + sig_bp * ((rem / 60.0).max(0.02) / 3.0).sqrt() * (rem / window);
             if margin_bp.abs() < effective_guard_bp {
-                return Err(format!(
-                    "basis guard: projected margin {:+.1}bp inside {:.1}bp noise band [banked {:+.1}bp cushion {:.1}bp]",
-                    margin_bp, effective_guard_bp, banked_margin_bp, cushion_bp
-                ));
+                return Err(GateReason {
+                    reason: format!(
+                        "basis guard: projected margin {:+.1}bp inside {:.1}bp noise band [banked {:+.1}bp cushion {:.1}bp]",
+                        margin_bp, effective_guard_bp, banked_margin_bp, cushion_bp
+                    ),
+                    margin_bp: Some(margin_bp),
+                    banked_bp: Some(banked_margin_bp),
+                    cushion_bp: Some(cushion_bp),
+                    guard_bp: Some(effective_guard_bp),
+                });
             }
             let breakeven = (ref_px * window - banked_avg * banked_s) / rem;
             let sig_avg = sig_frac * ((rem / 60.0).max(0.02) / 3.0).sqrt();
@@ -530,8 +612,58 @@ mod tests {
         // produce) gates the exact same margin — proves eval_model reads
         // the explicit argument, not p.basis_guard_bp directly.
         let err = eval_model(&p, &f, now, 8.0).unwrap_err();
-        assert!(err.contains("basis guard"), "{}", err);
-        assert!(err.contains("8.0"), "reason string must print the effective value: {}", err);
+        assert!(err.reason.contains("basis guard"), "{}", err.reason);
+        assert!(
+            err.reason.contains("8.0"),
+            "reason string must print the effective value: {}",
+            err.reason
+        );
+        assert_eq!(err.guard_bp, Some(8.0), "and carry it structurally");
+    }
+
+    #[test]
+    fn basis_gate_carries_its_numbers_as_fields_not_only_prose() {
+        // The whole point of GateReason: the margin/banked/cushion/guard a
+        // consumer needs are fields, so rewording `reason` can't break them.
+        let p = params("s");
+        let (f, now) = feed_with(100.001, 100.001); // ~0.1bp — inside the 3bp param
+        let g = eval_model(&p, &f, now, p.basis_guard_bp).unwrap_err();
+        let margin = g.margin_bp.expect("basis gate reports its margin");
+        assert!(margin.abs() < p.basis_guard_bp, "gated margin is inside the guard: {margin}");
+        assert_eq!(g.guard_bp, Some(p.basis_guard_bp));
+        assert!(g.banked_bp.is_some() && g.cushion_bp.is_some());
+        // The fields must agree with the sentence the old regexes parsed —
+        // that agreement is what makes the regex a safe legacy fallback.
+        assert!(g.reason.contains(&format!("{:+.1}bp", margin)), "{}", g.reason);
+    }
+
+    #[test]
+    fn non_basis_gates_report_no_numbers() {
+        let p = params("s");
+        let (f, _) = feed_with(100.05, 100.05);
+        let g = eval_model(&p, &f, 1400.0 + MAX_SPOT_AGE_S + 1.0, p.basis_guard_bp).unwrap_err();
+        assert!(g.reason.contains("stale"), "{}", g.reason);
+        assert_eq!(
+            (g.margin_bp, g.banked_bp, g.cushion_bp, g.guard_bp),
+            (None, None, None, None),
+            "a stale feed has no margin to report"
+        );
+    }
+
+    #[test]
+    fn shape_klines_drops_malformed_and_zero_rows() {
+        let raw = serde_json::json!([
+            [60000, "100.0", "101.0", "99.0", "100.5", "1.0"],
+            [120000, "0", "0", "0", "0", "1.0"],          // zero prices — dropped
+            [180000, "not-a-number", "1", "1", "100.0", "1.0"], // unparseable open — dropped
+            [240000, "200.0", "201.0", "199.0", "201.0", "1.0"],
+        ]);
+        let ks = shape_klines(&raw);
+        assert_eq!(ks.len(), 2);
+        assert_eq!(ks[0], Kline { t: 60, o: 100.0, c: 100.5 });
+        assert!((ks[0].mid() - 100.25).abs() < 1e-9, "mid is (o+c)/2");
+        assert_eq!(ks[1].t, 240);
+        assert!(shape_klines(&serde_json::json!({"code": -1121})).is_empty(), "error body -> no rows");
     }
 
     #[test]
