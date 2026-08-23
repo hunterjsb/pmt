@@ -24,6 +24,7 @@ pub mod gamma;
 pub mod order;
 pub mod orderbook;
 pub mod position;
+pub mod replay;
 pub mod risk;
 pub mod strategy;
 pub mod strategies;

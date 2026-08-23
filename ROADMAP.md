@@ -45,8 +45,21 @@ don't record is a night the corpus can't judge.
   pure `eval_model(params, feed, now)`; live tick is a thin adapter; replay drives the same
   function. Replay-only `Tunables` make the pre-brake policy expressible for reproducing
   recorded nights (live arms cannot reach them).
-- Acceptance target pinned: the −$370 window is `btc-updown-15m-1787446800` (32 real fires,
-  ~$698 bought over 435s, 85 eval/gated records — dense enough for evals-mode replay).
+- **`pmengine replay` SHIPPED 2026-08-23**: evals mode (drives decide() from the recorded
+  eval tape) + full mode (rebuilds the model from book-tape + cached klines, strict
+  no-look-ahead: only closed minutes bank; forming minute = (open+spot)/2 like the live
+  feed). Conservative instant taker fills; `--outcomes` takes wallet truth (ALWAYS pass it —
+  evals mode's fallback settles on the tape's last p_up, i.e. the model grading itself).
+- **Acceptance PASSED on the −$370 window `btc-updown-15m-1787449500`** (01:45Z; wallet:
+  $370.14 bought, $0 redeemed): pre-brake params reproduce the catastrophe — first sim fire
+  at the identical tick as reality, $495/$500 committed, −$504 vs real −$370 (sim fills every
+  clip; reality got partial fills before the guard cut in). Same night under today's braked
+  policy: 3 fires, $59 committed, −$60 — the brakes cut the loss ~88% on recorded reality.
+- Pinning lesson (2026-08-23): `btc-updown-15m-1787446800` looked like the loss on tape
+  density but wallet shows $0 bought — 32 "fires" that never filled, re-emitted every 12s as
+  inflight TTL expired. Two morals: (a) pick acceptance windows by WALLET, never by tape
+  (the tape records intent, the wallet records reality); (b) replay's instant-fill assumption
+  over-states exposure on windows where the book never filled us — a known, conservative gap.
 - `pmengine replay`: walk a corpus timestamp-faithfully — a decision at t sees only data ≤ t
   (look-ahead is the classic backtest lie). Fills are conservative: taker at recorded ask,
   capped at recorded ask size, fees applied.

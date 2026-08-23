@@ -1418,7 +1418,9 @@ fn vol_floor_bp(slow_bp: f64, samples: usize, param_bp: f64) -> f64 {
 }
 
 /// Lag-1 autocorrelation of log-returns over the last `n` closes.
-fn lag1_autocorr(closes: &[f64], n: usize) -> f64 {
+/// pub(crate): the replay harness's full-mode feed reconstruction needs
+/// the exact same regime signal the live feed thread computes.
+pub(crate) fn lag1_autocorr(closes: &[f64], n: usize) -> f64 {
     let m = closes.len().min(n + 1);
     if m < 10 {
         return 0.0;

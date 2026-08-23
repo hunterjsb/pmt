@@ -49,6 +49,40 @@ enum Commands {
 
     /// List available strategies
     List,
+
+    /// Offline backtest: replay recorded tape data through updown's decide() core
+    Replay {
+        /// "evals" replays the recorded eval tape; "full" rebuilds the model from
+        /// the book/spot tape + Binance klines.
+        #[arg(long, default_value = "evals")]
+        mode: String,
+
+        /// Eval tape path — drives evals mode, and sources the real-fire
+        /// comparison in either mode (default ~/.pmt/engine/updown-tape.jsonl).
+        #[arg(long)]
+        tape: Option<PathBuf>,
+
+        /// Book/spot tape path, full mode only (default ~/.pmt/engine/book-tape.jsonl).
+        #[arg(long)]
+        book_tape: Option<PathBuf>,
+
+        /// Slug or slug prefix to replay — every matching window in the tape, time order.
+        #[arg(long)]
+        slug: String,
+
+        /// JSON array of arm params (+ optional "tunables" override) to run, one per slug.
+        #[arg(long)]
+        params: Option<PathBuf>,
+
+        /// Optional JSONL {"slug":..,"winner":"up"|"down"} — wallet truth overrides
+        /// the TWAP-proxy settlement.
+        #[arg(long)]
+        outcomes: Option<PathBuf>,
+
+        /// Also write the report as JSONL here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 /// Load .env file, searching in current directory and parent directories up to 3 levels.
@@ -129,6 +163,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Run { strategies, dry_run, max_ticks, skip_warmup }) => {
             run_strategies(strategies, dry_run, max_ticks, skip_warmup).await
+        }
+        Some(Commands::Replay { mode, tape, book_tape, slug, params, outcomes, out }) => {
+            // reqwest::blocking builds its own mini tokio runtime; calling
+            // it straight from #[tokio::main]'s worker thread panics on
+            // drop (nested runtime). A plain OS thread sidesteps that —
+            // same reason updown.rs's own blocking calls all run off
+            // std::thread::spawn, never inline on the async task.
+            match std::thread::spawn(move || {
+                pmengine::replay::run(pmengine::replay::ReplayOpts {
+                    mode, tape, book_tape, slug, params, outcomes, out,
+                })
+            })
+            .join()
+            {
+                Ok(res) => res.map_err(Into::into),
+                Err(_) => Err("replay thread panicked".into()),
+            }
         }
         None => {
             eprintln!("Usage: pmengine <command>");
