@@ -648,6 +648,16 @@ class TapeCollapser:
     def __init__(self) -> None:
         self._runs: dict[str, _Run] = {}
 
+    def break_runs(self) -> None:
+        """End every open run without rendering anything.
+
+        For a discontinuity the tape itself cannot show. A run states a count
+        and a span ("×12, 47s"), and both are lies if records went missing
+        underneath it — so a remote feed whose answer came back `truncated`
+        calls this before handing over the batch on the far side of the gap.
+        """
+        self._runs.clear()
+
     def add(self, raw: str, lines) -> None:
         """Feed one raw tape line; appends/updates rendered output in `lines`."""
         try:
@@ -1192,6 +1202,19 @@ def windows_title(sb: dict | None, arms: dict | None = None,
     return f"windows · {shown} of {len(rows)} · {held}"
 
 
+def tape_title(remote: bool = False) -> str:
+    """`tape`, or `tape · remote` when the panel is being fed by the engine's
+    control plane rather than a local file.
+
+    Which one is showing is not cosmetic: a watch pointed at a remote engine
+    reads the tape over the same tunnel as everything else, so its records can
+    lag or arrive with a gap the engine admitted to, where a local file just
+    stops. An operator who can't tell the two apart reads a quiet remote panel
+    as a quiet fleet.
+    """
+    return "tape · remote" if remote else "tape"
+
+
 def build_windows_table(sb: dict | None, now: float,
                         arms: dict | None = None,
                         limit: int | None = None,
@@ -1311,7 +1334,8 @@ WATCH_KEYS = (
 )
 
 # Keep in sync with cli_crypto_watch's cadence constants.
-_REFRESH_LINE = "tape 1s · engine 2s · stats 10s · odds 30s · balance 60s"
+_REFRESH_LINE = ("tape 1s (remote 2s) · engine 2s · stats 10s · odds 30s · "
+                 "balance 60s")
 
 _HELP_MODAL_W = 78  # readable prose width; clamped to the terminal by the caller
 

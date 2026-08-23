@@ -195,6 +195,128 @@ pub struct TradesQuery {
     pub since: Option<i64>,
 }
 
+// ---------- decision-tape tail (`GET /tape`) ----------
+//
+// The one endpoint here that does NOT go through `EngineCommand`. The tape is
+// a file the engine appends to and nothing else reads, so routing it through
+// the command channel would put a file read inside the trading `select!` arm —
+// the exact shape that darkened the plane for 9.6s in analysis/watch_load.md.
+// This handler owns its own bounded read on a blocking thread instead.
+
+/// Bytes read off the END of the tape per request. The tape is append-only
+/// and already 18MB+ and growing, so a full scan is unbounded work that gets
+/// worse every day. 512KB is ~1500 records — many minutes of fleet activity,
+/// far more recency than a remote dashboard needs — and it stays 512KB
+/// whatever the file becomes.
+const TAPE_TAIL_BYTES: u64 = 512 * 1024;
+/// Records per response when the caller doesn't say, and the hard cap it
+/// can't argue past. Both bound the payload the SSM tunnel has to carry.
+const TAPE_LIMIT_DEFAULT: usize = 200;
+const TAPE_LIMIT_MAX: usize = 500;
+/// The durable eval/fire tape, under `crate::jsonl::engine_dir()`.
+const TAPE_FILE: &str = "updown-tape.jsonl";
+
+#[derive(Debug, Deserialize)]
+pub struct TapeQuery {
+    /// Cursor: return records whose `t` is strictly greater. Absent = 0, i.e.
+    /// "whatever the window holds", which is what a cold client wants.
+    pub since: Option<f64>,
+    pub limit: Option<usize>,
+}
+
+/// One `GET /tape` answer: records oldest-first, plus the honest admission of
+/// what it left out.
+#[derive(Debug, Default, Serialize)]
+pub struct TapeSlice {
+    pub records: Vec<serde_json::Value>,
+    /// Records past `since` that this response does NOT carry — either the
+    /// byte window didn't reach back to the cursor, or there were more than
+    /// `limit` of them and the newest won. The client advances its cursor
+    /// anyway and accepts the gap: a remote tape is a recency feed, not
+    /// history.
+    pub truncated: bool,
+    /// Newest `t` in `records` — the cursor to send next. `null` when the
+    /// response is empty, in which case the client keeps the one it had.
+    pub cursor: Option<f64>,
+}
+
+/// Read the tail of a JSONL tape and return the records newer than `since`,
+/// oldest-first.
+///
+/// Bounded twice over, and both bounds are load-bearing: at most
+/// `TAPE_TAIL_BYTES` are READ regardless of file size, and at most `limit + 1`
+/// records are PARSED because the scan runs backwards from the newest line and
+/// stops at the cursor. Cost is therefore a function of how much is new, not
+/// of how big the tape has grown.
+///
+/// Lines that don't parse — a torn mid-write append, a record with no `t` —
+/// are skipped, never fatal: one bad line must not cost the operator the whole
+/// panel.
+fn tape_tail(path: &std::path::Path, since: f64, limit: usize) -> std::io::Result<TapeSlice> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let start = len.saturating_sub(TAPE_TAIL_BYTES);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::with_capacity(TAPE_TAIL_BYTES.min(len) as usize);
+    // take(), not a bare read_to_end: the engine is appending concurrently, so
+    // the file can be longer now than metadata() just said.
+    (&mut f).take(TAPE_TAIL_BYTES).read_to_end(&mut buf)?;
+
+    // A window that starts mid-file starts mid-record. Drop the partial head
+    // rather than hand back half a line.
+    let body: &[u8] = if start > 0 {
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => &buf[i + 1..],
+            None => &[],
+        }
+    } else {
+        &buf
+    };
+
+    // NEWEST FIRST, and stop the moment the answer is complete. The window is
+    // the read bound; this is the PARSE bound, and it's the one that matters —
+    // the steady state is a 2s poll with a handful of new records, and parsing
+    // the whole 512KB to find them costs ~50x what parsing them does. One
+    // writer appends this tape, so `t` ascends and the first record at-or-
+    // before the cursor genuinely ends the search.
+    let mut matched: Vec<serde_json::Value> = Vec::new();
+    let mut reached_cursor = false;
+    let mut over_limit = false;
+    for line in body.rsplit(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(t) = v.get("t").and_then(serde_json::Value::as_f64) else {
+            continue;
+        };
+        if t <= since {
+            reached_cursor = true;
+            break;
+        }
+        // Checked after the cursor test, so a batch that lands exactly on the
+        // cap isn't reported as truncated when nothing was actually dropped.
+        if matched.len() == limit {
+            over_limit = true;
+            break;
+        }
+        matched.push(v);
+    }
+    let cursor = matched.first().and_then(|v| v["t"].as_f64());
+    matched.reverse();
+
+    // Truncated two ways, both meaning "records past your cursor that this
+    // answer doesn't carry": we filled the cap, or we ran out of window before
+    // reaching the cursor. A window that started at byte 0 IS the whole file,
+    // so it can't be hiding anything.
+    let truncated = over_limit || (!reached_cursor && start > 0);
+    Ok(TapeSlice { records: matched, truncated, cursor })
+}
+
 #[derive(Debug, Serialize)]
 pub struct StatusReport {
     pub uptime_secs: u64,
@@ -324,6 +446,7 @@ fn build_router(cmd_tx: mpsc::Sender<EngineCommand>) -> Router {
             )
             .route("/subscriptions", get(subscriptions_handler))
             .route("/trades/{token_id}", get(trades_handler))
+            .route("/tape", get(tape_handler))
             .route("/orders/all", get(orders_all_handler))
             .route(
                 "/orders/external",
@@ -529,6 +652,34 @@ async fn trades_handler(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// `GET /tape?since=<epoch_float>&limit=<n>` — the bounded tail of the
+/// decision tape, so a `pmt crypto watch` running off-box (control URL through
+/// an SSM tunnel) can see the same records the desktop reads straight off the
+/// file. Read-only, stateless, and the only handler that never enters the
+/// engine's command queue.
+///
+/// Measured release-build cost against the live 24.7MB tape, 2026-08-23:
+/// **88µs** in the steady state (a 2s-poll cursor, 7 new records), 162µs for
+/// a 30s cursor, 471µs cold at the default limit and 1.20ms cold at the 500
+/// cap. Flat in file size by construction — see `tape_tail`.
+async fn tape_handler(Query(q): Query<TapeQuery>) -> Result<Json<TapeSlice>, StatusCode> {
+    let since = q.since.unwrap_or(0.0);
+    let limit = q.limit.unwrap_or(TAPE_LIMIT_DEFAULT).clamp(1, TAPE_LIMIT_MAX);
+    let Some(path) = crate::jsonl::engine_dir().map(|d| d.join(TAPE_FILE)) else {
+        return Ok(Json(TapeSlice::default()));
+    };
+    // spawn_blocking, not the event loop. It is a small read, but it is real
+    // file I/O in a process where the axum tasks share a runtime with the
+    // trading select! — the cost of getting that wrong is measured in seconds.
+    match tokio::task::spawn_blocking(move || tape_tail(&path, since, limit)).await {
+        Ok(Ok(slice)) => Ok(Json(slice)),
+        // No tape yet isn't an error: a fresh engine simply has nothing to
+        // show, and a remote dashboard must not read that as a dead plane.
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(Json(TapeSlice::default())),
+        Ok(Err(_)) | Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 /// Body for `POST /orders/external`. Fields match `ExternalOrder` minus
 /// `created_at`, which the engine fills in on receipt.
 #[derive(Debug, Deserialize)]
@@ -691,10 +842,180 @@ async fn schedule_cancel_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn router_constructs_without_panicking() {
         let (tx, _rx) = mpsc::channel::<EngineCommand>(1);
         let _ = build_router(tx);
     }
+
+    // ---------- GET /tape ----------
+
+    /// Own directory per test + pid, so parallel runs never share a tape.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("pmengine-tape-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A tape of `n` eval records at t = 1000, 1001, ... — plus enough padding
+    /// per line to make byte-window arithmetic testable at a known size.
+    fn write_tape(path: &Path, n: usize, pad: usize) {
+        let f = std::fs::File::create(path).unwrap();
+        let mut w = std::io::BufWriter::new(f);
+        for i in 0..n {
+            let rec = serde_json::json!({
+                "t": 1000.0 + i as f64, "ev": "eval", "slug": "btc-updown-5m-1",
+                "pad": "x".repeat(pad),
+            });
+            writeln!(w, "{}", rec).unwrap();
+        }
+        w.flush().unwrap();
+    }
+
+    #[test]
+    fn tape_tail_returns_only_records_past_the_cursor_oldest_first() {
+        let dir = scratch("cursor");
+        let p = dir.join("tape.jsonl");
+        write_tape(&p, 10, 0);
+
+        let slice = tape_tail(&p, 1005.0, 200).unwrap();
+        let ts: Vec<f64> = slice.records.iter().map(|r| r["t"].as_f64().unwrap()).collect();
+        assert_eq!(ts, vec![1006.0, 1007.0, 1008.0, 1009.0]);
+        assert_eq!(slice.cursor, Some(1009.0));
+        // The whole file fit in the window and nothing hit the cap.
+        assert!(!slice.truncated);
+    }
+
+    #[test]
+    fn tape_tail_with_no_cursor_returns_the_whole_small_file_untruncated() {
+        let dir = scratch("cold");
+        let p = dir.join("tape.jsonl");
+        write_tape(&p, 5, 0);
+
+        let slice = tape_tail(&p, 0.0, 200).unwrap();
+        assert_eq!(slice.records.len(), 5);
+        assert!(!slice.truncated, "a file smaller than the window hides nothing");
+    }
+
+    #[test]
+    fn tape_tail_caps_at_limit_and_keeps_the_newest() {
+        let dir = scratch("cap");
+        let p = dir.join("tape.jsonl");
+        write_tape(&p, 50, 0);
+
+        let slice = tape_tail(&p, 0.0, 10).unwrap();
+        assert_eq!(slice.records.len(), 10);
+        // The NEWEST ten, not the oldest: a dashboard wants current, and
+        // says so by marking the answer truncated.
+        assert_eq!(slice.records[0]["t"].as_f64().unwrap(), 1040.0);
+        assert_eq!(slice.cursor, Some(1049.0));
+        assert!(slice.truncated);
+    }
+
+    #[test]
+    fn tape_tail_never_scans_past_the_byte_window() {
+        let dir = scratch("window");
+        let p = dir.join("tape.jsonl");
+        // ~1KB per record over 4MB of file: eight times the 512KB window, so a
+        // handler that scanned the whole thing would answer from record 0.
+        write_tape(&p, 4000, 900);
+        let size = std::fs::metadata(&p).unwrap().len();
+        assert!(size > 4 * TAPE_TAIL_BYTES, "fixture must dwarf the window");
+
+        // A limit far above what the window holds, so the BYTE bound is what
+        // stops this and not the record cap.
+        let slice = tape_tail(&p, 0.0, 100_000).unwrap();
+        let oldest = slice.records.first().unwrap()["t"].as_f64().unwrap();
+        let in_window = TAPE_TAIL_BYTES as f64 / (size as f64 / 4000.0);
+        assert!(
+            oldest > 1000.0 + 4000.0 - in_window * 1.1,
+            "answered from t={oldest}, which is older than the last 512KB holds"
+        );
+        // Newest record always present — recency is the whole point.
+        assert_eq!(slice.cursor, Some(4999.0));
+        assert!(slice.truncated, "a cursor the window can't reach is a gap, and must say so");
+    }
+
+    #[test]
+    fn tape_tail_marks_truncation_only_when_the_window_misses_the_cursor() {
+        let dir = scratch("trunc");
+        let p = dir.join("tape.jsonl");
+        write_tape(&p, 4000, 900);
+
+        // A cursor inside the window: complete answer, nothing hidden.
+        let fresh = tape_tail(&p, 4990.0, TAPE_LIMIT_MAX).unwrap();
+        assert_eq!(fresh.records.len(), 9);
+        assert!(!fresh.truncated, "the window covered this cursor");
+
+        // A cursor from before the window: the gap is real and reported.
+        let stale = tape_tail(&p, 1001.0, TAPE_LIMIT_MAX).unwrap();
+        assert!(stale.truncated);
+        assert!(!stale.records.is_empty(), "truncated still returns what it has");
+    }
+
+    #[test]
+    fn tape_tail_skips_malformed_lines_without_failing_the_request() {
+        let dir = scratch("malformed");
+        let p = dir.join("tape.jsonl");
+        let mut f = std::fs::File::create(&p).unwrap();
+        writeln!(f, r#"{{"t":1000.0,"ev":"eval"}}"#).unwrap();
+        writeln!(f, r#"{{"t":1001.0,"ev":"fi"#).unwrap();   // torn mid-write append
+        writeln!(f).unwrap();                                // blank
+        writeln!(f, r#"["not","an","object"]"#).unwrap();
+        writeln!(f, r#"{{"ev":"eval"}}"#).unwrap();          // no t
+        writeln!(f, r#"{{"t":"soon","ev":"eval"}}"#).unwrap(); // t isn't a number
+        writeln!(f, r#"{{"t":1002.0,"ev":"fire"}}"#).unwrap();
+        drop(f);
+
+        let slice = tape_tail(&p, 0.0, 200).unwrap();
+        let ts: Vec<f64> = slice.records.iter().map(|r| r["t"].as_f64().unwrap()).collect();
+        assert_eq!(ts, vec![1000.0, 1002.0]);
+    }
+
+    #[test]
+    fn tape_tail_drops_the_partial_line_the_window_starts_inside() {
+        let dir = scratch("partial");
+        let p = dir.join("tape.jsonl");
+        write_tape(&p, 4000, 900);
+
+        // Every record that comes back must be whole and parseable — the seek
+        // lands mid-record, and half a line is not a record.
+        let slice = tape_tail(&p, 0.0, TAPE_LIMIT_MAX).unwrap();
+        for r in &slice.records {
+            assert!(r.get("ev").is_some() && r.get("t").is_some());
+        }
+    }
+
+    #[test]
+    fn tape_tail_on_a_missing_tape_is_a_not_found_the_handler_can_answer_empty() {
+        let missing = std::env::temp_dir().join("pmengine-tape-definitely-absent.jsonl");
+        let err = tape_tail(&missing, 0.0, 200).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn tape_tail_cost_is_flat_in_file_size() {
+        let dir = scratch("cost");
+        let p = dir.join("tape.jsonl");
+        // 4MB, eight windows deep. A full scan of the live 24MB tape runs
+        // hundreds of ms; the bound here is loose enough for a cold CI box and
+        // still an order of magnitude under that.
+        write_tape(&p, 4000, 900);
+
+        let start = std::time::Instant::now();
+        for _ in 0..5 {
+            let _ = tape_tail(&p, 0.0, TAPE_LIMIT_MAX).unwrap();
+        }
+        let per_call = start.elapsed() / 5;
+        assert!(
+            per_call < std::time::Duration::from_millis(50),
+            "tape_tail took {per_call:?} — the read is supposed to be window-bounded"
+        );
+    }
 }
+

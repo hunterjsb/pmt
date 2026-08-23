@@ -287,7 +287,12 @@ def _fetcher(monkeypatch, *, sb=None, status=None, bal=None, sb_boom=None,
     is _tape_scoreboard — the SAME function `pmt crypto stats` runs, which
     is the whole point: one acquisition path, one truth."""
     state = cw.WatchState()
-    f = cw.WatchFetcher(state, sliding_floor=0.0)
+    # A tape feed pointed at nothing, with the control plane stubbed dead: the
+    # fetchers under test here are the OTHER four, and none of them may be
+    # made to depend on whether this box happens to have a tape file.
+    f = cw.WatchFetcher(state, sliding_floor=0.0,
+                        tape_feed=cw.TapeFeed(path="/nonexistent/tape.jsonl"))
+    monkeypatch.setattr(cw, "_engine_get", lambda *a, **k: None)
     monkeypatch.setattr(wallet, "funder_address", lambda: "0xabc")
     monkeypatch.setattr(cw.positions, "fetch_positions",
                         _raiser(odds) if isinstance(odds, BaseException)
@@ -407,26 +412,27 @@ def test_fetcher_balance_failure_keeps_last_capital(monkeypatch):
 def test_fetcher_tick_honors_per_source_cadences(monkeypatch):
     state, f = _fetcher(monkeypatch, bal={"total": 1.0})
     ran: list[str] = []
-    for name in ("status", "sb", "bal", "odds"):
+    for name in ("status", "sb", "bal", "odds", "tape"):
         monkeypatch.setattr(f, f"fetch_{name}", lambda n=name: ran.append(n))
 
     f.tick(1000.0)
-    assert sorted(ran) == ["bal", "odds", "sb", "status"]  # first tick primes everything
+    # first tick primes everything
+    assert sorted(ran) == ["bal", "odds", "sb", "status", "tape"]
     ran.clear()
 
     f.tick(1001.0)                                   # nothing is due yet
     assert ran == []
     f.tick(1002.0)
-    assert ran == ["status"]                         # engine: 2s
+    assert sorted(ran) == ["status", "tape"]          # engine + tape: 2s
     ran.clear()
     f.tick(1010.0)
-    assert sorted(ran) == ["sb", "status"]            # scoreboard: 10s
+    assert sorted(ran) == ["sb", "status", "tape"]    # scoreboard: 10s
     ran.clear()
     f.tick(1030.0)
-    assert sorted(ran) == ["odds", "sb", "status"]    # position marks: 30s
+    assert sorted(ran) == ["odds", "sb", "status", "tape"]  # position marks: 30s
     ran.clear()
     f.tick(1060.0)
-    assert sorted(ran) == ["bal", "odds", "sb", "status"]  # balance: 60s
+    assert sorted(ran) == ["bal", "odds", "sb", "status", "tape"]  # balance: 60s
 
 
 # ---------- current odds: a display feed, on the slow lane ----------
@@ -588,3 +594,292 @@ def test_wait_key_without_a_tty_paces_instead_of_spinning(monkeypatch):
     monkeypatch.setattr(cw.time, "sleep", lambda s: slept.append(s))
     assert cw._wait_key(0.05) is None
     assert slept == [0.05]  # no tty to select on -> the sleep is the pacing
+
+
+# ---------- the tape's two sources behind one cursor ----------
+#
+# `pmt crypto watch` reads the tape off ~/.pmt/engine — the ENGINE's disk, not
+# the operator's, the moment PMENGINE_CONTROL_URL points down an SSM tunnel.
+# TapeFeed adds the control plane as a fallback. These pin the two halves of
+# the deal: the desktop path is untouched (and provably makes no request), and
+# the remote path never renders a record the panel already has.
+
+import watch_ui  # noqa: E402 — the section below renders through the real collapser
+
+
+def _ev(t, **kw):
+    """A complete eval record — every field _render_record reads, so these
+    tests exercise the real collapser rather than a shape it silently drops."""
+    return {"t": t, "ev": "eval", "slug": "btc-updown-5m-1", "p_up": 0.5,
+            "sig_bp": 1.0, "rho": 0.0, "committed": 0.0, "sides": [], **kw}
+
+
+def _tape_file(tmp_path, *ts, name="updown-tape.jsonl"):
+    """A local tape file whose records land at the given absolute `t`s."""
+    import json as _j
+    p = tmp_path / name
+    p.write_text("".join(_j.dumps(_ev(t)) + "\n" for t in ts))
+    return str(p)
+
+
+def _remote(records, truncated=False):
+    """A stub control plane, recording every call it is asked to make."""
+    calls: list[tuple] = []
+
+    def _get(path, params=None, **kw):
+        calls.append((path, dict(params or {})))
+        batch = records.pop(0) if records else []
+        return {"records": batch, "truncated": truncated,
+                "cursor": batch[-1]["t"] if batch else None}
+    return _get, calls
+
+
+def test_a_fresh_local_tape_makes_zero_control_plane_calls(monkeypatch, tmp_path):
+    """THE pin on the desktop path. The engine's own box already has the whole
+    tape on disk; a watch there must not start asking the trading loop's
+    control plane for it, on any cadence, ever."""
+    feed = cw.TapeFeed(path=_tape_file(tmp_path, time.time() - 1.0))
+    _get, calls = _remote([[{"t": 9e9, "ev": "fire"}]])
+    monkeypatch.setattr(cw, "_engine_get", _get)
+
+    for _ in range(20):
+        feed.poll()
+
+    assert calls == [], "a fresh local tape must serve the panel by itself"
+    assert feed.remote is False
+
+
+def test_a_missing_local_tape_falls_back_to_the_control_plane(monkeypatch, tmp_path):
+    feed = cw.TapeFeed(path=str(tmp_path / "nothing-here.jsonl"))
+    _get, calls = _remote([[{"t": 1000.0, "ev": "fire", "side": "up"}]])
+    monkeypatch.setattr(cw, "_engine_get", _get)
+
+    from collections import deque
+    feed.poll()
+    assert [c[0] for c in calls] == ["/tape"]
+    feed.drain(watch_ui.TapeCollapser(), deque(maxlen=200))
+    assert feed.remote is True
+
+
+def test_a_frozen_local_tape_falls_back_to_the_control_plane(monkeypatch, tmp_path):
+    """A laptop that once ran the engine has a real tape file — hours cold.
+    Its presence must not be mistaken for its being the live one."""
+    stale = time.time() - (cw.TAPE_STALE_S + 60)
+    feed = cw.TapeFeed(path=_tape_file(tmp_path, stale))
+    _get, calls = _remote([[{"t": 9e9, "ev": "fire"}]])
+    monkeypatch.setattr(cw, "_engine_get", _get)
+
+    assert feed.local_is_fresh() is False
+    feed.poll()
+    assert [c[0] for c in calls] == ["/tape"]
+
+
+def test_the_first_remote_poll_opens_at_the_newest_local_record(monkeypatch, tmp_path):
+    """A stale local file still tells us where the panel got to. Opening the
+    cursor at 0 instead would re-serve every record already on screen."""
+    from collections import deque
+    stale = time.time() - 4000
+    feed = cw.TapeFeed(path=_tape_file(tmp_path, stale - 20, stale - 10, stale))
+    collapser, lines = watch_ui.TapeCollapser(), deque(maxlen=200)
+    with open(feed._path) as fh:
+        for raw in fh:
+            feed.accept(raw, collapser, lines)
+
+    _get, calls = _remote([[]])
+    monkeypatch.setattr(cw, "_engine_get", _get)
+    feed.poll()
+    assert calls[0][1]["since"] == stale
+
+
+def test_the_remote_cursor_advances_and_never_refetches(monkeypatch, tmp_path):
+    from collections import deque
+    feed = cw.TapeFeed(path=str(tmp_path / "absent.jsonl"))
+    _get, calls = _remote([
+        [_ev(100.0), _ev(101.0)],
+        [_ev(102.0)],
+        [],
+    ])
+    monkeypatch.setattr(cw, "_engine_get", _get)
+    collapser, lines = watch_ui.TapeCollapser(), deque(maxlen=200)
+
+    feed.poll(); feed.drain(collapser, lines)
+    assert calls[0][1]["since"] == 0.0          # cold: whatever the window holds
+    feed.poll(); feed.drain(collapser, lines)
+    assert calls[1][1]["since"] == 101.0        # exactly where the last batch ended
+    feed.poll()
+    assert calls[2][1]["since"] == 102.0
+    # An empty answer must not rewind the cursor.
+    feed.poll()
+    assert calls[3][1]["since"] == 102.0
+
+
+def test_the_remote_poll_asks_for_a_bounded_slice(monkeypatch, tmp_path):
+    """Cursor plus cap: the payload a tunnel has to carry is bounded at both
+    ends, which is the whole watch-load discipline this feed inherits."""
+    feed = cw.TapeFeed(path=str(tmp_path / "absent.jsonl"))
+    _get, calls = _remote([[]])
+    monkeypatch.setattr(cw, "_engine_get", _get)
+    feed.poll()
+    assert calls[0][1]["limit"] == cw.TAPE_LIMIT <= 500
+
+
+def test_a_record_the_panel_already_has_is_never_rendered_twice(monkeypatch, tmp_path):
+    """The cursor is shared by BOTH sources, so a local file that thaws while
+    the remote is serving (or the reverse) can't double-paint the overlap."""
+    from collections import deque
+    import json as _j
+    feed = cw.TapeFeed(path=str(tmp_path / "absent.jsonl"))
+    collapser, lines = watch_ui.TapeCollapser(), deque(maxlen=200)
+
+    fire = {"t": 500.0, "ev": "fire", "side": "up", "size": 10, "ask": 0.9,
+            "fair": 0.99, "net": 0.09, "rho": 0.1, "committed": 9.0}
+    _get, _ = _remote([[fire]])
+    monkeypatch.setattr(cw, "_engine_get", _get)
+    feed.poll()
+    feed.drain(collapser, lines)
+    assert len(lines) == 1
+
+    # The same record arriving off the local file: already seen, already shown.
+    assert feed.accept(_j.dumps(fire), collapser, lines) is False
+    assert len(lines) == 1
+    # ...and an older one, which is what a re-read from a stale offset yields.
+    assert feed.accept(_j.dumps({**fire, "t": 499.0}), collapser, lines) is False
+    assert len(lines) == 1
+
+
+def test_a_remote_record_renders_exactly_as_a_local_one(monkeypatch, tmp_path):
+    """Same TapeCollapser, same line. A record is a record whatever carried
+    it, so the panel can't develop a second look for remote windows."""
+    from collections import deque
+    import json as _j
+    fire = {"t": 500.0, "ev": "fire", "side": "up", "size": 10, "ask": 0.9,
+            "fair": 0.99, "net": 0.09, "rho": 0.1, "committed": 9.0}
+
+    local_lines: deque = deque(maxlen=200)
+    cw.TapeFeed(path=str(tmp_path / "a.jsonl")).accept(
+        _j.dumps(fire), watch_ui.TapeCollapser(), local_lines)
+
+    feed = cw.TapeFeed(path=str(tmp_path / "b.jsonl"))
+    _get, _ = _remote([[fire]])
+    monkeypatch.setattr(cw, "_engine_get", _get)
+    remote_lines: deque = deque(maxlen=200)
+    feed.poll()
+    feed.drain(watch_ui.TapeCollapser(), remote_lines)
+
+    assert list(remote_lines) == list(local_lines)
+
+
+def test_a_truncation_marker_is_accepted_and_the_feed_continues(monkeypatch, tmp_path):
+    """A remote tape is a recency feed. When the engine says its byte window
+    couldn't reach our cursor, the answer is to take what arrived and move the
+    cursor on — never to retry, and never to stall waiting for the gap."""
+    from collections import deque
+    feed = cw.TapeFeed(path=str(tmp_path / "absent.jsonl"))
+    _get, calls = _remote([[_ev(900.0)], []], truncated=True)
+    monkeypatch.setattr(cw, "_engine_get", _get)
+    collapser, lines = watch_ui.TapeCollapser(), deque(maxlen=200)
+
+    feed.poll()
+    assert feed.gap is True
+    feed.drain(collapser, lines)
+    assert feed.gap is False, "the marker is consumed by the render that handled it"
+    assert len(lines) == 1
+    feed.poll()
+    assert calls[1][1]["since"] == 900.0     # continued from what arrived
+
+
+def test_nothing_collapses_across_a_gap_the_engine_admitted_to(monkeypatch, tmp_path):
+    """Two identical evals of one arm normally fold into a single run line
+    counting both. If records went missing between them, that count and its
+    span are fiction — so a truncated batch breaks the open runs first."""
+    from collections import deque
+    feed = cw.TapeFeed(path=str(tmp_path / "absent.jsonl"))
+    collapser, lines = watch_ui.TapeCollapser(), deque(maxlen=200)
+
+    # Back to back, no gap: one collapsed line.
+    _get, _ = _remote([[_ev(100.0)], [_ev(101.0)]])
+    monkeypatch.setattr(cw, "_engine_get", _get)
+    feed.poll(); feed.drain(collapser, lines)
+    feed.poll(); feed.drain(collapser, lines)
+    assert len(lines) == 1
+
+    # Same two reads, but the engine says it skipped over records to get here.
+    feed2 = cw.TapeFeed(path=str(tmp_path / "absent2.jsonl"))
+    collapser2, lines2 = watch_ui.TapeCollapser(), deque(maxlen=200)
+    _get2, _ = _remote([[_ev(100.0)]])
+    monkeypatch.setattr(cw, "_engine_get", _get2)
+    feed2.poll(); feed2.drain(collapser2, lines2)
+    _get3, _ = _remote([[_ev(101.0)]], truncated=True)
+    monkeypatch.setattr(cw, "_engine_get", _get3)
+    feed2.poll(); feed2.drain(collapser2, lines2)
+    assert len(lines2) == 2, "a run was allowed to span records it never saw"
+
+
+def test_an_unreachable_engine_keeps_the_panel_and_the_cursor(monkeypatch, tmp_path):
+    """A tunnel that blinks must cost nothing: the lines already on screen are
+    still true, and the next good poll resumes with no gap of our own making."""
+    from collections import deque
+    feed = cw.TapeFeed(path=str(tmp_path / "absent.jsonl"))
+    _get, calls = _remote([[_ev(700.0)]])
+    monkeypatch.setattr(cw, "_engine_get", _get)
+    collapser, lines = watch_ui.TapeCollapser(), deque(maxlen=200)
+    feed.poll(); feed.drain(collapser, lines)
+
+    monkeypatch.setattr(cw, "_engine_get", lambda *a, **k: None)  # engine.fetch on failure
+    feed.poll()
+    assert len(lines) == 1
+    assert feed.remote is True
+
+    monkeypatch.setattr(cw, "_engine_get", _get)
+    feed.poll()
+    assert calls[-1][1]["since"] == 700.0
+
+
+def test_an_empty_remote_answer_never_claims_the_panel_is_remote(monkeypatch, tmp_path):
+    """An idle desktop crosses the staleness line (nothing armed, nothing
+    written) and does poll — but the poll comes back empty, so the panel is
+    still showing its own file and must keep saying so."""
+    feed = cw.TapeFeed(path=str(tmp_path / "absent.jsonl"))
+    _get, calls = _remote([[], [], []])
+    monkeypatch.setattr(cw, "_engine_get", _get)
+    for _ in range(3):
+        feed.poll()
+    assert calls and feed.remote is False
+
+
+def test_the_tape_poll_is_belted_by_the_fetcher_like_every_other_source(monkeypatch):
+    state, f = _fetcher(monkeypatch)
+    monkeypatch.setattr(f.tape_feed, "poll", _raiser(ConnectionError("tunnel down")))
+    f.tick(0.0)                                  # must not raise
+    f.tick(10_000.0)
+
+
+def test_the_remote_tape_cadence_matches_the_control_planes_other_poll():
+    # One extra small request per engine poll, not a second cadence to reason
+    # about — and the analysis that cleared watch of the 2026-08-23 blackout
+    # was measured at exactly this rate.
+    assert cw.TAPE_EVERY_S == cw.ENGINE_EVERY_S
+
+
+def test_a_desktop_waking_from_an_idle_spell_never_claims_remote(monkeypatch, tmp_path):
+    """The one case that could make the desktop's title flicker: nothing armed
+    for a while, so the local tape crosses the staleness line and the poll
+    goes out — then the fleet wakes and BOTH sources carry the same records.
+    The file is read first every frame, so the remote never serves anything
+    and the panel keeps saying what it is."""
+    from collections import deque
+    import json as _j
+    feed = cw.TapeFeed(path=_tape_file(tmp_path, time.time() - 900))
+    collapser, lines = watch_ui.TapeCollapser(), deque(maxlen=200)
+    assert feed.local_is_fresh() is False
+
+    woke = _ev(time.time())
+    _get, calls = _remote([[woke]])
+    monkeypatch.setattr(cw, "_engine_get", _get)
+    feed.poll()                                   # fetched, not yet rendered
+    assert calls, "an idle local tape is stale and does poll"
+
+    feed.accept(_j.dumps(woke), collapser, lines)  # the render loop's file read
+    feed.drain(collapser, lines)                   # ...gets there first
+    assert len(lines) == 1
+    assert feed.remote is False, "the local file served this; the title must not move"

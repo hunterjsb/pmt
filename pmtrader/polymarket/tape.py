@@ -15,6 +15,7 @@ lesson).
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
@@ -77,3 +78,52 @@ def iter_records(path: str, floor: float | None = None,
             if evs_set is not None and r.get("ev") not in evs_set:
                 continue
             yield r
+
+
+# The tail read a caller needs to answer "how fresh is this file" — a few
+# hundred records' worth, never the whole tape (updown-tape.jsonl passed 24MB
+# in August 2026 and only grows).
+_TAIL_BYTES = 64 * 1024
+
+
+def record_t(raw: str | bytes) -> float | None:
+    """One raw tape line's `t`, or None if it isn't a record with a numeric
+    one — a torn mid-write append, a blank line, the partial line a seek into
+    the middle of the file landed inside.
+
+    ONE parse rule for "does this line carry a timestamp", so the freshness
+    check below and the watch dashboard's dedupe cursor can't disagree about
+    which lines count.
+    """
+    try:
+        r = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(r, dict) and isinstance(r.get("t"), (int, float)) \
+            and not isinstance(r.get("t"), bool):
+        return float(r["t"])
+    return None
+
+
+def newest_t(path: str, tail_bytes: int = _TAIL_BYTES) -> float | None:
+    """The `t` of the newest parseable record in a tape, or None if there
+    isn't one (no file, empty file, nothing parseable in the tail).
+
+    Reads backwards from the last `tail_bytes` and stops at the first record
+    it can read, so the cost is flat in file size. Used to decide whether a
+    LOCAL tape is still being written — a laptop pointed at a remote engine
+    has either no file at all or one frozen hours ago.
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - tail_bytes))
+            chunk = fh.read()
+    except OSError:
+        return None
+    for raw in reversed(chunk.split(b"\n")):
+        t = record_t(raw)
+        if t is not None:
+            return t
+    return None

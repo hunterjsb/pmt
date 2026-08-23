@@ -9,10 +9,12 @@ Three styles of call, deliberately separate:
 - `get(path)` / `post(path, body)` — strict: prints + exits on failure.
   Use when the user is asking the engine for something explicit and a
   non-response is a real error (`pmt engine status`, alert approval).
-- `notify(path, body)` — best-effort fire-and-forget. Returns None when
-  the engine is unreachable instead of exiting. Use for "tell the
-  engine if it's listening" handoffs (registering external orders,
-  scheduling TTL cancels).
+- `notify(path, body)` / `fetch(path)` — best-effort write and read.
+  Return None when the engine is unreachable instead of exiting. Use for
+  "tell the engine if it's listening" handoffs (registering external
+  orders, scheduling TTL cancels) and for polled reads that must not
+  print a red error every cadence when a tunnel blinks (the watch
+  dashboard's remote tape).
 - `place(side, token, price, size)` / `place_or_direct(...)` — orderpath:
   route writes through the engine to share its rate-limit budget. The
   `_or_direct` variant falls back to a direct CLOB place when the
@@ -70,7 +72,26 @@ def post(path: str, body: dict | None = None) -> Any:
     return r.json()
 
 
-# ---------- best-effort notify (silent on error) ----------
+# ---------- best-effort read/notify (silent on error) ----------
+
+def fetch(path: str, params: dict | None = None, timeout: float = 3.0) -> Any | None:
+    """Best-effort GET — the read counterpart to notify().
+
+    Returns None on anything short of a 2xx instead of exiting, and prints
+    NOTHING. A caller on a repeating cadence (the watch dashboard polling the
+    remote tape over an SSM tunnel) would otherwise paint a red error into the
+    operator's terminal every few seconds for a link that reconnects on its
+    own. Strict `get()` stays the right call when the operator asked a
+    question and a non-answer is the answer.
+    """
+    try:
+        r = requests.get(f"{base_url()}{path}", params=params, timeout=timeout)
+        if r.status_code >= 400:
+            return None
+        return r.json()
+    except (requests.RequestException, ValueError):
+        return None
+
 
 def notify(path: str, body: dict | None = None) -> dict | None:
     """Returns the JSON response on success, or None if unreachable / 4xx."""

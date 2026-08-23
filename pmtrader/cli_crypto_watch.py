@@ -10,11 +10,17 @@ literally the function `pmt crypto stats` runs. Watch is a VIEW of the same
 acquisition, never a second one; see that module's docstring for what the
 alternative cost.
 
+The tape panel has two sources behind one cursor (TapeFeed): the local file
+the render loop seeks, and — when that file isn't this box's, because
+PMENGINE_CONTROL_URL points down an SSM tunnel — the engine's `GET /tape` on
+the worker.
+
 Pairs with watch_ui.py, which owns every render function this uses.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import select
 import sys
@@ -28,11 +34,12 @@ import click
 import watch_ui
 from cli_common import _api, _parse_since
 from cli_crypto_stats import _tape_scoreboard
+from engine import fetch as _engine_get
 from engine import post as _engine_post
 from polymarket import positions, tape, wallet
 from watch_ui import (
     _SB_EMPTY, build_header_panel, build_help_modal, build_windows_table,
-    header_height, window_rows, windows_title,
+    header_height, tape_title, window_rows, windows_title,
 )
 
 
@@ -115,6 +122,14 @@ ENGINE_EVERY_S = 2.0
 SB_EVERY_S = 10.0
 ODDS_EVERY_S = 30.0       # per-position marks: a display feed, not a control input
 BAL_EVERY_S = 60.0
+TAPE_EVERY_S = 2.0        # remote-tape poll — see TapeFeed; free while local is fresh
+# A local tape whose newest record is older than this is not being written by
+# an engine on THIS box. 30s because the fleet evaluates on a 5s throttle, so a
+# healthy tape is never half a minute cold while anything is armed — but a
+# genuinely idle desktop crosses it too, and TapeFeed is built for that to be
+# harmless (the poll comes back empty and the panel says nothing).
+TAPE_STALE_S = 30.0
+TAPE_LIMIT = 500          # the engine's own hard cap; ask for it explicitly
 WORKER_INTERVAL_S = 0.25  # how often the worker checks what's due
 # 'q' must feel instant. An idle worker exits its wait immediately; one stuck
 # mid-fetch is simply abandoned (daemon thread, the process is leaving anyway)
@@ -213,6 +228,132 @@ class WatchState:
             return dict(self._d)
 
 
+class TapeFeed:
+    """Where the tape panel's records come from, and what it has already seen.
+
+    Two sources, one cursor. The LOCAL file is primary: on the engine's own
+    box `~/.pmt/engine/updown-tape.jsonl` is the whole story, the render loop
+    seeks it in microseconds and this class never touches the network. But
+    that path reads the ENGINE's disk, not the operator's, the moment
+    PMENGINE_CONTROL_URL points down an SSM tunnel — which is why a watch on a
+    laptop showed a tape panel with almost nothing in it. So when the local
+    file is missing or frozen, the fetch worker polls the engine's
+    `GET /tape?since=<cursor>` instead and feeds the SAME TapeCollapser: a
+    record is a record whatever carried it.
+
+    The cursor is what makes mixing them safe. Every record the panel accepted
+    advanced it, from either source, so a handover in either direction cannot
+    re-render what is already on screen. It is also the `since` the poll sends,
+    which is what keeps the payload to "what's new" rather than a tape slice
+    per tick.
+
+    Nothing here runs on the desktop's happy path: local-fresh short-circuits
+    before the request, so an engine on this box sees ZERO tape calls.
+    """
+
+    def __init__(self, path: str | None = None,
+                 stale_after: float = TAPE_STALE_S,
+                 limit: int = TAPE_LIMIT) -> None:
+        self._lock = threading.Lock()
+        self._path = tape.UPDOWN_TAPE if path is None else path
+        self._stale_after = stale_after
+        self._limit = limit
+        self._cursor = 0.0
+        self._pending: list[str] = []
+        self._remote = False
+        self._gap = False
+
+    # -- render side: the cursor gate every record passes through --
+
+    def accept(self, raw: str, collapser, lines) -> bool:
+        """Gate one raw tape line on the cursor, then render it.
+
+        A line with no readable `t` is passed through ungated rather than
+        dropped — the collapser has its own opinion about records it can't
+        parse, and silently swallowing one here would hide a record the panel
+        exists to show.
+        """
+        t = tape.record_t(raw)
+        if t is not None:
+            with self._lock:
+                if t <= self._cursor:
+                    return False
+                self._cursor = t
+        collapser.add(raw, lines)
+        return True
+
+    def drain(self, collapser, lines) -> None:
+        """Render whatever the worker fetched since the last frame."""
+        with self._lock:
+            pending, self._pending = self._pending, []
+            gap, self._gap = self._gap, False
+        if gap:
+            # The engine said its byte window didn't reach our cursor: records
+            # we will never see sit between the last line on the panel and the
+            # first of these. Nothing may collapse across that seam — a run
+            # spanning it would state a count and a span that never happened.
+            collapser.break_runs()
+        served = False
+        for raw in pending:
+            served |= self.accept(raw, collapser, lines)
+        if served:
+            # Claimed HERE rather than at fetch time. A record the local file
+            # had already supplied is not the remote serving the panel: a
+            # desktop whose fleet wakes after an idle spell does cross the
+            # staleness line and does fetch, but its own file wins the race
+            # every frame, so the title never flickers to remote.
+            with self._lock:
+                self._remote = True
+
+    @property
+    def remote(self) -> bool:
+        """True once a poll has delivered records the local file did not
+        already have — i.e. the panel is showing the engine's tape, not this
+        box's. Not merely "the local file looked stale": an idle desktop is
+        stale and still entirely local."""
+        with self._lock:
+            return self._remote
+
+    @property
+    def gap(self) -> bool:
+        """A fetched-but-not-yet-drained batch that the engine marked
+        `truncated` — its byte window didn't reach our cursor, or it hit the
+        record cap. Recency is what a remote tape is for, so a gap is accepted
+        and continued from, never retried; all it changes is that the
+        collapser must not merge across it. Cleared by drain()."""
+        with self._lock:
+            return self._gap
+
+    # -- worker side: one bounded request, only when the file can't serve --
+
+    def local_is_fresh(self, now: float | None = None) -> bool:
+        newest = tape.newest_t(self._path)
+        if newest is None:
+            return False
+        return (time.time() if now is None else now) - newest < self._stale_after
+
+    def poll(self) -> None:
+        """One tape tick on the fetch worker."""
+        if self.local_is_fresh():
+            with self._lock:
+                self._remote = False
+            return
+        with self._lock:
+            since = self._cursor
+        body = _engine_get("/tape", {"since": since, "limit": self._limit})
+        if not isinstance(body, dict):
+            return  # unreachable, or a tunnel mid-reconnect: keep the last panel
+        records = body.get("records") or []
+        with self._lock:
+            if not records:
+                # A reachable engine with nothing new. Says nothing about the
+                # source, so the title doesn't move: an idle desktop must not
+                # start claiming its own tape is remote.
+                return
+            self._gap = self._gap or bool(body.get("truncated"))
+            self._pending.extend(json.dumps(r) for r in records)
+
+
 class WatchFetcher:
     """Every network call the watch dashboard makes, on one daemon thread.
 
@@ -223,11 +364,16 @@ class WatchFetcher:
     the render loop never waits on it. See fetch_sb.
     """
 
-    def __init__(self, state: WatchState, sliding_floor: float) -> None:
+    def __init__(self, state: WatchState, sliding_floor: float,
+                 tape_feed: TapeFeed | None = None) -> None:
         self.state = state
         self.sliding_floor = sliding_floor
+        # The tape is the one source that publishes somewhere other than
+        # WatchState: it's a queue the renderer consumes exactly once, not a
+        # value it re-reads every frame. See TapeFeed.
+        self.tape_feed = TapeFeed() if tape_feed is None else tape_feed
         self._due: dict[str, float] = {"status": 0.0, "sb": 0.0, "bal": 0.0,
-                                       "odds": 0.0}
+                                       "odds": 0.0, "tape": 0.0}
 
     # -- individual fetches: each may raise; tick() belts them --
 
@@ -256,6 +402,12 @@ class WatchFetcher:
     def fetch_bal(self) -> None:
         self.state.update(bal=_api().get_usdc_balance() or {})
 
+    def fetch_tape(self) -> None:
+        # ONE bounded GET, and only when the local file can't serve — the
+        # cursor keeps it to what's new and the engine caps it at 500 records.
+        # On the desktop this returns without making a request at all.
+        self.tape_feed.poll()
+
     # -- failure handling: last good value + a visible marker --
 
     def _status_failed(self, exc: BaseException) -> None:
@@ -276,6 +428,12 @@ class WatchFetcher:
         # trades table paints "—" and says nothing rather than something wrong.
         self.state.update(odds={})
 
+    def _tape_failed(self, exc: BaseException) -> None:
+        # Keep the records already on the panel and the cursor that got them.
+        # A tape is a log: what it showed a second ago is still true, and the
+        # next successful poll resumes from the same cursor with no gap.
+        pass
+
     def tick(self, now: float) -> None:
         """Run whatever is due at `now`. Never raises."""
         for name, every, fetch, failed in (
@@ -283,6 +441,7 @@ class WatchFetcher:
             ("sb", SB_EVERY_S, self.fetch_sb, self._sb_failed),
             ("odds", ODDS_EVERY_S, self.fetch_odds, self._odds_failed),
             ("bal", BAL_EVERY_S, self.fetch_bal, self._bal_failed),
+            ("tape", TAPE_EVERY_S, self.fetch_tape, self._tape_failed),
         ):
             if now < self._due[name]:
                 continue
@@ -331,11 +490,15 @@ def crypto_watch(since: float | None) -> None:
     floor_label = ("all time" if floor <= 0 else
                    datetime.fromtimestamp(floor, tz=timezone.utc).strftime("since %m-%d %H:%MZ"))
     lines: deque = deque(maxlen=200)
+    # Seeding goes through the feed, not straight at the collapser: it leaves
+    # the cursor on the newest local record, which is exactly the `since` the
+    # remote poll should open with if this box turns out not to be the engine's.
+    tape_feed = TapeFeed()
     offset = 0
     try:
         with open(tape.UPDOWN_TAPE) as fh:
             for raw in fh.readlines()[-120:]:
-                collapser.add(raw, lines)
+                tape_feed.accept(raw, collapser, lines)
             offset = fh.tell()
     except OSError:
         pass
@@ -345,7 +508,7 @@ def crypto_watch(since: float | None) -> None:
     # wallet walk lands). See docs/LESSONS.md#L28.
     state = WatchState()
     stop = threading.Event()
-    fetcher = WatchFetcher(state, floor)
+    fetcher = WatchFetcher(state, floor, tape_feed=tape_feed)
     worker = threading.Thread(target=fetcher.loop, args=(stop,),
                               name="pmt-watch-fetch", daemon=True)
     snap = state.read()
@@ -376,7 +539,7 @@ def crypto_watch(since: float | None) -> None:
         # second row, so the "last N lines" arithmetic above stops holding and
         # records scroll out of a panel that looks like it has space.
         body.no_wrap, body.overflow = True, "ellipsis"
-        return Panel(body, title="tape", border_style="dim")
+        return Panel(body, title=tape_title(tape_feed.remote), border_style="dim")
 
     # Three slots, one of them a table: header, the windows table, the tape.
     layout = Layout()
@@ -417,10 +580,14 @@ def crypto_watch(since: float | None) -> None:
                         with open(tape.UPDOWN_TAPE) as fh:
                             fh.seek(offset)
                             for raw in fh:
-                                collapser.add(raw, lines)
+                                tape_feed.accept(raw, collapser, lines)
                             offset = fh.tell()
                     except OSError:
                         pass
+                    # Whatever the worker pulled off the control plane since
+                    # the last frame — nothing at all unless the file above
+                    # went cold. Still zero network on this thread.
+                    tape_feed.drain(collapser, lines)
                     # The header grows a row for the settlement feed, one for
                     # an unreachable engine and one for a render error; size
                     # the slot to what it will paint or Rich clips the row
