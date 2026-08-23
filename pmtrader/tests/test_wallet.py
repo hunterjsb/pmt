@@ -297,3 +297,19 @@ def test_mutated_redeem_replaces_its_draft_not_double_counts(monkeypatch):
     redeems = [r for r in led.rows if r["type"] == "REDEEM"]
     assert len(redeems) == 1, "draft must be replaced, not doubled"
     assert redeems[0]["usdcSize"] == 20.04
+
+
+def test_resync_dedupes_a_redeem_that_mutated_mid_walk(monkeypatch):
+    # Draft on page 1, final on page 2 (the seam overlap re-serves mutated
+    # rows) — one walk must keep exactly the final version.
+    draft = {"transactionHash": "0xr2", "type": "REDEEM", "slug": "eth-updown-5m-2000",
+             "outcome": "Down", "size": 0.0, "usdcSize": 0.0, "timestamp": 200}
+    final = dict(draft, size=40.0, usdcSize=40.0, timestamp=201)
+    pages = {0: [draft] + [_led_row(1000 - i, 1.0) for i in range(wallet.PAGE_SIZE - 1)],
+             wallet.PAGE_STEP: [final]}
+    monkeypatch.setattr(wallet, "fetch_activity_page", lambda a, o: pages.get(o, []))
+    led = wallet.ActivityLedger()
+    led.refresh("0xabc")  # first call = full walk (the resync path)
+    redeems = [r for r in led.rows if r["type"] == "REDEEM"]
+    assert len(redeems) == 1
+    assert redeems[0]["usdcSize"] == 40.0

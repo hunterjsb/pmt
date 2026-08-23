@@ -191,6 +191,7 @@ class ActivityLedger:
         """
         rows: list[dict] = []
         seen: set = set()
+        redeems: dict = {}
         offset = 0
         pages = 0
         while True:
@@ -198,9 +199,20 @@ class ActivityLedger:
             pages += 1
             for a in page:
                 k = row_key(a)
-                if k not in seen:
-                    seen.add(k)
-                    rows.append(a)
+                if k in seen:
+                    continue
+                if a.get("type") == "REDEEM":
+                    # The identity dedupe must hold WITHIN a walk too: a
+                    # redeem can mutate mid-walk, putting its draft on one
+                    # page and its final on the seam overlap of the next.
+                    rid = redeem_identity(a)
+                    prev = redeems.get(rid)
+                    if prev is not None:
+                        seen.discard(row_key(prev))
+                        rows.remove(prev)
+                    redeems[rid] = a
+                seen.add(k)
+                rows.append(a)
             if len(page) < PAGE_SIZE:
                 break
             offset += PAGE_STEP
@@ -208,8 +220,13 @@ class ActivityLedger:
         new = len(seen - self._seen)
         if stale:
             _log_ledger_drift(stale)
+            drift_usd = sum(a.get("usdcSize") or 0.0 for a in stale)
+            if drift_usd > 1.0:
+                # loud enough to correlate with a "watch read $X wrong" report
+                print(f"[ledger] resync purged {len(stale)} stale rows "
+                      f"(${drift_usd:,.2f} of graded value had been double-counted)")
         self.rows, self._seen = rows, seen
-        self._redeems = {redeem_identity(a): a for a in rows if a.get("type") == "REDEEM"}
+        self._redeems = redeems
         self.primed = True
         self.last_pages = pages
         self.last_drift = len(stale)
