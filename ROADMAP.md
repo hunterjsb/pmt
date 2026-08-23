@@ -30,12 +30,23 @@ don't record is a night the corpus can't judge.
 - **Sigma floor refresh on roll**: rolled arms currently clone the original arm-time σ floor
   forever; recompute from the feed's own trailing closes at each roll. (Smallest engine change,
   pending approval.)
-- Backfillable now: klines, Chainlink rounds, resolved outcomes. Forward-only: books, spot ticks.
+- **Polymarket trade flow** (added 2026-08-23, issue #3): the book tape records top-of-book but
+  not prints. VPIN-style toxicity (R8) needs signed volume — sample `recent_trades`
+  count/volume per armed token into the book recorder. Poly-side flow is NOT backfillable;
+  every unrecorded night is a night R8 can't be calibrated on.
+- Backfillable now: klines, Chainlink rounds, resolved outcomes, Binance aggTrade flow.
+  Forward-only: books, spot ticks, Polymarket prints.
 
 ## Phase 1 — Replay harness (the judge) · next week
 
-- Extract the decision core (`fair_p_up` + firing policy) behind a snapshot interface: a pure
-  function of (recorded feed state, recorded book, params, t). No I/O in the core.
+- ~~Extract the decision core (`fair_p_up` + firing policy) behind a snapshot interface: a pure
+  function of (recorded feed state, recorded book, params, t). No I/O in the core.~~
+  **DONE 2026-08-23 (1bae00a)**: `decide(view, model, now) -> {actions, tape, finished}` +
+  pure `eval_model(params, feed, now)`; live tick is a thin adapter; replay drives the same
+  function. Replay-only `Tunables` make the pre-brake policy expressible for reproducing
+  recorded nights (live arms cannot reach them).
+- Acceptance target pinned: the −$370 window is `btc-updown-15m-1787446800` (32 real fires,
+  ~$698 bought over 435s, 85 eval/gated records — dense enough for evals-mode replay).
 - `pmengine replay`: walk a corpus timestamp-faithfully — a decision at t sees only data ≤ t
   (look-ahead is the classic backtest lie). Fills are conservative: taker at recorded ask,
   capped at recorded ask size, fees applied.
@@ -67,6 +78,7 @@ R3 → R5/R6/R1 → R7/R8/R9.
 - **R2 Calibration gate + fractional Kelly** — clip size from quarter-Kelly on post-fee,
   post-haircut edge; hard per-window %-of-bankroll cap; no size increases until each p-bucket
   shows calibration over ≥30 decided windows. (Current reality check: stated fair ≥0.95 hits 92%.)
+  Variance for sizing/quoting on a binary is Bernoulli: σ² = p(1−p) (issue #3, tfrmma).
 - **R3 Odds discipline** — test a max entry price (~0.70) for non-banked entries on the corpus.
   External research says high-price "sure things" are poor risk/reward after fees; our own tape
   can confirm or refute before we adopt it.
@@ -89,7 +101,11 @@ R3 → R5/R6/R1 → R7/R8/R9.
   at ρ 0.7 the arms lose together.
 - **R8 Near-even late-flow guard** — when the book is still ~50/50 in the final 30–60s and
   late Binance flow is abnormal, cut or zero the size multiplier: that combination is the
-  manipulation fingerprint the 5m literature documents.
+  manipulation fingerprint the 5m literature documents. Formalization (issue #3): VPIN
+  volume-bucket imbalance (Easley/López de Prado/O'Hara) on Binance aggTrades (backfillable)
+  and Polymarket prints (needs the Phase 0 flow recorder); Bartlett & O'Hara (2026, Kalshi)
+  show one-sided flow predicts maker losses — the same signal should gate our taker clips.
+  Cheap v1 the corpus can already test: consecutive-same-side-flow counter.
 - **R9 Entry gate: banked evidence, not clock %** — the 50% `min_elapsed` gate is unswept
   folklore with a known cliff failure (the −$370 window fired at the first legal tick, when
   BTC still moves >10bp in the remaining time 29% of the time). Our edge is banked-mass
@@ -110,11 +126,28 @@ R3 → R5/R6/R1 → R7/R8/R9.
   - **Instrumented 2026-08-23**: eval tape now records margin_bp / banked_bp / cushion_bp
     every tick (guard-gated ticks carry them in the gate reason) — the θ sweep has corpus
     data from tonight forward.
+- **R10 AS-lite inventory tilt** (added 2026-08-23, issue #3) — pre-maker reservation-price
+  skew as a pure function: `r = p_fair − q·γ·p_fair·(1−p_fair)·τ`, with p_fair = OUR model
+  (banked-adjusted p_up), never book mid. Used first as a size/side tilt on existing taker
+  clips — long UP makes adding UP less attractive and exiting easier, the continuous
+  generalization of the no-averaging-down brake. Evidence for priority: the Paradigm
+  challenge writeup found inventory skew alone was make-or-break (−$7 edge without it).
+  Unit test: skew direction (long UP → lower UP reservation). γ swept on the replay
+  harness like every other knob; no live sizing input before an A/B win. Becomes the
+  quoting core of Phase 3.1 when the maker path lands.
 
 ## Phase 3 — Strategy expansion (each gated by Phase 1)
 
 1. **Maker mode** — rest quotes at fair-minus-edge; the fill-economics build (existing top
-   backlog item). Prerequisite for everything two-sided.
+   backlog item). Prerequisite for everything two-sided. Design library (issue #3): keep
+   the Avellaneda–Stoikov shell (reservation price + optimal spread + R10 inventory skew,
+   Bernoulli variance σ² = p(1−p)), but **replace their fair value with ours** — simple BS
+   digital FV is weaker than banked TWAP + live σ on 5/15m crypto. Reading order: polybot
+   `avellaneda_stoikov.py`/`pricing.py` → zostaff hft-pm docs §4–5 (incl. logit-space quotes
+   near 0/1) → blockchainhansi 15m BTC strategy engine (skew + pair merge) → Feil & Nendel
+   2026 (HJB with settlement risk — interacts with R9's cushion as τ→0). Toxicity widens
+   spread / pauses quotes (R8's VPIN). pascal-labs forensics = the behavioral blueprint of
+   a profitable MM on exactly our market class.
 2. **Tail-snipe** — final 30–60s, banked-decided/flip-proof only, a formalization of the mode
    we already trust.
 3. **Complete-set scanner** — Up + Down < $1.00 after fees; structural, low-directional.
