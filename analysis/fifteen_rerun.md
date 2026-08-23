@@ -273,22 +273,30 @@ sign test is ≥ 0.125. Every bootstrap CI spans zero.
 Zero fires needs a mechanism, not a shrug. Each row relaxes ONE gate on top
 of the live `rtds_terminal` / `rtds_hybrid` params, btc+eth, 32 windows:
 
-| relaxation | terminal: windows / clips / net | hybrid: windows / clips / net |
-|---|---|---|
-| *(none — the leg above)* | **0 / 0 / $0.00** | **0 / 0 / $0.00** |
-| `basis_guard_bp` 6,8 → 0.1 | 0 / 0 / $0.00 | 1 / 1 / +$1.12 |
-| `min_fair` 0.97 → 0.50 | 0 / 0 / $0.00 | 0 / 0 / $0.00 |
-| `min_edge` → 0.001 | 0 / 0 / $0.00 | 1 / 2 / +$0.99 |
-| `max_price` → 0.999 | 0 / 0 / $0.00 | 0 / 0 / $0.00 |
-| `quiesce_secs` 20 → 0 | 0 / 0 / $0.00 | 0 / 0 / $0.00 |
-| `clip_cooldown_s` → 0 | 0 / 0 / $0.00 | — |
-| **every book-side gate at once**, θ and guard LIVE | **0 / 0 / $0.00** | — |
-| **every gate at once except θ** | **0 / 0 / $0.00** | 5 / 12 / +$2.11 |
-| **`theta` 0.3 → 0** | **6 / 7 / −$1.73** | **13 / 22 / −$184.12** |
-| everything, θ included | 25 / 49 / −$70.83 | 31 / 93 / −$414.61 |
+| relaxation | terminal (win / clips / net) | hybrid | range_avg *(for contrast)* |
+|---|---|---|---|
+| *(none — the leg above)* | **0 / 0 / $0.00** | **0 / 0 / $0.00** | 6 / 49 / −$2.37 |
+| `basis_guard_bp` 6,8 → 0.1 | 0 / 0 / $0.00 | 1 / 1 / +$1.12 | 29 / 357 / −$2,986.08 |
+| `min_fair` 0.97 → 0.50 | 0 / 0 / $0.00 | 0 / 0 / $0.00 | 6 / 49 / −$2.37 |
+| `min_edge` → 0.001 | 0 / 0 / $0.00 | 1 / 2 / +$0.99 | 8 / 52 / −$31.58 |
+| `max_price` → 0.999 | 0 / 0 / $0.00 | 0 / 0 / $0.00 | 6 / 49 / −$2.37 |
+| `quiesce_secs` 20 → 0 | 0 / 0 / $0.00 | 0 / 0 / $0.00 | 6 / 49 / −$2.37 |
+| `clip_cooldown_s` → 0 | 0 / 0 / $0.00 | 0 / 0 / $0.00 | 6 / 49 / −$2.37 |
+| **every book-side gate at once**, θ + guard LIVE | **0 / 0 / $0.00** | 2 / 7 / +$0.41 | 8 / 55 / −$44.30 |
+| **every gate at once except θ** | **0 / 0 / $0.00** | 5 / 12 / +$2.11 | 30 / 389 / −$3,463.49 |
+| **`theta` 0.3 → 0** | **6 / 7 / −$1.73** | **13 / 22 / −$184.12** | 16 / 63 / −$155.97 |
+| everything, θ included | 25 / 49 / −$70.83 | 31 / 93 / −$414.61 | 32 / 428 / −$3,146.32 |
 
-θ is **necessary and sufficient**. And it has to go all the way to zero —
-the sweep:
+For **terminal**, θ is **necessary and sufficient**: every other single
+relaxation is zero, every combination that keeps θ live is zero, and θ→0 on
+its own opens it. For **hybrid** θ is sufficient and dominant (13 windows
+against the 1–2 that leak past a guard or edge relaxation) but not strictly
+necessary. The `range_avg` column is there to show what a rule with real
+volume looks like under the same ladder — its guard is carrying $3,000 of
+refused loss, which is the other half of why nothing else in the study
+should be loosened.
+
+θ also has to go all the way to zero for terminal — the sweep:
 
 | θ | 0.30 (live) | 0.25 | 0.20 | 0.15 | 0.10 | 0.05 | 0.00 |
 |---|---|---|---|---|---|---|---|
@@ -320,10 +328,20 @@ still never closes: with `min_fair 0.5`, `min_edge 0.001`,
 fires **zero**.
 
 **The clincher.** At θ = 0 terminal does fire — 7 clips across 6 windows —
-and **every single one lands at `rem` between 210s and 886s**, i.e. outside
-the settlement window entirely, priced on pure diffusion with zero banked
-evidence. That is precisely the trade θ exists to refuse. Turning θ off does
-not buy the terminal rule's edge; it buys a coin flip wearing its name.
+and **every one of those windows opens at `rem` between 365s and 874s**.
+The fully-open leg (49 clips over 25 windows) opens between 210s and 886s.
+**No terminal leg, at any relaxation, ever opens a position inside the
+`rem ≤ 60s` settlement window** — the only region where the rule it is named
+for has banked anything. Every fire it makes is priced on pure diffusion
+with zero banked evidence, which is precisely the trade θ exists to refuse.
+Turning θ off does not buy the terminal rule's edge; it buys a coin flip
+wearing its name.
+
+(hybrid is the honest counter-example and it does not rescue anything:
+`openbuttheta` opens as late as `rem = 20s`, because hybrid's safety is
+`range_avg`'s banked mass over `terminal`'s cushion and the numerator is
+non-zero from the start. Five windows, +$2.11, with every book gate torn
+off. That is the shape of the opportunity, and it is not a business.)
 
 This is the same conclusion `fifteen_stream_fit.md` §3 flagged against
 itself. Its bankability table (hybrid reaching `banked_decided` in 21–28 of
@@ -563,10 +581,9 @@ uv run --project pmtrader python analysis/fifteen_rerun.py survey --work $W/ab \
   --book-tape $W/book-tape-frozen.jsonl --arms-state $W/arms-state-frozen.json \
   --outcomes $W/outcomes-merged.jsonl --rtds-dir $W/home/.pmt/corpus/rtds
 
+# The matrix, the gate-attribution ladder and the depth table, one command.
 WORK=$W analysis/fifteen_rerun.sh
-
-uv run --project pmtrader python analysis/fifteen_rerun.py depth --work $W/ab \
-  --book-tape $W/book-tape-frozen.jsonl --rtds-dir $W/home/.pmt/corpus/rtds
+# LADDER=0 skips the ladder; SETS=/LEGS= narrow the matrix.
 ```
 
 Engine branch `fifteen-rerun` off `master` (4dd28cd); submodule

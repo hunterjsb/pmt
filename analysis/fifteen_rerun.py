@@ -746,6 +746,76 @@ def cmd_depth(a):
     return 0
 
 
+
+# -------------------------------------------------------------- ladder
+
+
+# Gate-attribution ladder. A leg that fires zero clips needs a MECHANISM, not
+# a shrug: each entry relaxes exactly one gate on top of the leg's own live
+# params, so the row that starts firing names the gate that was binding.
+# `openbuttheta` and `bookopen` are the two that decide it — if every
+# book-side gate can be opened at once and the leg still fires nothing, the
+# blocker is model-side.
+LADDER = {
+    "g0":           dict(basis_guard_bp=0.1),
+    "th0":          dict(theta=0.0),
+    "f50":          dict(min_fair=0.5),
+    "e0":           dict(min_edge=0.001, early_min_edge=0.001),
+    "mp":           dict(max_price=0.999),
+    "q0":           dict(quiesce_secs=0.0),
+    "cool0":        dict(clip_cooldown_s=0.0),
+    # theta and the guard stay LIVE; every book-side gate opened.
+    "bookopen":     dict(min_fair=0.5, min_edge=0.001, early_min_edge=0.001,
+                         max_price=0.999, quiesce_secs=0.0),
+    # everything opened EXCEPT theta.
+    "openbuttheta": dict(basis_guard_bp=0.1, min_fair=0.5, min_edge=0.001,
+                         early_min_edge=0.001, max_price=0.999, quiesce_secs=0.0),
+    "open":         dict(basis_guard_bp=0.1, theta=0.0, min_fair=0.5,
+                         min_edge=0.001, early_min_edge=0.001,
+                         max_price=0.999, quiesce_secs=0.0),
+    **{f"th{int(t * 100):03d}": dict(theta=t)
+       for t in (0.05, 0.10, 0.15, 0.20, 0.25)},
+}
+
+
+def cmd_ladder(a):
+    work = pathlib.Path(a.work)
+    n = 0
+    for leg in a.legs.split(","):
+        src_file = work / f"params-{a.group}-{leg}.json"
+        if not src_file.exists():
+            print(f"  (no {src_file})")
+            continue
+        base = json.loads(src_file.read_text())
+        for name, upd in LADDER.items():
+            arr = json.loads(json.dumps(base))
+            for e in arr:
+                e.update(upd)
+            (work / f"params-ladder-{leg}_{name}.json").write_text(json.dumps(arr, indent=1))
+            n += 1
+    print(f"[ladder] {n} params file(s) over {len(base)} window(s)")
+    return 0
+
+
+def cmd_ladder_report(a):
+    work = pathlib.Path(a.work)
+    hdr = f"{'leg':>34} {'fired':>7} {'clips':>7} {'net $':>11} {'first fire rem':>16}"
+    print(hdr + "\n" + "-" * len(hdr))
+    for f in sorted(work.glob("out-ladder-*.jsonl")):
+        rows = [r for r in load_rows(f).values()]
+        fired = [r for r in rows if r["sim"]["fires"]]
+        rems = []
+        for r in fired:
+            end = float(r["slug"].rsplit("-", 1)[1]) + DUR_S
+            if r["sim"]["first_fire_t"]:
+                rems.append(end - r["sim"]["first_fire_t"])
+        span = (f"{min(rems):.0f}-{max(rems):.0f}s" if rems else "-")
+        print(f"{f.stem[len('out-ladder-'):]:>34} {len(fired):>4}/{len(rows):<2} "
+              f"{sum(r['sim']['fires'] for r in fired):>7} "
+              f"{sum(r['sim']['pnl'] or 0.0 for r in rows):>+11.2f} {span:>16}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -771,6 +841,16 @@ def main():
     p.add_argument("--book-tape", default=str(PMT / "engine" / "book-tape.jsonl"))
     p.add_argument("--rtds-dir", default=str(CORPUS / "rtds"))
     p.set_defaults(fn=cmd_depth)
+
+    p = sub.add_parser("ladder")
+    p.add_argument("--work", required=True)
+    p.add_argument("--group", default="pair")
+    p.add_argument("--legs", default="rtds_terminal,rtds_hybrid,rtds_range_avg")
+    p.set_defaults(fn=cmd_ladder)
+
+    p = sub.add_parser("ladder-report")
+    p.add_argument("--work", required=True)
+    p.set_defaults(fn=cmd_ladder_report)
 
     a = ap.parse_args()
     sys.exit(a.fn(a))

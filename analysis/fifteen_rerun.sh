@@ -70,3 +70,21 @@ run "$AB/params-census-rtds.json"   "$AB/out-census-rtds.jsonl"
 
 echo "== report =="
 $PY "$REPO/analysis/fifteen_rerun.py" report --work "$AB" --cap "$CAP"
+
+# The gate-attribution ladder. A leg that fires zero clips needs a mechanism,
+# so each ladder run relaxes exactly ONE gate on top of the leg's live params
+# and the row that starts firing names the gate that was binding.
+if [ "${LADDER:-1}" = "1" ]; then
+  echo "== gate-attribution ladder =="
+  rm -f "$AB"/params-ladder-*.json "$AB"/out-ladder-*.jsonl
+  $PY "$REPO/analysis/fifteen_rerun.py" ladder --work "$AB"
+  for f in "$AB"/params-ladder-*.json; do
+    n=$(basename "$f" .json); n=${n#params-ladder-}
+    run "$f" "$AB/out-ladder-$n.jsonl" >/dev/null
+  done
+  $PY "$REPO/analysis/fifteen_rerun.py" ladder-report --work "$AB"
+fi
+
+echo "== book depth by remaining time =="
+$PY "$REPO/analysis/fifteen_rerun.py" depth --work "$AB" \
+  --book-tape "$BOOK" --rtds-dir "$RTDS"
