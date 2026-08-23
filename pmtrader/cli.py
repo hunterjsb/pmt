@@ -1647,9 +1647,11 @@ def crypto_updown(ref: str, as_json: bool) -> None:
               help="No fires before this fraction of the window has elapsed")
 @click.option("--roll/--no-roll", default=True, show_default=True,
               help="Auto-rearm the next window in the series at close (same budget)")
+@click.option("--clip", type=float, default=25.0, show_default=True,
+              help="Max notional per individual fire (position builds in clips)")
 def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
                side: str | None, quiesce: float, min_fair: float, min_elapsed: float,
-               roll: bool) -> None:
+               roll: bool, clip: float) -> None:
     """Arm the pmengine updown trigger on a market.
 
     Prices the market (semantics, vol, fee) and hands the parameters to the
@@ -1672,7 +1674,7 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         "sigma_bp_per_min": r["sigma_bp_per_min"], "fee_rate": r["fee_rate"],
         "size_usdc": size, "min_edge": min_edge, "max_price": max_price,
         "quiesce_secs": quiesce, "min_fair": min_fair, "min_elapsed_frac": min_elapsed,
-        "roll": roll,
+        "roll": roll, "clip_usdc": clip,
     }
     if side:
         payload["side_filter"] = side
