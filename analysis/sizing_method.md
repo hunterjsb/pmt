@@ -46,7 +46,8 @@ and how sure are we".
 Two consequences worth stating out loud because the live ladder violates both:
 
 * **Size cannot create edge.** Only entering cheaper or picking better can.
-  Doubling an arm doubles the sign of whatever edge it already has.
+  Doubling an arm doubles the exposure to whatever sign the edge already carries,
+  and past the growth optimum it makes a positive edge lose money faster.
 * **The all-time ledger is exactly the signature of over-betting a real edge.**
   257W–23L (91.8%) and **−$565.75** on $25,478 of notional. A fleet that wins
   92% of its windows and loses money is not a fleet with no edge; it is a fleet

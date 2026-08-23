@@ -136,6 +136,21 @@ R3 → R5/R6/R1 → R7/R8/R9.
   post-haircut edge; hard per-window %-of-bankroll cap; no size increases until each p-bucket
   shows calibration over ≥30 decided windows. (Current reality check: stated fair ≥0.95 hits 92%.)
   Variance for sizing/quoting on a binary is Bernoulli: σ² = p(1−p) (issue #3, tfrmma).
+  - **METHODOLOGY LANDED 2026-08-23 — `analysis/sizing_method.md` + `sizing_method.py`,
+    recommendations awaiting operator review.** Sizes now derive from the wallet-graded
+    record instead of hand-scaled history. Per arm, era- and feed-weighted: the payoff is
+    measured on WINNING windows only (the loss leg is exactly −100% of notional in all 280
+    graded windows, so **break-even win rate == the price we pay**), the win rate is shrunk
+    toward that break-even with a 30-window prior, quarter-Kelly follows. The fleet budget is
+    derived twice — bottom-up (Σ per-arm quarter-Kelly × N_eff/N, N_eff = N/(1+(N−1)ρ) at
+    the measured ρ=0.767) and top-down (empirical Kelly over the fleet-SLOT return
+    distribution) — and taken at the minimum: **$92, replacing the un-derived $500 cap**.
+    Headline: the live ladder is **6.5× the correlation-adjusted full Kelly**, and at $2,400
+    of concurrent exposure the 17:15Z five-arm slot (−100%) exceeds the account. The
+    size-INCREASE gate is now checkable: an arm goes up only when its 90% Wilson lower bound
+    clears its own break-even — **today no arm does** (xrp +55 windows away, sol +84, eth
+    +523, btc never at its current win rate). Re-derive on any era boundary, feed change,
+    ±25% bankroll move, multi-arm loss event, ≥50% n_eff growth, or weekly.
 - **R3 Odds discipline** — test a max entry price (~0.70) for non-banked entries on the corpus.
   External research says high-price "sure things" are poor risk/reward after fees; our own tape
   can confirm or refute before we adopt it.
