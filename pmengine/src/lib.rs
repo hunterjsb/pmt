@@ -31,6 +31,7 @@ pub mod position;
 #[cfg(private_strategies)]
 pub mod replay;
 pub mod risk;
+pub mod series_guard;
 pub mod strategy;
 pub mod strategies;
 pub mod wsfeed;
@@ -46,6 +47,7 @@ pub use order::OrderManager;
 pub use orderbook::{BookAgeStats, BookSource, Level, MarketDataHub, MarketEvent, OrderBook};
 pub use position::{Fill, Position, PositionTracker};
 pub use risk::{RiskLimits, RiskManager};
+pub use series_guard::{SeriesAllowlist, SERIES_ALLOWLIST_VAR};
 pub use strategy::{MarketInfo, Signal, Strategy, StrategyContext, StrategyRuntime, Urgency};
 
 /// Re-export commonly used types from dependencies

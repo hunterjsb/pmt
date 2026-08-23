@@ -99,8 +99,25 @@ Stored in `.env` at repo root. Key variables:
 ```
 PM_PRIVATE_KEY=0x...
 PM_FUNDER_ADDRESS=0x...
-PM_SIGNATURE_TYPE=0|1|2  # 0=EOA, 1=Poly Proxy, 2=GnosisSafe
+PM_SIGNATURE_TYPE=0|1|2|3  # 0=EOA, 1=Poly Proxy, 2=GnosisSafe, 3=deposit wallet
+PMENGINE_SERIES_ALLOWLIST=  # optional; see "Series partition" below
 ```
+
+**Deposit wallets** (`3` / POLY_1271, the post-2026-05-04 account class): funder
+is a CONTRACT that validates orders via EIP-1271, and the order signature is an
+ERC-7739 wrapper rather than a bare ECDSA blob. Auth (L1 + L2) is unchanged.
+See `docs/deposit-wallet.md`; the signing shape is pinned to the Python
+reference by `pmengine/tests/poly1271_golden.rs`.
+
+**Series partition** (`PMENGINE_SERIES_ALLOWLIST`): comma-separated slug
+PREFIXES this engine may trade, e.g. `xrp-updown-5m,sol-updown-5m`. Two engines
+under one operator account must never share a series — their orders sit on the
+same book under the same wallet, so one can match the other's resting quote,
+which is wash-trade shaped. Arms outside the list are refused by
+`StrategyRuntime`; rolls and recovered arms are refused inside `updown` (a roll
+chain re-arms itself without passing through the control plane). **Unset =
+unpartitioned**, byte-identical to an engine that predates the guard, so the
+desktop needs no change.
 
 ## Strategy Workflow
 
