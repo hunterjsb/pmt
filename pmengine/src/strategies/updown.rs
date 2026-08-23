@@ -134,6 +134,14 @@ pub(crate) struct ArmParams {
     /// at 0.57 — the clock says "go" long before the evidence does.
     #[serde(default)]
     pub theta: f64,
+    /// Settlement rule the model prices. "range_avg" = the pre-2026-08-23
+    /// belief (whole-range TWAP average); "terminal" = the empirically
+    /// verified rule (the 60s-TWAP stream's value at range END vs start —
+    /// see docs/LESSONS.md settlement-rule discovery; terminal matched
+    /// 93-99% of 3,193 gamma resolutions vs 86-88% for range_avg).
+    /// Default stays range_avg until the replay A/B promotes terminal.
+    #[serde(default = "d_settle_rule")]
+    pub settle_rule: String,
     /// Assumed max adversarial spot push (bp) for the flip-proof test.
     /// Boundary manipulators shove Binance in the final seconds; when the
     /// banked margin exceeds even that push times the remaining weight,
@@ -166,6 +174,7 @@ pub(crate) fn d_late_rem() -> f64 { 120.0 }
 fn d_rho_block() -> f64 { -0.25 }
 fn d_manip_push() -> f64 { 25.0 }
 fn d_p_cap() -> f64 { 1.0 }
+fn d_settle_rule() -> String { "range_avg".to_string() }
 /// Flip-proof buys stay live until this close to resolution.
 const FLIP_BUY_CUTOFF_S: f64 = 8.0;
 

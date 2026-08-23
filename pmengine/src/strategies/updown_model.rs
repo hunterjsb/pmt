@@ -252,6 +252,12 @@ pub(crate) fn eval_model(
                 margin_bp: (spot / open - 1.0) * 1e4, banked_margin_bp: 0.0, cushion_bp: 0.0,
                 guard_bp: effective_guard_bp,
             })
+        } else if p.settle_rule == "terminal" {
+            let ref_px = *f
+                .per_min
+                .get(&(p.start as i64 - 60))
+                .ok_or("range-start reference not printed yet")?;
+            return eval_terminal(p, now, spot, ref_px, sig_frac, sig_bp, rho, effective_guard_bp);
         } else {
             let ref_px = *f
                 .per_min
@@ -343,6 +349,97 @@ pub(crate) fn eval_model(
 /// worst case limit still clears edge_req. max_price stays the hard cap.
 pub(crate) fn pay_up_limit(ask: f64, net: f64, edge_req: f64, pay_up_max: f64, max_price: f64) -> f64 {
     (ask + (net - edge_req).max(0.0).min(pay_up_max)).min(max_price)
+}
+
+/// Settlement TWAP width for a window: 30s for 5m markets, 60s otherwise
+/// (the post-2026-08-07 Chainlink stream widths).
+pub(crate) fn settle_tw_secs(window_secs: f64) -> f64 {
+    if window_secs <= 300.0 { 30.0 } else { 60.0 }
+}
+
+/// Terminal-rule pricing: these markets settle on the 60s-TWAP stream's
+/// value at range END vs its value at range start — NOT the whole-range
+/// average (verified 2026-08-23 against 3,193 resolutions; see
+/// docs/LESSONS.md). Consequences priced here:
+///   - Before the settlement window opens, NOTHING is locked: p_up is
+///     pure diffusion of spot to the TWAP's center of mass, margin is
+///     spot-vs-ref, banked/safety are honestly zero (the old "banked
+///     mass" was a momentum proxy, not settlement arithmetic).
+///   - Inside the final TW seconds, the forming settlement TWAP locks
+///     linearly: banked = the elapsed share of the TWAP already beyond
+///     reach, cushion = residual diffusion of the unformed share. The
+///     banked_decided / flip_proof semantics regain literal truth here.
+#[allow(clippy::too_many_arguments)]
+fn eval_terminal(
+    p: &ArmParams,
+    now: f64,
+    spot: f64,
+    ref_px: f64,
+    sig_frac: f64,
+    sig_bp: f64,
+    rho: f64,
+    effective_guard_bp: f64,
+) -> Result<ModelEval, GateReason> {
+    let rem = (p.end - now).max(0.0);
+    let tw = settle_tw_secs(p.end - p.start);
+    let margin_bp = (spot / ref_px - 1.0) * 1e4;
+
+    if rem <= 0.0 {
+        let p_up = if spot >= ref_px { 1.0 } else { 0.0 };
+        return Ok(ModelEval {
+            p_up, sig_bp, banked_decided: true, flip_proof: true, rho,
+            margin_bp, banked_margin_bp: margin_bp, cushion_bp: effective_guard_bp,
+            guard_bp: effective_guard_bp,
+        });
+    }
+
+    let (banked_margin_bp, cushion_bp, horizon_min) = if rem > tw {
+        // Settlement window not open: diffuse to its center (~tw/2 before
+        // the wire). Nothing locked; cushion is 1σ of that terminal move
+        // plus the oracle guard.
+        let h = ((rem - tw / 2.0) / 60.0).max(0.02);
+        (0.0, effective_guard_bp + sig_frac * h.sqrt() * 1e4, h)
+    } else {
+        // Inside the forming TWAP: elapsed share locks at ~spot (the
+        // stream barely wanders inside <60s except by jump — the minute-
+        // grain feed can't resolve finer, and spot is the live stream's
+        // best proxy). Residual = diffusion of the unformed share.
+        let locked_frac = ((tw - rem) / tw).clamp(0.0, 1.0);
+        let h = (rem / 60.0).max(0.02);
+        let banked = margin_bp * locked_frac;
+        let cushion = effective_guard_bp
+            + sig_frac * (h / 3.0).sqrt() * 1e4 * (1.0 - locked_frac);
+        (banked, cushion, h)
+    };
+
+    if margin_bp.abs() < effective_guard_bp {
+        return Err(GateReason {
+            reason: format!(
+                "basis guard: terminal margin {:+.1}bp inside {:.1}bp noise band [banked {:+.1}bp cushion {:.1}bp]",
+                margin_bp, effective_guard_bp, banked_margin_bp, cushion_bp
+            ),
+            margin_bp: Some(margin_bp),
+            banked_bp: Some(banked_margin_bp),
+            cushion_bp: Some(cushion_bp),
+            guard_bp: Some(effective_guard_bp),
+        });
+    }
+
+    let p_up = if ref_px <= 0.0 || spot <= 0.0 {
+        0.5
+    } else {
+        1.0 - norm_cdf((ref_px / spot).ln() / (sig_frac * horizon_min.sqrt()))
+    };
+    debug_assert!(p_up.is_finite());
+    let banked_decided =
+        banked_margin_bp.abs() > cushion_bp && (banked_margin_bp > 0.0) == (p_up > 0.5);
+    let flip_proof = banked_decided
+        && banked_margin_bp.abs()
+            > effective_guard_bp + p.manip_push_bp * (rem / tw).min(1.0);
+    Ok(ModelEval {
+        p_up, sig_bp, banked_decided, flip_proof, rho,
+        margin_bp, banked_margin_bp, cushion_bp, guard_bp: effective_guard_bp,
+    })
 }
 
 /// Signed safety for one side: banked evidence divided by the residual
@@ -701,5 +798,55 @@ mod tests {
         assert!(m.p_up.is_finite(), "p_up must never be NaN");
         assert!((m.p_up - 1.0).abs() < 1e-9, "banked beyond reach = up certain");
         assert!(m.banked_decided, "an unreachable margin is decided");
+    }
+
+    #[test]
+    fn settle_tw_widths_by_duration() {
+        assert_eq!(settle_tw_secs(300.0), 30.0);
+        assert_eq!(settle_tw_secs(900.0), 60.0);
+        assert_eq!(settle_tw_secs(14400.0), 60.0);
+    }
+
+    #[test]
+    fn terminal_rule_banks_nothing_before_the_settlement_window() {
+        let mut p = params("s");
+        p.settle_rule = "terminal".into();
+        let (mut f, now) = feed_with(105.0, 100.5); // +50bp spot margin
+        f.spot_ts = now;
+        let m = eval_model(&p, &f, now, p.basis_guard_bp).unwrap();
+        assert_eq!(m.banked_margin_bp, 0.0, "range history must not count");
+        assert!(!m.banked_decided);
+        assert!(m.p_up > 0.9, "+50bp vs 3bp/min over ~1min is near-certain");
+        assert!((m.margin_bp - 50.0).abs() < 1.0);
+        // A stormy sigma over the same margin must soften the read.
+        p.sigma_bp_per_min = 60.0;
+        let stormy = eval_model(&p, &f, now, p.basis_guard_bp).unwrap();
+        assert!(stormy.p_up > 0.5 && stormy.p_up < 0.9,
+                "diffusion softens under vol: {}", stormy.p_up);
+    }
+
+    #[test]
+    fn terminal_rule_locks_inside_the_forming_twap() {
+        let mut p = params("s"); // 900s window -> tw 60
+        p.settle_rule = "terminal".into();
+        let (mut f, _) = feed_with(105.0, 100.5);
+        let now = p.end - 15.0; // 45s of the 60s TWAP formed
+        f.spot_ts = now;
+        let m = eval_model(&p, &f, now, p.basis_guard_bp).unwrap();
+        assert!((m.banked_margin_bp - 50.0 * 0.75).abs() < 1.0, "3/4 locked");
+        assert!(m.banked_decided, "+37bp locked vs a small residual cushion");
+    }
+
+    #[test]
+    fn terminal_rule_range_history_cannot_fake_certainty() {
+        // The sol15 shape: 13 banked minutes far above ref, spot back AT ref.
+        // range_avg called this decided; terminal must call it a coin flip
+        // (margin inside the guard -> gated).
+        let mut p = params("s");
+        p.settle_rule = "terminal".into();
+        let (mut f, now) = feed_with(105.0, 100.001); // spot ~ref
+        f.spot_ts = now;
+        let err = eval_model(&p, &f, now, p.basis_guard_bp).unwrap_err();
+        assert!(err.reason.contains("terminal margin"), "{}", err.reason);
     }
 }
