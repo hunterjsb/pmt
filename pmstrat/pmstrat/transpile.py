@@ -614,10 +614,15 @@ class RustCodeGen:
         return f'''//! Auto-generated from Python strategy: {self.meta.name}
 //! DO NOT EDIT - regenerate with `pmstrat transpile`
 
-use crate::strategy::{{Signal, Strategy, StrategyContext, Urgency}};
+use crate::strategy::{{Signal, Strategy, StrategyContext}};
+// Only order-placing strategies reach these; an inert one must still compile
+// warning-free under the clippy gate.
+#[allow(unused_imports)]
+use crate::strategy::Urgency;
 use crate::position::Fill;
 #[allow(unused_imports)]
 use rust_decimal::Decimal;
+#[allow(unused_imports)]
 use rust_decimal_macros::dec;
 
 {constants}pub struct {self.struct_name} {{
@@ -1431,6 +1436,12 @@ impl Strategy for {self.struct_name} {{
                 else:
                     # &str type (constant, param) or iteration variable - pass directly
                     result.append(var_name)
+            elif isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                # A bare string literal is already &'static str — exactly what
+                # HashMap<String, _>::get wants (String: Borrow<str>). The
+                # generic path would wrap it in .to_string() and hand the map
+                # an owned String by value, which doesn't compile.
+                result.append(f'"{arg.value}"')
             else:
                 # Not a name - generate normally (string literals, etc.)
                 result.append(self._gen_expr(arg))
@@ -1976,6 +1987,9 @@ class StrategyFileInfo:
     struct_name: str
     # True when the file asks for `pub(crate) mod` instead of a private `mod`.
     pub_crate: bool = False
+    # True when the file lives in the private/ submodule mount: its mod decl,
+    # re-export and registry insert are all wrapped in #[cfg(private_strategies)].
+    private: bool = False
 
 
 @dataclass
@@ -1987,6 +2001,8 @@ class HelperFileInfo:
     strategies), so they are declared `pub(crate)`.
     """
     module_name: str
+    # Same cfg treatment as a private strategy — see StrategyFileInfo.private.
+    private: bool = False
 
 
 # A strategy file can ask for crate-wide module visibility by carrying this
@@ -2032,61 +2048,121 @@ def scan_strategy_file(path: Path) -> StrategyFileInfo | None:
 
 def scan_strategies_dir(
     strategies_dir: Path,
+    include_private: bool = True,
 ) -> tuple[list[StrategyFileInfo], list[HelperFileInfo]]:
-    """Classify every .rs file in the strategies dir.
+    """Classify every .rs file in the strategies dir, plus private/ if mounted.
 
     Returns (strategies, helpers), both sorted by module name. A file is a
     strategy if it has a `pub struct X` with an `impl Strategy for X`;
-    everything else is a helper module that still needs declaring.
+    everything else is a helper module that still needs declaring. Files
+    found under `strategies_dir/private/` (the pmt-strategies submodule
+    mount) are classified by the same rules and flagged `private=True` so
+    the generator can cfg-gate them. A module stem present in BOTH dirs is
+    ambiguous — hard error, never a silent shadow.
     """
     files = [f for f in sorted(strategies_dir.glob("*.rs")) if f.name != "mod.rs"]
 
+    private_files: list[Path] = []
+    if include_private:
+        private_dir = strategies_dir / "private"
+        # The .rs glob skips the submodule's README / fixtures / CI files.
+        private_files = [
+            f for f in sorted(private_dir.glob("*.rs")) if f.name != "mod.rs"
+        ]
+
+    public_stems = {f.stem for f in files}
+    for f in private_files:
+        if f.stem in public_stems:
+            public_path = strategies_dir / f.name
+            raise RuntimeError(
+                f"module '{f.stem}' exists both publicly and privately: "
+                f"{public_path} vs {f} — remove one; a private strategy "
+                "must not be shadowed by a public file of the same name"
+            )
+
     strategies: list[StrategyFileInfo] = []
     helpers: list[HelperFileInfo] = []
-    for f in files:
+    for f, is_private in [(f, False) for f in files] + [(f, True) for f in private_files]:
         info = scan_strategy_file(f)
         if info:
+            info.private = is_private
             strategies.append(info)
         else:
-            helpers.append(HelperFileInfo(module_name=f.stem))
+            helpers.append(HelperFileInfo(module_name=f.stem, private=is_private))
 
     strategies.sort(key=lambda s: s.module_name)
     helpers.sort(key=lambda h: h.module_name)
     return strategies, helpers
 
 
-def generate_mod_rs(strategies_dir: Path) -> str:
+def generate_mod_rs(strategies_dir: Path, public: bool = False) -> str:
     """Generate mod.rs content with registry for all strategies in directory.
+
+    Files under `strategies_dir/private/` (the pmt-strategies submodule
+    mount) keep their `crate::strategies::<name>` module paths via
+    `#[path = "private/<file>.rs"]` declarations, and every private item —
+    mod decl, re-export, registry insert — is wrapped in
+    `#[cfg(private_strategies)]` (set by pmengine's build.rs when the
+    submodule is present). The SAME committed mod.rs therefore compiles in
+    both a public clone (no submodule) and a private checkout.
 
     Args:
         strategies_dir: Path to the pmengine/src/strategies directory
+        public: Skip private/ entirely and emit the public form. Local
+            iteration escape hatch only — never commit its output; the
+            canonical mod.rs is regenerated with the submodule inited.
 
     Returns:
         Generated Rust code for mod.rs
     """
-    strategies, helpers = scan_strategies_dir(strategies_dir)
+    strategies, helpers = scan_strategies_dir(
+        strategies_dir, include_private=not public
+    )
+
+    def _decl(name: str, visibility: str, private: bool) -> str:
+        if private:
+            return (
+                "#[cfg(private_strategies)]\n"
+                f'#[path = "private/{name}.rs"]\n'
+                f"{visibility}mod {name};"
+            )
+        return f"{visibility}mod {name};"
 
     # Generate mod declarations — strategies and helper modules interleaved
-    # in one alphabetical block, each with the visibility its file asks for.
+    # in one alphabetical block across both dirs, each with the visibility
+    # its file asks for.
     mod_lines: dict[str, str] = {
-        s.module_name: f"{'pub(crate) ' if s.pub_crate else ''}mod {s.module_name};"
+        s.module_name: _decl(
+            s.module_name, "pub(crate) " if s.pub_crate else "", s.private
+        )
         for s in strategies
     }
     for h in helpers:
-        mod_lines[h.module_name] = f"pub(crate) mod {h.module_name};"
+        mod_lines[h.module_name] = _decl(h.module_name, "pub(crate) ", h.private)
     mod_decls = "\n".join(mod_lines[name] for name in sorted(mod_lines))
 
     # Generate pub use statements
-    pub_uses = "\n".join(f"pub use {s.module_name}::{s.struct_name};" for s in strategies)
+    pub_uses = "\n".join(
+        ("#[cfg(private_strategies)]\n" if s.private else "")
+        + f"pub use {s.module_name}::{s.struct_name};"
+        for s in strategies
+    )
 
     # Generate registry entries
     registry_entries = []
     for s in strategies:
-        registry_entries.append(f'''    m.insert("{s.module_name}", StrategyInfo {{
+        gate = "    #[cfg(private_strategies)]\n" if s.private else ""
+        registry_entries.append(f'''{gate}    m.insert("{s.module_name}", StrategyInfo {{
         factory: || Box::new({s.module_name}::{s.struct_name}::new()),
     }});''')
 
     registry_body = "\n\n".join(registry_entries)
+
+    # With zero unconditional inserts a public build sees `let mut m` never
+    # mutated — clippy fails on unused_mut. Only reachable if every strategy
+    # went private; the in-tree example keeps one unconditional insert.
+    all_private = all(s.private for s in strategies) if strategies else True
+    registry_allow = "#[allow(unused_mut)]\n" if all_private else ""
 
     return f'''//! Auto-generated strategy registry - DO NOT EDIT MANUALLY
 //! Regenerate with: pmstrat transpile --all
@@ -2098,6 +2174,13 @@ def generate_mod_rs(strategies_dir: Path) -> str:
 //! A strategy file that needs crate-wide visibility of its own module says so
 //! in the file with a `// pmstrat: pub(crate)` marker line — nothing here is
 //! hand-maintained.
+//!
+//! Files under `private/` (the pm-trade/pmt-strategies submodule mount) keep
+//! their `crate::strategies::<name>` module paths via `#[path]` declarations;
+//! their every item here is gated on `cfg(private_strategies)`, set by
+//! build.rs when the submodule is initialized. This one committed file
+//! compiles identically in public clones (no submodule) and private
+//! checkouts — regenerate it with the submodule inited.
 
 {mod_decls}
 
@@ -2116,7 +2199,7 @@ pub struct StrategyInfo {{
 ///
 /// This function is called by the engine to look up strategies by name.
 /// The registry is auto-generated by `pmstrat transpile --all`.
-pub fn registry() -> HashMap<&'static str, StrategyInfo> {{
+{registry_allow}pub fn registry() -> HashMap<&'static str, StrategyInfo> {{
     let mut m = HashMap::new();
 
 {registry_body}
@@ -2126,14 +2209,49 @@ pub fn registry() -> HashMap<&'static str, StrategyInfo> {{
 '''
 
 
-def regenerate_mod_rs(strategies_dir: Path) -> None:
+def _private_submodule_declared(strategies_dir: Path) -> bool:
+    """True when a .gitmodules up the tree declares strategies_dir/private
+    as a submodule mount — i.e. this checkout is SUPPOSED to have private
+    strategies, whether or not the submodule is initialized."""
+    private_dir = (strategies_dir / "private").resolve()
+    for parent in [strategies_dir, *strategies_dir.resolve().parents]:
+        gitmodules = parent / ".gitmodules"
+        if not gitmodules.is_file():
+            continue
+        for line in gitmodules.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("path") and "=" in line:
+                declared = line.split("=", 1)[1].strip()
+                if (parent / declared).resolve() == private_dir:
+                    return True
+    return False
+
+
+def regenerate_mod_rs(strategies_dir: Path, public: bool = False) -> None:
     """Regenerate mod.rs in the given strategies directory.
+
+    Refuses when the repo declares the private-strategies submodule but the
+    mount is empty (uninitialized): generating there would emit a mod.rs
+    with no private decls — committing that would drop every private
+    strategy from the engine. `public=True` knowingly emits the public form
+    anyway (local iteration only; never commit it).
 
     Args:
         strategies_dir: Path to the pmengine/src/strategies directory
+        public: Skip private/ and bypass the uninitialized-submodule guard.
     """
+    if not public:
+        private_dir = strategies_dir / "private"
+        has_private_rs = any(private_dir.glob("*.rs"))
+        if _private_submodule_declared(strategies_dir) and not has_private_rs:
+            raise RuntimeError(
+                "pmt-strategies submodule not initialized — run: "
+                "git submodule update --init --checkout "
+                "pmengine/src/strategies/private, or pass --public to "
+                "knowingly emit the public form"
+            )
     mod_rs_path = strategies_dir / "mod.rs"
-    content = generate_mod_rs(strategies_dir)
+    content = generate_mod_rs(strategies_dir, public=public)
     mod_rs_path.write_text(content)
 
 
@@ -2526,8 +2644,13 @@ fn test_strategy_instantiation() {{
 '''
 
 
-def generate_tests(strategy_func: Callable) -> str:
-    """Generate Rust test code for a strategy."""
+def generate_tests(strategy_func: Callable, private: bool = False) -> str:
+    """Generate Rust test code for a strategy.
+
+    A private strategy's test file opens with `#![cfg(private_strategies)]`
+    so it compiles to an empty (cleanly skipped) test crate in a checkout
+    without the pmt-strategies submodule.
+    """
     meta = get_strategy_meta(strategy_func)
     if meta is None:
         raise ValueError("Function must be decorated with @strategy")
@@ -2540,12 +2663,17 @@ def generate_tests(strategy_func: Callable) -> str:
     )
 
     generator = RustTestGenerator(config)
-    return generator.generate()
+    code = generator.generate()
+    if private:
+        code = "#![cfg(private_strategies)]\n\n" + code
+    return code
 
 
-def generate_tests_to_file(strategy_func: Callable, output_path: str) -> None:
+def generate_tests_to_file(
+    strategy_func: Callable, output_path: str, private: bool = False
+) -> None:
     """Generate Rust tests and write to a file."""
-    test_code = generate_tests(strategy_func)
+    test_code = generate_tests(strategy_func, private=private)
     with open(output_path, 'w') as f:
         f.write(test_code)
 

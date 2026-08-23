@@ -4,7 +4,8 @@ characterization fixture for pmengine's replay harness.
 Reads the local corpus only: no network, and it never writes to a tape. The
 window must be wallet-graded, because a fixture is the ground truth other
 measurements get checked against (docs/LESSONS.md#L36). See
-pmengine/fixtures/README.md for what a fixture is and what a failing one means.
+the fixtures README (in the pmt-strategies submodule) for what a fixture is and
+what a failing one means.
 
 Its own module because it is a build tool with a build tool's dependencies —
 the pmengine binary, the repo layout, a secret scan — that no reporting
@@ -114,7 +115,9 @@ def _rtds_gap(coverage: tuple[float, float] | None, symbol: str,
 @click.command("fixture")
 @click.argument("slug")
 @click.option("--out", "out_dir", default=None,
-              help="Fixture directory (default: pmengine/fixtures)")
+              help="Fixture directory (default: pmengine/src/strategies/private/fixtures"
+                   " — the pmt-strategies submodule; fixtures embed as-armed params"
+                   " and must never land in the public repo)")
 @click.option("--mode", type=click.Choice(["auto", "evals", "full"]), default="auto",
               show_default=True,
               help="auto = full when the book tape and klines cover the window")
@@ -159,7 +162,13 @@ def crypto_fixture(slug: str, out_dir: str | None, mode: str, teaches: str | Non
         raise click.UsageError(f"not an updown slug: {slug!r}")
     start, end = parsed["start"], parsed["end"]
 
-    out_path = Path(out_dir) if out_dir else _repo_root() / "pmengine" / "fixtures"
+    # Default into the pmt-strategies submodule mount: a fresh capture embeds
+    # the arm's as-armed params — alpha that must never land in public pmt.
+    out_path = (
+        Path(out_dir)
+        if out_dir
+        else _repo_root() / "pmengine" / "src" / "strategies" / "private" / "fixtures"
+    )
     out_path.mkdir(parents=True, exist_ok=True)
     dest = out_path / f"{slug}.json"
     prior: dict = {}

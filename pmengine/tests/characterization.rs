@@ -1,5 +1,6 @@
 //! The committed characterization suite: every fixture under
-//! `pmengine/fixtures/` replayed through decide() on every `cargo test`.
+//! `pmengine/src/strategies/private/fixtures/` (the pmt-strategies
+//! submodule) replayed through decide() on every `cargo test`.
 //!
 //! A failure here is a finding, not a chore. It means the decision core
 //! changed behaviour on a trade that actually happened, with real money —
@@ -11,11 +12,19 @@
 //! fixture runner never reaches `klines_for_window` — replay's only network
 //! path. `characterization_offline.rs` proves the `~/.pmt` half.
 
+// No pmt-strategies submodule -> no updown, no replay tree, no fixtures:
+// this whole crate compiles to zero tests and skips cleanly. The documented
+// private gate sets PMENGINE_EXPECT_PRIVATE=1 so tests/flavor.rs fails
+// loudly if this skip ever happens where the private flavor was expected.
+#![cfg(private_strategies)]
+
 use pmengine::replay::fixtures::{self, Fixture};
 use std::path::PathBuf;
 
 fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+    // Inside the pmt-strategies submodule mount: the fixtures embed as-armed
+    // params/tunables — live alpha — so they live with the private code.
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/strategies/private/fixtures")
 }
 
 fn all_fixtures() -> Vec<(PathBuf, Fixture)> {

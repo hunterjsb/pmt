@@ -53,11 +53,17 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/pmengine-}" >> $GITHUB_OUTPUT
 
+      # NEVER add submodule checkout to this workflow: the artifact lands on
+      # a public release page — compiled private strategies must not.
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
           name: pmengine ${{ steps.version.outputs.version }}
           files: pmengine/pmengine-*.tar.gz
           generate_release_notes: true
+          body: |
+            **Public flavor** — private strategies not included. This build
+            carries only the in-tree example strategy; it is not the binary
+            the live engine runs.
 
   # Deploy step removed 2026-05-17 — no EC2 target exists. pmengine is dormant until we provision a new execution host.

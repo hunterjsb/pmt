@@ -9,6 +9,10 @@
 //! dependency on the corpus fails loudly here instead of on a fresh
 //! checkout six months from now.
 
+// Skips cleanly without the pmt-strategies submodule — see
+// characterization.rs for why, and tests/flavor.rs for the loud-skip guard.
+#![cfg(private_strategies)]
+
 use pmengine::replay::fixtures;
 use std::path::PathBuf;
 
@@ -21,7 +25,8 @@ fn the_suite_passes_with_no_pmt_directory() {
     std::env::set_var("HOME", &fake_home);
     assert!(!fake_home.join(".pmt").exists(), "the fake home must be empty");
 
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/strategies/private/fixtures");
     for path in fixtures::fixture_paths(&dir).expect("fixtures directory") {
         let fx = fixtures::load_fixture(&path).unwrap_or_else(|e| panic!("{}", e));
         let res = fixtures::run_fixture(&fx)

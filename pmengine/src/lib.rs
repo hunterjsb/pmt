@@ -21,10 +21,14 @@ pub mod config;
 pub mod control;
 pub mod engine;
 pub mod gamma;
+pub(crate) mod jsonl;
 pub mod order;
 pub mod order_tape;
 pub mod orderbook;
 pub mod position;
+// The replay tree is the updown decision-core harness end to end — it only
+// exists when the private strategies do.
+#[cfg(private_strategies)]
 pub mod replay;
 pub mod risk;
 pub mod strategy;

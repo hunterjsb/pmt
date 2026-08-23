@@ -19,7 +19,12 @@ import pytest
 from polymarket import eras
 from polymarket.eras import Era
 
-_FIXTURES = Path(__file__).resolve().parents[2] / "pmengine" / "fixtures"
+# Fixtures live in the private pmt-strategies submodule; a public checkout has
+# no evidence half, so those tests skip rather than fail.
+_FIXTURES = (
+    Path(__file__).resolve().parents[2]
+    / "pmengine" / "src" / "strategies" / "private" / "fixtures"
+)
 
 
 def _reg(*pairs) -> tuple[Era, ...]:
@@ -166,7 +171,7 @@ def test_current_agrees_with_for_start_on_the_same_instant():
 
 def _fixture_eras() -> list[tuple[str, float, list[str]]]:
     if not _FIXTURES.is_dir():
-        pytest.skip("pmengine/fixtures not in this checkout")
+        pytest.skip("pmt-strategies fixtures not mounted in this checkout")
     out = []
     for p in sorted(_FIXTURES.glob("*.json")):
         d = json.loads(p.read_text())

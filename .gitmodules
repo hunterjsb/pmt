@@ -1,0 +1,7 @@
+[submodule "pmengine/src/strategies/private"]
+	path = pmengine/src/strategies/private
+	url = https://github.com/pm-trade/pmt-strategies.git
+	# Private repo: plain/anonymous clones (incl. --recurse-submodules) skip
+	# this mount instead of failing on the URL. Private devs run the one-time
+	#   git submodule update --init --checkout pmengine/src/strategies/private
+	update = none
