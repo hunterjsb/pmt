@@ -132,8 +132,17 @@ R3 → R5/R6/R1 → R7/R8/R9.
 - **R5 Session + fast-ρ regimes** — add a 5–15m ρ estimate beside the 60m one; in negative-ρ
   regimes allow banked-decided entries only; attribute P&L by session (Asia chop vs London/NY)
   and gate accordingly.
-- **R6 Fat tails** — jump-aware p_up (or a hard p_up cap ≈0.98 unless banked-decided). The
-  once-an-hour >3σ jump rate says the Gaussian overpays exactly where we bet.
+- **R6 Fat tails — MEASURED 2026-08-23, PREMISE REFUTED** (`analysis/r6_tail_flip_study.py`,
+  21 days × 48k simulated windows): conditional flip rate at safety ≥ 1.0 is **~0%** in every
+  symbol × duration × rem bucket — far BETTER than the Gaussian promise (15.9% at 1.0), and
+  the model's p_up is calibrated-to-conservative on its own settlement math (claimed ≥0.95
+  realizes 96.8-99.2%). The wallet's ~92% at stated ≥0.95 is explained by BASIS events, not
+  path reversals: replaying the sol15 −$142 window shows the Binance math was RIGHT (down)
+  and Chainlink settled UP on a ~36bp settlement-boundary divergence — >p99 of SOL's measured
+  basis. Verdicts: cushion widening NOT supported, k=1.0/J=0 stands; `p_cap` (built dark,
+  76d6bfc) stays dark — capping a calibrated model fixes nothing; the residual tail is R1's
+  domain (settlement basis), defended by measured static guards + the dark dynamic guard,
+  and by not trading formats whose basis tail exceeds their guard (sol15's epitaph).
 - **R7 Correlation-aware fleet cap** — cap total un-decided committed notional across arms;
   at ρ 0.7 the arms lose together.
 - **R8 Near-even late-flow guard** — when the book is still ~50/50 in the final 30–60s and

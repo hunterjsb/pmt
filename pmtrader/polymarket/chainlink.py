@@ -68,7 +68,9 @@ BINANCE_SYMBOL = {"btc": "BTCUSDT", "eth": "ETHUSDT", "sol": "SOLUSDT", "xrp": "
 
 # Live per-arm basis guards (ROADMAP.md 2026-08-23): BTC 3bp, alts 6bp, XRP
 # off pending this exact data. DOGE isn't in the live fleet yet — no guard set.
-GUARD_BP: dict[str, float | None] = {"btc": 3.0, "eth": 6.0, "sol": 6.0, "xrp": None, "doge": None}
+# Deployed per-arm guards as of 2026-08-23 (R1 aligned measurement + replay
+# A/B): btc 6, eth 8, sol 10. xrp/doge stay untradeable via Binance proxy.
+GUARD_BP: dict[str, float | None] = {"btc": 6.0, "eth": 8.0, "sol": 10.0, "xrp": None, "doge": None}
 
 CORPUS_DIR = Path.home() / ".pmt" / "corpus"
 

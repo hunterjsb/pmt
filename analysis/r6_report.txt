@@ -1,0 +1,292 @@
+R6 tail-flip study — target lookback 21d, symbols ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+
+COVERAGE
+BTCUSDT: 2026-08-02 05:44 UTC -> 2026-08-23 05:49 UTC  (21.0d, 30246 minutes, 0 gap(s) >1min, +6 fetched this run)
+ETHUSDT: 2026-08-02 05:45 UTC -> 2026-08-23 05:49 UTC  (21.0d, 30245 minutes, 0 gap(s) >1min, +5 fetched this run)
+SOLUSDT: 2026-08-02 05:46 UTC -> 2026-08-23 05:49 UTC  (21.0d, 30244 minutes, 0 gap(s) >1min, +4 fetched this run)
+
+WINDOWS
+  BTCUSDT/5m: total=6049 used=6049 skipped(gap)=0   [sanity: naive 50%-elapsed reversal rate = 10.7% of 6049 windows — pipeline check, unrelated to the cushion; see naive_reversal_rate() docstring]
+  BTCUSDT/15m: total=2016 used=2016 skipped(gap)=0   [sanity: naive 50%-elapsed reversal rate = 13.3% of 2016 windows — pipeline check, unrelated to the cushion; see naive_reversal_rate() docstring]
+  ETHUSDT/5m: total=6048 used=6048 skipped(gap)=0   [sanity: naive 50%-elapsed reversal rate = 11.3% of 6048 windows — pipeline check, unrelated to the cushion; see naive_reversal_rate() docstring]
+  ETHUSDT/15m: total=2015 used=2015 skipped(gap)=0   [sanity: naive 50%-elapsed reversal rate = 13.5% of 2015 windows — pipeline check, unrelated to the cushion; see naive_reversal_rate() docstring]
+  SOLUSDT/5m: total=6048 used=6048 skipped(gap)=0   [sanity: naive 50%-elapsed reversal rate = 11.1% of 6048 windows — pipeline check, unrelated to the cushion; see naive_reversal_rate() docstring]
+  SOLUSDT/15m: total=2015 used=2015 skipped(gap)=0   [sanity: naive 50%-elapsed reversal rate = 12.9% of 2015 windows — pipeline check, unrelated to the cushion; see naive_reversal_rate() docstring]
+
+====================================================================================================
+FLIP-RATE TABLES  (n = # windows whose safety first entered this bucket at this rem; flip% = banked side lost)
+Gaussian 1-tail = 1-norm_cdf(bucket lower edge) — what the model implicitly claims the flip probability is at that safety multiple, IF returns were Gaussian.
+====================================================================================================
+
+--- BTCUSDT / 5m  (guard=6.0bp, windows: total=6049 used=6049 skipped(gap)=0) ---
+safety      gauss 1-tail                 0-60s               60-120s              120-300s              300-600s          600s+ (info)
+0.5-0.75 (info, pre-decided)        30.85%   n=682   flip=  0.0%   n=882   flip=  0.1%   n=598   flip=  0.0%         n=0                   n=0          
+0.75-1.0 (info, pre-decided)        22.66%   n=552   flip=  0.0%   n=563   flip=  0.0%   n=202   flip=  0.0%         n=0                   n=0          
+1.0-1.25          15.87%   n=420   flip=  0.0%   n=352   flip=  0.0%   n=83    flip=  0.0%         n=0                   n=0          
+1.25-1.5          10.56%   n=297   flip=  0.0%   n=222   flip=  0.0%   n=39    flip=  0.0%         n=0                   n=0          
+1.5-2              6.68%   n=262   flip=  0.0%   n=186   flip=  0.0%   n=17    flip=  0.0%         n=0                   n=0          
+2-3                2.28%   n=206   flip=  0.0%   n=90    flip=  0.0%   n=8     flip=  0.0%         n=0                   n=0          
+3-5                0.13%   n=83    flip=  0.0%   n=25    flip=  0.0%   n=2     flip=  0.0%         n=0                   n=0          
+5+                 0.00%   n=21    flip=  0.0%   n=7     flip=  0.0%         n=0                   n=0                   n=0          
+
+--- BTCUSDT / 15m  (guard=6.0bp, windows: total=2016 used=2016 skipped(gap)=0) ---
+safety      gauss 1-tail                 0-60s               60-120s              120-300s              300-600s          600s+ (info)
+0.5-0.75 (info, pre-decided)        30.85%   n=63    flip=  0.0%   n=92    flip=  0.0%   n=399   flip=  0.3%   n=579   flip=  0.2%   n=13    flip=  0.0%
+0.75-1.0 (info, pre-decided)        22.66%   n=82    flip=  0.0%   n=96    flip=  0.0%   n=386   flip=  0.0%   n=320   flip=  0.0%   n=2     flip=  0.0%
+1.0-1.25          15.87%   n=71    flip=  0.0%   n=122   flip=  0.0%   n=311   flip=  0.0%   n=176   flip=  0.0%         n=0          
+1.25-1.5          10.56%   n=71    flip=  0.0%   n=85    flip=  0.0%   n=268   flip=  0.0%   n=98    flip=  0.0%         n=0          
+1.5-2              6.68%   n=59    flip=  0.0%   n=94    flip=  0.0%   n=221   flip=  0.0%   n=51    flip=  0.0%         n=0          
+2-3                2.28%   n=43    flip=  0.0%   n=76    flip=  0.0%   n=134   flip=  0.0%   n=19    flip=  0.0%         n=0          
+3-5                0.13%   n=37    flip=  0.0%   n=38    flip=  0.0%   n=55    flip=  0.0%   n=2     flip=  0.0%         n=0          
+5+                 0.00%   n=15    flip=  0.0%   n=10    flip=  0.0%   n=12    flip=  0.0%   n=1     flip=  0.0%         n=0          
+
+--- ETHUSDT / 5m  (guard=8.0bp, windows: total=6048 used=6048 skipped(gap)=0) ---
+safety      gauss 1-tail                 0-60s               60-120s              120-300s              300-600s          600s+ (info)
+0.5-0.75 (info, pre-decided)        30.85%   n=698   flip=  0.0%   n=832   flip=  0.2%   n=589   flip=  0.0%         n=0                   n=0          
+0.75-1.0 (info, pre-decided)        22.66%   n=538   flip=  0.0%   n=526   flip=  0.0%   n=221   flip=  0.0%         n=0                   n=0          
+1.0-1.25          15.87%   n=398   flip=  0.0%   n=346   flip=  0.0%   n=73    flip=  0.0%         n=0                   n=0          
+1.25-1.5          10.56%   n=286   flip=  0.0%   n=229   flip=  0.0%   n=39    flip=  0.0%         n=0                   n=0          
+1.5-2              6.68%   n=284   flip=  0.0%   n=176   flip=  0.0%   n=26    flip=  0.0%         n=0                   n=0          
+2-3                2.28%   n=188   flip=  0.0%   n=88    flip=  0.0%   n=7     flip=  0.0%         n=0                   n=0          
+3-5                0.13%   n=88    flip=  0.0%   n=23    flip=  0.0%   n=3     flip=  0.0%         n=0                   n=0          
+5+                 0.00%   n=16    flip=  0.0%   n=8     flip=  0.0%         n=0                   n=0                   n=0          
+
+--- ETHUSDT / 15m  (guard=8.0bp, windows: total=2015 used=2015 skipped(gap)=0) ---
+safety      gauss 1-tail                 0-60s               60-120s              120-300s              300-600s          600s+ (info)
+0.5-0.75 (info, pre-decided)        30.85%   n=79    flip=  0.0%   n=119   flip=  0.0%   n=396   flip=  0.5%   n=558   flip=  0.4%   n=15    flip=  0.0%
+0.75-1.0 (info, pre-decided)        22.66%   n=85    flip=  0.0%   n=103   flip=  0.0%   n=364   flip=  0.0%   n=304   flip=  0.0%   n=1     flip=  0.0%
+1.0-1.25          15.87%   n=61    flip=  0.0%   n=109   flip=  0.0%   n=301   flip=  0.0%   n=173   flip=  0.0%         n=0          
+1.25-1.5          10.56%   n=68    flip=  0.0%   n=83    flip=  0.0%   n=252   flip=  0.0%   n=93    flip=  0.0%         n=0          
+1.5-2              6.68%   n=54    flip=  0.0%   n=83    flip=  0.0%   n=199   flip=  0.0%   n=61    flip=  0.0%         n=0          
+2-3                2.28%   n=41    flip=  0.0%   n=57    flip=  0.0%   n=148   flip=  0.0%   n=17    flip=  0.0%         n=0          
+3-5                0.13%   n=29    flip=  0.0%   n=36    flip=  0.0%   n=60    flip=  0.0%   n=2     flip=  0.0%         n=0          
+5+                 0.00%   n=14    flip=  0.0%   n=10    flip=  0.0%   n=13    flip=  0.0%   n=1     flip=  0.0%         n=0          
+
+--- SOLUSDT / 5m  (guard=10.0bp, windows: total=6048 used=6048 skipped(gap)=0) ---
+safety      gauss 1-tail                 0-60s               60-120s              120-300s              300-600s          600s+ (info)
+0.5-0.75 (info, pre-decided)        30.85%   n=771   flip=  0.0%   n=790   flip=  0.0%   n=470   flip=  0.0%         n=0                   n=0          
+0.75-1.0 (info, pre-decided)        22.66%   n=467   flip=  0.0%   n=472   flip=  0.0%   n=168   flip=  0.0%         n=0                   n=0          
+1.0-1.25          15.87%   n=339   flip=  0.0%   n=286   flip=  0.0%   n=60    flip=  0.0%         n=0                   n=0          
+1.25-1.5          10.56%   n=264   flip=  0.0%   n=162   flip=  0.0%   n=21    flip=  0.0%         n=0                   n=0          
+1.5-2              6.68%   n=224   flip=  0.0%   n=134   flip=  0.0%   n=16    flip=  0.0%         n=0                   n=0          
+2-3                2.28%   n=137   flip=  0.0%   n=72    flip=  0.0%   n=7     flip=  0.0%         n=0                   n=0          
+3-5                0.13%   n=66    flip=  0.0%   n=17    flip=  0.0%   n=2     flip=  0.0%         n=0                   n=0          
+5+                 0.00%   n=11    flip=  0.0%   n=6     flip=  0.0%         n=0                   n=0                   n=0          
+
+--- SOLUSDT / 15m  (guard=10.0bp, windows: total=2015 used=2015 skipped(gap)=0) ---
+safety      gauss 1-tail                 0-60s               60-120s              120-300s              300-600s          600s+ (info)
+0.5-0.75 (info, pre-decided)        30.85%   n=90    flip=  0.0%   n=94    flip=  0.0%   n=472   flip=  0.0%   n=524   flip=  0.6%   n=12    flip=  0.0%
+0.75-1.0 (info, pre-decided)        22.66%   n=80    flip=  0.0%   n=100   flip=  0.0%   n=384   flip=  0.0%   n=263   flip=  0.0%   n=2     flip=  0.0%
+1.0-1.25          15.87%   n=74    flip=  0.0%   n=103   flip=  0.0%   n=285   flip=  0.0%   n=143   flip=  0.0%         n=0          
+1.25-1.5          10.56%   n=71    flip=  0.0%   n=94    flip=  0.0%   n=198   flip=  0.0%   n=90    flip=  0.0%         n=0          
+1.5-2              6.68%   n=58    flip=  0.0%   n=66    flip=  0.0%   n=165   flip=  0.0%   n=53    flip=  0.0%         n=0          
+2-3                2.28%   n=39    flip=  0.0%   n=53    flip=  0.0%   n=113   flip=  0.0%   n=18    flip=  0.0%         n=0          
+3-5                0.13%   n=21    flip=  0.0%   n=29    flip=  0.0%   n=48    flip=  0.0%   n=4     flip=  0.0%         n=0          
+5+                 0.00%   n=7     flip=  0.0%   n=9     flip=  0.0%   n=8     flip=  0.0%   n=1     flip=  0.0%         n=0          
+
+====================================================================================================
+P_UP CALIBRATION  (win% = claimed side matched the window's actual winner)
+====================================================================================================
+
+--- BTCUSDT / 5m ---
+
+  p_up calibration (claimed_p = max(p_up,1-p_up), first-crossing per threshold):
+  threshold       n     win%
+  >=0.95       5861    99.0%
+  >=0.97       5850    99.4%
+  >=0.98       5837    99.4%
+  >=0.99       5822    99.5%
+
+--- BTCUSDT / 15m ---
+
+  p_up calibration (claimed_p = max(p_up,1-p_up), first-crossing per threshold):
+  threshold       n     win%
+  >=0.95       2005    98.1%
+  >=0.97       2005    98.3%
+  >=0.98       2003    98.7%
+  >=0.99       2002    99.0%
+
+--- ETHUSDT / 5m ---
+
+  p_up calibration (claimed_p = max(p_up,1-p_up), first-crossing per threshold):
+  threshold       n     win%
+  >=0.95       5966    99.2%
+  >=0.97       5952    99.5%
+  >=0.98       5938    99.6%
+  >=0.99       5917    99.7%
+
+--- ETHUSDT / 15m ---
+
+  p_up calibration (claimed_p = max(p_up,1-p_up), first-crossing per threshold):
+  threshold       n     win%
+  >=0.95       2014    98.5%
+  >=0.97       2014    99.0%
+  >=0.98       2014    99.4%
+  >=0.99       2014    99.6%
+
+--- SOLUSDT / 5m ---
+
+  p_up calibration (claimed_p = max(p_up,1-p_up), first-crossing per threshold):
+  threshold       n     win%
+  >=0.95       5995    98.9%
+  >=0.97       5985    99.2%
+  >=0.98       5977    99.4%
+  >=0.99       5968    99.6%
+
+--- SOLUSDT / 15m ---
+
+  p_up calibration (claimed_p = max(p_up,1-p_up), first-crossing per threshold):
+  threshold       n     win%
+  >=0.95       2015    98.6%
+  >=0.97       2012    99.3%
+  >=0.98       2012    99.3%
+  >=0.99       2012    99.6%
+
+====================================================================================================
+FIT RECOMMENDATION  (* marks a rem bucket failing flip<3% or n<30 at that grid value)
+====================================================================================================
+
+--- BTCUSDT / 5m ---
+
+  FIT — smallest multiplicative k with flip<3% and n>=30 in every rem bucket (0-60,60-120,120-300,300-600):
+    k=1.00  n=471   0.0%   n=424   0.0%   n=111   0.0%   n=0        
+    k=1.25  n=366   0.0%   n=296   0.0%   n=47    0.0%   n=0        
+    k=1.50  n=279   0.0%   n=210   0.0%   n=22    0.0%*  n=0        
+    k=1.75  n=226   0.0%   n=139   0.0%   n=11    0.0%*  n=0        
+    k=2.00  n=208   0.0%   n=93    0.0%   n=8     0.0%*  n=0        
+    k=2.25  n=159   0.0%   n=66    0.0%   n=6     0.0%*  n=0        
+    k=2.50  n=124   0.0%   n=49    0.0%   n=6     0.0%*  n=0        
+    k=2.75  n=106   0.0%   n=33    0.0%   n=4     0.0%*  n=0        
+    k=3.00  n=83    0.0%   n=26    0.0%*  n=2     0.0%*  n=0        
+    => not achieved within k<=3.00 (thin/failing rem bucket persists — see * above)
+
+  FIT — smallest additive jump J (bp) with flip<3% and n>=30 in every rem bucket, at safety'=|banked|/(cushion+J*rem/window)>=1.0:
+    J=0     n=471   0.0%   n=424   0.0%   n=111   0.0%   n=0        
+    J=10    n=553   0.0%   n=294   0.0%   n=34    0.0%   n=0        
+    J=20    n=585   0.0%   n=198   0.0%   n=11    0.0%*  n=0        
+    J=30    n=591   0.0%   n=118   0.0%   n=8     0.0%*  n=0        
+    J=50    n=520   0.0%   n=56    0.0%   n=6     0.0%*  n=0        
+    => not achieved within J<=50bp (thin/failing rem bucket persists — see * above)
+
+--- BTCUSDT / 15m ---
+
+  FIT — smallest multiplicative k with flip<3% and n>=30 in every rem bucket (0-60,60-120,120-300,300-600):
+    k=1.00  n=72    0.0%   n=122   0.0%   n=316   0.0%   n=181   0.0%   <= PASS
+    k=1.25  n=72    0.0%   n=86    0.0%   n=277   0.0%   n=100   0.0%   <= PASS
+    k=1.50  n=59    0.0%   n=94    0.0%   n=221   0.0%   n=51    0.0%   <= PASS
+    k=1.75  n=55    0.0%   n=69    0.0%   n=179   0.0%   n=30    0.0%   <= PASS
+    k=2.00  n=43    0.0%   n=76    0.0%   n=134   0.0%   n=19    0.0%*
+    k=2.25  n=49    0.0%   n=53    0.0%   n=115   0.0%   n=8     0.0%*
+    k=2.50  n=43    0.0%   n=47    0.0%   n=88    0.0%   n=6     0.0%*
+    k=2.75  n=35    0.0%   n=45    0.0%   n=70    0.0%   n=4     0.0%*
+    k=3.00  n=37    0.0%   n=38    0.0%   n=55    0.0%   n=2     0.0%*
+    => k=1.00
+
+  FIT — smallest additive jump J (bp) with flip<3% and n>=30 in every rem bucket, at safety'=|banked|/(cushion+J*rem/window)>=1.0:
+    J=0     n=72    0.0%   n=122   0.0%   n=316   0.0%   n=181   0.0%   <= PASS
+    J=10    n=119   0.0%   n=151   0.0%   n=321   0.0%   n=72    0.0%   <= PASS
+    J=20    n=171   0.0%   n=160   0.0%   n=280   0.0%   n=36    0.0%   <= PASS
+    J=30    n=210   0.0%   n=177   0.0%   n=229   0.0%   n=17    0.0%*
+    J=50    n=240   0.0%   n=200   0.0%   n=143   0.0%   n=10    0.0%*
+    => J=0bp
+
+--- ETHUSDT / 5m ---
+
+  FIT — smallest multiplicative k with flip<3% and n>=30 in every rem bucket (0-60,60-120,120-300,300-600):
+    k=1.00  n=448   0.0%   n=430   0.0%   n=105   0.0%   n=0        
+    k=1.25  n=334   0.0%   n=302   0.0%   n=53    0.0%   n=0        
+    k=1.50  n=293   0.0%   n=194   0.0%   n=29    0.0%*  n=0        
+    k=1.75  n=247   0.0%   n=124   0.0%   n=15    0.0%*  n=0        
+    k=2.00  n=194   0.0%   n=90    0.0%   n=8     0.0%*  n=0        
+    k=2.25  n=155   0.0%   n=59    0.0%   n=7     0.0%*  n=0        
+    k=2.50  n=125   0.0%   n=39    0.0%   n=6     0.0%*  n=0        
+    k=2.75  n=102   0.0%   n=32    0.0%   n=4     0.0%*  n=0        
+    k=3.00  n=89    0.0%   n=24    0.0%*  n=3     0.0%*  n=0        
+    => not achieved within k<=3.00 (thin/failing rem bucket persists — see * above)
+
+  FIT — smallest additive jump J (bp) with flip<3% and n>=30 in every rem bucket, at safety'=|banked|/(cushion+J*rem/window)>=1.0:
+    J=0     n=448   0.0%   n=430   0.0%   n=105   0.0%   n=0        
+    J=10    n=522   0.0%   n=330   0.0%   n=43    0.0%   n=0        
+    J=20    n=585   0.0%   n=227   0.0%   n=20    0.0%*  n=0        
+    J=30    n=601   0.0%   n=159   0.0%   n=12    0.0%*  n=0        
+    J=50    n=561   0.0%   n=88    0.0%   n=8     0.0%*  n=0        
+    => not achieved within J<=50bp (thin/failing rem bucket persists — see * above)
+
+--- ETHUSDT / 15m ---
+
+  FIT — smallest multiplicative k with flip<3% and n>=30 in every rem bucket (0-60,60-120,120-300,300-600):
+    k=1.00  n=61    0.0%   n=109   0.0%   n=305   0.0%   n=179   0.0%   <= PASS
+    k=1.25  n=69    0.0%   n=87    0.0%   n=258   0.0%   n=97    0.0%   <= PASS
+    k=1.50  n=54    0.0%   n=84    0.0%   n=201   0.0%   n=61    0.0%   <= PASS
+    k=1.75  n=56    0.0%   n=57    0.0%   n=174   0.0%   n=33    0.0%   <= PASS
+    k=2.00  n=41    0.0%   n=57    0.0%   n=148   0.0%   n=17    0.0%*
+    k=2.25  n=41    0.0%   n=60    0.0%   n=113   0.0%   n=12    0.0%*
+    k=2.50  n=45    0.0%   n=46    0.0%   n=86    0.0%   n=8     0.0%*
+    k=2.75  n=34    0.0%   n=42    0.0%   n=72    0.0%   n=5     0.0%*
+    k=3.00  n=29    0.0%*  n=37    0.0%   n=60    0.0%   n=2     0.0%*
+    => k=1.00
+
+  FIT — smallest additive jump J (bp) with flip<3% and n>=30 in every rem bucket, at safety'=|banked|/(cushion+J*rem/window)>=1.0:
+    J=0     n=61    0.0%   n=109   0.0%   n=305   0.0%   n=179   0.0%   <= PASS
+    J=10    n=102   0.0%   n=138   0.0%   n=306   0.0%   n=92    0.0%   <= PASS
+    J=20    n=133   0.0%   n=160   0.0%   n=275   0.0%   n=56    0.0%   <= PASS
+    J=30    n=172   0.0%   n=170   0.0%   n=236   0.0%   n=37    0.0%   <= PASS
+    J=50    n=221   0.0%   n=166   0.0%   n=195   0.0%   n=13    0.0%*
+    => J=0bp
+
+--- SOLUSDT / 5m ---
+
+  FIT — smallest multiplicative k with flip<3% and n>=30 in every rem bucket (0-60,60-120,120-300,300-600):
+    k=1.00  n=392   0.0%   n=359   0.0%   n=80    0.0%   n=0        
+    k=1.25  n=312   0.0%   n=228   0.0%   n=35    0.0%   n=0        
+    k=1.50  n=234   0.0%   n=150   0.0%   n=21    0.0%*  n=0        
+    k=1.75  n=176   0.0%   n=102   0.0%   n=14    0.0%*  n=0        
+    k=2.00  n=139   0.0%   n=75    0.0%   n=7     0.0%*  n=0        
+    k=2.25  n=129   0.0%   n=43    0.0%   n=6     0.0%*  n=0        
+    k=2.50  n=109   0.0%   n=29    0.0%*  n=5     0.0%*  n=0        
+    k=2.75  n=80    0.0%   n=23    0.0%*  n=4     0.0%*  n=0        
+    k=3.00  n=66    0.0%   n=17    0.0%*  n=2     0.0%*  n=0        
+    => not achieved within k<=3.00 (thin/failing rem bucket persists — see * above)
+
+  FIT — smallest additive jump J (bp) with flip<3% and n>=30 in every rem bucket, at safety'=|banked|/(cushion+J*rem/window)>=1.0:
+    J=0     n=392   0.0%   n=359   0.0%   n=80    0.0%   n=0        
+    J=10    n=467   0.0%   n=263   0.0%   n=34    0.0%   n=0        
+    J=20    n=474   0.0%   n=210   0.0%   n=20    0.0%*  n=0        
+    J=30    n=500   0.0%   n=153   0.0%   n=12    0.0%*  n=0        
+    J=50    n=487   0.0%   n=96    0.0%   n=6     0.0%*  n=0        
+    => not achieved within J<=50bp (thin/failing rem bucket persists — see * above)
+
+--- SOLUSDT / 15m ---
+
+  FIT — smallest multiplicative k with flip<3% and n>=30 in every rem bucket (0-60,60-120,120-300,300-600):
+    k=1.00  n=75    0.0%   n=104   0.0%   n=291   0.0%   n=147   0.0%   <= PASS
+    k=1.25  n=71    0.0%   n=94    0.0%   n=201   0.0%   n=93    0.0%   <= PASS
+    k=1.50  n=58    0.0%   n=66    0.0%   n=166   0.0%   n=54    0.0%   <= PASS
+    k=1.75  n=48    0.0%   n=53    0.0%   n=142   0.0%   n=32    0.0%   <= PASS
+    k=2.00  n=39    0.0%   n=53    0.0%   n=113   0.0%   n=18    0.0%*
+    k=2.25  n=32    0.0%   n=44    0.0%   n=92    0.0%   n=10    0.0%*
+    k=2.50  n=35    0.0%   n=34    0.0%   n=74    0.0%   n=7     0.0%*
+    k=2.75  n=25    0.0%*  n=33    0.0%   n=59    0.0%   n=5     0.0%*
+    k=3.00  n=21    0.0%*  n=29    0.0%*  n=48    0.0%   n=4     0.0%*
+    => k=1.00
+
+  FIT — smallest additive jump J (bp) with flip<3% and n>=30 in every rem bucket, at safety'=|banked|/(cushion+J*rem/window)>=1.0:
+    J=0     n=75    0.0%   n=104   0.0%   n=291   0.0%   n=147   0.0%   <= PASS
+    J=10    n=107   0.0%   n=144   0.0%   n=258   0.0%   n=97    0.0%   <= PASS
+    J=20    n=143   0.0%   n=158   0.0%   n=238   0.0%   n=60    0.0%   <= PASS
+    J=30    n=160   0.0%   n=161   0.0%   n=216   0.0%   n=42    0.0%   <= PASS
+    J=50    n=211   0.0%   n=148   0.0%   n=180   0.0%   n=19    0.0%*
+    => J=0bp
+
+====================================================================================================
+SUMMARY — multiplicative k vs additive J, per symbol/duration
+====================================================================================================
+  BTCUSDT   5m    k: not achieved <=3.00       J: not achieved <=50bp  at least one parameterization did not reach the target within its grid — see FIT detail above
+  BTCUSDT   15m   k=1.00                       J=0bp                 multiplicative wins (achieved at a lower grid step)
+  ETHUSDT   5m    k: not achieved <=3.00       J: not achieved <=50bp  at least one parameterization did not reach the target within its grid — see FIT detail above
+  ETHUSDT   15m   k=1.00                       J=0bp                 multiplicative wins (achieved at a lower grid step)
+  SOLUSDT   5m    k: not achieved <=3.00       J: not achieved <=50bp  at least one parameterization did not reach the target within its grid — see FIT detail above
+  SOLUSDT   15m   k=1.00                       J=0bp                 multiplicative wins (achieved at a lower grid step)
+
+Caveats: buckets are first-crossing events (one per window per bucket, tracked without resetting on a mid-window banked-side flip — see module docstring). n<30 cells are not reliable; treat any FIT recommendation drawn from thin cells as provisional. The 600s+ rem column is informational only and excluded from the FIT pass/fail criterion.
+SCOPE: 'winner' here is the model's OWN Binance-kline settlement math (avg of the full window's per-minute marks vs ref), never Chainlink/Polymarket's actual resolution — by design (see module docstring). If a live loss shows banked_decided true right up to close yet this study still reports ~0% flip at that safety/rem cell, the live loss was most likely basis error (Binance vs Chainlink), not a genuine reversal of the Binance remaining path — that's R1's measurement, not this one. Cross-check any specific incident against ~/.pmt/corpus/chainlink-{symbol}.jsonl before concluding the cushion itself is miscalibrated.
