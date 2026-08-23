@@ -62,9 +62,11 @@ def test_window_universe_sorted_by_start():
 
 
 def test_ck_settlement_width():
-    assert ck_settlement_width_s(300) == 30    # 5m window
+    # one width everywhere: the measured record killed the 30s-at-5m
+    # convention (book-graded 283/284 at 60s vs 277/284; settle_width.md)
+    assert ck_settlement_width_s(300) == 60    # 5m window
     assert ck_settlement_width_s(900) == 60    # 15m window
-    assert ck_settlement_width_s(1800) == 60   # anything wider than 5m
+    assert ck_settlement_width_s(1800) == 60   # anything wider
 
 
 # ---------- (a) wallet truth ----------
@@ -111,16 +113,16 @@ def _rounds(prices_by_t: dict[int, float]) -> list[dict]:
 
 
 def test_chainlink_outcome_up_when_settlement_above_reference():
-    # 5m window [1000, 1300), width 30s: reference [970,1000), settlement [1270,1300).
+    # 5m window [1000, 1300), width 60s: reference [940,1000), settlement [1240,1300).
     # last round sits exactly at window end so the "corpus caught up" guard clears.
-    rounds = _rounds({960: 100.0, 1250: 110.0, 1300: 999.0})
+    rounds = _rounds({900: 100.0, 1250: 110.0, 1300: 999.0})
     window = {"slug": "s", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
     winner, reason = chainlink_outcome(window, rounds)
     assert winner == "up" and reason is None
 
 
 def test_chainlink_outcome_down_when_settlement_below_reference():
-    rounds = _rounds({960: 100.0, 1250: 90.0, 1300: 999.0})
+    rounds = _rounds({900: 100.0, 1250: 90.0, 1300: 999.0})
     window = {"slug": "s", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
     winner, reason = chainlink_outcome(window, rounds)
     assert winner == "down" and reason is None
@@ -152,8 +154,10 @@ def test_chainlink_outcome_dropped_when_no_round_within_10min_of_query_span():
 
 
 def test_chainlink_outcome_boundary_exactly_10min_is_still_ok():
-    # span_start for this window = 1000 - 30 = 970; a round at exactly 970-600=370 is fine
-    rounds = _rounds({370: 100.0, 1260: 105.0, 1300: 110.0})
+    # span_start for this window = 1000 - 60 = 940; a round at exactly 940-600=340
+    # is fine, and the reference TWAP rides that maximal 600s carry too. The
+    # settlement round sits at 1240 so its whole [1240,1300) span is fresh.
+    rounds = _rounds({340: 100.0, 1240: 105.0, 1300: 110.0})
     window = {"slug": "s", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
     winner, reason = chainlink_outcome(window, rounds)
     assert winner == "up" and reason is None
@@ -244,7 +248,7 @@ def test_build_outcomes_wallet_takes_priority_over_chainlink():
     windows = [{"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}]
     wallet = {"btc-updown-5m-1000": "down"}
     # chainlink rounds would say "up" if consulted -- wallet must win instead
-    rounds_by_symbol = {"btc": _rounds({960: 100.0, 1250: 110.0, 1300: 999.0})}
+    rounds_by_symbol = {"btc": _rounds({900: 100.0, 1250: 110.0, 1300: 999.0})}
     rows, dropped = build_outcomes(windows, wallet, rounds_by_symbol)
     assert rows == [{"slug": "btc-updown-5m-1000", "winner": "down", "source": "wallet"}]
     assert dropped == []
@@ -252,7 +256,7 @@ def test_build_outcomes_wallet_takes_priority_over_chainlink():
 
 def test_build_outcomes_falls_back_to_chainlink_when_not_traded():
     windows = [{"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}]
-    rounds_by_symbol = {"btc": _rounds({960: 100.0, 1250: 110.0, 1300: 999.0})}
+    rounds_by_symbol = {"btc": _rounds({900: 100.0, 1250: 110.0, 1300: 999.0})}
     rows, dropped = build_outcomes(windows, {}, rounds_by_symbol)
     assert rows == [{"slug": "btc-updown-5m-1000", "winner": "up", "source": "chainlink"}]
     assert dropped == []
@@ -364,7 +368,7 @@ def test_build_outcomes_book_is_strictly_last():
     book = {"btc-updown-5m-1000": [_book(1290, dn_bid=0.97, up_ask=0.02),
                                     _book(1295, dn_bid=0.98, up_ask=0.02)]}
     # chainlink says up and is fresh -> book (down) must NOT be consulted
-    rounds = {"btc": _rounds({960: 100.0, 1250: 110.0, 1300: 999.0})}
+    rounds = {"btc": _rounds({900: 100.0, 1250: 110.0, 1300: 999.0})}
     rows, _ = build_outcomes([w], {}, rounds, book)
     assert rows == [{"slug": w["slug"], "winner": "up", "source": "chainlink"}]
     # chainlink stale -> book grades
@@ -390,6 +394,6 @@ def test_chainlink_outcome_refuses_margin_inside_noise_floor():
     # ~2bp move: real settlements this close live inside flat-hold interpolation
     # error (measured 2026-08-23: sub-1bp labels worse than a coin flip vs wallet)
     w = {"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
-    rounds = _rounds({960: 100.0, 1250: 100.02, 1300: 100.02})
+    rounds = _rounds({900: 100.0, 1240: 100.02, 1300: 100.02})
     winner, reason = chainlink_outcome(w, rounds)
     assert winner is None and "noise floor" in reason
