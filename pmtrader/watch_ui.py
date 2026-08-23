@@ -266,6 +266,67 @@ def _tape_render(line: str) -> str | None:
     return line.rstrip()
 
 
+class TapeCollapser:
+    """Collapse runs of basis-guard-gated evals into ONE live summary line.
+
+    On a quiet tape 99% of records are per-arm "gated basis guard" — four
+    arms each printing an identical-shaped line every eval drowned the
+    events that matter (fires, exits, brakes, rolls). A run of consecutive
+    basis-gated records, any mix of arms, renders as a single line holding
+    each arm's FRESHEST margin-vs-guard plus a run count, updated in place.
+    Any other event (including theta/brake gates, which are rare and
+    meaningful) ends the run and renders normally.
+    """
+
+    def __init__(self) -> None:
+        self._by: dict[str, str] = {}   # symbol -> freshest "+1.0/6" text
+        self._n = 0
+        self._t = 0.0
+        self._out: str | None = None    # exactly what we last put in the deque
+
+    def _render(self) -> str:
+        import time as _t
+
+        ts = _t.strftime("%H:%M:%S", _t.localtime(self._t))
+        per = " · ".join(f"{sym} {txt}" for sym, txt in sorted(self._by.items()))
+        return click.style(
+            f"{ts}  {'':<14} {_tape_tag(f'gated ×{self._n}')} basis bp/guard: {per}",
+            fg="yellow", dim=True)
+
+    def add(self, raw: str, lines) -> None:
+        """Feed one raw tape line; appends/updates rendered output in `lines`."""
+        try:
+            r = json.loads(raw)
+        except ValueError:
+            return
+        reason = (r.get("reason") or "") if r.get("ev") == tape.EV_GATED else ""
+        if reason.startswith("basis guard"):
+            sym = (r.get("slug") or "?").split("-")[0]
+            margin, guard = r.get("margin_bp"), r.get("guard_bp")
+            if margin is not None and guard is not None:
+                self._by[sym] = f"{margin:+.1f}/{guard:.0f}"
+            else:
+                m = _MARGIN_RE.search(reason)
+                self._by[sym] = f"{float(m.group(1)):+.1f}/{float(m.group(2)):.0f}" if m else "?"
+            self._n += 1
+            self._t = r.get("t", 0.0)
+            out = self._render()
+            if self._out is not None and lines and lines[-1] == self._out:
+                lines[-1] = out
+            else:
+                lines.append(out)
+            self._out = out
+            return
+        # any other event ends the run and renders normally
+        self._by, self._n, self._out = {}, 0, None
+        try:
+            rendered = _tape_render(raw)
+        except Exception:
+            return  # torn mid-write line must never take the dashboard down
+        if rendered:
+            lines.append(rendered)
+
+
 def _eff_table(s: dict) -> Table:
     """The effectiveness block: each corrected number beside what it means."""
     def signed(v: float | None, unit: str = "", pct: bool = True, digits: int = 2) -> str:

@@ -30,6 +30,7 @@ from watch_ui import (
     _restore_stdin, _safety_rich, _tape_render, _tape_slug, _wait_key,
     build_arms_table, build_header_panel, build_risk_header, build_windows_strip,
 )
+import watch_ui
 
 
 @click.group("crypto")
@@ -755,13 +756,7 @@ def crypto_watch(since: float | None) -> None:
 
     WATCH_DEFAULT_LOOKBACK_H = 6.0  # sliding recent window — it's a live dashboard, not the ledger
 
-    def _safe_render(raw: str) -> str | None:
-        # A line can be truncated mid-write by a concurrently-crashing
-        # engine; a bad record must never take the dashboard down with it.
-        try:
-            return _tape_render(raw)
-        except Exception:
-            return None
+    collapser = watch_ui.TapeCollapser()
 
     floor = _shadow_parse_since(since) if since else (_t.time() - WATCH_DEFAULT_LOOKBACK_H * 3600)
     floor_label = ("all time" if floor <= 0 else
@@ -770,10 +765,8 @@ def crypto_watch(since: float | None) -> None:
     offset = 0
     try:
         with open(tape.UPDOWN_TAPE) as fh:
-            for raw in fh.readlines()[-60:]:
-                r = _safe_render(raw)
-                if r:
-                    lines.append(r)
+            for raw in fh.readlines()[-120:]:
+                collapser.add(raw, lines)
             offset = fh.tell()
     except OSError:
         pass
@@ -850,9 +843,7 @@ def crypto_watch(since: float | None) -> None:
                         with open(tape.UPDOWN_TAPE) as fh:
                             fh.seek(offset)
                             for raw in fh:
-                                r = _safe_render(raw)
-                                if r:
-                                    lines.append(r)
+                                collapser.add(raw, lines)
                             offset = fh.tell()
                     except OSError:
                         pass
