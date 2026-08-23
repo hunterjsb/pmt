@@ -48,9 +48,9 @@ def test_watch_fetch_sb_is_the_stats_acquisition_path(monkeypatch):
     assert calls == [(0.0, 1234.0)], "fetch_sb did not go through the module-level acquisition path"
 
 
-def test_a_graded_trade_always_reaches_the_watch_trades_table(monkeypatch):
+def test_a_graded_trade_always_reaches_the_watch_windows_table(monkeypatch):
     """End-to-end over the ONE acquisition path: whatever score_activity
-    grades is what the dashboard's trades panel paints.
+    grades is what the dashboard's windows panel paints.
 
     Both halves are pinned here because the dashboard has lost each of them:
     a DECIDED window must render, and a FILLED-but-undecided one must render
@@ -84,12 +84,14 @@ def test_a_graded_trade_always_reaches_the_watch_trades_table(monkeypatch):
     sb = state.read()["sb"]
 
     c = Console(record=True, width=90)
-    c.print(watch_ui.build_trades_table(sb, time.time(), limit=cw.TRADES_MAX_ROWS))
+    c.print(watch_ui.build_windows_table(sb, time.time(), limit=cw.WINDOWS_MAX_ROWS))
     out = c.export_text()
     assert "eth 5m" in out, "a decided trade vanished between the grade and the table"
     assert "bnb 5m" in out, "a filled trade is invisible until its redeem posts"
     assert "riding" in out
-    assert watch_ui.trades_title(sb) == "trades · last 1 decided · 1 riding"
+    # ...and the strip's at-a-glance glyphs came through the merge with it.
+    assert "◆" in out and "✓" in out
+    assert watch_ui.windows_title(sb) == "windows · 0 live · 1 riding · last 1 decided"
 
 
 def test_a_riding_position_stays_on_the_panel_through_a_roll_until_it_grades(monkeypatch):
@@ -98,8 +100,10 @@ def test_a_riding_position_stays_on_the_panel_through_a_roll_until_it_grades(mon
 
     Three frames off the ONE acquisition path: the arm fills window A, then
     rolls to window B (nothing filled there yet), then A's redeem row posts.
-    A must be on the trades panel in all three — riding through the roll, then
-    decided — because the wallet, not the arm, is what retires a position.
+    A must be on the windows panel in all three — riding through the roll, then
+    decided — because the wallet, not the arm, is what retires a position. The
+    arm rolling to B is passed in as the LIVE arm each frame, so this also pins
+    that the live head never displaces the position it rolled off.
     """
     import watch_ui
     from rich.console import Console
@@ -121,12 +125,15 @@ def test_a_riding_position_stays_on_the_panel_through_a_roll_until_it_grades(mon
     monkeypatch.setattr(cs.tape, "iter_records", lambda *a_, **k: iter(fires))
     monkeypatch.setattr(cs, "_gamma_resolution_cached", lambda slug: None)
 
-    def panel_text():
+    def panel_text(live=a):
         state = cw.WatchState()
         cw.WatchFetcher(state, sliding_floor=0.0).fetch_sb()
         sb = state.read()["sb"]
+        arms = {live: {"filled_usdc": 0.0, "roll": True,
+                       "eval": {"state": "armed", "committed": 0.0}}}
         c = Console(record=True, width=100)
-        c.print(watch_ui.build_trades_table(sb, time.time(), limit=cw.TRADES_MAX_ROWS))
+        c.print(watch_ui.build_windows_table(sb, time.time(), arms=arms,
+                                             limit=cw.WINDOWS_MAX_ROWS))
         return sb, c.export_text()
 
     # 1. filled, window A still open
@@ -137,44 +144,116 @@ def test_a_riding_position_stays_on_the_panel_through_a_roll_until_it_grades(mon
     # 2. the arm has rolled to B and armed it — A is nobody's current window
     #    any more, and used to vanish from every per-arm view at this point.
     fires.append({"ev": "fire", "slug": b, "side": "up", "fair": 1.0, "t": 0})
-    sb, out = panel_text()
+    sb, out = panel_text(live=b)
     assert [w["slug"] for w in sb["riding_windows"]] == [a], "the rolled-off position was dropped"
     assert "riding" in out
+    # A (riding) and B (the arm's new live window) are two rows, not one.
+    assert out.count("btc 5m") == 2
+    assert "◆" in out and "○" in out
 
     # 3. the wallet grades it — and only now does it stop riding
     rows.append(redeem_a)
-    sb, out = panel_text()
+    sb, out = panel_text(live=b)
     assert sb["riding_windows"] == []
     assert [w["slug"] for w in sb["windows"]] == [a]
     assert "btc 5m" in out and "riding" not in out
+    assert "✓" in out
 
 
-def test_trades_panel_never_starves_the_tape_and_never_paints_a_clipped_box():
+def test_windows_panel_never_starves_the_tape_and_never_paints_a_clipped_box():
     """The panel is sized to the rows it will actually paint. Rich clips a
     Layout slot that overflows, and a table cut off below its last row (no
     bottom border) reads as a crash rather than as a cap."""
-    # Roomy screen, plenty of trades: the view cap is what bites.
-    assert cw.trades_rows_shown(50, 12, 16) == cw.TRADES_MAX_ROWS
-    # Few trades: don't reserve rows for trades that don't exist.
-    assert cw.trades_rows_shown(50, 12, 2) == 2
-    # Cramped screen: the tape keeps its floor, one trade row still survives.
-    assert cw.trades_rows_shown(30, 12, 16) == 1
+    # Roomy screen, plenty of windows: the view cap is what bites.
+    assert cw.windows_rows_shown(50, 12, 16) == cw.WINDOWS_MAX_ROWS
+    # Few windows: don't reserve rows for windows that don't exist.
+    assert cw.windows_rows_shown(50, 12, 2) == 2
+    # Cramped screen: the tape keeps its floor, one window row still survives.
+    assert cw.windows_rows_shown(30, 12, 16) == 1
     for h in range(20, 60):
         for head_h in (cw.HEAD_MIN_H, cw.HEAD_MIN_H + 2):
-            n = cw.trades_rows_shown(h, 12, 16, head_h)
-            assert 1 <= n <= cw.TRADES_MAX_ROWS
-            # head + strip + arms + panel: what's left is the tape's.
-            left = h - head_h - cw.STRIP_H - 12 - (n + cw.TRADES_CHROME)
+            n = cw.windows_rows_shown(h, 12, 16, head_h)
+            assert 1 <= n <= cw.WINDOWS_MAX_ROWS
+            # head + arms + panel: what's left is the tape's.
+            left = h - head_h - 12 - (n + cw.WINDOWS_CHROME)
             assert left >= cw.MIN_TAPE_ROWS or n == 1
 
 
-def test_a_taller_header_costs_the_tape_rows_not_the_trades_floor():
+def test_the_deleted_strip_paid_for_the_panels_extra_rows():
+    """The merge freed the strip's three terminal rows, and the panel spends
+    them on itself: it now carries the fleet's LIVE windows above the tail the
+    old panel showed, so the decided tail must not have got shorter."""
+    assert cw.WINDOWS_MAX_ROWS == 11  # was 8 + the strip's 3
+    assert not hasattr(cw, "STRIP_H")
+
+
+def test_a_taller_header_costs_the_tape_rows_not_the_windows_floor():
     # The header grows a row for the settlement feed and one for a render
-    # error; the trades panel keeps its floor of one row either way.
-    roomy = cw.trades_rows_shown(50, 12, 16, cw.HEAD_MIN_H)
-    taller = cw.trades_rows_shown(50, 12, 16, cw.HEAD_MIN_H + 2)
-    assert roomy == taller == cw.TRADES_MAX_ROWS  # a roomy screen absorbs it
-    assert cw.trades_rows_shown(31, 12, 16, cw.HEAD_MIN_H + 2) == 1
+    # error; the windows panel keeps its floor of one row either way.
+    roomy = cw.windows_rows_shown(50, 12, 16, cw.HEAD_MIN_H)
+    taller = cw.windows_rows_shown(50, 12, 16, cw.HEAD_MIN_H + 2)
+    assert roomy == taller == cw.WINDOWS_MAX_ROWS  # a roomy screen absorbs it
+    assert cw.windows_rows_shown(28, 12, 16, cw.HEAD_MIN_H + 2) == 1
+
+
+# ---------- the controls modal: keys in, dashboard back ----------
+
+def test_the_modal_lists_exactly_the_keys_the_watch_handles():
+    """Both directions. A key with no line in the panel is undiscoverable; a
+    line with no handler behind it is a lie the operator will act on."""
+    import string
+
+    import watch_ui
+
+    listed = {k for k, _label, _d in watch_ui.WATCH_KEYS if k is not None}
+    for key in listed:
+        # Every listed key does something in at least one state (esc with
+        # nothing open is correctly inert).
+        assert any(cw.handle_key(key, open_) != (False, open_, False)
+                   for open_ in (False, True)), key
+    # Nothing else does anything, in either state.
+    for key in string.printable:
+        if key.lower() in listed:
+            continue
+        for open_ in (False, True):
+            assert cw.handle_key(key, open_) == (False, open_, False), key
+    assert cw.handle_key(None, False) == (False, False, False)
+
+
+def test_h_toggles_the_modal_and_restores_the_dashboard():
+    # A toggle repaints now, not on the next second — the modal must feel
+    # instant at the 20Hz key poll.
+    quit_now, show, dirty = cw.handle_key("h", False)
+    assert (quit_now, show, dirty) == (False, True, True)
+    assert cw.handle_key("h", True) == (False, False, True)
+
+
+def test_esc_and_q_close_the_modal_before_q_can_quit():
+    """A foreground panel the quit key punched through would cost the operator
+    their dashboard on a stray press."""
+    assert cw.handle_key("\x1b", True) == (False, False, True)
+    assert cw.handle_key("q", True) == (False, False, True)   # closes, does NOT quit
+    assert cw.handle_key("q", False)[0] is True               # ...and then quits
+    # An idle esc changes nothing and forces no repaint.
+    assert cw.handle_key("\x1b", False) == (False, False, False)
+
+
+def test_the_modal_is_a_pure_renderable_and_never_touches_the_fetchers():
+    """It is FOREGROUND, not a pause: the worker thread and every cadence are
+    untouched, so dismissing restores a live frame rather than a frozen one."""
+    import inspect
+
+    import watch_ui
+
+    # Source past the docstring (3.13+ dedents __doc__, so it is not a
+    # substring of the source and can't be subtracted).
+    body = inspect.getsource(watch_ui.build_help_modal).split('"""')[-1]
+    for forbidden in ("fetch", "requests", "_api", "post("):
+        assert forbidden not in body, forbidden
+    # ...and the loop keeps rebuilding the dashboard behind it, so dismissing
+    # restores the current frame rather than the one 'h' was pressed on.
+    loop = inspect.getsource(cw.crypto_watch.callback)  # click wraps the command
+    assert "live.update(_modal(" in loop and "else layout" in loop
 
 
 def _fetcher(monkeypatch, *, sb=None, status=None, bal=None, sb_boom=None,

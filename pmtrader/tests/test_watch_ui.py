@@ -1,8 +1,8 @@
 """Pure-seam tests for the crypto watch dashboard's render layer: margin-regex
 parsing, evidence/countdown color thresholds, the tape log's fixed-width
-alignment, the risk header's committed/undecided math, the recent-windows
-strip, the trades table, the arms table's column geometry, and the
-terminal-mode helpers.
+alignment, the risk header's committed/undecided math, the merged windows
+table (lifecycle glyphs, live/riding/decided merge, retention), the controls
+modal, the arms table's column geometry, and the terminal-mode helpers.
 
 Every dashboard render function must tolerate a missing/partial eval (an
 engine restart mid-watch leaves last_eval None or half-built) — several tests
@@ -368,70 +368,32 @@ def test_committed_column_fits_a_resting_bid_beside_a_four_figure_fill():
     assert "$1,204.50 ◇$450" in row, row
 
 
-def test_controls_panel_legend_names_every_arms_table_marker():
-    # The overlay is the only place the glyphs are spelled out.
-    from rich.console import Console
-    import io
-
-    con = Console(file=io.StringIO(), width=160)
-    con.print(cc._controls_panel())
-    out = con.file.getvalue()
-    for glyph in ("⟳", "≈", "◇", "◆"):
-        assert glyph in out, glyph
-    # ONE content line: the strip slot is 3 rows and a second would be clipped.
-    body = [ln for ln in out.splitlines() if ln.startswith("│")]
-    assert len(body) == 1, body
-
-
-# ---------- recent-windows strip ----------
-
-def test_window_chip_formats_win_and_loss():
-    win = cc._window_chip({"slug": "btc-updown-5m-1700000000", "won": True,
-                            "pnl": 12.0, "est": False})
-    loss = cc._window_chip({"slug": "eth-updown-15m-1700000000", "won": False,
-                             "pnl": -44.0, "est": False})
-    assert win == "[green]✓ btc5 +12[/green]"
-    assert loss == "[red]✗ eth15 -44[/red]"
-
-
-def test_window_chip_estimated_is_dim_not_win_loss_colored():
-    chip = cc._window_chip({"slug": "sol-updown-5m-1700000000", "won": True,
-                             "pnl": 3.0, "est": True})
-    assert chip.startswith("[dim]") and "[green]" not in chip
-
-
-def test_build_windows_strip_empty():
-    assert cc.build_windows_strip([]) == "[dim]no windows traded yet[/dim]"
-    assert cc.build_windows_strip(None) == "[dim]no windows traded yet[/dim]"
-
-
-def test_a_fresh_fill_chips_the_strip_before_its_redeem_posts():
-    """A FILLED window with no verdict yet is the newest thing that happened —
-    it must chip the strip immediately, not stay absent until its redeem row
-    posts (or, on a loss, until the 300s gamma grace expires)."""
-    strip = cc.build_windows_strip(
-        [{"slug": "eth-updown-5m-1787509500", "won": True, "pnl": 4.0, "est": False,
-          "end_ts": 1787509800}],
-        [{"slug": "bnb-updown-5m-1787510100", "notional": 19.44, "won": None,
-          "end_ts": 1787510400}],
-    )
-    assert strip.startswith("[cyan]◆ bnb5 $19[/cyan]")
-    assert "✓ eth5 +4" in strip
-
-
-# ---------- trades table ----------
+# ---------- the merged windows table ----------
 #
 # The panel that exists because a real BNB fill (2026-08-23 14:38, window
 # 14:35-14:40) was invisible on the dashboard for nearly four minutes: the arm
 # had rolled, the fire had scrolled off the tape, and the only per-trade view
 # carried decided windows only.
+#
+# It absorbed the recent-windows chip strip on 2026-08-23 (watch_ui's design
+# note). The "nothing lost in the merge" tests below are the pin on that: the
+# strip's at-a-glance ✓/✗ sequence and its ◆ riding chips must still be
+# readable off the merged table, in the same order.
 
-def _trades_text(sb, now=1787510500.0, width=100, limit=None, odds=None):
+def _trades_text(sb, now=1787510500.0, width=100, limit=None, odds=None,
+                 arms=None):
     from rich.console import Console
 
     c = Console(record=True, width=width)
-    c.print(cc.build_trades_table(sb, now, limit=limit, odds=odds))
+    c.print(cc.build_windows_table(sb, now, arms=arms, limit=limit, odds=odds))
     return c.export_text()
+
+
+def _glyph_column(out: str) -> str:
+    """The lifecycle column read straight down — what the chip strip used to
+    be, and the thing the merge is not allowed to lose."""
+    return "".join(ln.strip("│").split("│")[0].strip()
+                   for ln in out.splitlines() if ln.startswith("│"))
 
 
 def _decided(slug, pnl, end_ts, **kw):
@@ -452,6 +414,61 @@ def test_every_decided_window_in_the_scoreboard_renders_a_trades_row():
     assert out.count("btc 5m") == 6
 
 
+# ---------- nothing lost in the strip -> table merge ----------
+
+def test_the_merged_table_carries_the_decided_sequence_the_strip_showed():
+    """The strip's whole job was an at-a-glance ✓/✗ run, newest first. Read the
+    merged table's glyph column straight down and it is the same run, in the
+    same order — which is the only reason deleting the strip is not a loss."""
+    pnls = [4.0, -44.0, 12.0, -3.0, 1.0]
+    sb = {"windows": [_decided(f"btc-updown-5m-{1787500000 + i * 300}", p,
+                                1787500300 + i * 300)
+                      for i, p in enumerate(pnls)],
+          "riding_windows": []}
+    # newest window-end first, so the sequence reverses the construction order
+    assert _glyph_column(_trades_text(sb)) == "✓✗✓✗✓"
+
+
+def test_the_merged_table_carries_the_riding_chips_identity():
+    """`◆ bnb5 $19` was the strip's riding chip: glyph, arm, notional. All
+    three survive as columns, and the ◆ still leads the newest row."""
+    sb = {"windows": [_decided("eth-updown-5m-1787509500", 4.0, 1787509800)],
+          "riding_windows": [_riding("bnb-updown-5m-1787510100", 1787510400)]}
+    out = _trades_text(sb)
+    assert _glyph_column(out) == "◆✓"
+    row = next(ln for ln in out.splitlines() if "bnb 5m" in ln)
+    assert "◆" in row and "$19.44" in row and "riding" in row
+
+
+def test_an_estimated_verdict_is_dim_in_the_glyph_column_like_its_chip_was():
+    # Same lower-confidence convention the ~estimated chip carried: the glyph
+    # keeps its shape and loses its win/loss color.
+    est = {"slug": "sol-updown-5m-1", "won": True, "pnl": 3.0, "est": True}
+    assert cc._stage_cell(est) == "[dim]✓[/]"
+    assert cc._stage_cell(dict(est, est=False)) == "[green]✓[/]"
+
+
+def test_the_glyph_column_names_every_stage_of_a_windows_life():
+    stages = {"armed": "○", "gated": "⊘", "riding": "◆", "won": "✓", "lost": "✗"}
+    for stage, glyph in stages.items():
+        assert glyph in cc._STAGE_LEGEND, stage
+    assert cc._stage_cell({"state": "armed"}) == "[green]○[/]"
+    assert cc._stage_cell({"state": "gated"}) == "[yellow]⊘[/]"
+    assert cc._stage_cell({"held": True}) == "[cyan]◆[/]"
+    assert cc._stage_cell({"won": False}) == "[red]✗[/]"
+    # A state this build doesn't know is still "not firing", never a fake gate.
+    assert cc._stage_cell({"state": "quiesce"}) == "[dim]⊘[/]"
+
+
+def test_a_gated_arm_holding_a_position_still_reads_as_riding():
+    """The gate blocks the NEXT fire, not the position already on the books —
+    money outranks posture in the glyph column."""
+    w = {"slug": "btc-updown-5m-1", "held": True, "live": True, "state": "gated"}
+    assert cc._stage(w) == "riding"
+    # ...and a graded window is decided whatever its arm is still doing.
+    assert cc._stage(dict(w, won=True)) == "won"
+
+
 def test_a_filled_window_renders_before_its_redeem_posts():
     """THE regression. A win waits on Polymarket's redeem row and a loss posts
     no row at all until the 300s gamma grace expires; for that whole stretch
@@ -468,15 +485,23 @@ def test_a_filled_window_renders_before_its_redeem_posts():
     assert "+0.00" not in out
 
 
-def test_trades_title_states_the_retention_cap():
-    sb = {"windows": [_decided("btc-updown-5m-1787500000", 1.0, 1787500300)] * 12,
-          "riding_windows": [{"slug": "bnb-updown-5m-1787510100", "notional": 19.0}] * 2}
-    assert cc.trades_title(sb) == "trades · last 12 decided · 2 riding"
-    assert cc.trades_title({}) == "trades · last 0 decided · 0 riding"
-    assert cc.trades_title(None) == "trades · last 0 decided · 0 riding"
+def test_windows_title_states_the_retention_cap():
+    sb = {"windows": [_decided(f"btc-updown-5m-{1787500000 + i}", 1.0,
+                                1787500300 + i) for i in range(12)],
+          "riding_windows": [_riding(f"bnb-updown-5m-{1787510100 + i}",
+                                      1787510400 + i) for i in range(2)]}
+    assert cc.windows_title(sb) == "windows · 0 live · 2 riding · last 12 decided"
+    assert cc.windows_title({}) == "windows · 0 live · 0 riding · last 0 decided"
+    assert cc.windows_title(None) == "windows · 0 live · 0 riding · last 0 decided"
     # A short panel says how much of the held set it is actually painting.
-    assert cc.trades_title(sb, 6) == "trades · 6 of 14 · 12 decided · 2 riding"
-    assert cc.trades_title(sb, 14) == "trades · last 12 decided · 2 riding"
+    assert cc.windows_title(sb, shown=6) == (
+        "windows · 6 of 14 · 0 live · 2 riding · last 12 decided")
+    assert cc.windows_title(sb, shown=14) == (
+        "windows · 0 live · 2 riding · last 12 decided")
+    # A live arm with nothing filled adds a row, and the title counts it.
+    arms = {"xrp-updown-5m-1787600000": {"eval": {"state": "gated"}}}
+    assert cc.windows_title(sb, arms) == (
+        "windows · 1 live · 2 riding · last 12 decided")
 
 
 def _riding(slug, end_ts, notional=19.44):
@@ -488,25 +513,122 @@ def test_a_fresh_fill_tops_the_panel_and_a_short_panel_keeps_it():
     sb = {"windows": [_decided(f"btc-updown-5m-{1787500000 + i * 300}", 1.0,
                                 1787500300 + i * 300) for i in range(6)],
           "riding_windows": [_riding("bnb-updown-5m-1787510100", 1787510400)]}
-    rows = cc.trade_rows(sb, limit=2)
+    rows = cc.window_rows(sb, limit=2)
     assert rows[0]["slug"] == "bnb-updown-5m-1787510100"
     assert len(rows) == 2
-    assert len(cc.trade_rows(sb)) == 7  # no limit: everything
+    assert len(cc.window_rows(sb)) == 7  # no limit: everything
 
 
 def test_a_window_stuck_riding_since_yesterday_does_not_squat_on_the_panel():
     """Four windows had been undecided for 13-25h on 2026-08-23 ($317 of
     them). Riding-always-first would have handed them 4 of the panel's 6 rows
     in perpetuity; the risk header's "riding N windows $W" is where a stuck
-    total belongs, not this panel, which answers "what just happened"."""
+    total belongs, not this panel, which answers "where is the fleet now"."""
     sb = {"windows": [_decided(f"btc-updown-5m-{1787509500 + i * 300}", 1.0,
                                 1787509800 + i * 300) for i in range(4)],
           "riding_windows": [_riding(f"eth-updown-5m-{1787420000 + i}", 1787420300 + i)
                               for i in range(4)]}
-    rows = cc.trade_rows(sb, limit=4)
+    rows = cc.window_rows(sb, limit=4)
     assert all(r["won"] is not None for r in rows), "stale riding crowded out today"
     # ...and they are still all there, in age order, when nothing is capping.
-    assert len(cc.trade_rows(sb)) == 8
+    assert len(cc.window_rows(sb)) == 8
+
+
+# ---------- the live head: windows the wallet cannot see yet ----------
+
+_LIVE_ARMS = {
+    "btc-updown-5m-1787510700": {  # ends 1787511000, still open
+        "filled_usdc": 120.0, "roll": True,
+        "eval": {"state": "armed", "committed": 120.0}},
+    "xrp-updown-5m-1787510700": {"eval": {"state": "gated", "committed": 0.0}},
+}
+
+
+def test_a_live_arm_holds_a_row_before_anything_has_filled():
+    """The head of the lifecycle. An armed window has no wallet row until it
+    fires, so the scoreboard cannot see it at all — without the engine's arms
+    the table could only ever start at "already spent money"."""
+    rows = cc.window_rows({"windows": [], "riding_windows": []}, _LIVE_ARMS)
+    assert {r["slug"] for r in rows} == set(_LIVE_ARMS)
+    assert all(r["live"] and r["won"] is None for r in rows)
+    out = _trades_text({}, arms=_LIVE_ARMS, now=1787510800.0)
+    assert "armed" in out and "gated" in out
+    assert "live" in out  # the window has not ended: age reads as live, not 0s
+
+
+def test_a_fire_fills_the_row_that_is_already_there_instead_of_adding_one():
+    """One row per window is the whole point of keying on the slug: the
+    operator watches a row move through its life, not a second row appear
+    under the first."""
+    slug = "btc-updown-5m-1787510700"
+    sb = {"windows": [], "riding_windows": [_riding(slug, 1787511000)]}
+    rows = cc.window_rows(sb, _LIVE_ARMS)
+    assert [r["slug"] for r in rows].count(slug) == 1
+    merged = next(r for r in rows if r["slug"] == slug)
+    assert merged["live"] and cc._stage(merged) == "riding"
+
+
+def test_the_wallet_wins_over_the_engine_on_a_window_both_know():
+    """Wallet is ground truth. The engine only ever contributes posture — its
+    committed figure may not touch a window the scoreboard already priced."""
+    slug = "btc-updown-5m-1787510700"
+    sb = {"windows": [], "riding_windows": [_riding(slug, 1787511000, notional=7.5)]}
+    merged = next(r for r in cc.window_rows(sb, _LIVE_ARMS) if r["slug"] == slug)
+    assert merged["notional"] == 7.5, "the engine's $120 overwrote the wallet"
+    assert merged["entry_px"] == 0.97 and merged["side"] == "up"
+
+
+def test_the_engines_committed_is_dim_until_the_wallet_confirms_it():
+    # It is a real figure and belongs on screen the moment the engine reports
+    # it — but it is not ground truth, and must not read like the wallet's.
+    from rich.console import Console
+
+    slug = "btc-updown-5m-1787510700"
+
+    def row_ansi(sb):
+        c = Console(record=True, width=100)
+        c.print(cc.build_windows_table(sb, 1787510800.0, arms=_LIVE_ARMS))
+        return next(ln for ln in c.export_text(styles=True).splitlines()
+                    if "btc 5m" in ln)
+
+    assert "$120.00" in row_ansi({})
+    engine_only = row_ansi({}).split("$120.00")[0]
+    assert engine_only.endswith("\x1b[2m"), "the engine's own figure is not dim"
+    # ...and the wallet's own figure for the same window is not dimmed.
+    confirmed = row_ansi({"windows": [], "riding_windows": [_riding(slug, 1787511000)]})
+    assert "$19.44" in confirmed
+    assert not confirmed.split("$19.44")[0].endswith("\x1b[2m")
+
+
+def test_window_rows_never_annotates_the_scoreboard_it_was_handed():
+    """The scoreboard object is shared with the risk header's riding totals;
+    marking it up in place would quietly change what another panel reads."""
+    riding = _riding("btc-updown-5m-1787510700", 1787511000)
+    decided = _decided("eth-updown-5m-1787500000", 1.0, 1787500300)
+    sb = {"windows": [decided], "riding_windows": [riding]}
+    before = (dict(riding), dict(decided))
+    cc.window_rows(sb, _LIVE_ARMS)
+    assert (riding, decided) == before
+    assert sb["riding_windows"] == [riding] and sb["windows"] == [decided]
+
+
+def test_a_non_window_arm_never_becomes_a_row():
+    # The arms table shows whatever the engine named; this table's unit is a
+    # WINDOW, and a row it cannot place in time would sort to the bottom
+    # forever.
+    assert cc.window_rows({}, {"not-a-real-slug": {"eval": {"state": "armed"}}}) == []
+    assert cc.live_rows(None) == [] and cc.live_rows({}) == []
+
+
+def test_the_table_reads_top_to_bottom_as_the_lifecycle():
+    """One sort key — window end, descending — and a window's stage is a
+    function of its age, so time order IS lifecycle order: live head, riding,
+    decided tail."""
+    sb = {"windows": [_decided("eth-updown-5m-1787500000", 1.0, 1787500300),
+                      _decided("sol-updown-5m-1787499700", -2.0, 1787500000)],
+          "riding_windows": [_riding("bnb-updown-5m-1787510100", 1787510400)]}
+    assert _glyph_column(_trades_text(sb, arms=_LIVE_ARMS,
+                                      now=1787510800.0)) == "○⊘◆✓✗"
 
 
 def test_age_label_reads_as_time_since_not_a_clock():
@@ -529,11 +651,37 @@ def test_trades_table_tolerates_a_half_built_row():
 
 
 def test_trades_table_empty_scoreboard_says_so():
-    # The placeholder must FIT its cell — an ellipsized "no trade…" is exactly
+    # The placeholder must FIT its cell — an ellipsized "no window…" is exactly
     # the ambiguity this panel exists to remove.
-    assert "no trades" in _trades_text({"windows": [], "riding_windows": []})
-    assert "no trades" in _trades_text(None)
+    assert "no windows" in _trades_text({"windows": [], "riding_windows": []})
+    assert "no windows" in _trades_text(None)
     assert "…" not in _trades_text(None)
+
+
+def test_the_merged_table_fits_a_narrow_terminal_without_losing_a_column():
+    """Fixed natural widths, not expand: the whole table is ~70 columns, so it
+    paints the same on an 80-column terminal as on a 200-column one."""
+    sb = {"windows": [_decided("btc-updown-5m-1787500000", -12436.76, 1787500300)],
+          "riding_windows": [_riding("bnb-updown-5m-1787510100", 1787510400)]}
+    for width in (80, 100, 200):
+        out = _trades_text(sb, width=width, arms=_LIVE_ARMS)
+        rows = [ln for ln in out.splitlines() if ln.startswith("│")]
+        assert all(len(ln) <= width for ln in rows), width
+        assert _glyph_column(out) == "○⊘◆✗", width
+
+
+def test_the_column_geometry_is_identical_across_every_stage():
+    """A double-wide glyph in the stage column would shove every field after it
+    one place right on that row only — the exact jitter the fixed widths exist
+    to prevent."""
+    sb = {"windows": [_decided("btc-updown-5m-1787500000", 12.0, 1787500300),
+                      _decided("sol-updown-5m-1787499700", -2.0, 1787500000,
+                               est=True)],
+          "riding_windows": [_riding("bnb-updown-5m-1787510100", 1787510400)]}
+    out = _trades_text(sb, arms=_LIVE_ARMS)
+    rows = [ln for ln in out.splitlines() if ln.startswith("│")]
+    assert len({len(ln) for ln in rows}) == 1, rows
+    assert len({tuple(len(c) for c in ln.strip("│").split("│")) for ln in rows}) == 1
 
 
 def test_a_riding_row_says_what_we_paid_and_what_it_is_worth_now():
@@ -547,7 +695,7 @@ def test_a_riding_row_says_what_we_paid_and_what_it_is_worth_now():
     out = _trades_text(sb, odds={("bnb-updown-5m-1787510100", "up"): 0.99})
     row = next(ln for ln in out.splitlines() if "bnb 5m" in ln)
     cells = [c.strip() for c in row.strip("│").split("│")]
-    assert cells == ["1m", "bnb 5m", "up", "0.97", "0.99", "$19.44", "riding"]
+    assert cells == ["◆", "1m", "bnb 5m", "up", "0.97", "0.99", "$19.44", "riding"]
 
 
 def test_the_now_column_is_blank_when_the_marks_feed_has_nothing():
@@ -559,7 +707,7 @@ def test_the_now_column_is_blank_when_the_marks_feed_has_nothing():
         out = _trades_text(sb, odds=odds)
         row = next(ln for ln in out.splitlines() if "bnb 5m" in ln)
         cells = [c.strip() for c in row.strip("│").split("│")]
-        assert cells[3] == "0.97" and cells[4] == "—", (odds, cells)
+        assert cells[4] == "0.97" and cells[5] == "—", (odds, cells)
 
 
 def test_the_now_column_colors_by_which_side_is_winning():
@@ -1088,7 +1236,6 @@ def _frame_text(width: int = 160) -> str:
     place a fact duplicated ACROSS builders is visible."""
     from rich.console import Console
     from rich.panel import Panel
-    from rich.text import Text
 
     status = {"arms": _FRAME_ARMS, "rtds": dict(_LIVE_RTDS)}
     sb = {"wins": 40, "losses": 6, "net": 512.25, "rolls": 12, "estimated": 0,
@@ -1100,8 +1247,8 @@ def _frame_text(width: int = 160) -> str:
     # the exposure line lives INSIDE the header panel now — no standalone row
     c.print(cc.build_header_panel(snap, "since 08-23 04:00Z", None))
     c.print(cc.build_arms_table(_FRAME_ARMS, now=1700000000.0))
-    c.print(Panel(Text.from_markup(cc.build_windows_strip(sb["windows"])),
-                  title="recent windows", border_style="dim"))
+    c.print(Panel(cc.build_windows_table(sb, 1700000000.0, arms=_FRAME_ARMS),
+                  title=cc.windows_title(sb, _FRAME_ARMS), border_style="dim"))
     return c.export_text()
 
 
@@ -1293,13 +1440,44 @@ def test_quit_requested_swallows_select_errors(monkeypatch):
     assert cc._poll_key() is None  # never raises, dashboard must survive
 
 
-def test_controls_panel_renders():
+# ---------- the controls modal ----------
+
+def _modal_text(width=160):
     from rich.console import Console
-    import io
-    con = Console(file=io.StringIO(), width=160)
-    con.print(cc._controls_panel())
-    out = con.file.getvalue()
-    assert "quit" in out and "controls" in out
+
+    c = Console(record=True, width=width)
+    c.print(cc.build_help_modal(width))
+    return c.export_text()
+
+
+def test_the_modal_spells_out_every_glyph_on_screen():
+    """The modal is the only place the glyphs are named — the strip that used
+    to carry a one-line legend is gone, and a glyph nothing explains is
+    decoration."""
+    out = _modal_text()
+    for glyph in ("⟳", "≈", "◇", "○", "⊘", "◆", "✓", "✗"):
+        assert glyph in out, glyph
+
+
+def test_the_modal_lists_every_key_with_an_explanation():
+    out = _modal_text()
+    for _press, label, desc in cc.WATCH_KEYS:
+        assert label in out, label
+        assert desc.split(";")[0][:24] in out, desc
+
+
+def test_the_modal_says_what_since_does_now_that_it_has_the_room():
+    # It changes what the header's `recent` row means, and --help is not
+    # reachable without leaving the dashboard.
+    out = _modal_text()
+    assert "--since" in out and "recent" in out
+
+
+def test_the_modal_fits_a_narrow_terminal():
+    # A foreground panel wider than the screen is a wrapped mess, not a modal.
+    for width in (60, 78, 200):
+        for ln in _modal_text(width).splitlines():
+            assert len(ln) <= min(width, cc._HELP_MODAL_W), (width, ln)
 
 
 def test_poll_key_passes_timeout_through_to_select(monkeypatch):
