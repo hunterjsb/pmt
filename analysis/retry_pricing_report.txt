@@ -1,0 +1,285 @@
+
+====================================================================================================
+0. CORPUS AND THE POPULATION UNDER STUDY
+====================================================================================================
+span             08-23 02:45:20Z -> 08-23 08:41:09Z  (5.93h)
+                 = book-tape start .. last wallet activity row; outside it
+                   one side of every counterfactual is missing
+fires in span    502   graded windows 100   (slug,side) keys 100
+fills            379 filled   123 zero-fill   12,718 shares
+outcome sources  {'chainlink': 5, 'wallet': 93, 'book': 2}
+era mix          {'brake': 338, 'theta': 56, 'theta+payup': 108}
+mode mix         {'spec': 92, 'safe': 409, 'flip': 1}
+print coverage   08-22 02:59:36Z -> 08-23 07:39:00Z  (ends 62min before the span; the print tier is a LOWER bound past that)
+limit rebuild    order-latency-tape ack rows: 109 exact, 8 mismatched, 7 unjoinable  <- pay_up_limit() reconstruction is EXACT
+delta matcher    1/125 order-tape rows suppressed (the matcher already holds a quote when price+size match)
+
+--- the retry population — an unfilled clip re-decided by the 12s TTL -------------------------------
+  re-decides of an unfilled clip: 81
+    repriced WORSE   55 (68%)   n=55    p10    1.00 p50    3.00 p90   10.00 p99   12.00 min    1.00 max    35.00 c
+    repriced SAME    13 (16%)
+    repriced BETTER  13 (16%)  n=13    p10    1.00 p50    1.00 p90    4.00 p99    4.00 min    0.10 max     4.00 c
+
+  FIRST RESULT, and it reframes the question: the 12s re-decide is not only a
+  chase. A third of them come back at a BETTER price than the clip that missed.
+  Any policy that pins the original limit forgoes those improvements as well as
+  the chase, and the table below charges it for both.
+  chains 139   chase chains 15   ladder 75   singletons 49
+
+--- does the book come back? — an ask <= the missed clip's own limit, after the re-decide -----------
+  horizon    chase chains    ask   ask2   print
+  12s                  15      0      0       0
+  24s                  15      2      2       1
+  36s                  15      3      2       3
+  60s                  15      4      3       5
+  120s                 15      4      3       5
+
+====================================================================================================
+1. FILL-MODEL CALIBRATION — does the book test reproduce the wallet?
+====================================================================================================
+The model only ever runs on intervals where no order of ours was live, so it
+cannot be validated in place. What CAN be checked is the direction of its bias:
+run it over each recorded clip's OWN life and compare to the wallet. The tape
+samples at 1-5s while the engine fires off a live book, so it is expected to
+OVER-fill there. That over-fill rate is the haircut every gain below must
+survive.
+
+  ask    n= 502  says-fill  440 vs wallet  379   precision 0.80  recall 0.93   FALSE FILLS 88 (17.5% of clips)
+  ask2   n= 502  says-fill  314 vs wallet  379   precision 0.86  recall 0.71   FALSE FILLS 44 (8.8% of clips)
+  print  n= 502  says-fill  436 vs wallet  379   precision 0.83  recall 0.96   FALSE FILLS 72 (14.3% of clips)
+
+  READ: a false fill is the model claiming a cross the wallet never saw. On a
+  clip's OWN life that is mostly the tape's stale ask, which is exactly why the
+  counterfactual never scans a placement's own life — it starts strictly after
+  the re-decide whose ask proves the live book had moved above our limit.
+
+====================================================================================================
+2. POLICY TABLE — Δ vs today's policy, priced on the recorded tape
+====================================================================================================
+
+base = today's policy. RECORDED fills only; no fill model anywhere in this row.
+  clips 502   filled 379   shares 12,718   notional $9,624
+  settlement P&L $-246.46  (hold-to-resolution, no exits, no fees —
+  the absolute level is not wallet truth, only the Δ column is read)
+
+--- fill tier = ask   (the loosest — one stale sample is enough) ------------------------------------
+  policy                   clips  fill   shares     lost   gained     Δ P&L     bootstrap CI95
+  hold TTL 24s               433   356   10,716   -2,649     +647     +9.60  [    -59,   +100]
+  hold TTL 36s               409   342   10,311   -3,079     +672    +17.28  [    -79,   +162]
+  hold TTL 60s               391   335   10,132   -3,355     +769    -37.51  [   -104,    +25]
+  ratchet (cap 0c)           419   314   11,144   -1,908     +334    +26.13  [   -131,   +281]
+  chase cap 2c               441   332   11,699   -1,228     +209    +50.37  [    -94,   +296]
+  chase cap 4c               470   348   12,098     -729     +109    +76.39  [    -54,   +310]
+  chase cap 8c               495   371   12,555     -213      +50    -16.19  [    -45,     -0]
+
+--- fill tier = ask2   (two consecutive samples) ----------------------------------------------------
+  policy                   clips  fill   shares     lost   gained     Δ P&L     bootstrap CI95
+  hold TTL 24s               433   350   10,427   -2,649     +359    +31.91  [    -71,   +198]
+  hold TTL 36s               408   339   10,165   -3,131     +578    +14.01  [    -90,   +173]
+  hold TTL 60s               386   328    9,814   -3,561     +657    -53.17  [   -131,    +23]
+  ratchet (cap 0c)           409   303   10,760   -2,251     +293     -0.80  [   -171,   +265]
+  chase cap 2c               430   321   11,325   -1,552     +160    +25.67  [   -136,   +284]
+  chase cap 4c               469   347   12,048     -779     +109    +71.89  [    -60,   +308]
+  chase cap 8c               488   367   12,454     -309      +45    -20.48  [    -53,     -0]
+
+--- fill tier = print   (real trade prints; lower bound past 07:39Z) --------------------------------
+  policy                   clips  fill   shares     lost   gained     Δ P&L     bootstrap CI95
+  hold TTL 24s               433   358   10,634   -2,649     +566     +3.13  [    -62,    +84]
+  hold TTL 36s               411   349   10,281   -3,030     +593    -17.55  [    -79,    +54]
+  hold TTL 60s               393   342   10,089   -3,287     +658    -39.90  [   -104,    +22]
+  ratchet (cap 0c)           424   321   11,270   -1,737     +289    +33.57  [   -121,   +288]
+  chase cap 2c               443   336   11,745   -1,245     +272    +56.29  [    -85,   +299]
+  chase cap 4c               478   356   12,234     -603     +120    -13.93  [    -43,    +17]
+  chase cap 8c               497   373   12,597     -180      +59     -8.51  [    -23,     -0]
+
+--- give-up rules — EXACT (they only subtract recorded fills; no fill model) ------------------------
+  policy                   clips  fill   shares     lost   gained     Δ P&L     bootstrap CI95
+  give up after 0 (chain)    421   326    9,856   -2,862       +0    +39.91  [   -106,   +279]
+  give up after 0 (win)      302   243    7,650   -5,068       +0    -53.89  [   -382,   +381]
+  give up after 1 (win)      434   335   11,435   -1,283       +0    -95.86  [   -209,    -20]
+  give up after 2 (win)      484   369   12,483     -235       +0     -8.08  [    -21,     +0]
+  give up after 3 (win)      493   374   12,596     -122       +0     -5.04  [    -15,     +0]
+  give up after 1 (chain)    486   369   12,428     -290       +0    -16.96  [    -33,     -5]
+  give up after 2 (chain)    498   377   12,667      -51       +0     -3.10  [     -9,     +0]
+
+--- the knob that actually moved — pay_up_max, from the ENTRY side ----------------------------------
+
+  Every policy above fixes the retry. pay_up_max prevents it: a fatter
+  marketable buffer means the clip crosses even though the ask ticked up while
+  the order was in flight, and a marketable limit still fills AT the book, so
+  the buffer costs nothing unless the book actually moved. Over this corpus
+  pay_up_max was 0 (pre-06:00Z) then 0.02. As of 15:0xZ TODAY the live arms
+  carry btc/eth 0.05, sol 0.04, bnb/xrp 0.02 — a 2.5x loosening of the chase
+  budget with no A/B behind it, so here is what the corpus says it buys.
+
+  Counterfactual: an unfilled clip whose re-decide came back at ask' would have
+  crossed on the FIRST attempt if ask' <= tick(ask + min(surplus, pay_up_max)).
+  ask' is the engine's own next live read, so this needs no book model at all.
+
+  pay_up_max     worse re-decides pre-empted  buffer spent (UPPER bound
+                                                     on the extra paid)
+      0c                0/55                                0.00c
+      2c               24/55                                1.83c   <- the corpus's own policy
+      4c               40/55                                3.20c
+      5c               42/55                                3.79c   <- LIVE NOW (btc/eth)
+      8c               48/55                                4.83c
+
+  READ: the buffer is the only lever in this study that buys fills WITHOUT
+  buying a stale price — the limit stays marketable, so it pays the BOOK on
+  arrival (section 1 of latency_report: filled clips pay at or better than
+  their quoted ask 95% of the time), and the column above is the ceiling on
+  the extra, not the expectation. What it cannot do is reach the clips whose
+  re-decide moved further than the buffer: the p90 worse re-decide is +10c,
+  twice the 5c now live.
+
+====================================================================================================
+3. ADVERSE SELECTION — do held-price fills lose more often?
+====================================================================================================
+The mechanism to fear: the ask comes back down to our original limit precisely
+when the market has re-priced our side CHEAPER — i.e. when the tape went against
+the thesis. If that is what is happening, every fill a hold policy 'recovers' is
+one we should be glad to have missed. Graded on the L36-cleaned outcomes
+(wallet rows first), shares-weighted.
+
+  population                                         fills      sh   $notl   won%       P&L    c/sh  wins   top w
+  base: fills on a clip that was NOT a chase re-decide   326   9,856   8,317  82.3%   -206.55   -2.10    89  -168.4
+  base: fills bought BY a chase re-decide               53   2,862   1,307  44.3%    -39.91   -1.39    26  -101.0
+  hold 24s: fills recovered at the original limit [ask]    23     647     616  88.7%    -42.36   -6.55    12   -67.4
+  hold 24s: chase fills the hold forgoes                46   2,649   1,106  39.8%    -51.96   -1.96    25  -101.0
+  hold 24s: fills recovered at the original limit [print]    25     566     536  86.1%    -48.83   -8.63    13   -72.3
+  hold 24s: chase fills the hold forgoes                46   2,649   1,106  39.8%    -51.96   -1.96    25  -101.0
+  hold 36s: fills recovered at the original limit [ask]    23     672     634  88.1%    -42.46   -6.32    13   -73.7
+  hold 36s: chase fills the hold forgoes                60   3,079   1,511  47.2%    -59.74   -1.94    27  -131.4
+  hold 36s: fills recovered at the original limit [print]    29     593     561  84.8%    -58.07   -9.79    16   -83.0
+  hold 36s: chase fills the hold forgoes                59   3,030   1,469  47.2%    -40.52   -1.34    27  -106.6
+  hold 60s: fills recovered at the original limit [ask]    25     769     723  89.6%    -34.12   -4.44    16   -73.7
+  hold 60s: chase fills the hold forgoes                69   3,355   1,771  52.9%     +3.39   +0.10    28   -86.5
+  hold 60s: fills recovered at the original limit [print]    32     658     620  87.8%    -41.72   -6.34    19   -73.7
+  hold 60s: chase fills the hold forgoes                69   3,287   1,709  51.9%     -1.82   -0.06    28   -86.5
+  give up after 1: recorded fills the stand-down forgoes    44   1,283   1,187 100.0%    +95.86   +7.47     7   +42.3
+  give up after 2: recorded fills the stand-down forgoes    10     235     227 100.0%     +8.08   +3.44     2    +5.0
+  give up after 3: recorded fills the stand-down forgoes     5     122     117 100.0%     +5.04   +4.13     1    +5.0
+
+--- recorded fills by retry index — is there a depth at which the chase turns bad? ------------------
+  retry index                                        fills      sh   $notl   won%       P&L    c/sh  wins   top w
+    retry 0  (the original clip / a ladder add)        326   9,856   8,317  82.3%   -206.55   -2.10    89  -168.4
+    retry 1                                             43   2,572   1,034  38.0%    -56.88   -2.21    25  -101.0
+    retry 2                                              8     239     225 100.0%    +13.86   +5.80     7    +3.1
+    retry 3                                              1      25      24 100.0%     +0.50   +2.00     1    +0.5
+    retry 4+                                             1      26      23 100.0%     +2.60  +10.00     1    +2.6
+
+--- retry-1 fills split by which way the re-decide moved — where the damage actually is -------------
+    re-decide came back WORSE  (the chase this study is about)    34     896     839  94.1%     +4.04   +0.45    22   -49.3
+    re-decide came back at the SAME ask                  0       0       0   0.0%     +0.00   +0.00     0    +0.0
+    re-decide came back BETTER (the ask fell)            9   1,676     195   8.0%    -60.91   -3.63     7   -51.7
+
+  Every case in the BETTER row, because it is 2 windows wearing a share count:
+    btc-updown-15m-1787457600    down won=up   A ask 0.91 x27 -> 0    B ask 0.89 x28 -> 28 @ 0.878   P&L  -24.59
+    btc-updown-15m-1787457600    down won=up   A ask 0.89 x28 -> 0    B ask 0.87 x10 -> 10 @ 0.870   P&L   -8.70
+    btc-updown-15m-1787457600    down won=up   A ask 0.97 x25 -> 0    B ask 0.93 x26 -> 26 @ 0.710   P&L  -18.46
+    sol-updown-15m-1787458500    down won=down A ask 0.98 x25 -> 0    B ask 0.98 x25 -> 25 @ 0.979   P&L   +0.53
+    btc-updown-15m-1787459400    down won=down A ask 0.96 x26 -> 0    B ask 0.95 x26 -> 26 @ 0.950   P&L   +1.30
+    eth-updown-15m-1787460300    down won=down A ask 0.97 x51 -> 0    B ask 0.96 x52 -> 52 @ 0.950   P&L   +2.60
+    eth-updown-5m-1787462100     down won=up   A ask 0.05 x10 -> 0    B ask 0.01 x1478 -> 1478 @ 0.010   P&L  -14.78
+    btc-updown-15m-1787465700    up   won=up   A ask 0.96 x26 -> 0    B ask 0.95 x26 -> 26 @ 0.960   P&L   +1.04
+    btc-updown-15m-1787470200    down won=down A ask 0.98 x25 -> 0    B ask 0.96 x5 -> 5 @ 0.970   P&L   +0.15
+
+  Read the two that carry it. eth-5m-1787462100 is 1,478 shares of a ONE-CENT
+  side ($14.78 of notional) — a penny lottery clip that inflates every
+  share-weighted statistic it touches and moves $15. btc-15m-1787457600 is the
+  L22 window, a known loser whose clips lost on retry 0 as well as retry 1.
+  Strip those two and the 'cheaper re-decide is poison' story is gone. This is
+  the L37 failure mode caught early: a share-weighted slice of n=2 windows.
+
+--- worked example — one chase chain, every policy side by side -------------------------------------
+  eth-updown-15m-1787461200 down   winner=down  (wallet)   quiesce at 08-23 05:14:40Z
+    +   0.0s  fire down     57sh  ask 0.87  limit 0.87  net +12.1c  -> wallet filled    0.0sh
+    +  12.0s  fire down     52sh  ask 0.95  limit 0.95  net  +4.6c  -> wallet filled   52.0sh @ 0.950
+    +  24.1s  fire down     55sh  ask 0.90  limit 0.90  net  +9.3c  -> wallet filled   55.0sh @ 0.883
+    +  36.1s  fire down     50sh  ask 0.91  limit 0.91  net  +8.4c  -> wallet filled   50.0sh @ 0.910
+    +  48.2s  fire down     54sh  ask 0.91  limit 0.91  net  +8.4c  -> wallet filled   54.0sh @ 0.910
+    +  60.2s  fire down     50sh  ask 0.93  limit 0.93  net  +6.5c  -> wallet filled   50.0sh @ 0.915
+    hold 24s: order stays at 0.87; book test says nothing crossed
+    hold 36s: order stays at 0.87; book test says 40sh @ 0.87 at +28.4s
+
+====================================================================================================
+4. PRICE IMPROVEMENT — held limit vs what the chase actually paid
+====================================================================================================
+  hold 24s — cents/share the held limit SAVES vs the chase's own VWAP
+    all re-decides   n= 17  n=17    p10   -6.00 p50   -1.00 p90    0.00 p99    2.00 min  -26.00 max     2.00 c
+    WORSE ones only  n=  5  n=5     p10   -7.00 p50    0.00 p90    2.00 p99    2.00 min   -7.00 max     2.00 c
+  hold 36s — cents/share the held limit SAVES vs the chase's own VWAP
+    all re-decides   n= 26  n=26    p10   -6.00 p50   -1.00 p90    0.00 p99    4.54 min  -37.94 max     4.54 c
+    WORSE ones only  n=  9  n=9     p10   -1.83 p50    0.00 p90    1.78 p99    4.54 min   -7.00 max     4.54 c
+
+  Negative = the chase paid LESS than the limit we would have pinned. That is
+  the mirror of the 'repriced BETTER' third above, and it is the reason the
+  pay-up row's +10.64c does not translate into +10.64c of recoverable price.
+
+====================================================================================================
+5. AGAINST latency_report SECTION 6 ROW (c)
+====================================================================================================
+
+  row (c) priced the 12s TTL's own drift at $771.40 over 22,715 shares in 11.7h
+  (+3.396 c/share) as lambda(12s)=46.3% x 10.64c pay-up, charged as if resting
+  the original limit were free.
+
+  This span carries 12,718 filled shares in 5.93h; pro-rata by shares that is
+  $431.89 of theoretical retry-pricing value sitting inside this corpus.
+  policy                     tier     Δ P&L   CI95 upper   vs the $432 row (c) implies
+  hold TTL 24s                ask     +9.60         +100   REJECTED
+  hold TTL 24s               ask2    +31.91         +198   REJECTED
+  hold TTL 24s              print     +3.13          +84   REJECTED
+  hold TTL 36s                ask    +17.28         +162   REJECTED
+  hold TTL 36s               ask2    +14.01         +173   REJECTED
+  hold TTL 36s              print    -17.55          +54   REJECTED
+  hold TTL 60s                ask    -37.51          +25   REJECTED
+  hold TTL 60s               ask2    -53.17          +23   REJECTED
+  hold TTL 60s              print    -39.90          +22   REJECTED
+  ratchet (cap 0c)            ask    +26.13         +281   REJECTED
+  ratchet (cap 0c)           ask2     -0.80         +265   REJECTED
+  ratchet (cap 0c)          print    +33.57         +288   REJECTED
+  chase cap 2c                ask    +50.37         +296   REJECTED
+  chase cap 2c               ask2    +25.67         +284   REJECTED
+  chase cap 2c              print    +56.29         +299   REJECTED
+  chase cap 4c                ask    +76.39         +310   REJECTED
+  chase cap 4c               ask2    +71.89         +308   REJECTED
+  chase cap 4c              print    -13.93          +17   REJECTED
+  chase cap 8c                ask    -16.19           -0   REJECTED
+  chase cap 8c               ask2    -20.48           -0   REJECTED
+  chase cap 8c              print     -8.51           -0   REJECTED
+
+  Every policy's 95% upper bound is below $432 (max upper: $310).
+  The corpus REJECTS row (c)'s pro-rata value for every retry policy tested.
+  Row (c) is not a $772 pot of money that a shorter TTL or a pinned limit picks
+  up; it is the price of a chase that the recorded book mostly does not give
+  back, plus a third of re-decides that come back CHEAPER and are pure gain.
+
+====================================================================================================
+6. MATCHER SENSITIVITY — does the answer survive the fill attribution?
+====================================================================================================
+The whole table rides on one free parameter: which fire a wallet row is hung
+on. latency_report's sweep showed the median is robust and the tail is not, and
+a retry study lives exactly in the tail — clip k+1's fills landing on clip k is
+the same event this study calls 'the chase filled'. Re-run the headline
+policies under the opposite attribution.
+
+  policy                     tier   newest-first Δ   oldest-first Δ
+  base (absolute P&L)           —          -246.46          -242.71
+  hold TTL 24s                ask            +9.60            -9.45
+  hold TTL 36s                ask           +17.28           -22.86
+  hold TTL 60s                ask           -37.51           -33.40
+  ratchet (cap 0c)            ask           +26.13           -46.34
+  chase cap 2c                ask           +50.37           -24.95
+  chase cap 4c                ask           +76.39           -21.77
+  chase cap 8c                ask           -16.19           -11.68
+  give up after 0 (chain)     ask           +39.91            +8.75
+  give up after 0 (win)       ask           -53.89            -0.19
+  give up after 1 (win)       ask           -95.86           -79.87
+  give up after 2 (win)       ask            -8.08            -5.04
+  give up after 3 (win)       ask            -5.04            -5.04
+  give up after 1 (chain)     ask           -16.96           -11.98
+  give up after 2 (chain)     ask            -3.10            -2.60
+
+  A policy whose sign flips between these two columns is measuring the join,
+  not the market.
