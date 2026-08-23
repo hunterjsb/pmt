@@ -1,0 +1,417 @@
+# latency_report  generated 08-23 09:27:34Z
+# corpus [08-22 22:02:17Z .. 08-23 09:03:12Z]
+
+====================================================================================================
+0. CORPUS CENSUS
+====================================================================================================
+fire records         944   08-22 22:02:17Z -> 08-23 09:03:12Z  (11.02h)
+eval                9582   08-22 22:02:17Z -> 08-23 09:24:36Z
+gated              11623   08-22 23:07:30Z -> 08-23 09:24:36Z
+roll                 367   08-23 00:05:00Z -> 08-23 09:25:00Z
+cleanup              400   08-22 22:05:00Z -> 08-23 09:25:00Z
+book samples       43539   08-23 02:45:20Z -> 08-23 09:24:59Z  309 slugs
+wallet BUY fills     928   12-29 01:57:53Z -> 08-23 08:38:06Z  182 (slug,side) keys
+public prints     167941   08-22 02:59:36Z -> 08-23 07:39:00Z  220 slugs   (COVERS ONLY PART OF THE FIRE ERA)
+validated outcomes   345
+
+era boundaries: brake@08-23 02:18:46Z  theta@08-23 05:00:00Z  theta+payup@08-23 06:00:00Z
+
+====================================================================================================
+1. FIRE -> FILL  [BOUNDED ABOVE: wallet timestamps are Polygon blocks, integer seconds]
+====================================================================================================
+What this is and is not. `_lat` below = (on-chain fill second) - (engine fire
+timestamp). It contains, in order: the rest of the strategy tick, order build,
+EIP-712 signing, the HTTPS round trip, CLOB matching, the exchange's on-chain
+settlement transaction, Polygon block inclusion, and the data-api indexer.
+Only the first four are ours. Polygon blocks are ~2s and the timestamp is
+truncated to the second, so subtract roughly 2-3s to get an upper bound on
+anything pmengine controls. This number can never prove the order path is
+fast; it can prove it is not catastrophically slow, and it can be compared
+across eras and symbols, where the block-time term cancels.
+
+fires 944   any fill 660 (69.9%)   zero fill 284 (30.1%)   partial 46 (4.9%)
+intended notional $23,567   crossed $16,077   = 68.2% of intent
+unattributed fills 43 ($495) — fills with no live fire to hang on; see matcher caveats
+
+--- fire -> first fill, overall ---------------------------------------------------------------------
+  n=660   p10    2.08 p50    2.91 p90    5.20 p99   12.88 min   -0.78 max    14.93 s
+  same, minus a 2.0s allowance for Polygon inclusion (upper bound on OUR path):
+  n=660   p10    0.08 p50    0.91 p90    3.20 p99   10.88 min    0.00 max    12.93 s
+
+--- fire -> LAST fill (a clip that fills in pieces is not done at first touch) ----------------------
+  n=660   p10    2.22 p50    2.92 p90    6.28 p99   14.40 min   -0.42 max    14.97 s
+
+--- by symbol ---------------------------------------------------------------------------------------
+  btc 15m    n=242   p10    2.08 p50    2.85 p90    3.97 p99   13.37 min   -0.78 max    14.93 s
+  eth 5m     n=118   p10    1.88 p50    2.87 p90    3.97 p99   12.61 min    0.82 max    14.87 s
+  sol 5m     n=99    p10    2.48 p50    2.96 p90    5.97 p99   10.43 min   -0.02 max    14.57 s
+  btc 5m     n=98    p10    2.43 p50    2.97 p90    6.92 p99   14.02 min    1.66 max    14.54 s
+  eth 15m    n=79    p10    1.85 p50    2.95 p90    4.33 p99   10.19 min   -0.62 max    12.88 s
+  sol 15m    n=13    p10    1.65 p50    2.37 p90    3.03 p99    3.33 min    1.58 max     3.33 s
+  xrp 5m     n=8     p10    1.92 p50    2.72 p90    4.02 p99   10.17 min    0.92 max    10.17 s
+  bnb 5m     n=3     p10    1.92 p50    3.72 p90    3.81 p99    3.81 min    1.92 max     3.81 s
+
+--- by policy era -----------------------------------------------------------------------------------
+  pre-brake    fires  397  filled  64.2%  n=255   p10    2.02 p50    2.92 p90    5.92 p99   14.54 min   -0.78 max    14.93 s
+  brake        fires  378  filled  70.6%  n=267   p10    2.22 p50    2.88 p90    5.40 p99   10.83 min   -0.62 max    12.88 s
+  theta        fires   56  filled  82.1%  n=46    p10    2.56 p50    2.96 p90    3.96 p99   10.96 min    1.76 max    10.96 s
+  theta+payup  fires  113  filled  81.4%  n=92    p10    1.95 p50    2.87 p90    3.80 p99    6.20 min    1.70 max     9.97 s
+
+--- by mode (spec = locked budget, safe = banked) ---------------------------------------------------
+  safe       n=505   p10    2.08 p50    2.88 p90    4.33 p99   13.37 min   -0.78 max    14.87 s
+  spec       n=147   p10    2.16 p50    2.93 p90    5.92 p99   12.88 min    0.88 max    14.93 s
+  ?          n=6     p10    1.67 p50    2.69 p90    3.92 p99    8.94 min    1.67 max     8.94 s
+  flip       n=2     p10    2.72 p50    2.72 p90    3.20 p99    3.20 min    2.72 max     3.20 s
+
+--- REALIZED SLIPPAGE — fill VWAP minus the ask the engine decided on (cents/share) -----------------
+  If the order path were losing races, this is where it would show:
+  we would systematically pay MORE than the ask we saw. Positive = paid up.
+  n=660   p10   -2.00 p50    0.00 p90    0.00 p99    2.00 min  -22.00 max     9.00 c
+  paid worse than quote 32 (4.8%)   at quote 456 (69.1%)   price improvement 172 (26.1%)
+  mean -0.743 c/share   total $-150.80 across 660 filled clips
+
+--- does latency correlate with slippage? (if the wire were the problem it would) -------------------
+  lat <3s     n=437   mean slip  -0.75c  p90  +0.00c
+  lat 3-5s    n=152   mean slip  -0.94c  p90  +0.00c
+  lat 5-10s   n=49    mean slip  +0.08c  p90  +0.00c
+  lat 10-20s  n=18    mean slip  -1.01c  p90  +0.00c
+
+--- matcher sensitivity — does the answer move if the attribution window moves? ---------------------
+  The join has one free parameter: how much on-chain grace a fire's order
+  gets after it should have died. If the headline moves a lot across this
+  sweep the join is doing the talking, not the data.
+  newest-first  grace   2.0s  matched  654  p50  2.90s  p90   4.38s  crossed $15,887  mean slip -0.72c  orphans 60
+  newest-first  grace   3.0s  matched  660  p50  2.91s  p90   5.20s  crossed $16,077  mean slip -0.74c  orphans 43  <- used above
+  newest-first  grace   5.0s  matched  667  p50  2.92s  p90   5.48s  crossed $16,141  mean slip -0.73c  orphans 32
+  newest-first  grace   8.0s  matched  670  p50  2.92s  p90   5.67s  crossed $16,255  mean slip -0.72c  orphans 22
+  newest-first  grace  15.0s  matched  673  p50  2.92s  p90   5.87s  crossed $16,382  mean slip -0.72c  orphans 12
+  oldest-first  grace   2.0s  matched  660  p50  2.92s  p90   5.55s  crossed $16,036  mean slip -0.70c  orphans 49
+  oldest-first  grace   3.0s  matched  681  p50  2.97s  p90  14.12s  crossed $16,133  mean slip -0.32c  orphans 37
+  oldest-first  grace   5.0s  matched  699  p50  2.98s  p90  14.85s  crossed $16,193  mean slip -0.15c  orphans 29
+  oldest-first  grace   8.0s  matched  706  p50  3.01s  p90  14.98s  crossed $16,255  mean slip -0.10c  orphans 22
+  oldest-first  grace  15.0s  matched  710  p50  3.37s  p90  15.92s  crossed $16,382  mean slip -0.01c  orphans 12
+  The oldest-first rows are the artefact: p90 explodes to ~14s the moment the
+  grace exceeds a re-quote interval, because clip k+1's fills start landing on
+  clip k. p50 barely moves in any row -- the median is robust, the tail is not.
+
+====================================================================================================
+1c. WHY A CLIP DOES NOT FILL — 'we were too slow' vs 'nothing was there'
+====================================================================================================
+This is the fork the whole question turns on. A clip that fails to cross was
+either beaten to real liquidity (a latency loss) or aimed at an ask that could
+never have absorbed it (a sizing/depth problem that speed cannot touch).
+
+The book tape records the size resting at the top of our side. Compare it to
+the clip we sent. A clip larger than the depth at its own quoted ask was never
+going to fill in full no matter how fast the wire was.
+
+  fires with a book sample carrying top-of-book size: 500/944
+
+--- top-of-book size on OUR side at the fire, filled vs unfilled clips ------------------------------
+  filled  : n=372   p10    6.76 p50   50.00 p90  332.27 p99 2343.17 min    0.36 max  9543.36 sh
+  unfilled: n=128   p10   13.46 p50   77.30 p90  432.90 p99 1384.78 min    3.95 max  1572.58 sh
+
+--- clip size as a multiple of the depth it was aimed at --------------------------------------------
+  filled    n=372   p10    0.08 p50    0.57 p90    1.80 p99   12.20 min    0.00 max   138.89 x
+            clip exceeded top-of-book depth: 60/372 (16.1%)
+  unfilled  n=128   p10    0.08 p50    0.44 p90    1.00 p99    6.00 min    0.02 max     6.33 x
+            clip exceeded top-of-book depth: 6/128 (4.7%)
+
+--- no ask at all on our side when we fired ---------------------------------------------------------
+  book sample had no ask on our side: 0  | zero/absent size at the ask: 0
+
+--- did the quoted ask even match the book we recorded? ---------------------------------------------
+  fire ask minus the nearest book sample's ask (cents):
+  n=500   p10   -1.00 p50    0.00 p90    2.00 p99    8.00 min  -19.00 max    22.00 c
+  Nonzero here is the sampling cadence, not an error: the engine fires off its
+  live book and the tape wrote a sample up to 5s earlier. It bounds how much
+  the book moved inside one tape interval.
+
+--- fill rate by depth ratio — the discriminating table ---------------------------------------------
+  clip / depth    fires   filled%   fill ratio p50
+  <=0.25x           145     67.6%             1.00
+  0.25-0.5x          88     70.5%             1.00
+  0.5-1x            143     74.8%             1.00
+  1-2x               86     82.6%             1.00
+  >2x                38     89.5%             1.00
+
+  READ: if fill rate falls off with the depth ratio, the misses are a sizing
+  problem. If it is flat and low everywhere, we are losing races.
+
+====================================================================================================
+1b. RE-QUOTE CHAINS — the measured cost of not filling first time
+====================================================================================================
+A clip that does not cross inside the inflight TTL is re-emitted at whatever
+the ask is ~12s later. That re-emission is the ONLY channel through which
+being slow costs us money in this system, because a filled clip never pays
+worse than its quoted ask (section 1). So this is the cents/share the whole
+latency question has to be priced against.
+
+A chain is consecutive fires on one (slug, side) under the gap threshold. Note
+what a chain is NOT: it is not always a retry. The engine ladders into a
+winning window on the same cadence, so a chain whose first clip filled is an
+intentional add, not a chase. Both are broken out.
+
+--- fire cadence — is the inflight TTL what we think it is? -----------------------------------------
+  n=701   p10   12.00 p50   12.05 p90   12.41 p99   18.05 min   12.00 max    19.75 s
+  modal gaps: [(12.0, 390), (12.1, 217), (12.3, 13), (12.4, 8), (12.2, 6)]
+  assumed INFLIGHT_TTL_S = 12.0  (measured mode 12.0s — AGREES)
+
+  chains 243   length histogram [(1, 80), (2, 50), (3, 30), (4, 21), (5, 17), (6, 4), (7, 7), (8, 10), (9, 3), (10, 4), (11, 2), (12, 2)] ...
+
+--- chains whose FIRST clip did not fill — the true chase -------------------------------------------
+  chase chains 39   ladder chains 124   singletons 80
+  chase chains that eventually filled: 25 / 39
+  FIRST INTENT -> EVENTUAL FILL
+  n=25    p10   13.92 p50   15.19 p90   20.97 p99   27.47 min   12.97 max    27.47 s
+  retries needed before a fill: [(1, 23), (2, 2)]
+  PAY-UP: fill VWAP minus the FIRST clip's ask (cents/share)
+  n=25    p10   -0.10 p50    7.00 p90   21.00 p99   92.00 min   -1.00 max    92.00 c
+    mean +10.64 c/share, median +7.00, 88% paid up
+  QUOTE DRIFT: the ask at the clip that filled, minus the first ask
+  n=25    p10    1.00 p50    8.00 p90   21.00 p99   92.00 min   -2.00 max    92.00 c
+
+--- cost per retry step — ask(k) - ask(0), by retry index, chase chains only ------------------------
+  retry 0  n=39   mean  +0.00c  p50  +0.00c  p90  +0.00c
+  retry 1  n=39   mean  +9.59c  p50  +4.00c  p90 +20.00c
+  retry 2  n=23   mean  +5.61c  p50  +5.00c  p90 +14.00c
+  retry 3  n=14   mean  +6.50c  p50  +4.00c  p90 +14.00c
+  retry 4  n=10   mean  +5.00c  p50  +4.00c  p90 +16.00c
+  retry 5  n=8    mean  +2.12c  p50  +6.00c  p90 +14.00c
+  retry 6  n=7    mean  +3.57c  p50 +11.00c  p90 +14.00c
+  retry 7  n=7    mean  +4.43c  p50  +7.00c  p90 +17.00c
+  retry 8  n=7    mean  +7.43c  p50  +8.00c  p90 +18.00c
+  retry 9  n=6    mean +14.17c  p50 +14.00c  p90 +24.00c
+  retry 10 n=4    mean +13.00c  p50 +19.00c  p90 +26.00c
+  retry 11 n=3    mean  +8.67c  p50 +16.00c  p90 +20.00c
+  retry 12 n=3    mean +10.67c  p50 +17.00c  p90 +21.00c
+  retry 13 n=3    mean +10.33c  p50 +17.00c  p90 +21.00c
+
+--- what the chase actually cost, in dollars --------------------------------------------------------
+  2,226 shares filled inside chase chains, $+174.88 vs the first clip's quoted ask = +7.86 c/share
+  NOTE: this is the price of the whole chase, not of network latency. A faster
+  wire only recovers it if the first clip was marketable and we lost a race for
+  it. Section 1's slippage number says filled clips do not lose races.
+
+--- era split of the chase (the 06:00Z pay-up deploy) -----------------------------------------------
+  pre-brake    chase chains   21  filled   13  pay-up mean +15.02c  p50  +7.00c
+  brake        chase chains    9  filled    5  pay-up mean  +4.38c  p50  +4.00c
+  theta        chase chains    2  filled    2  pay-up mean  +9.00c  p50  +8.00c
+  theta+payup  chase chains    7  filled    5  pay-up mean  +6.20c  p50  +8.00c
+
+====================================================================================================
+2. INFORMATION FRESHNESS AT DECISION  [MEASURED — the engine's own spot_age_s]
+====================================================================================================
+spot_age_s is written by the engine on every book-tape sample: how old the
+reference spot was at that instant. It is the cleanest latency number in the
+whole corpus because it needs no join and no clock alignment.
+
+--- across every book-tape sample -------------------------------------------------------------------
+  n=43170 p10    0.04 p50    0.37 p90    1.18 p99    2.29 min   -0.06 max     9.92 s
+  (369 samples discarded: an early build wrote an absolute epoch into spot_age_s)
+  <0.25s      17244 ( 39.9%)
+  0.25-0.5s    9628 ( 22.3%)
+  0.5-1s      10284 ( 23.8%)
+  1-2s         5169 ( 12.0%)
+  2-5s          821 (  1.9%)
+  >5s            24 (  0.1%)
+
+  READ: a WS-healthy feed at 1Hz gives a uniform 0-1s age (mean 0.5s). A
+  REST fallback at 2s gives 0-2s. What is here is the former with a tail,
+  NOT a 100ms-fresh push feed. The reference is ~1 update/second and we sit
+  on average half an update behind it.
+
+--- at the moment of each fire (nearest book sample at or before the fire) --------------------------
+  fires matched to a book sample: 506/944
+  spot_age_s AT the nearest sample:
+  n=506   p10    0.04 p50    0.36 p90    1.04 p99    1.88 min   -0.00 max     2.68 s
+  + the gap from that sample to the fire (total reference staleness at fire):
+  n=506   p10    0.57 p50    2.64 p90    4.85 p99    5.83 min    0.01 max     6.51 s
+
+--- did stale spot cost us? fill rate / slippage / outcome by staleness band ------------------------
+  band      fires   fill%   slip c    won%  n out
+  <0.5s        37   78.4%    -1.98   63.0%     27
+  0.5-1s       59   78.0%    -1.98   75.6%     45
+  1-2s        105   75.2%    -0.51   80.5%     77
+  2-5s        268   75.0%    -0.46   88.9%    199
+  >5s          37   62.2%    -0.72   95.5%     22
+
+  If stale reference data were the binding problem, the >1s bands would show
+  a worse win rate or worse slippage than the <0.5s band. Read the columns,
+  not the hope.
+
+====================================================================================================
+3. BOOK AGE AT DECISION  [BOUNDED — the tape samples at 1s/5s, so the engine's true book age is <= this]
+====================================================================================================
+Two independent reads:
+  (a) how long before the fire our last RECORDED book sample was. This bounds
+      book age from above by the tape's sampling cadence, not the engine's
+      actual WS book age -- the engine's in-memory book is newer than the tape
+      says. Treat it as a ceiling.
+  (b) the public print tape: trades that had ALREADY happened on that market
+      between our last book sample and our fire. Those are, definitionally,
+      information we had not priced. This one is exact where the print tape
+      covers the window.
+
+--- (a) fire time minus last recorded book sample — CEILING on book age -----------------------------
+  n=507   p10    0.26 p50    2.25 p90    4.45 p99    4.93 min    0.00 max     4.97 s
+  tape cadence itself: samples arrive every 1s or 5s (bimodal), so a ceiling
+  of ~2.2s median mostly measures the TAPE, not the engine. The engine's
+  book is a websocket book; its true age needs Phase 7 to read.
+
+--- (b) prints that landed between our last book sample and the fire --------------------------------
+  fires with print coverage: 486/944  (the print tape is a harvested slice, not the whole fire era)
+  prints we had not seen at fire time: 54.9% of fires had >=1; mean 2.81, max 57
+  n=486   p10    0.00 p50    1.00 p90    8.00 p99   24.00 min    0.00 max    57.00 prints
+  notional traded in that blind gap:
+  n=486   p10    0.00 p50    1.00 p90   76.11 p99  352.83 min    0.00 max  1517.99 $
+  |our quoted ask - last print on our side| at fire (cents):
+  n=486   p10    0.00 p50    1.00 p90    5.54 p99   14.00 min    0.00 max    28.00 c
+
+====================================================================================================
+4. REACTION LAG AND DECISION-LOOP HEALTH
+====================================================================================================
+The decision loop should be invisible: a 50ms tick means an actionable state
+becomes an order within one tick. The tape cannot see that directly -- eval
+and gated records share a 5s throttle, so any eval->fire measurement is
+quantized at 5s and is mostly measuring gate hysteresis, not the loop.
+
+What the tape CAN measure exactly is the loop's own clock drift: a cadence
+that is supposed to be exactly 12.000s or 5.000s arrives late by however long
+the loop actually took. That excess IS decision-loop latency, and it needs no
+join, no assumption and no instrumentation.
+
+--- TICK-CLOCK DRIFT — excess over the nominal cadence (this is the loop's own cost) ----------------
+  fire cadence 12.000s   n=656   p10    0.19 p50   49.81 p90   99.92 p99 1399.56 min    0.00 max  1799.87 ms
+    excess clusters at (ms): [(50, 303), (0, 181), (100, 61), (20, 10), (30, 9), (10, 9)]
+  eval throttle 5.000s   n=20692 p10    0.25 p50   49.84 p90  197.02 p99  416.62 min -620.82 max   708.77 ms
+    excess clusters at (ms): [(50, 7394), (0, 4753), (100, 1571), (10, 698), (30, 652), (20, 620)]
+
+  READ: if the excess clusters near 50ms and below, the loop is
+  landing on the next tick after its deadline -- i.e. the loop is doing its job
+  in under one tick and the cadence quantization is all we see. A long right
+  tail here is a STALLED loop and would be a real finding.
+
+--- fire placement inside the eval cadence (are fires waiting for an eval tick?) --------------------
+  n=944   p10    0.20 p50    2.25 p90    4.51 p99    4.95 min    0.00 max    14.65 s
+  A uniform spread across 0-5s means fires run on their own clock and do
+  NOT wait for the eval tick -- the eval tape is a log, not the trigger.
+
+--- window open -> first fire (how long an armed window sits before acting) -------------------------
+  n=168   p10  150.03 p50  180.03 p90  492.02 p99  713.51 min   90.00 max   790.50 s
+  as a fraction of the window: n=168   p10    0.50 p50    0.53 p90    0.70 p99    0.79 min    0.30 max     0.88 frac
+  This is NOT latency. It is the R9 entry gate waiting for banked TWAP
+  evidence -- a policy choice measured in MINUTES, three orders of magnitude
+  above anything on the wire.
+
+--- first fire vs the last gate that was still blocking it ------------------------------------------
+  n=70    p10    1.20 p50   26.00 p90  231.10 p99  466.86 min    0.10 max   554.98 s
+  release reasons (last gate before the first fire): [('basis guard', 61), ('feed stale', 9)]
+  Quantized at the 5s tape throttle: a value at or under
+  5s means the fire came on the very next opportunity after the gate
+  released, which is as fast as this tape can resolve. Anything materially
+  above 5s is real hesitation and worth a look.
+
+====================================================================================================
+6. WHAT A MILLISECOND IS ACTUALLY WORTH  [DERIVED — measured inputs, stated model]
+====================================================================================================
+The mechanism by which wire latency can cost this system money is exactly one:
+we read an ask, send a marketable limit at that ask, and in the time the order
+is in flight the ask moves UP. Our order then rests below the market instead of
+crossing, we wait out the inflight TTL, and re-quote higher. Nothing else on
+the order path can hurt us -- a filled clip never pays more than its own limit.
+
+So the value of latency = P(the ask ticks up while we are in flight) x (what
+the eventual re-quote costs). Both terms are measured below; only the scaling
+from the tape's 1s cadence down to wire timescales is a model, and it is the
+most conservative one available (a constant-rate jump process, which does not
+soften the tail the way a diffusion would).
+
+--- ask dynamics from the 1Hz book samples ----------------------------------------------------------
+  observed intervals 34,628  (615.3 leg-minutes at ~1s cadence)
+  ask ticked UP 1,869 (5.4%)   DOWN 2,147 (6.2%)   unchanged 30,612 (88.4%)
+  ADVERSE MOVE RATE lambda = 0.0506 upward ask moves per second per leg
+  size of an adverse move when it happens: n=1869  p10    1.00 p50    3.00 p90   15.00 p99   40.00 min    0.10 max    71.00 c
+
+--- the cost of a miss, measured (section 1b) -------------------------------------------------------
+  observed miss rate (clips with zero fill)       30.1%
+  mean pay-up on a chase that eventually filled  +10.64 c/share
+
+--- attributing misses to flight time ---------------------------------------------------------------
+  flight time                 P(ask ticks up in flight)  share of the observed miss rate
+  50 ms  (co-located floor)                       0.25%                             0.8%
+  120 ms (direct clob, measured)                  0.61%                             2.0%
+  160 ms (via eu-west-1 proxy)                    0.81%                             2.7%
+  250 ms (proxy + a cold hop)                     1.26%                             4.2%
+  1.0 s  (a stalled tick)                         4.94%                            16.4%
+  2.0 s  (REST book poll period)                  9.63%                            32.0%
+  3.2 s  (poll + 10 serial legs @120ms)          14.96%                            49.7%
+  12.0 s (the inflight TTL)                      45.53%                           151.3%
+
+  Concurrency behind that poll row: median 5 slugs alive per minute
+  (p90 6), so the poller walks ~10 legs serially (p90 ~12) at the
+  measured RTT before it comes back round to any one of them.
+
+  READ: the observed miss rate is 30.1%. Flight time at the measured
+  RTT explains the fraction in the right-hand column. Whatever is left is
+  something other than the wire.
+
+--- cents per share, per clip, of each latency scenario ---------------------------------------------
+  expected cost = P(miss from staleness) x 10.64c pay-up
+  50 ms  (co-located floor)                  0.0269 c/share      (reference floor)
+  120 ms (direct clob, measured)             0.0645 c/share      vs floor +0.0376 c/share
+  160 ms (via eu-west-1 proxy)               0.0859 c/share      vs floor +0.0590 c/share
+  250 ms (proxy + a cold hop)                0.1339 c/share      vs floor +0.1070 c/share
+  1.0 s  (a stalled tick)                    0.5255 c/share      vs floor +0.4986 c/share
+  2.0 s  (REST book poll period)             1.0250 c/share      vs floor +0.9981 c/share
+  3.2 s  (poll + 10 serial legs @120ms)      1.5920 c/share      vs floor +1.5651 c/share
+  12.0 s (the inflight TTL)                  4.8463 c/share      vs floor +4.8194 c/share
+
+--- THE THREE COMPETING FIXES, priced on the same corpus --------------------------------------------
+  corpus: 22,715 shares filled over 11.0h
+
+  (a ) NETWORK: 160ms order path -> 50ms co-located
+       $    13.39 total   +0.0590 c/share
+  (a') NETWORK, free: drop the eu-west-1 proxy, 160ms -> 120ms
+       $     4.86 total   +0.0214 c/share
+  (b ) POLLING: 3.2s effective book age -> 0.06s (the market WS, measured live)
+       $   354.41 total   +1.5603 c/share
+  (c ) RETRY PRICING: the 12s inflight TTL's own drift -> 3s
+       $   760.13 total   +3.3464 c/share
+
+  Every row uses the same measured lambda and the same measured pay-up, so the
+  RATIOS between them are the solid part. Two caveats on the absolute levels,
+  both against the bottom row: at 12s the jump model predicts a 46% adverse-move
+  probability, which is above the 30% miss rate actually observed, so (c) is the
+  most overstated of the four; and a shorter TTL means re-quoting into a moving
+  price more often, which is the failure mode the ROADMAP's pinning lesson is
+  about. (c) is a hypothesis worth its own study, not a change to make on this
+  evidence.
+
+  What survives all of that: (c) and (b) are one to two orders of magnitude
+  larger than (a), and they are a policy constant and a poller we wrote. (a)
+  is the only one that costs money to fix and it is the smallest.
+
+====================================================================================================
+5. THE BUDGET — where the time between 'the world changed' and 'we own it' goes
+====================================================================================================
+
+  stage                                           p50        p90  label     note
+  ------------------------------------------------------------------------------------------------------------
+  INFO: reference wire lag (Binance->us)    ~182/2 ms          -  MEASURED  half the TCP RTT to data-stream.binance.vision (Tokyo)
+  INFO: spot age at the sample                  0.36s      1.04s  MEASURED  engine's spot_age_s; local-receipt age, EXCLUDES the wire lag above
+  INFO: + gap to the fire                       2.64s      4.85s  BOUNDED   inflated by the 5s tape cadence; the engine's live value is lower
+  INFO: book view age                         <=2.25s    <=4.45s  BOUNDED   ceiling = tape cadence; REST book poller runs at 2s serially
+  DECISION: loop lateness per cadence            50ms      198ms  MEASURED  tick-clock drift, section 4; p99 418ms, max 1.8s
+  DECISION: gate release -> first fire            26s       231s  MEASURED  entry policy, not machinery
+  ORDER: warm HTTP RTT to clob                  119ms      123ms  MEASURED  net_probe; +40ms p50 more via the eu-west-1 proxy the engine actually uses
+  ORDER: EIP-712 sign + HMAC + SigV4           ~0.2ms     ~0.5ms  GUESS     k256 ECDSA + 2 SHA256; local CPU, needs Phase 7 to confirm
+  ORDER: intent -> on-chain fill                2.91s      5.20s  BOUNDED   includes ~2s Polygon inclusion + 1s timestamp truncation
+  FILL WAIT: re-quote after a miss             12.05s     12.41s  MEASURED  INFLIGHT_TTL_S = 12.0, a constant we own
+
+  cents/share, filled clips vs their own quoted ask : -0.743c (mean), +0.00c (p50)
+  cents/share, chase chains vs their FIRST ask      : +10.64c (mean), +7.00c (p50)
+
+  The two lines above are the whole verdict in miniature. The first says
+  what the wire costs us on orders that fill: nothing, or less than nothing.
+  The second says what NOT filling costs us. Compare them before buying speed.
