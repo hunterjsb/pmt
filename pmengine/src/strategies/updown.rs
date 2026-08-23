@@ -20,6 +20,7 @@
 //!   - quiesce pulls everything before resolution; exits stay live longer
 
 use crate::position::Fill;
+use crate::strategies::updown_oracle;
 use crate::strategy::{Signal, Strategy, StrategyContext, Urgency};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -204,6 +205,12 @@ pub(crate) struct ModelEval {
     pub(crate) margin_bp: f64,
     pub(crate) banked_margin_bp: f64,
     pub(crate) cushion_bp: f64,
+    /// The basis guard actually enforced this eval — p.basis_guard_bp,
+    /// possibly raised (never lowered) by the live Chainlink-vs-Binance
+    /// oracle read. See `updown_oracle::live_guard_bp`. Recorded on every
+    /// eval (not just twap gate checks) so the tape always shows what
+    /// threshold was live, even for close_open evals that don't gate on it.
+    pub(crate) guard_bp: f64,
 }
 
 /// Top-of-book for one token: (price, size) per side, None when the level
@@ -268,6 +275,10 @@ impl Default for Tunables {
 pub(crate) struct ArmState {
     pub(crate) p: ArmParams,
     feed: Arc<Mutex<FeedState>>,
+    /// Chainlink poller's rolling basis-sample window + poll diagnostics.
+    /// Separate lock from `feed` — the poller only takes `feed`'s lock
+    /// briefly to read the lag-aligned per_min mark, never holds both.
+    oracle: Arc<Mutex<updown_oracle::OracleState>>,
     feed_stop: Arc<AtomicBool>,
     feed_handles: Vec<std::thread::JoinHandle<()>>,
     pub(crate) subscribed: bool,
@@ -416,6 +427,7 @@ impl ArmState {
         Self {
             p,
             feed: Arc::new(Mutex::new(FeedState::default())),
+            oracle: Arc::new(Mutex::new(updown_oracle::OracleState::default())),
             feed_stop: Arc::new(AtomicBool::new(false)),
             feed_handles: Vec::new(),
             subscribed: false,
@@ -497,6 +509,15 @@ impl ArmState {
 
     fn start_feeds(&mut self) {
         self.spawn_ws_spot();
+        // Pushed into feed_handles like the other threads — stop_feed's
+        // existing join loop covers its teardown, no separate lifecycle.
+        self.feed_handles.push(updown_oracle::spawn_poller(
+            self.oracle.clone(),
+            self.feed.clone(),
+            self.feed_stop.clone(),
+            self.p.symbol.clone(),
+            self.p.end,
+        ));
         let feed = self.feed.clone();
         let stop = self.feed_stop.clone();
         let symbol = self.p.symbol.clone();
@@ -547,14 +568,30 @@ impl ArmState {
     /// Model fair P(UP) plus regime/decidedness context. Errors = gated.
     fn fair_p_up(&self, now: f64) -> Result<ModelEval, String> {
         let f = self.feed.lock().unwrap();
-        eval_model(&self.p, &f, now)
+        let effective_guard_bp = {
+            let mut o = self.oracle.lock().unwrap();
+            // make_contiguous avoids allocating a fresh Vec on every tick —
+            // we already hold the exclusive lock.
+            let samples = o.samples.make_contiguous();
+            updown_oracle::live_guard_bp(samples, self.p.basis_guard_bp, updown_oracle::OBS_MIN_SAMPLES)
+        };
+        eval_model(&self.p, &f, now, effective_guard_bp)
     }
 }
 
-/// The pricing model as a pure function of (params, feed snapshot, t) —
-/// the live tick locks the feed and delegates; replay hands in a feed
-/// state reconstructed from the corpus. Errors = gated.
-pub(crate) fn eval_model(p: &ArmParams, f: &FeedState, now: f64) -> Result<ModelEval, String> {
+/// The pricing model as a pure function of (params, feed snapshot, t,
+/// effective guard) — the live tick locks the feed, computes the live-
+/// raised guard on the ArmState side, and delegates; replay hands in a
+/// feed state reconstructed from the corpus and passes p.basis_guard_bp
+/// unchanged (see src/replay.rs). `effective_guard_bp` is p.basis_guard_bp
+/// itself, or higher if the live oracle poller has raised it — never
+/// lower. Errors = gated.
+pub(crate) fn eval_model(
+    p: &ArmParams,
+    f: &FeedState,
+    now: f64,
+    effective_guard_bp: f64,
+) -> Result<ModelEval, String> {
     {
         if now - f.spot_ts > MAX_SPOT_AGE_S {
             return Err(match &f.last_err {
@@ -579,6 +616,7 @@ pub(crate) fn eval_model(p: &ArmParams, f: &FeedState, now: f64) -> Result<Model
             Ok(ModelEval {
                 p_up: norm_cdf(z), sig_bp, banked_decided: false, flip_proof: false, rho,
                 margin_bp: (spot / open - 1.0) * 1e4, banked_margin_bp: 0.0, cushion_bp: 0.0,
+                guard_bp: effective_guard_bp,
             })
         } else {
             let ref_px = *f
@@ -604,7 +642,8 @@ pub(crate) fn eval_model(p: &ArmParams, f: &FeedState, now: f64) -> Result<Model
                 let m = (banked_avg / ref_px - 1.0) * 1e4;
                 return Ok(ModelEval {
                     p_up, sig_bp, banked_decided: true, flip_proof: true, rho,
-                    margin_bp: m, banked_margin_bp: m, cushion_bp: p.basis_guard_bp,
+                    margin_bp: m, banked_margin_bp: m, cushion_bp: effective_guard_bp,
+                    guard_bp: effective_guard_bp,
                 });
             }
             let proj = (banked_avg * banked_s + spot * rem) / window;
@@ -613,12 +652,12 @@ pub(crate) fn eval_model(p: &ArmParams, f: &FeedState, now: f64) -> Result<Model
             // still record them — the R9 safety-gate sweep needs the corpus
             // to know what |banked|/cushion was while the flat guard held.
             let banked_margin_bp = (banked_avg / ref_px - 1.0) * 1e4 * (banked_s / window);
-            let cushion_bp = p.basis_guard_bp
+            let cushion_bp = effective_guard_bp
                 + sig_bp * ((rem / 60.0).max(0.02) / 3.0).sqrt() * (rem / window);
-            if margin_bp.abs() < p.basis_guard_bp {
+            if margin_bp.abs() < effective_guard_bp {
                 return Err(format!(
                     "basis guard: projected margin {:+.1}bp inside {:.1}bp noise band [banked {:+.1}bp cushion {:.1}bp]",
-                    margin_bp, p.basis_guard_bp, banked_margin_bp, cushion_bp
+                    margin_bp, effective_guard_bp, banked_margin_bp, cushion_bp
                 ));
             }
             let breakeven = (ref_px * window - banked_avg * banked_s) / rem;
@@ -631,12 +670,17 @@ pub(crate) fn eval_model(p: &ArmParams, f: &FeedState, now: f64) -> Result<Model
                 banked_margin_bp.abs() > cushion_bp && (banked_margin_bp > 0.0) == (p_up > 0.5);
             // Flip-proof: survives basis noise PLUS a full-remaining-window
             // adversarial push. rem/window scales the push's TWAP influence.
+            // Uses effective_guard_bp too (not just the design brief's named
+            // three sites) — a fourth p.basis_guard_bp read lived here;
+            // leaving it on the stale param would let a raised live guard
+            // still wave flip clips through quiesce on noise it no longer
+            // trusts.
             let flip_proof = banked_decided
                 && banked_margin_bp.abs()
-                    > p.basis_guard_bp + p.manip_push_bp * (rem / window);
+                    > effective_guard_bp + p.manip_push_bp * (rem / window);
             Ok(ModelEval {
                 p_up, sig_bp, banked_decided, flip_proof, rho,
-                margin_bp, banked_margin_bp, cushion_bp,
+                margin_bp, banked_margin_bp, cushion_bp, guard_bp: effective_guard_bp,
             })
         }
     }
@@ -981,7 +1025,7 @@ impl ArmState {
             "rho": m.rho, "mode": if unlocked { "safe" } else { "spec" },
             "chop_blocked": chop_blocked, "banked_decided": m.banked_decided,
             "margin_bp": m.margin_bp, "banked_bp": m.banked_margin_bp,
-            "cushion_bp": m.cushion_bp,
+            "cushion_bp": m.cushion_bp, "guard_bp": m.guard_bp,
             "committed": committed, "budget": budget, "room": room,
             "inflight": inflight_usdc, "sides": evals,
         }));
@@ -991,7 +1035,7 @@ impl ArmState {
                 "t": now, "ev": "eval", "slug": p.slug, "p_up": p_up,
                 "sig_bp": sig_bp, "rho": m.rho, "banked_decided": m.banked_decided,
                 "margin_bp": m.margin_bp, "banked_bp": m.banked_margin_bp,
-                "cushion_bp": m.cushion_bp,
+                "cushion_bp": m.cushion_bp, "guard_bp": m.guard_bp,
                 "committed": committed, "sides": evals,
             }));
         }
@@ -1272,10 +1316,18 @@ impl Strategy for Updown {
                     .arms
                     .iter()
                     .map(|(slug, a)| {
+                        let o = a.oracle.lock().unwrap();
                         (slug.clone(), serde_json::json!({
                             "filled_usdc": a.filled_usdc,
                             "roll": a.p.roll,
                             "eval": a.last_eval,
+                            "oracle": {
+                                "samples": o.samples.len(),
+                                "last_chainlink": o.last_chainlink,
+                                "last_updated_at": o.last_updated_at,
+                                "last_poll_at": o.last_poll_at,
+                                "err": o.last_err,
+                            },
                         }))
                     })
                     .collect();
@@ -1591,6 +1643,7 @@ mod tests {
         ModelEval {
             p_up: 1.0, sig_bp: 3.0, banked_decided: true, flip_proof: false,
             rho: 0.0, margin_bp: 20.0, banked_margin_bp: 15.0, cushion_bp: 5.0,
+            guard_bp: 3.0,
         }
     }
 
@@ -1886,6 +1939,49 @@ mod tests {
     #[test]
     fn twap_thin_margin_trips_basis_guard() {
         let (arm, now) = armed_with_feed(100.001, 100.001); // ~0.1bp
+        let err = arm.fair_p_up(now).unwrap_err();
+        assert!(err.contains("basis guard"), "{}", err);
+    }
+
+    #[test]
+    fn eval_model_explicit_effective_guard_can_exceed_the_static_param() {
+        // margin_bp ~5bp here — clears the 3bp arm-time param comfortably.
+        let (arm, now) = armed_with_feed(100.05, 100.05);
+        let f = arm.feed.lock().unwrap();
+        assert!(
+            eval_model(&arm.p, &f, now, arm.p.basis_guard_bp).is_ok(),
+            "static param alone passes"
+        );
+        // A higher effective guard (as a live-raised oracle read would
+        // produce) gates the exact same margin — proves eval_model reads
+        // the explicit argument, not p.basis_guard_bp directly.
+        let err = eval_model(&arm.p, &f, now, 8.0).unwrap_err();
+        assert!(err.contains("basis guard"), "{}", err);
+        assert!(err.contains("8.0"), "reason string must print the effective value: {}", err);
+    }
+
+    #[test]
+    fn eval_model_effective_equal_to_param_matches_old_behavior() {
+        // Mechanical check that threading effective_guard_bp through
+        // doesn't change anything when effective == param — the case every
+        // live arm hits until the oracle poller has 30+ samples.
+        let (arm, now) = armed_with_feed(100.05, 100.05);
+        let f = arm.feed.lock().unwrap();
+        let m = eval_model(&arm.p, &f, now, arm.p.basis_guard_bp).unwrap();
+        assert_eq!(m.guard_bp, arm.p.basis_guard_bp);
+    }
+
+    #[test]
+    fn fair_p_up_uses_live_raised_guard_from_oracle_samples() {
+        let (arm, now) = armed_with_feed(100.05, 100.05); // ~5bp margin
+        assert!(arm.fair_p_up(now).is_ok(), "empty oracle window: static 3bp param alone passes");
+        {
+            let mut o = arm.oracle.lock().unwrap();
+            for _ in 0..40 {
+                // p95 of a constant 9bp window is 9bp — above the 5bp margin.
+                updown_oracle::push_sample(&mut o.samples, 9.0);
+            }
+        }
         let err = arm.fair_p_up(now).unwrap_err();
         assert!(err.contains("basis guard"), "{}", err);
     }

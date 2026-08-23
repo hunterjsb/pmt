@@ -445,6 +445,10 @@ fn replay_evals_window(
                     margin_bp: rec.get("margin_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
                     banked_margin_bp: rec.get("banked_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
                     cushion_bp: rec.get("cushion_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    // Tape written before the dynamic guard shipped has no
+                    // "guard_bp" field — fall back to the arm's static param,
+                    // matching what the engine actually enforced back then.
+                    guard_bp: rec.get("guard_bp").and_then(|v| v.as_f64()).unwrap_or(p.basis_guard_bp),
                     flip_proof: false,
                 };
                 let view = view_from_sides(&rec["sides"], &sim);
@@ -683,7 +687,12 @@ fn replay_full_window(
         let spot = rec["spot"].as_f64().unwrap_or(0.0);
         let spot_age = rec["spot_age_s"].as_f64().unwrap_or(0.0);
         let feed = feed_state_at(&rows, p.start as i64, spot, now - spot_age, now);
-        let model = eval_model(p, &feed, now);
+        // Static guard only — replay has no recorded oracle-sample corpus
+        // (yet; oracle-tape.jsonl starts accumulating once the dynamic
+        // guard runs live), so pass the operator's param unchanged: replay
+        // output must match the exact static-guard behavior this window
+        // ran under live.
+        let model = eval_model(p, &feed, now, p.basis_guard_bp);
         let view = view_from_book_record(rec, &sim, p);
         let out = arm.decide(&view, model, now);
         apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate);
