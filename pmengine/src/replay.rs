@@ -531,7 +531,7 @@ pub(crate) fn replay_evals_window_traced(
             EV_EVAL => {
                 let p_up = rec["p_up"].as_f64().unwrap_or(0.5);
                 last_p_up = Some(p_up);
-                let model = model_from_eval_record(rec, p_up, p);
+                let model = model_from_eval_record(rec, p_up, p, &arm.tunables);
                 let view = view_from_sides(&rec["sides"], &sim);
                 let out = arm.decide(&view, Ok(model), now);
                 trace.extend(out.tape.iter().cloned());
@@ -558,12 +558,28 @@ pub(crate) fn replay_evals_window_traced(
 /// Rebuild the model read that a recorded `eval` line captured. One
 /// implementation, shared by the per-window and the fleet driver — two
 /// copies of this parse would let the two drivers judge different engines.
-fn model_from_eval_record(rec: &Value, p_up: f64, p: &ArmParams) -> ModelEval {
+fn model_from_eval_record(rec: &Value, p_up: f64, p: &ArmParams, tun: &Tunables) -> ModelEval {
+    // Evals mode replays the recorded decidedness as-is — it is the flag the
+    // live engine actually acted on. `decided_k` may only SUBTRACT from it,
+    // and only where the record carries the two numbers to judge by. The
+    // `> 1.0` guard is what makes the default provably inert: at k = 1.0 the
+    // recomputation would just be the record's own inequality, and on tape
+    // written before banked_bp/cushion_bp shipped it would read 0 > 0 and
+    // wrongly un-decide the window.
+    let mut banked_decided = rec["banked_decided"].as_bool().unwrap_or(false);
+    if banked_decided && tun.decided_k > 1.0 {
+        if let (Some(b), Some(c)) = (
+            rec.get("banked_bp").and_then(|v| v.as_f64()),
+            rec.get("cushion_bp").and_then(|v| v.as_f64()),
+        ) {
+            banked_decided = tun.decided(b, c, p_up);
+        }
+    }
     ModelEval {
         p_up,
         sig_bp: rec["sig_bp"].as_f64().unwrap_or(0.0),
         rho: rec["rho"].as_f64().unwrap_or(0.0),
-        banked_decided: rec["banked_decided"].as_bool().unwrap_or(false),
+        banked_decided,
         margin_bp: rec.get("margin_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
         banked_margin_bp: rec.get("banked_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
         cushion_bp: rec.get("cushion_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -1209,7 +1225,7 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
                 EV_EVAL => {
                     let p_up = rec["p_up"].as_f64().unwrap_or(0.5);
                     a.last_p_up = Some(p_up);
-                    let model = model_from_eval_record(rec, p_up, &a.p);
+                    let model = model_from_eval_record(rec, p_up, &a.p, &a.arm.tunables);
                     let view = view_from_sides(&rec["sides"], &a.sim);
                     Some(a.arm.decide_fleet(&view, Ok(model), now, &mut fleet_room))
                 }
