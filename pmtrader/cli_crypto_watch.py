@@ -286,7 +286,12 @@ def crypto_watch(since: float | None) -> None:
 
     def tape_panel(height: int) -> Panel:
         shown = list(lines)[-max(height - 2, 1):]
-        return Panel(Text.from_ansi("\n".join(shown)), title="tape", border_style="dim")
+        body = Text.from_ansi("\n".join(shown))
+        # One tape record, one row. A wrapped line silently costs the panel a
+        # second row, so the "last N lines" arithmetic above stops holding and
+        # records scroll out of a panel that looks like it has space.
+        body.no_wrap, body.overflow = True, "ellipsis"
+        return Panel(body, title="tape", border_style="dim")
 
     layout = Layout()
     layout.split_column(

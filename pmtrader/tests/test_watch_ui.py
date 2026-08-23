@@ -897,6 +897,16 @@ def test_the_span_still_trails_the_line_it_belongs_to():
     assert out[0].rstrip().endswith(f"⟨{cc._hms(_T0)}→{cc._hms(_T0 + 2)}⟩")
 
 
+def test_the_fleet_wide_basis_line_carries_no_span_because_it_cannot_afford_one():
+    # Five arms' margins is already the widest line the tape emits; the
+    # ⟨from→to⟩ tail pushed it past the panel and cost a second row.
+    out = _collapse(*[_basis(i, slug=s) for i in range(3)
+                      for s in (_BTC, _ETH, "sol-updown-5m-1700000000")])
+    assert len(out) == 1
+    assert "⟨" not in out[0]
+    assert out[0][_agg_col():].startswith("×9")
+
+
 # --- roll + window-close consolidation ---
 
 def _roll(i=0, slug=_BTC, size=25):
@@ -1205,7 +1215,7 @@ def test_the_scoreboard_age_and_clock_ride_the_border_not_a_row():
 
 
 def test_composed_frame_shows_the_capital_figure_exactly_once():
-    # The regression: build_risk_header led with the same "capital $X" the
+    # The regression: the exposure line led with the same "capital $X" the
     # header panel already carried, one row above it — two dense money lines
     # back to back that read as one line printed twice.
     out = _frame_text()

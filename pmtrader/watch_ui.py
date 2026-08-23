@@ -10,8 +10,10 @@ The two hard rules the dashboard is built on:
   * every cell tolerates a missing or half-built eval — an engine restart
     mid-watch leaves `last_eval` None or partial, and the dashboard must keep
     painting rather than raise;
-  * column geometry is fixed (see _ARMS_COLUMNS, _TAPE_TAG_WIDTH), so the
-    layout never jitters as state/reason text changes tick to tick.
+  * column geometry is fixed (see _HEAD_*, _ARMS_COLUMNS, _TRADES_COLUMNS,
+    _TAPE_TAG_WIDTH, _TAPE_AGG_WIDTH), so the layout never jitters as
+    state/reason text changes tick to tick, and every panel puts a given
+    kind of figure at the same offset every frame.
 
 Also holds the tty-mode helpers, since cbreak/key-polling exists only to serve
 this dashboard's input loop.
@@ -393,7 +395,12 @@ def _render_record(r: dict, raw: str, n: int = 1) -> str:
 
 _NUM_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
 
-_OWN_LOOKBACK = 8  # how deep under later output a live run's line may sit and still be updated
+# How deep under later output a live run's line may sit and still be updated.
+# Sized for a fleet-wide roll: every arm emits its window-close, THEN every arm
+# emits its roll, so the first arm's line is one-per-arm deep by the time its
+# own roll arrives to merge into it. 16 leaves headroom over the 8 arms that
+# have actually run at once.
+_OWN_LOOKBACK = 16
 
 
 def _run_suffix(run: _Run) -> str:
@@ -503,11 +510,15 @@ class _BasisGuardRun(_CollapseRule):
             run.state[sym] = f"{float(m.group(1)):+.1f}/{float(m.group(2)):.0f}" if m else "?"
 
     def render(self, run: _Run) -> str:
+        # No span suffix: this is the widest line the tape emits (a per-symbol
+        # margin for every arm in the fleet) and the ⟨from→to⟩ tail pushed it
+        # past the panel, costing a second row to say what the line's own
+        # timestamp and count already say.
         per = " · ".join(f"{sym} {txt}" for sym, txt in sorted(run.state.items()))
         return click.style(
             f"{_hms(run.t1)}  {'':<14} {_tape_tag('gated')}{_tape_agg(run.n)}"
             f"basis bp/guard: {per}",
-            fg="yellow", dim=True) + _run_suffix(run)
+            fg="yellow", dim=True)
 
 
 class _EvalRun(_CollapseRule):
