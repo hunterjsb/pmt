@@ -258,59 +258,7 @@ pub async fn spawn(
     tracing::info!(bind = %bind, "Control plane listening");
 
     let handle = tokio::spawn(async move {
-        let app = Router::new()
-            .route("/status", get(status_handler))
-            .route("/strategies", get(strategies_handler))
-            .route(
-                "/strategies/:id/pause",
-                axum::routing::post(pause_strategy_handler),
-            )
-            .route(
-                "/strategies/:id/resume",
-                axum::routing::post(resume_strategy_handler),
-            )
-            .route(
-                "/strategies/:id/stop",
-                axum::routing::post(stop_strategy_handler),
-            )
-            .route(
-                "/strategies/:id/command",
-                axum::routing::post(strategy_command_handler),
-            )
-            .route("/orders", get(orders_handler))
-            .route("/alerts", get(alerts_handler))
-            .route(
-                "/alerts/:id/approve",
-                axum::routing::post(approve_alert_handler),
-            )
-            .route(
-                "/alerts/:id/reject",
-                axum::routing::post(reject_alert_handler),
-            )
-            .route("/subscriptions", get(subscriptions_handler))
-            .route("/trades/:token_id", get(trades_handler))
-            .route("/orders/all", get(orders_all_handler))
-            .route(
-                "/orders/external",
-                axum::routing::post(register_external_order_handler),
-            )
-            .route(
-                "/orders/external/:id/cancelled",
-                axum::routing::post(mark_external_cancelled_handler),
-            )
-            .route(
-                "/orders/:id/cancel",
-                axum::routing::post(cancel_order_by_id_handler),
-            )
-            .route(
-                "/orders/:id/schedule-cancel",
-                axum::routing::post(schedule_cancel_handler),
-            )
-            .route(
-                "/trade/place",
-                axum::routing::post(place_trade_handler),
-            )
-            .with_state(cmd_tx);
+        let app = build_router(cmd_tx);
 
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "Control plane serve loop ended");
@@ -318,6 +266,66 @@ pub async fn spawn(
     });
 
     Ok(handle)
+}
+
+/// Route table, extracted so a unit test constructs it. axum panics on
+/// route-syntax errors at RUNTIME (the 0.7->0.8 `/:id` -> `/{id}` change
+/// took the control plane down while cargo test stayed green — the engine
+/// ticked on, headless). Construction under test makes that impossible.
+fn build_router(cmd_tx: mpsc::Sender<EngineCommand>) -> Router {
+    Router::new()
+            .route("/status", get(status_handler))
+            .route("/strategies", get(strategies_handler))
+            .route(
+                "/strategies/{id}/pause",
+                axum::routing::post(pause_strategy_handler),
+            )
+            .route(
+                "/strategies/{id}/resume",
+                axum::routing::post(resume_strategy_handler),
+            )
+            .route(
+                "/strategies/{id}/stop",
+                axum::routing::post(stop_strategy_handler),
+            )
+            .route(
+                "/strategies/{id}/command",
+                axum::routing::post(strategy_command_handler),
+            )
+            .route("/orders", get(orders_handler))
+            .route("/alerts", get(alerts_handler))
+            .route(
+                "/alerts/{id}/approve",
+                axum::routing::post(approve_alert_handler),
+            )
+            .route(
+                "/alerts/{id}/reject",
+                axum::routing::post(reject_alert_handler),
+            )
+            .route("/subscriptions", get(subscriptions_handler))
+            .route("/trades/{token_id}", get(trades_handler))
+            .route("/orders/all", get(orders_all_handler))
+            .route(
+                "/orders/external",
+                axum::routing::post(register_external_order_handler),
+            )
+            .route(
+                "/orders/external/{id}/cancelled",
+                axum::routing::post(mark_external_cancelled_handler),
+            )
+            .route(
+                "/orders/{id}/cancel",
+                axum::routing::post(cancel_order_by_id_handler),
+            )
+            .route(
+                "/orders/{id}/schedule-cancel",
+                axum::routing::post(schedule_cancel_handler),
+            )
+            .route(
+                "/trade/place",
+                axum::routing::post(place_trade_handler),
+            )
+            .with_state(cmd_tx)
 }
 
 async fn status_handler(
@@ -586,7 +594,7 @@ async fn cancel_order_by_id_handler(
     }
 }
 
-/// Body for `POST /orders/:id/schedule-cancel`. Either `at` (absolute
+/// Body for `POST /orders/{id}/schedule-cancel`. Either `at` (absolute
 /// RFC3339 deadline) or `after_seconds` (relative; engine computes
 /// `Utc::now() + after_seconds`). `after_seconds` is preferred since it's
 /// immune to clock skew between CLI and engine.
@@ -658,4 +666,15 @@ async fn schedule_cancel_handler(
     rx.await
         .map(|_| Json(serde_json::json!({"scheduled": true, "at": at})))
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "engine dropped reply".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn router_constructs_without_panicking() {
+        let (tx, _rx) = mpsc::channel::<EngineCommand>(1);
+        let _ = build_router(tx);
+    }
 }
