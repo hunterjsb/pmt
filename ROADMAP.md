@@ -54,6 +54,14 @@ don't record is a night the corpus can't judge.
   at the identical tick as reality, $495/$500 committed, −$504 vs real −$370 (sim fills every
   clip; reality got partial fills before the guard cut in). Same night under today's braked
   policy: 3 fires, $59 committed, −$60 — the brakes cut the loss ~88% on recorded reality.
+- **That acceptance test is now a committed fixture, not a paragraph** (issue #5,
+  `pmengine/fixtures/btc-updown-15m-1787449500.json`): `pmengine replay --fixtures fixtures`
+  reproduces it from repo data with no `~/.pmt` and no network — first fire at
+  1787449950.03049, $495.05 of $500 committed, −$504.15 sim vs −$370.14 wallet — and
+  `cargo test` runs it beside twelve more wallet-graded windows on every change. Expectations
+  are characterization (pinned from the engine as it stands, hand-checked against the wallet
+  record); moving one is a deliberate `--regen` that has to be justified in the commit.
+  Catalog, invariant vocabulary and the known gaps: `pmengine/fixtures/README.md`.
 - Pinning lesson (2026-08-23): `btc-updown-15m-1787446800` looked like the loss on tape
   density but wallet shows $0 bought — 32 "fires" that never filled, re-emitted every 12s as
   inflight TTL expired. Two morals: (a) pick acceptance windows by WALLET, never by tape

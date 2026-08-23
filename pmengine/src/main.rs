@@ -67,8 +67,25 @@ enum Commands {
         book_tape: Option<PathBuf>,
 
         /// Slug or slug prefix to replay — every matching window in the tape, time order.
+        /// Required unless --fixtures is given.
         #[arg(long)]
-        slug: String,
+        slug: Option<String>,
+
+        /// Characterization mode: replay committed fixtures (a directory or one
+        /// file) instead of a live tape. Offline and self-contained — no ~/.pmt,
+        /// no network — and asserts each fixture's recorded expectations.
+        #[arg(long)]
+        fixtures: Option<PathBuf>,
+
+        /// --fixtures only: restrict the run to one fixture by slug.
+        #[arg(long)]
+        only: Option<String>,
+
+        /// --fixtures only: rewrite ONE fixture's expectations from this run.
+        /// Deliberate act — the diff is printed, and the commit message has to
+        /// say what moved and why.
+        #[arg(long)]
+        bless: bool,
 
         /// JSON array of arm params (+ optional "tunables" override) to run, one per slug.
         #[arg(long)]
@@ -172,16 +189,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Run { strategies, dry_run, max_ticks, skip_warmup }) => {
             run_strategies(strategies, dry_run, max_ticks, skip_warmup).await
         }
-        Some(Commands::Replay { mode, tape, book_tape, slug, params, outcomes, out, fleet_cap }) => {
+        Some(Commands::Replay {
+            mode, tape, book_tape, slug, fixtures, only, bless, params, outcomes, out, fleet_cap,
+        }) => {
             // reqwest::blocking builds its own mini tokio runtime; calling
             // it straight from #[tokio::main]'s worker thread panics on
             // drop (nested runtime). A plain OS thread sidesteps that —
             // same reason updown.rs's own blocking calls all run off
             // std::thread::spawn, never inline on the async task.
-            match std::thread::spawn(move || {
-                pmengine::replay::run(pmengine::replay::ReplayOpts {
-                    mode, tape, book_tape, slug, params, outcomes, out, fleet_cap,
-                })
+            match std::thread::spawn(move || match fixtures {
+                Some(path) => pmengine::replay::fixtures::run(
+                    pmengine::replay::fixtures::FixtureOpts { path, only, bless },
+                ),
+                None => {
+                    let slug = slug.ok_or("replay needs --slug (or --fixtures)")?;
+                    pmengine::replay::run(pmengine::replay::ReplayOpts {
+                        mode, tape, book_tape, slug, params, outcomes, out, fleet_cap,
+                    })
+                }
             })
             .join()
             {
@@ -203,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("  pmengine run sure_bets market_maker --max-ticks 10");
             eprintln!("  pmengine list");
             eprintln!("  pmengine replay --mode evals --slug btc-updown-15m");
+            eprintln!("  pmengine replay --fixtures fixtures");
             Ok(())
         }
     }
