@@ -8,16 +8,36 @@
 //! A strategy file that needs crate-wide visibility of its own module says so
 //! in the file with a `// pmstrat: pub(crate)` marker line — nothing here is
 //! hand-maintained.
+//!
+//! Files under `private/` (the pm-trade/pmt-strategies submodule mount) keep
+//! their `crate::strategies::<name>` module paths via `#[path]` declarations;
+//! their every item here is gated on `cfg(private_strategies)`, set by
+//! build.rs when the submodule is initialized. This one committed file
+//! compiles identically in public clones (no submodule) and private
+//! checkouts — regenerate it with the submodule inited.
 
+mod example;
+#[cfg(private_strategies)]
+#[path = "private/updown.rs"]
 pub(crate) mod updown;
+#[cfg(private_strategies)]
+#[path = "private/updown_model.rs"]
 pub(crate) mod updown_model;
+#[cfg(private_strategies)]
+#[path = "private/updown_oracle.rs"]
 pub(crate) mod updown_oracle;
+#[cfg(private_strategies)]
+#[path = "private/updown_rtds.rs"]
 pub(crate) mod updown_rtds;
+#[cfg(private_strategies)]
+#[path = "private/updown_state.rs"]
 pub(crate) mod updown_state;
 
 use std::collections::HashMap;
 use crate::strategy::Strategy;
 
+pub use example::Example;
+#[cfg(private_strategies)]
 pub use updown::Updown;
 
 /// Information about a strategy in the registry.
@@ -33,6 +53,11 @@ pub struct StrategyInfo {
 pub fn registry() -> HashMap<&'static str, StrategyInfo> {
     let mut m = HashMap::new();
 
+    m.insert("example", StrategyInfo {
+        factory: || Box::new(example::Example::new()),
+    });
+
+    #[cfg(private_strategies)]
     m.insert("updown", StrategyInfo {
         factory: || Box::new(updown::Updown::new()),
     });

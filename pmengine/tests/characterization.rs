@@ -1,5 +1,6 @@
 //! The committed characterization suite: every fixture under
-//! `pmengine/fixtures/` replayed through decide() on every `cargo test`.
+//! `pmengine/src/strategies/private/fixtures/` (the pmt-strategies
+//! submodule) replayed through decide() on every `cargo test`.
 //!
 //! A failure here is a finding, not a chore. It means the decision core
 //! changed behaviour on a trade that actually happened, with real money —
@@ -21,7 +22,9 @@ use pmengine::replay::fixtures::{self, Fixture};
 use std::path::PathBuf;
 
 fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+    // Inside the pmt-strategies submodule mount: the fixtures embed as-armed
+    // params/tunables — live alpha — so they live with the private code.
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/strategies/private/fixtures")
 }
 
 fn all_fixtures() -> Vec<(PathBuf, Fixture)> {

@@ -31,7 +31,8 @@ fixtures. A policy change that cannot be dated from the repo's own record
 does not get a boundary, because a boundary nobody can check is a way to
 move the line after seeing the score.
 
-Names follow the fixture era vocabulary (pmengine/fixtures/README.md, the
+Names follow the fixture era vocabulary (the fixtures README in the private
+pmt-strategies submodule, the
 `era` key in each fixture) wherever the two overlap.
 """
 
@@ -59,7 +60,7 @@ class Era(NamedTuple):
 ERAS: tuple[Era, ...] = (
     # Open-ended on the left ON PURPOSE: epoch 0 means no window ever traded
     # can fall outside the registry. Covers the first two nights — the −$370
-    # btc-15m blowup (pmengine/fixtures/btc-updown-15m-1787449500.json, era
+    # btc-15m blowup (private/fixtures/btc-updown-15m-1787449500.json, era
     # tag `pre-brake`), the −$318 window 8b3c156 was cut to fix, and the xrp
     # basis losses that struck xrp off the tradeable list (ROADMAP.md:14
     # "per-arm basis guards (BTC 3bp, alts 6bp, XRP off)", :100 "XRP not
@@ -106,7 +107,7 @@ ERAS: tuple[Era, ...] = (
 
     # e296336 @ 1787484570 = 2026-08-23T11:29:30Z — "updown: read the
     # settlement stream itself — RTDS-fed arms (dark)". Corroborated by the
-    # first stream-fed window: pmengine/fixtures/xrp-updown-5m-1787485200.json,
+    # first stream-fed window: private/fixtures/xrp-updown-5m-1787485200.json,
     # era tag `post-rtds`, start 1787485200 — 10.5 min after this boundary
     # (b7b981a, "freeze the first stream-fed xrp window (post-rtds era)").
     # It shipped dark (ROADMAP.md:107, "no arm uses rtds until the operator
