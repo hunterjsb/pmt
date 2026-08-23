@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """R6 tail-flip study (ROADMAP.md Phase 2, R6).
 
+2026-08-23 CORRECTION — READ analysis/fourh_fit.md BEFORE USING THIS SCRIPT'S
+CONCLUSIONS. Its "winner" is the average of the window's minute marks vs the
+reference, i.e. what pmengine's eval_model believes settles the market. That is
+not what settles the market: analysis/settlement_rule_check.py shows over 3,193
+resolved windows that resolution follows the Chainlink 60s TWAP at the range END
+vs the same stream at range start (98.98% agreement at 4h vs 86.02% for the
+range average; 144-4 head-to-head where the two disagree). So the "~0% flip rate
+at safety >= 1.0" below is a true statement about a quantity that decides
+nothing. The flip rates against real resolutions are 1.8% (5m), 7.5% (15m) and
+9.6% (4h) at theta=1.0. R6's conclusions need re-deriving once eval_model is
+re-specified.
+
 The updown strategy's "banked_decided" verdict (pmengine/src/strategies/
 updown.rs::eval_model) trusts a Gaussian cushion:
 
@@ -76,7 +88,12 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 # not live: 8bp is its R1 settlement-p95 proposal (`--symbols BNBUSDT`).
 GUARD_BP = {"BTCUSDT": 6.0, "ETHUSDT": 8.0, "SOLUSDT": 10.0, "BNBUSDT": 8.0}
 
-DURATIONS = [("5m", 300), ("15m", 900)]
+# 4h added 2026-08-23 for the tail-harvest fit (analysis/fourh_fit.md). Its rem
+# buckets below only reach 600s, so a 4h window spends ~96% of its life in the
+# informational "600s+" column and the FIT pass/fail criterion is effectively
+# a statement about the final 10 minutes only — read analysis/fourh_fit.py's
+# 4h-scaled rem buckets for the rest of that window.
+DURATIONS = [("5m", 300), ("15m", 900), ("4h", 14400)]
 
 VOL_FAST_WINDOW = 12          # updown.rs VOL_FAST_WINDOW
 SIGMA_SLOW_WINDOW = 45        # updown.rs SIGMA_SLOW_WINDOW
