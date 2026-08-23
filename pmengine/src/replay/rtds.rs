@@ -33,7 +33,11 @@
 //!     vector `seed_feed` would have copied.
 
 use crate::strategies::updown::ArmParams;
-use crate::strategies::updown_model::{settle_tw_secs, FeedState};
+use crate::strategies::updown_model::{settle_tw_for, FeedState};
+// Tests still build hubs at a raw window width; the live path goes through
+// settle_tw_for, so ungated this is an unused import in a non-test build.
+#[cfg(test)]
+use crate::strategies::updown_model::settle_tw_secs;
 use crate::strategies::updown_rtds::{
     self, CorpusSample, RtdsHub, RtdsSub, HISTORY_WARMUP_S, RTDS_SYMBOLS,
 };
@@ -274,7 +278,7 @@ impl RtdsTimeline {
         let feed = Arc::new(Mutex::new(FeedState::default()));
         let sub = hub.register_offline(
             symbol,
-            settle_tw_secs(p.end - p.start),
+            settle_tw_for(p),
             p.start,
             feed.clone(),
         );
