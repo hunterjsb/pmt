@@ -512,7 +512,10 @@ def crypto_stats(since: float | None, full: bool, gates: bool,
             "series": sb["series"],
             "calibration": {str(k): v for k, v in sb["cal"].items()},
             "arms": status.get("arms", {}), "balance": bal,
-            "windows": sb["windows"], "effectiveness": eff_s,
+            "windows": sb["windows"],
+            # Filled but not yet graded. Same field watch's trades panel
+            # paints, so the two views can't disagree about what is open.
+            "riding_windows": sb["riding_windows"], "effectiveness": eff_s,
             "maker": blocks["maker"], "chase": blocks["chase"],
             "fleet": blocks["fleet"], "gates": gates_report,
             "era": era.name if era else None,

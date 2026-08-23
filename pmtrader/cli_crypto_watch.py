@@ -66,6 +66,19 @@ TRADES_CHROME = 6         # panel border (2) + table border/header/rule (4)
 MIN_TAPE_ROWS = 6         # the tape never gets squeezed below this for a trade row
 
 
+def trades_rows_shown(console_h: int, arms_h: int, n_rows: int) -> int:
+    """Trade rows this screen can hold: what there is, capped, and never so
+    many that the tape stops being readable.
+
+    The panel is BUILT to this number rather than clipped to it — a table cut
+    off mid-box below its last visible row reads as a crash, not as a cap —
+    and the panel title repeats it, so a short screen says "6 of 14" instead
+    of silently looking like the whole ledger.
+    """
+    room = console_h - 4 - 3 - arms_h - MIN_TAPE_ROWS - TRADES_CHROME
+    return max(1, min(TRADES_MAX_ROWS, n_rows, room))
+
+
 class WatchState:
     """The single hand-off point between the fetch thread and the render loop.
 
@@ -236,17 +249,10 @@ def crypto_watch(since: float | None) -> None:
                      title="recent windows", subtitle="[dim]h = controls[/dim]",
                      border_style="dim")
 
-    def trades_panel() -> Panel:
+    def trades_panel(rows: int) -> Panel:
         sb = snap["sb"]
-        return Panel(build_trades_table(sb, _t.time(), limit=TRADES_MAX_ROWS),
-                     title=trades_title(sb), border_style="dim")
-
-    def trades_size(console_h: int, arms_h: int) -> int:
-        """Rows for the trades panel: what it actually has, capped, and never
-        so many that the tape stops being readable."""
-        room = console_h - 4 - 3 - arms_h - MIN_TAPE_ROWS - TRADES_CHROME
-        n = min(TRADES_MAX_ROWS, len(trade_rows(snap["sb"])), room)
-        return max(1, n) + TRADES_CHROME
+        return Panel(build_trades_table(sb, _t.time(), limit=rows),
+                     title=trades_title(sb, rows), border_style="dim")
 
     def tape_panel(height: int) -> Panel:
         shown = list(lines)[-max(height - 2, 1):]
@@ -300,11 +306,13 @@ def crypto_watch(since: float | None) -> None:
                     except OSError:
                         pass
                     layout["arms"].size = max(len(snap["status"].get("arms") or {}), 1) + 4
-                    layout["trades"].size = trades_size(live.console.size.height,
-                                                         layout["arms"].size)
+                    n_trades = trades_rows_shown(live.console.size.height,
+                                                  layout["arms"].size,
+                                                  len(trade_rows(snap["sb"])))
+                    layout["trades"].size = n_trades + TRADES_CHROME
                     layout["head"].update(header())
                     layout["arms"].update(arms_table())
-                    layout["trades"].update(trades_panel())
+                    layout["trades"].update(trades_panel(n_trades))
                     layout["strip"].update(
                         _controls_panel() if show_controls else strip_panel())
                     h = (live.console.size.height - 4 - 3

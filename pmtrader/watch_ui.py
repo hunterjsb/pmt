@@ -757,11 +757,11 @@ def _riding_chip(w: dict) -> str:
 
 def build_windows_strip(windows: list[dict] | None,
                          riding: list[dict] | None = None) -> str:
-    """Chip row: riding positions first, then the last resolved windows,
-    newest first (caller supplies already-sorted lists — see score_activity's
-    "riding_windows" and "windows")."""
-    chips = [_riding_chip(w) for w in (riding or [])]
-    chips += [_window_chip(w) for w in (windows or [])]
+    """Chip row of the fleet's recent windows, newest first: ◆ for one still
+    riding, ✓/✗ for a decided one. Ordered by `trade_rows`, so the strip and
+    the trades table can never disagree about what happened when."""
+    chips = [_riding_chip(w) if w.get("won") is None else _window_chip(w)
+             for w in trade_rows({"windows": windows, "riding_windows": riding})]
     return "  ".join(chips) if chips else "[dim]no windows traded yet[/dim]"
 
 
@@ -807,25 +807,37 @@ def _trade_pnl_cell(w: dict) -> str:
 
 
 def trade_rows(sb: dict | None, limit: int | None = None) -> list[dict]:
-    """Riding positions then decided windows, in the order they render.
+    """Riding and decided windows in ONE list, newest window-end first.
 
-    `limit` trims the DECIDED tail only — riding rows lead, so a short panel
-    drops old history before it drops live money.
+    Recency, deliberately, rather than "riding always leads": a fresh fill
+    tops the panel anyway — a still-open window sorts above every closed one —
+    while a window stuck undecided since yesterday (four of them, $317, live on
+    2026-08-23) stops squatting on a six-row panel forever. Stuck money is
+    still totalled on the risk header's "riding N windows $W", which is where
+    a total belongs; this panel answers "what just happened".
     """
     sb = sb or {}
     rows = list(sb.get("riding_windows") or []) + list(sb.get("windows") or [])
+    rows.sort(key=lambda r: float(r.get("end_ts") or 0.0), reverse=True)
     return rows if limit is None else rows[:limit]
 
 
-def trades_title(sb: dict | None) -> str:
-    """`trades · last 12 decided · 2 riding` — retention STATED, not implied.
+def trades_title(sb: dict | None, shown: int | None = None) -> str:
+    """`trades · last 12 decided · 2 riding`, or `trades · 6 of 14 · 12
+    decided · 2 riding` when the panel is painting fewer rows than the
+    scoreboard holds.
 
-    A cap the operator can't see is indistinguishable from a dropped trade,
-    which is the confusion this whole panel exists to end.
+    Retention STATED, not implied — a cap the operator can't see is
+    indistinguishable from a dropped trade, which is the confusion this whole
+    panel exists to end.
     """
     sb = sb or {}
-    return (f"trades · last {len(sb.get('windows') or [])} decided"
-            f" · {len(sb.get('riding_windows') or [])} riding")
+    n_dec = len(sb.get("windows") or [])
+    n_ride = len(sb.get("riding_windows") or [])
+    held = f"{n_dec} decided · {n_ride} riding"
+    if shown is None or shown >= n_dec + n_ride:
+        return f"trades · last {held}"
+    return f"trades · {shown} of {n_dec + n_ride} · {held}"
 
 
 def build_trades_table(sb: dict | None, now: float,
@@ -837,7 +849,10 @@ def build_trades_table(sb: dict | None, now: float,
     the chip strip alone could not make, because it only ever carried decided
     windows.
     """
-    t = Table(expand=True, pad_edge=False)
+    # Natural widths, not expand=True: six narrow columns stretched across 160
+    # terminal columns puts a metre of whitespace between a trade's size and
+    # its P&L. The arms table expands because it genuinely fills the row.
+    t = Table(expand=False, pad_edge=False)
     for col, justify, width in _TRADES_COLUMNS:
         t.add_column(col, justify=justify, width=width, no_wrap=True, overflow="ellipsis")
     rows = trade_rows(sb, limit)
@@ -853,7 +868,9 @@ def build_trades_table(sb: dict | None, now: float,
             _trade_pnl_cell(w),
         )
     if not rows:
-        t.add_row("—", "—", "—", "—", "—", "[dim]no trades yet[/dim]")
+        # In the P&L cell, not a wider one: every column here is narrow, and a
+        # placeholder that ellipsizes is worse than a short honest one.
+        t.add_row("—", "—", "—", "—", "—", "[dim]no trades[/dim]")
     return t
 
 
@@ -885,6 +902,8 @@ _ARMS_COLUMNS = (
 )
 
 _ARMS_FLAG_LEGEND = "⟳ roll · ≈ stream-fed · ◇ maker bid"
+
+_CHIP_LEGEND = "◆ riding"  # the strip's own glyph: filled, no verdict yet
 
 
 def build_arms_table(arms: dict | None, now: float) -> Table:
@@ -1008,7 +1027,7 @@ def _controls_panel():
     from rich.panel import Panel
     return Panel(
         "[bold]q[/bold] quit · [bold]h[/bold] controls · Ctrl-C quits"
-        f"  [dim]|[/dim]  [cyan]{_ARMS_FLAG_LEGEND}[/cyan]"
+        f"  [dim]|[/dim]  [cyan]{_ARMS_FLAG_LEGEND} · {_CHIP_LEGEND}[/cyan]"
         "  [dim]|[/dim]  refresh: tape 1s · engine 2s · scoreboard 10s · balance 60s",
         title="controls", border_style="cyan")
 

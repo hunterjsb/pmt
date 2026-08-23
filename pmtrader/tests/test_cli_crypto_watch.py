@@ -92,6 +92,23 @@ def test_a_graded_trade_always_reaches_the_watch_trades_table(monkeypatch):
     assert watch_ui.trades_title(sb) == "trades · last 1 decided · 1 riding"
 
 
+def test_trades_panel_never_starves_the_tape_and_never_paints_a_clipped_box():
+    """The panel is sized to the rows it will actually paint. Rich clips a
+    Layout slot that overflows, and a table cut off below its last row (no
+    bottom border) reads as a crash rather than as a cap."""
+    # Roomy screen, plenty of trades: the view cap is what bites.
+    assert cw.trades_rows_shown(50, 12, 16) == cw.TRADES_MAX_ROWS
+    # Few trades: don't reserve rows for trades that don't exist.
+    assert cw.trades_rows_shown(50, 12, 2) == 2
+    # Cramped screen: the tape keeps its floor, one trade row still survives.
+    assert cw.trades_rows_shown(30, 12, 16) == 1
+    for h in range(20, 60):
+        n = cw.trades_rows_shown(h, 12, 16)
+        assert 1 <= n <= cw.TRADES_MAX_ROWS
+        # 4 head + 3 strip + arms + panel: what's left is the tape's.
+        assert h - 4 - 3 - 12 - (n + cw.TRADES_CHROME) >= cw.MIN_TAPE_ROWS or n == 1
+
+
 def _fetcher(monkeypatch, *, sb=None, status=None, bal=None, sb_boom=None):
     """A WatchFetcher with every network seam replaced. The scoreboard seam
     is _tape_scoreboard — the SAME function `pmt crypto stats` runs, which
