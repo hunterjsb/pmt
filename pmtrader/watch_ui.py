@@ -10,8 +10,10 @@ The two hard rules the dashboard is built on:
   * every cell tolerates a missing or half-built eval — an engine restart
     mid-watch leaves `last_eval` None or partial, and the dashboard must keep
     painting rather than raise;
-  * column geometry is fixed (see _ARMS_COLUMNS, _TAPE_TAG_WIDTH), so the
-    layout never jitters as state/reason text changes tick to tick.
+  * column geometry is fixed (see _HEAD_*, _ARMS_COLUMNS, _TRADES_COLUMNS,
+    _TAPE_TAG_WIDTH, _TAPE_AGG_WIDTH), so the layout never jitters as
+    state/reason text changes tick to tick, and every panel puts a given
+    kind of figure at the same offset every frame.
 
 Also holds the tty-mode helpers, since cbreak/key-polling exists only to serve
 this dashboard's input loop.
@@ -267,11 +269,29 @@ def _mode_text(e: dict) -> str:
 
 _TAPE_TAG_WIDTH = 9  # "FIRE DOWN"/"FLIP DOWN"/etc — the widest natural tag, unpadded
 
+_TAPE_AGG_WIDTH = 5  # "×9999" — one tape line never collapses more than that
+
 
 def _tape_tag(text: str) -> str:
     """Left-pad an event tag to a fixed width so the fields after it land at
     the same column regardless of event type (FIRE/EXIT/eval/gated/ROLL)."""
     return f"{text:<{_TAPE_TAG_WIDTH}}"
+
+
+def _tape_agg(n: int) -> str:
+    """The collapse counter in ITS OWN fixed column, immediately after the
+    tag — blank (but still occupied) for a line that collapsed nothing.
+
+    ONE column for every line type is the whole point: the count used to sit
+    inside the tag for a basis gate and at the end of the line for an eval,
+    so the eye had to re-find it per line type. Deliberately not the right
+    edge: tape bodies are 60-110 characters wide, so a right-aligned marker
+    would have to pad past the terminal or truncate a body to hold a column.
+
+    Plain text, never styled: it is concatenated into lines that are styled
+    as a whole, and a nested reset would drop the rest of the line's color.
+    """
+    return f"{('×' + str(n)) if n > 1 else '':<{_TAPE_AGG_WIDTH}}"
 
 
 def _hms(t: float) -> str:
@@ -300,10 +320,15 @@ def _tape_render(line: str) -> str | None:
     return _render_record(r, line)
 
 
-def _render_record(r: dict, raw: str) -> str:
+def _render_record(r: dict, raw: str, n: int = 1) -> str:
     """One parsed tape record as a rendered line; `raw` is the fallback for an
-    event this build doesn't know (never swallow a record we can't name)."""
-    head = _tape_head(r)
+    event this build doesn't know (never swallow a record we can't name).
+
+    `n` is how many records this line stands for — it renders into the fixed
+    aggregation column (_tape_agg) so every line type carries its count in the
+    same place. 1 leaves that column blank but occupied.
+    """
+    head, agg = _tape_head(r), _tape_agg(n)
 
     def money(v: float) -> str:
         return f"${_zero(v):,.2f}".rstrip("0").rstrip(".")
@@ -314,13 +339,14 @@ def _render_record(r: dict, raw: str) -> str:
         label = click.style(_tape_tag(f"{tag} {r['side'].upper()}"), fg="green", bold=True)
         pct = f"  {r['elapsed_frac'] * 100:.0f}% thru" if "elapsed_frac" in r else ""
         return (
-            f"{head} {label} {r['size']:g}sh @ {r['ask']:.2f}"
+            f"{head} {label}{agg}{r['size']:g}sh @ {r['ask']:.2f}"
             f"  fair {r['fair']:.4f}  {r['net'] * 100:+.1f}¢"
             f"  ρ{r['rho']:+.2f}  {money(r['committed'])} in{pct}"
         )
     if ev == tape.EV_EXIT:
         label = click.style(_tape_tag(f"EXIT {r['side'].upper()}"), fg="red", bold=True)
-        return f"{head} {label} {r['size']:g}sh @ bid {r['bid']:.2f}  fair {r['fair']:.4f}"
+        return (f"{head} {label}{agg}{r['size']:g}sh @ bid {r['bid']:.2f}"
+                f"  fair {r['fair']:.4f}")
     if ev == tape.EV_EVAL:
         sides = r.get("sides") or []
         best = _best_side(sides)
@@ -335,7 +361,7 @@ def _render_record(r: dict, raw: str) -> str:
         elif r.get("maker_candidate"):
             tags += click.style("  ◇maker-candidate", fg="cyan")
         body = (
-            f"{head} {_tape_tag('eval')} p↑{r['p_up']:.4f}  {book}"
+            f"{head} {_tape_tag('eval')}{agg}p↑{r['p_up']:.4f}  {book}"
             f"  ρ{r['rho']:+.2f}  {money(r['committed'])} in"
         )
         extras = "  ".join(x for x in (_safety_ansi(sides, r.get("p_up")), _brake_ansi(sides)) if x)
@@ -344,13 +370,15 @@ def _render_record(r: dict, raw: str) -> str:
         def ask(v: float | None) -> str:
             return f"{v:.2f}" if v is not None else "—"
         asks = f"  up {ask(r['up_ask'])}/dn {ask(r['dn_ask'])}" if "up_ask" in r else ""
-        return click.style(f"{head} {_tape_tag('gated')} {r.get('reason', '?')}{asks}",
+        return click.style(f"{head} {_tape_tag('gated')}{agg}{r.get('reason', '?')}{asks}",
                             fg="yellow", dim=True)
     if ev == tape.EV_ROLL:
-        return click.style(f"{head} {_tape_tag('ROLL')} next window armed (${r['size']:g})",
+        return click.style(f"{head} {_tape_tag('ROLL')}{agg}next window armed (${r['size']:g})",
                             fg="cyan")
     if ev == tape.EV_CLEANUP:
-        return click.style(f"{head} ── window closed ──", dim=True)
+        # Tagged like every other event now: an untagged line was the one hole
+        # in the tape's fixed column geometry.
+        return click.style(f"{head} {_tape_tag('closed')}{agg}── window closed ──", dim=True)
     return raw.rstrip()
 
 
@@ -367,16 +395,26 @@ def _render_record(r: dict, raw: str) -> str:
 
 _NUM_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
 
-_OWN_LOOKBACK = 8  # how deep under later output a live run's line may sit and still be updated
+# How deep under later output a live run's line may sit and still be updated.
+# Sized for a fleet-wide roll: every arm emits its window-close, THEN every arm
+# emits its roll, so the first arm's line is one-per-arm deep by the time its
+# own roll arrives to merge into it. 16 leaves headroom over the 8 arms that
+# have actually run at once.
+_OWN_LOOKBACK = 16
 
 
 def _run_suffix(run: _Run) -> str:
-    """`×12 ⟨23:40:01→23:43:20⟩`, or "" for a run of one — so an isolated
-    record renders byte-identically to an uncollapsed one and the count only
-    appears once there is something to count."""
+    """`⟨23:40:01→23:43:20⟩`, or "" for a run of one — so an isolated record
+    renders byte-identically to an uncollapsed one.
+
+    The COUNT is not here: it lives in the fixed _tape_agg column so every
+    line type carries it at the same offset. This is only the span, which is
+    variable-position by nature (it trails a variable-width body) and is read
+    after the count, never instead of it.
+    """
     if run.n < 2:
         return ""
-    return click.style(f"  ×{run.n} ⟨{_hms(run.t0)}→{_hms(run.t1)}⟩", dim=True)
+    return click.style(f"  ⟨{_hms(run.t0)}→{_hms(run.t1)}⟩", dim=True)
 
 
 def _within(anchor: dict, met: dict, tol: dict) -> bool:
@@ -431,11 +469,17 @@ class _CollapseRule:
     def metrics(self, r: dict) -> dict:
         return {}
 
+    def continues(self, run: _Run, r: dict) -> bool:
+        """Rule-private veto: start a NEW run even though the signature and
+        the metrics still match. Only a rule that holds a fixed set of records
+        (the roll/close pair) needs it; repetition rules never do."""
+        return True
+
     def fold(self, run: _Run, r: dict) -> None:
         """Accumulate whatever the rendered line needs beyond the freshest record."""
 
     def render(self, run: _Run) -> str:
-        return _render_record(run.rec, run.raw) + _run_suffix(run)
+        return _render_record(run.rec, run.raw, run.n) + _run_suffix(run)
 
 
 class _BasisGuardRun(_CollapseRule):
@@ -466,9 +510,14 @@ class _BasisGuardRun(_CollapseRule):
             run.state[sym] = f"{float(m.group(1)):+.1f}/{float(m.group(2)):.0f}" if m else "?"
 
     def render(self, run: _Run) -> str:
+        # No span suffix: this is the widest line the tape emits (a per-symbol
+        # margin for every arm in the fleet) and the ⟨from→to⟩ tail pushed it
+        # past the panel, costing a second row to say what the line's own
+        # timestamp and count already say.
         per = " · ".join(f"{sym} {txt}" for sym, txt in sorted(run.state.items()))
         return click.style(
-            f"{_hms(run.t1)}  {'':<14} {_tape_tag(f'gated ×{run.n}')} basis bp/guard: {per}",
+            f"{_hms(run.t1)}  {'':<14} {_tape_tag('gated')}{_tape_agg(run.n)}"
+            f"basis bp/guard: {per}",
             fg="yellow", dim=True)
 
 
@@ -542,6 +591,57 @@ class _GateRun(_CollapseRule):
         return {k: r[k] for k in self.tolerances if r.get(k) is not None}
 
 
+class _RollClosePair(_CollapseRule):
+    """A window closing and its arm re-arming the next one: ONE line.
+
+    The engine emits both at the same instant — `cleanup` naming the window
+    that just ended, `roll` naming the one it armed — so the pair always
+    appeared as two lines that only meant something together, and a five-arm
+    fleet printed ten of them every roll. Merged they read as the single fact
+    they are: `09:30 closed → next window armed ($1,000)`.
+
+    Keyed on the SERIES (`btc 5m`), not the slug, because the two records
+    deliberately name different windows of it. Anchored on `t`: a later close
+    is a later roll, never a continuation of this one.
+    """
+
+    name = "roll"
+    tolerances = {"t": 5.0}  # one roll moment — the pair shares a timestamp
+
+    def matches(self, r: dict) -> bool:
+        return r.get("ev") in (tape.EV_ROLL, tape.EV_CLEANUP)
+
+    def lane(self, r: dict) -> str:
+        parsed = updown_slugs.parse(r.get("slug") or "")
+        return f"roll:{parsed[4] if parsed else r.get('slug')}"
+
+    def metrics(self, r: dict) -> dict:
+        return {"t": r.get("t") or 0.0}
+
+    def continues(self, run: _Run, r: dict) -> bool:
+        # At most one close and one roll per line; a second of either is a
+        # second event and must get its own line.
+        return r.get("ev") not in run.state
+
+    def fold(self, run: _Run, r: dict) -> None:
+        run.state[r["ev"]] = r
+
+    def render(self, run: _Run) -> str:
+        closed = run.state.get(tape.EV_CLEANUP)
+        rolled = run.state.get(tape.EV_ROLL)
+        if rolled is None or closed is None:
+            # Half the pair (a --no-roll arm closing, or a roll with no close
+            # recorded) still renders as its own event, never as a merged line
+            # implying a fact the tape didn't carry.
+            return _render_record(rolled or closed, "")
+        w = updown_slugs.parse_updown_slug(closed.get("slug") or "")
+        shut = time.strftime("%H:%M", time.localtime(w["start"])) if w else "?"
+        return click.style(
+            f"{_tape_head(rolled)} {_tape_tag('ROLL')}{_tape_agg(1)}"
+            f"{shut} closed → next window armed (${rolled.get('size', 0):g})",
+            fg="cyan")
+
+
 def _best_side(sides: list[dict]) -> dict | None:
     """The side the eval line prints — same pick as _render_record's."""
     return max(sides, key=lambda s: s["net"], default=None)
@@ -551,9 +651,14 @@ class TapeCollapser:
     """Collapse runs of repetitive tape records into single live-updating lines.
 
     One rule per repetitive shape (see _CollapseRule). A record that matches no
-    rule — FIRE, EXIT, ROLL, CLEANUP, or any ev this build doesn't know —
-    never collapses and ends EVERY open run: those are the lines the whole
-    mechanism exists to make visible.
+    rule — FIRE, EXIT, or any ev this build doesn't know — never collapses and
+    ends EVERY open run: those are the lines the whole mechanism exists to make
+    visible.
+
+    ROLL and CLEANUP are the one pair that DOES merge (_RollClosePair), because
+    the engine emits them together and neither reads without the other. They
+    still end the runs of the arm they name, so an arm's eval run can never
+    survive across its own window boundary.
 
     A record also ends the runs it contradicts rather than only its own: the
     global basis run dies on anything that isn't a basis gate (an eval means
@@ -561,7 +666,8 @@ class TapeCollapser:
     other, since one arm cannot be both at once.
     """
 
-    _RULES: tuple[_CollapseRule, ...] = (_BasisGuardRun(), _EvalRun(), _GateRun())
+    _RULES: tuple[_CollapseRule, ...] = (_BasisGuardRun(), _EvalRun(), _GateRun(),
+                                          _RollClosePair())
 
     def __init__(self) -> None:
         self._runs: dict[str, _Run] = {}
@@ -606,7 +712,9 @@ class TapeCollapser:
         sig, met = rule.signature(r), rule.metrics(r)
         self._end_conflicting(lane, arm)
         run = self._runs.get(lane)
-        if run is None or run.sig != sig or not _within(run.anchor, met, rule.tolerances):
+        if (run is None or run.sig != sig
+                or not _within(run.anchor, met, rule.tolerances)
+                or not rule.continues(run, r)):
             run = self._runs[lane] = _Run(rule, arm, sig, met)
         run.n += 1
         run.t1 = r.get("t", 0.0)
@@ -680,10 +788,10 @@ def risk_cells(status: dict | None, sb: dict | None,
     """The exposure summary's segments, as cells:
     `["committed $Y", "$Z un-decided", ("◇resting $R"), "riding N windows $W"]`.
 
-    Committed and un-decided are separate cells here and one clause in
-    `build_risk_header` — the numbers and the un-decided threshold color are
-    computed once, in this function, so a grid layout and the one-line layout
-    can never disagree about what is at risk.
+    THE one place committed/un-decided/resting/riding are computed and the
+    un-decided threshold color is chosen. `exposure_rows` lays these into the
+    header grid both the dashboard and `pmt crypto stats` render, so the two
+    views cannot disagree about what is at risk.
 
     Reads only already-cached data (status/sb) — never fetches.
     """
@@ -709,23 +817,39 @@ def risk_cells(status: dict | None, sb: dict | None,
     return cells
 
 
-def build_risk_header(status: dict | None, sb: dict | None,
-                       rtds: bool = True) -> str:
-    """`committed $Y ($Z un-decided) · ◇resting $R · riding N windows $W` —
-    the one-line exposure summary between the scoreboard and the arms table.
+def exposure_rows(status: dict | None, sb: dict | None) -> list[tuple]:
+    """Live exposure as header-grid rows: `(label, v1, v2, v3)` tuples.
 
-    Deliberately carries no capital figure: that is the top panel's, and two
-    money-shaped lines stacked back to back read as one line printed twice.
+    The numbers and the un-decided threshold color come from `risk_cells`, so
+    the watch dashboard and `pmt crypto stats` can never disagree about what
+    is at risk — only about how many columns they had to say it in. Both
+    render THESE rows; neither joins its own line any more, which is what let
+    the two drift out of alignment in the first place.
 
-    `rtds=False` drops the stream-health tail. The dashboard has a full-width
-    row for this line; `pmt crypto stats` prints it inside a panel that has
-    to hold 100 columns, and the two clauses answer different questions
-    anyway — stats gives the stream its own line.
+    A resting maker bid earns its own row because it only exists on the days
+    a bid is actually on the book.
     """
-    cells = risk_cells(status, sb, rtds)
-    # committed and its un-decided share are one clause on a single line and
-    # two cells in a grid — same numbers, laid out for the space available.
-    return " · ".join([f"{cells[0]} ({cells[1]})"] + cells[2:])
+    cells = risk_cells(status or {}, sb, rtds=False)
+    resting = next((c for c in cells if "resting" in c), None)
+    riding = next(c for c in cells if c.startswith("riding"))
+    rows = [("exposure", cells[0], cells[1], f"[dim]{riding}[/dim]")]
+    if resting:
+        rows.append(("resting", resting, "[dim]maker bid on the book[/dim]", ""))
+    return rows
+
+
+def feed_row(status: dict | None) -> tuple | None:
+    """The shared settlement socket's health as one header-grid row, or None
+    when no arm is reading the stream: one socket's state and the fleet's
+    dollars answer different questions and get different rows."""
+    cells = rtds_line_cells(status or {})
+    if not cells:
+        return None
+    head, bits = cells[0], cells[1:]
+    return ("feed",
+            f"{head} [dim]{bits[0]}[/dim]" if bits else head,
+            f"[dim]{bits[1]}[/dim]" if len(bits) > 1 else "",
+            f"[dim]{' · '.join(bits[2:])}[/dim]" if len(bits) > 2 else "")
 
 
 def _chip_label(w: dict) -> str:
@@ -776,6 +900,7 @@ _TRADES_COLUMNS = (
     ("arm", "left", 8),
     ("side", "left", 4),
     ("entry", "right", 5),
+    ("now", "right", 5),
     ("size", "right", 9),
     ("P&L", "right", 9),
 )
@@ -804,6 +929,34 @@ def _trade_pnl_cell(w: dict) -> str:
         return "[cyan]riding[/cyan]"
     v = _zero(float(pnl))
     return f"[{_pnl_color(v)}]{'~' if w.get('est') else ''}{v:+,.2f}[/{_pnl_color(v)}]"
+
+
+def position_odds(odds: dict | None, w: dict) -> float | None:
+    """The CURRENT mark for the side this window holds, or None.
+
+    `odds` is polymarket.positions.current_odds' map — fetched on the watch
+    worker's slow cadence and allowed to be empty (a failed or not-yet-run
+    fetch), which is why every caller must tolerate None rather than reach
+    for a fallback price of its own.
+    """
+    if not odds:
+        return None
+    return odds.get(((w.get("slug") or ""), (w.get("side") or "").lower()))
+
+
+def _odds_cell(w: dict, odds: dict | None) -> str:
+    """`0.99` — what the held side is worth RIGHT NOW, beside what we paid.
+
+    Green once the side we're holding is the favourite, red once it isn't:
+    on a binary that settles to 0 or 1 this is the honest read on a riding
+    position, and it is the number the dashboard could not answer at all
+    ("what are the odds now?") while a window sat undecided.
+    """
+    px = position_odds(odds, w)
+    if px is None:
+        return "[dim]—[/dim]"
+    style = "green" if px >= 0.5 else "red"
+    return f"[{style}]{px:.2f}[/{style}]"
 
 
 def trade_rows(sb: dict | None, limit: int | None = None) -> list[dict]:
@@ -841,17 +994,28 @@ def trades_title(sb: dict | None, shown: int | None = None) -> str:
 
 
 def build_trades_table(sb: dict | None, now: float,
-                        limit: int | None = None) -> Table:
-    """Per-trade table: age, arm, side, avg entry, notional, P&L.
+                        limit: int | None = None,
+                        odds: dict | None = None) -> Table:
+    """Per-trade table: age, arm, side, avg entry, current mark, notional, P&L.
 
     Renders EVERY row it is handed (the caller caps via `limit`), so a window
     present in the scoreboard is always on screen somewhere — the guarantee
     the chip strip alone could not make, because it only ever carried decided
     windows.
+
+    A riding row reads `12s · bnb 5m · up · 0.97 · 0.99 · $19.44 · riding`:
+    what we got it for, what it is worth now, and how much of it there is. It
+    has to survive the arm rolling AWAY from that window — the position stays
+    ours until the wallet grades it, and this panel is where the operator
+    watches it land.
+
+    `odds` is the optional current-mark map (polymarket.positions), fetched on
+    the watch worker's slow cadence. Absent, empty or stale it degrades to `—`
+    in the `now` column and changes nothing else.
     """
-    # Natural widths, not expand=True: six narrow columns stretched across 160
-    # terminal columns puts a metre of whitespace between a trade's size and
-    # its P&L. The arms table expands because it genuinely fills the row.
+    # Natural widths, not expand=True: seven narrow columns stretched across
+    # 160 terminal columns puts a metre of whitespace between a trade's size
+    # and its P&L. The arms table expands because it genuinely fills the row.
     t = Table(expand=False, pad_edge=False)
     for col, justify, width in _TRADES_COLUMNS:
         t.add_column(col, justify=justify, width=width, no_wrap=True, overflow="ellipsis")
@@ -864,13 +1028,14 @@ def build_trades_table(sb: dict | None, now: float,
             _arm_label(w.get("slug", "")),
             w.get("side") or "—",
             f"{px:.2f}" if px else "—",
+            _odds_cell(w, odds),
             f"${_zero(float(w.get('notional') or 0.0)):,.2f}",
             _trade_pnl_cell(w),
         )
     if not rows:
         # In the P&L cell, not a wider one: every column here is narrow, and a
         # placeholder that ellipsizes is worse than a short honest one.
-        t.add_row("—", "—", "—", "—", "—", "[dim]no trades[/dim]")
+        t.add_row("—", "—", "—", "—", "—", "—", "[dim]no trades[/dim]")
     return t
 
 
@@ -1028,51 +1193,139 @@ def _controls_panel():
     return Panel(
         "[bold]q[/bold] quit · [bold]h[/bold] controls · Ctrl-C quits"
         f"  [dim]|[/dim]  [cyan]{_ARMS_FLAG_LEGEND} · {_CHIP_LEGEND}[/cyan]"
-        "  [dim]|[/dim]  refresh: tape 1s · engine 2s · scoreboard 10s · balance 60s",
+        "  [dim]|[/dim]  refresh: tape 1s · engine 2s · stats 10s · odds 30s · balance 60s",
         title="controls", border_style="cyan")
 
 
-def build_header_panel(snap: dict, floor_label: str, render_err: str | None):
-    """The dashboard's top panel: sliding W-L/P&L, capital, scoreboard data
-    age, all-time totals, and whatever went wrong last frame.
+# The top box is a LABEL/VALUE GRID, the same shape `pmt crypto stats` uses
+# (stats_render._HDR_*), so a figure sits in the same place in both views.
+# Widths are fixed and sized to the LONGEST value each column can hold, so the
+# columns never re-flow tick to tick and a number never loses digits to an
+# ellipsis: v1 "committed $12,345.67" (20), v2 "$12,345.67 un-decided" (22),
+# v3 "riding 12 windows $1,234.56" (27). Total 9+20+22+27 + padding + border =
+# 88 columns, well inside any terminal a full-screen dashboard runs in.
+_HEAD_LABEL_W = 9
+_HEAD_V1_W = 20
+_HEAD_V2_W = 22
+_HEAD_V3_W = 27
 
-    `snap` is one WatchState.read() mapping. The sliding block carries the
-    --since-floored recent pulse; the all-time figures come off the same
-    snapshot's full-history grade. Data age renders "—" (not "0s ago") before
-    the first wallet walk lands — an honest cue beats a confident zero.
+
+def _record_cell(wins: int, losses: int) -> str:
+    """`40W-6L (87.0%)` — one W-L cell, so the recent row and the all-time row
+    below it are read by eye rather than by arithmetic.
+
+    One decimal, matching `pmt crypto stats`: rounded to "92%" a headline rate
+    reads as level with a 92.5% break-even bar it is in fact under.
     """
-    from rich.panel import Panel
-
-    sb = snap["sb"]
-    sliding = sb.get("sliding") or _SB_EMPTY_SLIDING
-    wins, losses, net, rolls = sliding["wins"], sliding["losses"], sliding["net"], sliding["rolls"]
     n = wins + losses
-    wr = f"{wins / n * 100:.0f}%" if n else "—"
-    bal = snap["bal"]
-    cap = f"${bal['total']:,.2f}" if bal else "…"
-    color = _pnl_color(net)
-    stale = " · [yellow dim]stats stale[/]" if snap["sb_stale"] else ""
-    est = (f" · [dim]{sliding.get('estimated', 0)} ~estimated[/dim]"
-           if sliding.get("estimated") else "")
-    note = render_err or snap["err"]
-    err = f" · [red dim]{note}[/]" if note else ""
-    all_net = sb.get("net", 0.0)
-    all_color = _pnl_color(all_net)
-    all_time = (f" · [dim]all-time {sb.get('wins', 0)}W-{sb.get('losses', 0)}L "
-                f"[{all_color}]{all_net:+,.2f}[/{all_color}][/dim]")
-    if snap["sb_fetched_at"] is None:
-        age = "[dim]—[/dim]"
+    wr = f"{wins / n * 100:.1f}%" if n else "—"
+    return f"[bold]{wins}W-{losses}L[/bold] [dim]({wr})[/dim]"
+
+
+def _pnl_cell(net: float) -> str:
+    return f"[dim]P&L[/dim] [{_pnl_color(_zero(net))}]{_zero(net):+,.2f}[/]"
+
+
+def header_rows(snap: dict, render_err: str | None = None) -> list[tuple]:
+    """The top panel's rows as `(label, v1, v2, v3)` tuples.
+
+    Row order is the order the question is asked: how are we doing lately,
+    how are we doing overall, what is at risk right now, is the feed alive,
+    and what broke. A row with nothing to say is dropped, never padded with a
+    zero — which is why the panel's height is `header_height`, not a constant.
+    """
+    sb = snap.get("sb") or {}
+    sliding = sb.get("sliding") or _SB_EMPTY_SLIDING
+    est = sliding.get("estimated", 0) or 0
+    rolls = f"[dim]{sliding['rolls']} rolls[/dim]"
+    if est:
+        # `~` is the report-wide mark for an imputed figure (a gamma-confirmed
+        # win whose redeem row hasn't posted); it belongs beside the count it
+        # qualifies, not on a line of its own.
+        rolls += f" [dim]· ~{est} est[/dim]"
+    bal = snap.get("bal")
+    cap = (f"[dim]capital[/dim] [bold]${bal['total']:,.2f}[/bold]" if bal
+           else "[dim]capital …[/dim]")
+    rows = [
+        ("recent", _record_cell(sliding["wins"], sliding["losses"]),
+         _pnl_cell(sliding["net"]), rolls),
+        ("all-time", _record_cell(sb.get("wins", 0), sb.get("losses", 0)),
+         _pnl_cell(sb.get("net", 0.0)), cap),
+    ]
+    rows += exposure_rows(snap.get("status"), sb)
+    feed = feed_row(snap.get("status"))
+    if feed:
+        rows.append(feed)
+    return rows
+
+
+def header_note(snap: dict, render_err: str | None = None):
+    """The failure line, or None. A Text (not a grid row) because it is prose
+    the full width of the panel, not a value in a 20-column money field: a
+    traceback folded into one narrow cell costs five rows and says less.
+    Clipped to one line, so the panel's height stays predictable."""
+    note = render_err or snap.get("err")
+    if not note:
+        return None
+    from rich.text import Text
+
+    # Labelled and indented to the grid's own value column, so it reads as one
+    # more row of the same box.
+    t = Text.from_markup(f"[dim]{'note':<{_HEAD_LABEL_W}}[/dim]  [red dim]{note}[/]")
+    t.no_wrap, t.overflow = True, "ellipsis"
+    return t
+
+
+def header_height(snap: dict, render_err: str | None = None) -> int:
+    """Terminal rows the header panel will occupy — its rows, the failure line
+    if there is one, plus the border. The watch layout sizes its head slot from
+    this, the same way it sizes the arms slot from the arm count."""
+    return (len(header_rows(snap, render_err))
+            + (1 if header_note(snap, render_err) is not None else 0) + 2)
+
+
+def _header_subtitle(snap: dict) -> str:
+    """Scoreboard age + wall clock, on the panel's bottom border.
+
+    Age renders "—" (not "0s ago") before the first wallet walk lands: an
+    honest cue beats a confident zero. It belongs to the panel, not to a grid
+    row, because it qualifies every number in the box at once.
+    """
+    if snap.get("sb_fetched_at") is None:
+        age = "[dim]stats —[/dim]"
     else:
         age_s = time.time() - snap["sb_fetched_at"]
-        age_style = "yellow" if age_s > 30 else "dim"
-        age = f"[{age_style}]{age_s:.0f}s ago[/{age_style}]"
-    line1 = (f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L [{color}]{net:+,.2f}[/] · "
-             f"{rolls} rolls · capital {cap} · [dim]{floor_label}[/dim] · {age}"
-             f"{all_time}{stale}{est}{err} · "
-             f"[dim]{time.strftime('%H:%M:%S')}[/dim]")
-    # The exposure summary lives here as the box's second line — a bare row
-    # wedged between two panels read as chrome debris, not information.
-    line2 = build_risk_header(snap.get("status"), sb)
-    return Panel(f"{line1}\n{line2}", title="updown fleet", border_style="cyan")
+        age = f"[{'yellow' if age_s > 30 else 'dim'}]stats {age_s:.0f}s ago[/]"
+    stale = " [yellow dim]· stale[/]" if snap.get("sb_stale") else ""
+    return f"{age}{stale} [dim]· {time.strftime('%H:%M:%S')}[/dim]"
+
+
+def build_header_panel(snap: dict, floor_label: str, render_err: str | None):
+    """The dashboard's top panel: the recent pulse, the all-time ledger, live
+    exposure, the settlement feed, and whatever went wrong last frame — one
+    aligned label/value grid.
+
+    `snap` is one WatchState.read() mapping. The `recent` row carries the
+    --since-floored pulse; `all-time` comes off the same snapshot's
+    full-history grade, in the same columns, so the two compare by eye.
+    """
+    from rich.console import Group
+    from rich.panel import Panel
+
+    t = Table(box=None, pad_edge=False, padding=(0, 1), show_header=False)
+    t.add_column("label", justify="left", width=_HEAD_LABEL_W, no_wrap=True,
+                 overflow="ellipsis", style="dim")
+    # overflow="fold", not "ellipsis": on a terminal too narrow for the grid a
+    # value must wrap intact rather than lose its last digits — losing digits
+    # off a money figure is the one failure this box may not have.
+    for w in (_HEAD_V1_W, _HEAD_V2_W, _HEAD_V3_W):
+        t.add_column(justify="left", width=w, overflow="fold")
+    for row in header_rows(snap, render_err):
+        t.add_row(*row)
+    note = header_note(snap, render_err)
+    body = t if note is None else Group(t, note)
+    return Panel(body, title=f"[bold]updown fleet[/bold] [dim]· {floor_label}[/dim]",
+                 title_align="left", subtitle=_header_subtitle(snap),
+                 subtitle_align="right", border_style="cyan")
 
 

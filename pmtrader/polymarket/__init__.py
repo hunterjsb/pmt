@@ -8,7 +8,8 @@
 - `FlipResult`/`locked_buy_cash`/`lookup_market_name`/`sampling_markets`
 
 Submodules not re-exported here (import them directly): `pnl`, `crypto`,
-`chainlink`, `constants`, `shadow`, `tape`, `outcomes`, `updown_slugs`.
+`chainlink`, `constants`, `shadow`, `tape`, `outcomes`, `updown_slugs`,
+`positions`.
 """
 
 from . import hosts

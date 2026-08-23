@@ -25,11 +25,11 @@ import watch_ui
 from cli_common import _api, _parse_since
 from cli_crypto_stats import _tape_scoreboard
 from engine import post as _engine_post
-from polymarket import tape
+from polymarket import positions, tape, wallet
 from watch_ui import (
     _SB_EMPTY, _cbreak_stdin, _controls_panel, _restore_stdin, _wait_key,
     build_arms_table, build_header_panel, build_trades_table,
-    build_windows_strip, trade_rows, trades_title,
+    build_windows_strip, header_height, trade_rows, trades_title,
 )
 
 
@@ -49,6 +49,7 @@ from watch_ui import (
 # Fetch cadences — keep in sync with the line in _controls_panel().
 ENGINE_EVERY_S = 2.0
 SB_EVERY_S = 10.0
+ODDS_EVERY_S = 30.0       # per-position marks: a display feed, not a control input
 BAL_EVERY_S = 60.0
 WORKER_INTERVAL_S = 0.25  # how often the worker checks what's due
 # 'q' must feel instant. An idle worker exits its wait immediately; one stuck
@@ -61,12 +62,18 @@ RENDER_EVERY_S = 1.0      # repaint cadence when no key changed anything
 # Trades panel geometry. TRADES_MAX_ROWS is a VIEW cap, and the panel title
 # names it ("last N decided · M riding") — a cap the operator can't see reads
 # as a dropped trade, which is the confusion this panel exists to end.
-TRADES_MAX_ROWS = 6
+# 8, not 6: a five-arm fleet rolls five windows at once, and at 6 a single
+# roll cycle filled the panel and pushed the previous cycle off before the
+# operator could see how any of it resolved.
+TRADES_MAX_ROWS = 8
 TRADES_CHROME = 6         # panel border (2) + table border/header/rule (4)
 MIN_TAPE_ROWS = 6         # the tape never gets squeezed below this for a trade row
+STRIP_H = 3               # the recent-windows / controls slot
+HEAD_MIN_H = 5            # header border + the four rows it always paints
 
 
-def trades_rows_shown(console_h: int, arms_h: int, n_rows: int) -> int:
+def trades_rows_shown(console_h: int, arms_h: int, n_rows: int,
+                      head_h: int = HEAD_MIN_H) -> int:
     """Trade rows this screen can hold: what there is, capped, and never so
     many that the tape stops being readable.
 
@@ -74,8 +81,12 @@ def trades_rows_shown(console_h: int, arms_h: int, n_rows: int) -> int:
     off mid-box below its last visible row reads as a crash, not as a cap —
     and the panel title repeats it, so a short screen says "6 of 14" instead
     of silently looking like the whole ledger.
+
+    `head_h` is the header panel's live height (watch_ui.header_height): it
+    grows a row for the settlement feed and for a render error, and the tape
+    is what pays for that, never the trades panel's floor of one row.
     """
-    room = console_h - 4 - 3 - arms_h - MIN_TAPE_ROWS - TRADES_CHROME
+    room = console_h - head_h - STRIP_H - arms_h - MIN_TAPE_ROWS - TRADES_CHROME
     return max(1, min(TRADES_MAX_ROWS, n_rows, room))
 
 
@@ -88,7 +99,7 @@ class WatchState:
     handing the renderer one internally consistent snapshot per frame.
     """
 
-    _FIELDS = ("status", "bal", "sb", "sb_stale", "sb_fetched_at", "err")
+    _FIELDS = ("status", "bal", "sb", "sb_stale", "sb_fetched_at", "err", "odds")
 
     def __init__(self, sb: dict | None = None) -> None:
         self._lock = threading.Lock()
@@ -99,6 +110,9 @@ class WatchState:
             # renders as the header's "—" data-age, which is the honest cue
             # while the first walk is still in flight.
             "sb_stale": False, "sb_fetched_at": None, "err": None,
+            # Current per-position marks; empty until the first slow fetch
+            # lands, and the trades table renders "—" for a mark it lacks.
+            "odds": {},
         }
 
     def update(self, **kw) -> None:
@@ -126,7 +140,8 @@ class WatchFetcher:
     def __init__(self, state: WatchState, sliding_floor: float) -> None:
         self.state = state
         self.sliding_floor = sliding_floor
-        self._due: dict[str, float] = {"status": 0.0, "sb": 0.0, "bal": 0.0}
+        self._due: dict[str, float] = {"status": 0.0, "sb": 0.0, "bal": 0.0,
+                                       "odds": 0.0}
 
     # -- individual fetches: each may raise; tick() belts them --
 
@@ -145,6 +160,13 @@ class WatchFetcher:
         sb = _tape_scoreboard(0.0, sliding_floor=self.sliding_floor)
         self.state.update(sb=sb, sb_stale=False, sb_fetched_at=time.time(), err=None)
 
+    def fetch_odds(self) -> None:
+        # A DISPLAY feed on the slowest cadence that still answers "what is
+        # the position worth now" — never an input to grading (the wallet is
+        # ground truth) and never a call into the engine's control plane.
+        rows = positions.fetch_positions(wallet.funder_address())
+        self.state.update(odds=positions.current_odds(rows))
+
     def fetch_bal(self) -> None:
         self.state.update(bal=_api().get_usdc_balance() or {})
 
@@ -162,11 +184,18 @@ class WatchFetcher:
     def _bal_failed(self, exc: BaseException) -> None:
         pass  # keep the last capital figure; a flaky balance call shouldn't blank it
 
+    def _odds_failed(self, exc: BaseException) -> None:
+        # Blank, not last-good: a mark is a live quote, and a stale one beside
+        # a live entry price would read as "the position hasn't moved". The
+        # trades table paints "—" and says nothing rather than something wrong.
+        self.state.update(odds={})
+
     def tick(self, now: float) -> None:
         """Run whatever is due at `now`. Never raises."""
         for name, every, fetch, failed in (
             ("status", ENGINE_EVERY_S, self.fetch_status, self._status_failed),
             ("sb", SB_EVERY_S, self.fetch_sb, self._sb_failed),
+            ("odds", ODDS_EVERY_S, self.fetch_odds, self._odds_failed),
             ("bal", BAL_EVERY_S, self.fetch_bal, self._bal_failed),
         ):
             if now < self._due[name]:
@@ -251,19 +280,25 @@ def crypto_watch(since: float | None) -> None:
 
     def trades_panel(rows: int) -> Panel:
         sb = snap["sb"]
-        return Panel(build_trades_table(sb, _t.time(), limit=rows),
+        return Panel(build_trades_table(sb, _t.time(), limit=rows,
+                                        odds=snap.get("odds")),
                      title=trades_title(sb, rows), border_style="dim")
 
     def tape_panel(height: int) -> Panel:
         shown = list(lines)[-max(height - 2, 1):]
-        return Panel(Text.from_ansi("\n".join(shown)), title="tape", border_style="dim")
+        body = Text.from_ansi("\n".join(shown))
+        # One tape record, one row. A wrapped line silently costs the panel a
+        # second row, so the "last N lines" arithmetic above stops holding and
+        # records scroll out of a panel that looks like it has space.
+        body.no_wrap, body.overflow = True, "ellipsis"
+        return Panel(body, title="tape", border_style="dim")
 
     layout = Layout()
     layout.split_column(
-        Layout(name="head", size=4),
+        Layout(name="head", size=HEAD_MIN_H),
         Layout(name="arms", size=10),
         Layout(name="trades", size=TRADES_MAX_ROWS + TRADES_CHROME),
-        Layout(name="strip", size=3),
+        Layout(name="strip", size=STRIP_H),
         Layout(name="tape", ratio=1),
     )
 
@@ -306,16 +341,21 @@ def crypto_watch(since: float | None) -> None:
                     except OSError:
                         pass
                     layout["arms"].size = max(len(snap["status"].get("arms") or {}), 1) + 4
+                    # The header grows a row for the settlement feed and one
+                    # for a render error; size the slot to what it will paint
+                    # or Rich clips the row that says what broke.
+                    layout["head"].size = header_height(snap, render_err)
                     n_trades = trades_rows_shown(live.console.size.height,
                                                   layout["arms"].size,
-                                                  len(trade_rows(snap["sb"])))
+                                                  len(trade_rows(snap["sb"])),
+                                                  layout["head"].size)
                     layout["trades"].size = n_trades + TRADES_CHROME
                     layout["head"].update(header())
                     layout["arms"].update(arms_table())
                     layout["trades"].update(trades_panel(n_trades))
                     layout["strip"].update(
                         _controls_panel() if show_controls else strip_panel())
-                    h = (live.console.size.height - 4 - 3
+                    h = (live.console.size.height - layout["head"].size - STRIP_H
                          - layout["arms"].size - layout["trades"].size)
                     layout["tape"].update(tape_panel(h))
                     render_err = None
@@ -324,6 +364,7 @@ def crypto_watch(since: float | None) -> None:
                 except (Exception, SystemExit) as e:
                     render_err = f"{type(e).__name__}: {e}"[:100]
                     try:
+                        layout["head"].size = header_height(snap, render_err)
                         layout["head"].update(header())
                     except Exception:
                         pass
