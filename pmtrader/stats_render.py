@@ -180,14 +180,19 @@ def _streak_text(eff: dict) -> str:
 # and the record row can no longer wrap "streak 101 (best 101)" across a line
 # break the way a dot-joined line did once the numbers grew a digit.
 #
-# Widths are fixed so the shape is stable between runs and between eras.
-# Budget: 13 + 18 + 21 + 36 = 88, plus Rich's inter-column padding, plus the
+# Widths are fixed so the shape is stable between runs and between eras, and
+# each is sized to the LONGEST value its column can hold, so a number never
+# loses digits to an ellipsis:
+#   v1 "committed $12,345.67" (20) — was 18, which cut a four-figure exposure
+#   v2 "peak un-decided $1,500" (22) — was 21, which cut the ration itself
+#   v3 "GAP -0.1pp  SHORT of break-even" (31); the note cells are written to it
+# Budget: 13 + 20 + 22 + 31 = 86, plus Rich's inter-column padding, plus the
 # panel's border and padding — under 100 columns, which is the report's law.
 # The label column holds the longest label the box can emit, `era pre-brake`.
 _HDR_LABEL_W = 13
-_HDR_V1_W = 18
-_HDR_V2_W = 21
-_HDR_V3_W = 36
+_HDR_V1_W = 20
+_HDR_V2_W = 22
+_HDR_V3_W = 31
 
 
 def _record_cells(sb: dict, eff: dict) -> tuple:
@@ -249,7 +254,7 @@ def _gap_cells(eff: dict) -> tuple:
         # Empty value cells rather than a fabricated 0.0%: the bar is not zero,
         # it is unknown, and the row says which.
         return ("break-even", "", "",
-                "[dim]not enough decided windows to size the bar[/dim]")
+                "[dim]too few decided windows to size it[/dim]")
     gap = (wr - be) * 100
     if gap >= 0:
         verdict, style = "clear of break-even", "green"
@@ -278,37 +283,23 @@ def _fleet_cells(fleet: dict | None) -> tuple | None:
 
 
 def _exposure_rows(status: dict | None, sb: dict) -> list[tuple]:
-    """The live exposure, laid into the grid from watch's own risk cells.
+    """The live exposure rows — watch_ui's, not a second copy.
 
-    The numbers and the un-decided threshold color come from
-    watch_ui.risk_cells, the same function build_risk_header joins — so this
-    report and the dashboard can never disagree about what is at risk, only
-    about how many columns they had to say it in. A resting maker bid earns
-    its own row because it only exists on the days a bid is on the book.
+    watch_ui.exposure_rows builds the SAME tuples the dashboard's own header
+    grid renders, so this report and `pmt crypto watch` cannot disagree about
+    what is at risk or about which column it sits in.
     """
-    from watch_ui import risk_cells
+    from watch_ui import exposure_rows
 
-    cells = risk_cells(status or {}, sb, rtds=False)
-    resting = next((c for c in cells if "resting" in c), None)
-    riding = next(c for c in cells if c.startswith("riding"))
-    rows = [("exposure", cells[0], cells[1], f"[dim]{riding}[/dim]")]
-    if resting:
-        rows.append(("resting", resting, "[dim]maker bid on the book[/dim]", ""))
-    return rows
+    return exposure_rows(status, sb)
 
 
 def _feed_row(status: dict | None) -> tuple | None:
-    """The shared settlement socket's health, on its own row: one socket's
-    state and the fleet's dollars answer different questions."""
-    from watch_ui import rtds_line_cells
+    """The shared settlement socket's health row — again watch_ui's, so one
+    socket has one presentation across both views."""
+    from watch_ui import feed_row
 
-    cells = rtds_line_cells(status or {})
-    if not cells:
-        return None
-    head, bits = cells[0], cells[1:]
-    v1 = f"{head} [dim]{bits[0]}[/dim]" if bits else head
-    return ("feed", v1, f"[dim]{bits[1]}[/dim]" if len(bits) > 1 else "",
-            f"[dim]{' · '.join(bits[2:])}[/dim]" if len(bits) > 2 else "")
+    return feed_row(status)
 
 
 def header_grid(sb: dict, eff: dict, bal: dict | None, status: dict | None,
@@ -336,16 +327,21 @@ def header_grid(sb: dict, eff: dict, bal: dict | None, status: dict | None,
     est = sb.get("estimated") or 0
     if est:
         rows.append(("estimated", f"[dim]{est} windows[/dim]", "",
-                     "[dim]gamma unreachable, or a redeem still pending[/dim]"))
+                     "[dim]gamma dark or a redeem pending[/dim]"))
 
     t = Table(box=None, pad_edge=False, padding=(0, 1), show_header=False)
     t.add_column("label", justify="left", width=_HDR_LABEL_W, no_wrap=True,
                  overflow="ellipsis", style="dim")
     # max_width, not width, on the value columns: the grid still aligns (a
     # table renders one width per column for every row) but a sparse box hugs
-    # its content instead of padding out to a fixed 88 on a narrow terminal.
+    # its content instead of padding out to a fixed 86 on a narrow terminal.
+    #
+    # overflow="fold", not "ellipsis": on a terminal too narrow for the grid,
+    # Rich squeezes the columns, and a squeezed money cell used to lose its
+    # last digits ("240W-19L (92…", "peak un-decided $…"). Wrapping keeps the
+    # number whole, which is the only property this box may not trade away.
     for w in (_HDR_V1_W, _HDR_V2_W, _HDR_V3_W):
-        t.add_column(justify="left", max_width=w, no_wrap=True, overflow="ellipsis")
+        t.add_column(justify="left", max_width=w, overflow="fold")
     for row in rows:
         t.add_row(*row)
     return t

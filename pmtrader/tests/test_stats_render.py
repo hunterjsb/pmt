@@ -192,7 +192,7 @@ def test_gap_row_is_green_when_the_bar_is_cleared():
 
 def test_gap_row_says_so_rather_than_guessing_without_a_break_even():
     cells = sr._gap_cells(_eff(breakeven_win_rate=None))
-    assert "not enough" in " ".join(cells)
+    assert "too few" in " ".join(cells)
     # ...and leaves the value cells EMPTY rather than printing a 0.0% bar: the
     # bar is unknown, which is not the same claim as zero.
     assert cells[1] == "" and cells[2] == ""
@@ -224,7 +224,7 @@ def test_header_notes_estimated_windows_only_when_there_are_some():
     assert "estimated" not in _render(sr.header_panel(_sb(), _eff(), None, {}, 0))
     out = _render(sr.header_panel(_sb(estimated=3), _eff(), None, {}, 0))
     assert "estimated" in out and "3 windows" in out
-    assert "gamma unreachable" in out
+    assert "gamma dark" in out
 
 
 def test_header_reports_committed_and_riding_exposure():
