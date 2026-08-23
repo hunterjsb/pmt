@@ -889,3 +889,18 @@ def test_wait_key_without_a_tty_paces_instead_of_spinning(monkeypatch):
     assert cc._wait_key(0.05) is None
     assert slept == [0.05]  # no tty to select on -> the sleep is the pacing
 
+
+
+def test_committed_never_renders_negative_zero():
+    # Float drift after fills settle can leave committed at ~-1e-9; it must
+    # print "$0.00", never "-$0.00", everywhere money is shown.
+    import watch_ui as wu
+    assert wu._zero(-1e-9) == 0.0
+    assert wu._zero(-0.004) == 0.0
+    assert wu._zero(-0.02) == -0.02          # a real negative survives
+    from rich.console import Console
+    arms = {"btc-updown-5m-1000": {"eval": {"state": "armed", "committed": -1e-9,
+            "p_up": 0.5, "rho": 0.0, "sides": []}, "roll": True}}
+    c = Console(record=True, width=160)
+    c.print(wu.build_arms_table(arms, now=1000.0))
+    assert "-$0.00" not in c.export_text()

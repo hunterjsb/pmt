@@ -278,6 +278,13 @@ def _hms(t: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(t))
 
 
+def _zero(v: float) -> float:
+    """Snap sub-cent float drift to 0.0 so committed/exposure never render a
+    phantom "-$0.00" — a residual after fills settle to ~zero (mirrors
+    stats_render._zeroed; same threshold)."""
+    return 0.0 if abs(v) < 0.005 else v
+
+
 def _tape_head(r: dict) -> str:
     """`HH:MM:SS  slug-padded-to-14` — the fixed-width prefix shared by every
     tape-line renderer, so eval/fire/gated/roll/exit lines all column-align.
@@ -299,7 +306,7 @@ def _render_record(r: dict, raw: str) -> str:
     head = _tape_head(r)
 
     def money(v: float) -> str:
-        return f"${v:,.2f}".rstrip("0").rstrip(".")
+        return f"${_zero(v):,.2f}".rstrip("0").rstrip(".")
 
     ev = r.get("ev")
     if ev == tape.EV_FIRE:
@@ -685,10 +692,10 @@ def risk_cells(status: dict | None, sb: dict | None,
     riding_usd = (sb or {}).get("riding_usd", 0.0)
     color = ("red" if undecided > _UNDECIDED_RED_USD else
              "yellow" if undecided > _UNDECIDED_YELLOW_USD else "")
-    undecided_s = f"${undecided:,.2f} un-decided"
+    undecided_s = f"${_zero(undecided):,.2f} un-decided"
     if color:
         undecided_s = f"[{color}]{undecided_s}[/{color}]"
-    cells = [f"committed ${committed:,.2f}", undecided_s]
+    cells = [f"committed ${_zero(committed):,.2f}", undecided_s]
     # Only when a bid is actually on the book — a "◇resting $0.00" every tick
     # on a taker-only fleet is noise.
     if resting > 0.005:
@@ -798,7 +805,7 @@ def build_arms_table(arms: dict | None, now: float) -> Table:
         p_up = f"{e['p_up']:.2f}" if "p_up" in e else "—"
         rho = f"{e['rho']:+.2f}" if "rho" in e else "—"
         committed = e.get("committed", a.get("filled_usdc"))
-        committed_s = f"${committed:,.2f}" if committed is not None else "—"
+        committed_s = f"${_zero(committed):,.2f}" if committed is not None else "—"
         resting = a.get("resting_usdc") or e.get("resting") or 0.0
         if resting > 0.005:
             committed_s += f" [cyan]◇${resting:,.0f}[/cyan]"
