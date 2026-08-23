@@ -27,6 +27,25 @@ PAGE_STEP = 400
 RESYNC_S = 300.0
 
 
+def redeem_identity(a: dict) -> tuple:
+    """Stable identity for a REDEEM: everything EXCEPT the amounts.
+
+    Redeem rows MUTATE after first indexing — the payout fields finalize in
+    stages — and an identity that includes the amounts makes the finalized
+    version look like a NEW row beside its draft. Measured live 2026-08-23:
+    every one of the first 30 ledger-drift purges was a REDEEM ($1,227.83
+    double-counted), reading as an optimistic watch P&L between resyncs.
+    One redeem per (tx, market, outcome) is an on-chain invariant, so this
+    key is safe; $0 dust rows collapse harmlessly as before.
+    """
+    return (
+        a.get("transactionHash") or "",
+        "REDEEM",
+        a.get("asset") or a.get("slug") or "",
+        a.get("outcome") or "",
+    )
+
+
 def row_key(a: dict) -> tuple:
     """Stable identity for one activity row (no server-side id exists).
     Genuinely identical $0-redeem dust rows collapse too — zero-value, so
@@ -109,6 +128,7 @@ class ActivityLedger:
     def __init__(self) -> None:
         self.rows: list[dict] = []
         self._seen: set = set()
+        self._redeems: dict = {}  # redeem_identity -> the row currently held
         self.primed = False  # False until the first (full-history) walk lands
         self.last_pages = 0  # pages fetched by the most recent refresh
         self.last_drift = 0  # stale rows the most recent resync had to purge
@@ -140,6 +160,15 @@ class ActivityLedger:
                 k = row_key(a)
                 if k in self._seen:
                     continue
+                if a.get("type") == "REDEEM":
+                    # A mutated redeem must REPLACE its draft, never sit
+                    # beside it — see redeem_identity.
+                    rid = redeem_identity(a)
+                    prev = self._redeems.get(rid)
+                    if prev is not None:
+                        self._seen.discard(row_key(prev))
+                        self.rows.remove(prev)
+                    self._redeems[rid] = a
                 self._seen.add(k)
                 self.rows.append(a)
                 page_new += 1
@@ -180,6 +209,7 @@ class ActivityLedger:
         if stale:
             _log_ledger_drift(stale)
         self.rows, self._seen = rows, seen
+        self._redeems = {redeem_identity(a): a for a in rows if a.get("type") == "REDEEM"}
         self.primed = True
         self.last_pages = pages
         self.last_drift = len(stale)

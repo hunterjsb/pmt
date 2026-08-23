@@ -279,3 +279,21 @@ def test_ledger_stays_incremental_inside_resync_interval(monkeypatch):
     led.refresh("0xabc")     # inside RESYNC_S: single-page incremental stop
     assert calls["n"] == n_prime + 1
     assert led.last_drift == 0
+
+
+def test_mutated_redeem_replaces_its_draft_not_double_counts(monkeypatch):
+    # The live drift class: a REDEEM indexes with draft amounts, then the
+    # payout finalizes — same tx/market/outcome, different usdcSize. The
+    # ledger must hold exactly ONE version, the freshest.
+    draft = {"transactionHash": "0xr", "type": "REDEEM", "slug": "btc-updown-5m-1000",
+             "outcome": "Up", "size": 0.0, "usdcSize": 0.0, "timestamp": 100}
+    final = dict(draft, size=20.0, usdcSize=20.04, timestamp=101)
+    feed = [[draft]]
+    monkeypatch.setattr(wallet, "fetch_activity_page", lambda a, o: feed[0])
+    led = wallet.ActivityLedger()
+    led.refresh("0xabc")
+    feed[0] = [final]
+    led.refresh("0xabc")  # incremental path, inside RESYNC_S
+    redeems = [r for r in led.rows if r["type"] == "REDEEM"]
+    assert len(redeems) == 1, "draft must be replaced, not doubled"
+    assert redeems[0]["usdcSize"] == 20.04
