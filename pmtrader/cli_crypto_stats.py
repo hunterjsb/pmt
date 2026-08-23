@@ -613,6 +613,9 @@ def _gates_report(activity: list[dict], since_epoch: float) -> dict:
 
     wallet_wins = outcomes.wallet_outcomes(activity)
     rounds_by_symbol = {w["symbol"]: ck.load_corpus(w["symbol"]) for w in windows}
+    # No resolution lookups here on purpose: that is one gamma round-trip per
+    # ungraded window, and `pmt crypto outcomes` already banks them into the
+    # corpus — which load_outcomes below picks up for free.
     rows, _dropped = outcomes.build_outcomes(windows, wallet_wins, rounds_by_symbol)
 
     merged, _added, _upgraded = outcomes.merge_outcomes(outcomes.load_outcomes(), rows)

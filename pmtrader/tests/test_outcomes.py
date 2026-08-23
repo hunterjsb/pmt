@@ -2,17 +2,23 @@
 here is inline fixtures (activity rows, synthetic Chainlink rounds, tape lines).
 """
 
+import pytest
+
 from polymarket.outcomes import (
+    SOURCE_RANK,
     book_outcome,
     build_outcomes,
     chainlink_outcome,
     ck_settlement_width_s,
+    exited_flat,
     extract_updown_slugs,
     gamma_resolution,
     grade_window,
+    is_terminal_source,
     load_outcomes,
     merge_outcomes,
     parse_updown_slug,
+    source_rank,
     wallet_outcomes,
     window_universe,
     write_outcomes,
@@ -293,6 +299,95 @@ def test_merge_outcomes_never_downgrades_wallet_to_chainlink():
     # wallet row is untouched even though the new chainlink read disagrees
     assert merged["s1"] == {"slug": "s1", "winner": "up", "source": "wallet"}
     assert added == 0 and upgraded == 0
+
+
+# ---------- source ranking: wallet > resolution > chainlink > book ----------
+
+def test_source_rank_orders_the_four_sources():
+    assert (source_rank("wallet") > source_rank("resolution")
+            > source_rank("chainlink") > source_rank("book"))
+    # An unknown source can never outrank a real one, however it got written.
+    assert source_rank("vibes") < source_rank("book")
+    assert source_rank(None) < source_rank("book")
+
+
+def test_only_the_exchange_authored_sources_may_grade_a_win_or_a_loss():
+    # The wallet's payment and the market's settlement are the exchange's.
+    # Chainlink and the terminal book are OUR read, and a model that grades
+    # itself grades its own losses as wins.
+    assert is_terminal_source("wallet") and is_terminal_source("resolution")
+    assert not is_terminal_source("chainlink") and not is_terminal_source("book")
+    assert not is_terminal_source(None)
+    assert set(SOURCE_RANK) == {"wallet", "resolution", "chainlink", "book"}
+
+
+@pytest.mark.parametrize("weaker", ["resolution", "chainlink", "book"])
+def test_merge_outcomes_never_downgrades_wallet(weaker):
+    existing = {"s1": {"slug": "s1", "winner": "up", "source": "wallet"}}
+    merged, _added, upgraded = merge_outcomes(
+        existing, [{"slug": "s1", "winner": "down", "source": weaker}])
+    assert merged["s1"]["source"] == "wallet" and merged["s1"]["winner"] == "up"
+    assert upgraded == 0
+
+
+@pytest.mark.parametrize("weaker", ["chainlink", "book"])
+def test_merge_outcomes_resolution_upgrades_our_own_reads(weaker):
+    existing = {"s1": {"slug": "s1", "winner": "up", "source": weaker}}
+    merged, _added, upgraded = merge_outcomes(
+        existing, [{"slug": "s1", "winner": "down", "source": "resolution"}])
+    assert merged["s1"] == {"slug": "s1", "winner": "down", "source": "resolution"}
+    assert upgraded == 1
+
+
+def test_merge_outcomes_wallet_still_upgrades_resolution():
+    existing = {"s1": {"slug": "s1", "winner": "up", "source": "resolution"}}
+    merged, _added, upgraded = merge_outcomes(
+        existing, [{"slug": "s1", "winner": "down", "source": "wallet"}])
+    assert merged["s1"]["source"] == "wallet" and upgraded == 1
+
+
+@pytest.mark.parametrize("source", ["wallet", "resolution", "chainlink", "book"])
+def test_merge_outcomes_same_source_never_rewrites(source):
+    # First write wins, so the order of the walk cannot change the corpus.
+    existing = {"s1": {"slug": "s1", "winner": "up", "source": source}}
+    merged, added, upgraded = merge_outcomes(
+        existing, [{"slug": "s1", "winner": "down", "source": source}])
+    assert merged["s1"]["winner"] == "up" and (added, upgraded) == (0, 0)
+
+
+def test_build_outcomes_resolution_beats_chainlink_but_loses_to_wallet():
+    w = {"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300,
+         "start": 1000, "end": 1300}
+    # chainlink would read "up" here; the market settled "down".
+    rounds = {"btc": _rounds({960: 100.0, 1250: 110.0, 1300: 999.0})}
+    res = {"btc-updown-5m-1000": "down"}
+    rows, dropped = build_outcomes([w], {}, rounds, None, res)
+    assert rows == [{"slug": "btc-updown-5m-1000", "winner": "down", "source": "resolution"}]
+    assert dropped == []
+    # ...and the wallet still outranks it.
+    rows, _ = build_outcomes([w], {"btc-updown-5m-1000": "up"}, rounds, None, res)
+    assert rows == [{"slug": "btc-updown-5m-1000", "winner": "up", "source": "wallet"}]
+
+
+def test_build_outcomes_without_resolutions_is_unchanged():
+    w = {"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300,
+         "start": 1000, "end": 1300}
+    rounds = {"btc": _rounds({960: 100.0, 1250: 110.0, 1300: 999.0})}
+    rows, _ = build_outcomes([w], {}, rounds, None, {})
+    assert rows == [{"slug": "btc-updown-5m-1000", "winner": "up", "source": "chainlink"}]
+
+
+# ---------- a window sold flat can never produce a redeem row ----------
+
+def test_exited_flat_tolerates_data_api_share_dust():
+    assert exited_flat(100.0, 99.998625)      # a real 100-share exit
+    assert exited_flat(100.0, 100.0)
+
+
+def test_exited_flat_is_false_while_anything_is_still_held():
+    assert not exited_flat(100.0, 70.0)
+    assert not exited_flat(100.0, 0.0)
+    assert not exited_flat(0.0, 0.0)          # never traded, not "flat"
 
 
 def test_write_and_load_outcomes_roundtrip(tmp_path):
