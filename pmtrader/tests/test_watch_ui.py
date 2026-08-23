@@ -1532,3 +1532,20 @@ def test_committed_never_renders_negative_zero():
     c = Console(record=True, width=200)
     c.print(wu.build_windows_table({}, 1000.0, arms=arms))
     assert "-$0.00" not in c.export_text()
+
+
+def test_the_tape_panel_title_names_its_source():
+    """A watch on a laptop and one on the engine's box look identical
+    otherwise, and their tape panels fail in different ways — a remote one can
+    lag or carry a gap the engine admitted to, a local one just stops."""
+    assert cc.tape_title(False) == "tape"
+    assert cc.tape_title() == "tape"      # local is the default and the norm
+    assert cc.tape_title(True) == "tape · remote"
+
+
+def test_the_refresh_legend_still_names_every_cadence():
+    import cli_crypto_watch as cw
+    line = cc._REFRESH_LINE
+    for secs in (cw.ENGINE_EVERY_S, cw.SB_EVERY_S, cw.ODDS_EVERY_S,
+                 cw.BAL_EVERY_S, cw.TAPE_EVERY_S):
+        assert f"{secs:g}s" in line, f"{secs}s cadence is not in the help modal"
