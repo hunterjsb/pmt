@@ -56,7 +56,7 @@ def test_display_falls_back_to_raw_slug_when_unparseable():
 def test_hour_duration_slugs_are_updown_windows_too():
     # six settled 4h WINS (+$164.35) were invisible while the regex demanded
     # an 'm' token — the ledger of record may never drop a traded format
-    w = parse_updown_slug("btc-updown-4h-1787414400")
+    w = updown_slugs.parse_updown_slug("btc-updown-4h-1787414400")
     assert w == {"symbol": "btc", "dur_s": 14400, "start": 1787414400, "end": 1787428800}
-    assert series_key(w["symbol"], w["dur_s"]) == "btc 4h"
-    assert parse_updown_slug("eth-updown-1h-1787414400")["dur_s"] == 3600
+    assert updown_slugs.series_key(w["symbol"], w["dur_s"]) == "btc 4h"
+    assert updown_slugs.parse_updown_slug("eth-updown-1h-1787414400")["dur_s"] == 3600
