@@ -27,7 +27,7 @@ from cli_common import console, _api, _pnl_color
 from polymarket import effectiveness, tape, updown_slugs, wallet
 from watch_ui import (
     _SB_EMPTY, _brake_rich, _cbreak_stdin, _controls_panel, _eff_table,
-    _restore_stdin, _rtds_rich, _safety_rich, _tape_render, _tape_slug, _wait_key,
+    _restore_stdin, _rtds_line, _safety_rich, _tape_render, _tape_slug, _wait_key,
     build_arms_table, build_header_panel, build_risk_header, build_windows_strip,
 )
 import watch_ui
@@ -310,7 +310,7 @@ def crypto_trigger(as_json: bool) -> None:
         else:
             body = state
         console.print(f"{roll}{stream} {_tape_slug(slug):<14} {body}")
-    rtds = _rtds_rich(reply.get("rtds") or {})
+    rtds = _rtds_line(reply)
     if rtds:
         console.print(rtds)
     if reply.get("pending_rolls"):
@@ -822,7 +822,7 @@ def crypto_watch(since: float | None) -> None:
         return build_header_panel(snap, floor_label, render_err)
 
     def risk_panel() -> Text:
-        return Text.from_markup(build_risk_header(snap["status"], snap["bal"], snap["sb"]))
+        return Text.from_markup(build_risk_header(snap["status"], snap["sb"]))
 
     def arms_table() -> Table:
         return build_arms_table(snap["status"].get("arms"), _t.time())
