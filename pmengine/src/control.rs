@@ -212,6 +212,26 @@ pub struct StatusReport {
     #[serde(with = "rust_decimal::serde::str")]
     pub unrealized_pnl: Decimal,
     pub halted: bool,
+    /// Market WebSocket state. `ws_connected` false with tokens subscribed
+    /// means every book below is REST-cadence bound.
+    pub ws_connected: bool,
+    /// Socket has been down past the degrade threshold (see `wsfeed`).
+    pub ws_degraded: bool,
+    /// Tokens currently streaming on the socket.
+    pub ws_tokens: usize,
+    /// Market events applied since process start.
+    pub ws_events: u64,
+    pub ws_last_event_age_ms: Option<i64>,
+    pub ws_down_for_ms: Option<i64>,
+    /// Book freshness across tracked tokens, measured off local receipt time.
+    /// This is the number the WS work exists to move.
+    pub book_age_p50_ms: Option<i64>,
+    pub book_age_p90_ms: Option<i64>,
+    pub book_age_max_ms: Option<i64>,
+    /// How many books were last written by each feed — the honest read on
+    /// which source is actually carrying the engine.
+    pub books_from_ws: usize,
+    pub books_from_rest: usize,
 }
 
 #[derive(Debug, Serialize)]

@@ -709,12 +709,18 @@ impl BookRestResponse {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
+        // Feed metadata is stamped by the hub when the snapshot is accepted
+        // (`apply_rest_book`) — a snapshot that loses the staleness compare
+        // never becomes a book, so it never gets a receipt time either.
         OrderBook {
             token_id: token_id.to_string(),
             bids,
             asks,
             timestamp,
             hash: self.hash,
+            source: crate::orderbook::BookSource::Rest,
+            received_at_ms: 0,
+            update_count: 0,
         }
     }
 }

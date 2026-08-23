@@ -12,17 +12,13 @@ use crate::orderbook::MarketDataHub;
 use crate::position::{Fill, PositionTracker};
 use crate::risk::{RiskCheckResult, RiskLimits, RiskManager};
 use crate::strategy::{MarketInfo, Signal, StrategyContext, StrategyRuntime};
+use crate::wsfeed::{WsFeed, WsHealth};
 
 #[cfg(feature = "sigv4")]
 use crate::sigv4::SigV4Signer;
 
-use futures::StreamExt;
-use polymarket_client_sdk_v2::clob::ws::Client as WsClient;
-use polymarket_client_sdk_v2::types::U256;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -48,8 +44,13 @@ pub struct Engine {
     market_info: HashMap<String, MarketInfo>,
     /// Whether market discovery is enabled
     market_discovery_enabled: bool,
-    /// Flag indicating WebSocket needs reconnection due to new market discovery
-    ws_needs_reconnect: bool,
+    /// The authoritative market-data feed. Subscriptions are incremental, so
+    /// a runtime arm/roll adds and drops tokens without touching the socket —
+    /// the old `ws_needs_reconnect` flag existed because the WS was rebuilt
+    /// wholesale, and nothing outside market discovery ever acted on it.
+    ws_feed: WsFeed,
+    /// Shared health of `ws_feed`, read by the REST poller and `/status`.
+    ws_health: Arc<WsHealth>,
     /// Skip warmup period (useful when WS connection is unavailable)
     skip_warmup: bool,
     /// Cached free USDC collateral balance, refreshed periodically by the
@@ -87,6 +88,14 @@ pub struct Engine {
     /// Drained at the top of every tick — entries whose deadline has passed
     /// trigger a `cancel_order` call. Backs `pmt buy/sell --ttl`.
     pending_cancellations: Vec<(chrono::DateTime<chrono::Utc>, String)>,
+}
+
+/// Read a `u64` tunable from the environment, falling back to `default`.
+fn env_ms(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Internal event emitted by the trades poller for the main loop to process.
@@ -163,6 +172,12 @@ impl Engine {
         // Create market data hub with broadcast channel
         let market_data = Arc::new(MarketDataHub::new(1000));
 
+        // Start the WS feed before any strategy registers — registration
+        // subscribes its static tokens, and there must be somewhere for
+        // those subscriptions to land.
+        let ws_feed = WsFeed::spawn(market_data.clone());
+        let ws_health = ws_feed.health();
+
         Ok(Self {
             config,
             client,
@@ -177,7 +192,8 @@ impl Engine {
             gamma_client: None,
             market_info: HashMap::new(),
             market_discovery_enabled: false,
-            ws_needs_reconnect: false,
+            ws_feed,
+            ws_health,
             skip_warmup: false,
             usdc_balance: Arc::new(tokio::sync::RwLock::new(Decimal::ZERO)),
             fill_event_receiver,
@@ -319,6 +335,7 @@ impl Engine {
                     if !self.subscribed_tokens.contains(token_id) {
                         self.market_data.init_book(token_id).await;
                         self.subscribed_tokens.push(token_id.clone());
+                        self.ws_feed.subscribe(token_id);
                         new_tokens_found = true;
                         tracing::debug!(
                             token_id = token_id.as_str(),
@@ -340,13 +357,11 @@ impl Engine {
             "Market info updated"
         );
 
-        // Signal WebSocket reconnection if new tokens were discovered
         if new_tokens_found {
             tracing::info!(
                 token_count = self.subscribed_tokens.len(),
-                "New tokens discovered, WebSocket reconnection needed"
+                "New tokens discovered, streaming them"
             );
-            self.ws_needs_reconnect = true;
         }
 
         Ok(())
@@ -392,16 +407,20 @@ impl Engine {
     }
 
     /// Begin watching a token at runtime. Idempotent: a duplicate request is
-    /// a no-op. Initialises an empty book in the MarketDataHub (the REST
-    /// poller picks it up on its next tick) and flags the WebSocket for
-    /// reconnect so the new asset id is included in the subscription.
+    /// a no-op. Initialises an empty book in the MarketDataHub (which both
+    /// enrolls it in the REST health poll and makes it a valid target for WS
+    /// writes) and streams it on the market WebSocket.
+    ///
+    /// This is the path the updown arm/roll takes every five minutes, and it
+    /// is where the WS used to lose: the old code set a reconnect flag that
+    /// only market discovery read.
     pub async fn subscribe_token(&mut self, token_id: &str) {
         if self.subscribed_tokens.iter().any(|t| t == token_id) {
             return;
         }
         self.market_data.init_book(token_id).await;
         self.subscribed_tokens.push(token_id.to_string());
-        self.ws_needs_reconnect = true;
+        self.ws_feed.subscribe(token_id);
         self.ensure_condition_id(token_id).await;
         tracing::info!(token_id = %token_id, "Subscribed to token");
     }
@@ -409,7 +428,7 @@ impl Engine {
     /// Stop watching a token at runtime. Cancels any open orders on the
     /// token first (locally + on Polymarket), releases their risk-manager
     /// reservations, drops the position from the exposure ledger, removes
-    /// the book from the hub, and flags the WebSocket for reconnect.
+    /// the book from the hub, and stops streaming it.
     /// Order history is preserved.
     pub async fn unsubscribe_token(&mut self, token_id: &str) {
         if !self.subscribed_tokens.iter().any(|t| t == token_id) {
@@ -443,7 +462,7 @@ impl Engine {
             let mut map = self.token_to_condition.write().await;
             map.remove(token_id);
         }
-        self.ws_needs_reconnect = true;
+        self.ws_feed.unsubscribe(token_id);
         tracing::info!(token_id = %token_id, "Unsubscribed from token");
     }
 
@@ -455,6 +474,7 @@ impl Engine {
             if !self.subscribed_tokens.contains(&token_id) {
                 self.market_data.init_book(&token_id).await;
                 self.subscribed_tokens.push(token_id.clone());
+                self.ws_feed.subscribe(&token_id);
             }
             self.ensure_condition_id(&token_id).await;
         }
@@ -957,30 +977,39 @@ impl Engine {
             })
         };
 
-        // Spawn the REST book poller. Runs alongside the WebSocket subscription
-        // so books stay current even when WS is unavailable (e.g. from a US IP
-        // without a WS-capable proxy). Polls every book currently tracked by
-        // the MarketDataHub.
+        // Spawn the REST book poller — a health check and a fallback, no
+        // longer the book source.
+        //
+        // While the WS is connected it runs at the slow cadence: it costs a
+        // request per token per cycle, and every snapshot it takes loses the
+        // hub's staleness compare against live WS state anyway. The moment
+        // the socket drops it returns to the 2s cadence, which is exactly the
+        // behaviour that was shipping before the WS became authoritative —
+        // degrade, don't starve. (The 30s in `WsHealth::degraded` is the
+        // warn/report threshold, deliberately NOT the cadence trigger: at a
+        // 10s poll, waiting 30s to speed up means trading a 10s-old book.)
         let poller_handle = {
             let client = self.client.clone();
             let hub = self.market_data.clone();
-            let poll_interval = Duration::from_millis(
-                std::env::var("PMENGINE_BOOK_POLL_MS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(2000),
-            );
+            let health = self.ws_health.clone();
+            let fast = Duration::from_millis(env_ms("PMENGINE_BOOK_POLL_MS", 2000));
+            let slow = Duration::from_millis(env_ms("PMENGINE_BOOK_POLL_SLOW_MS", 10_000));
             tokio::spawn(async move {
-                let mut timer = tokio::time::interval(poll_interval);
-                // Skip immediate first tick
-                timer.tick().await;
                 loop {
-                    timer.tick().await;
+                    let cadence = if health.is_connected() { slow } else { fast };
+                    tokio::time::sleep(cadence).await;
                     let tokens: Vec<String> =
                         hub.get_all_books().await.keys().cloned().collect();
                     for token in tokens {
                         match client.get_book(&token).await {
-                            Ok(book) => hub.set_book(book).await,
+                            Ok(book) => {
+                                if !hub.apply_rest_book(book).await {
+                                    tracing::debug!(
+                                        token = %token,
+                                        "REST snapshot dropped: WS book is fresher"
+                                    );
+                                }
+                            }
                             Err(e) => tracing::debug!(
                                 token = %token,
                                 error = %e,
@@ -1005,737 +1034,702 @@ impl Engine {
             if let Err(e) = self.refresh_markets().await {
                 tracing::warn!(error = %e, "Initial market discovery failed");
             }
-            // Clear the reconnect flag - we'll connect WebSocket in the main loop
-            self.ws_needs_reconnect = false;
         }
 
-        // Use labeled loop to support WebSocket reconnection
-        // When new tokens are discovered, we break the inner loop and reconnect
-        'reconnect: loop {
-            // Reset WebSocket update count on each reconnection
-            let mut ws_update_count: u64 = 0;
+        // Book-health heartbeat: one INFO line carrying the WS state and the
+        // book-age distribution. This is the number the operator watches — a
+        // p50 in the hundreds of ms means the WS is carrying the book, a p50
+        // near the REST cadence means it isn't, whatever the connection flag
+        // claims.
+        let mut book_health_timer = interval(Duration::from_secs(
+            env_ms("PMENGINE_BOOK_HEALTH_S", 60),
+        ));
+        book_health_timer.tick().await;
+        let mut last_health_events: u64 = 0;
+        let mut last_health_at = Instant::now();
 
-            // Connect to WebSocket for market data if we have subscriptions
-            // Keep ws_client alive since the stream borrows from it
-            let ws_client = WsClient::default();
-            let mut ws_stream: Option<Pin<Box<dyn futures::Stream<Item = Result<_, _>> + Send>>> =
-                if !self.subscribed_tokens.is_empty() {
-                    let asset_ids: Result<Vec<U256>, _> = self
-                        .subscribed_tokens
-                        .iter()
-                        .map(|t| U256::from_str(t))
-                        .collect();
+        tracing::info!("Entering event loop");
 
-                    match asset_ids {
-                        Ok(ids) => {
-                            tracing::info!(count = ids.len(), "Subscribing to orderbook updates");
-                            match ws_client.subscribe_orderbook(ids) {
-                                Ok(stream) => Some(Box::pin(stream)),
-                                Err(e) => {
-                                    tracing::error!(error = %e, "Failed to subscribe to orderbook");
-                                    None
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "Invalid token ID format");
-                            None
-                        }
+        // Warmup: wait for books to sync. Any ONE of three exits is
+        // sufficient — `--skip-warmup`, WARMUP_WS_UPDATES streamed events,
+        // or WARMUP_DEADLINE wall clock. A still-missing book is the
+        // strategy's own `if book is None` guard's problem.
+        // See docs/LESSONS.md#L35.
+        const WARMUP_WS_UPDATES: u64 = 100;
+        const WARMUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+        let warmup_started_at = std::time::Instant::now();
+        let mut warmup_complete = false;
+
+        loop {
+            tokio::select! {
+
+                // Market discovery refresh (if enabled). Newly discovered
+                // tokens are streamed the moment they're added — there is
+                // no socket to rebuild any more.
+                _ = market_refresh_timer.tick(), if self.market_discovery_enabled => {
+                    if let Err(e) = self.refresh_markets().await {
+                        tracing::warn!(error = %e, "Market discovery refresh failed");
                     }
-                } else {
-                    tracing::info!("No subscriptions, running without WebSocket");
-                    None
-                };
+                }
 
-            tracing::info!("Entering event loop");
+                // Periodic book-health line.
+                _ = book_health_timer.tick() => {
+                    let stats = self.market_data.book_age_stats().await;
+                    let events = self.ws_health.events();
+                    let secs = last_health_at.elapsed().as_secs_f64().max(0.001);
+                    let rate = (events - last_health_events) as f64 / secs;
+                    last_health_events = events;
+                    last_health_at = Instant::now();
+                    tracing::info!(
+                        ws_connected = self.ws_health.is_connected(),
+                        ws_tokens = self.ws_health.tokens(),
+                        ws_events = events,
+                        ws_events_per_s = format!("{:.1}", rate),
+                        ws_last_event_age_ms = ?self.ws_health.last_event_age_ms(),
+                        books = stats.books,
+                        from_ws = stats.from_ws,
+                        from_rest = stats.from_rest,
+                        never_fed = stats.never_fed,
+                        book_age_p50_ms = ?stats.p50_ms,
+                        book_age_p90_ms = ?stats.p90_ms,
+                        book_age_max_ms = ?stats.max_ms,
+                        "Book health"
+                    );
+                }
 
-            // Warmup: wait for books to sync. Any ONE of three exits is
-            // sufficient — `--skip-warmup`, WARMUP_WS_UPDATES streamed diffs
-            // (never fires under a geoblocked WS), or WARMUP_DEADLINE wall
-            // clock. A still-missing book is the strategy's own `if book is
-            // None` guard's problem. See docs/LESSONS.md#L35.
-            const WARMUP_WS_UPDATES: u64 = 100;
-            const WARMUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-            let warmup_started_at = std::time::Instant::now();
-            let mut warmup_complete = false;
+                // Tick timer for strategy evaluation
+                _ = tick_timer.tick() => {
+                    tick_count += 1;
+                    let elapsed = last_tick.elapsed();
+                    last_tick = Instant::now();
 
-            loop {
-                tokio::select! {
+                    tracing::info!(tick = tick_count, elapsed_ms = elapsed.as_millis(), "Tick");
 
-                    // Market discovery refresh (if enabled)
-                    _ = market_refresh_timer.tick(), if self.market_discovery_enabled => {
-                        if let Err(e) = self.refresh_markets().await {
-                            tracing::warn!(error = %e, "Market discovery refresh failed");
-                        }
-
-                        // Break to reconnect WebSocket if new tokens were discovered
-                        if self.ws_needs_reconnect {
-                            tracing::info!(
-                                token_count = self.subscribed_tokens.len(),
-                                "Reconnecting WebSocket with new tokens"
-                            );
-                            self.ws_needs_reconnect = false;
-                            continue 'reconnect;
-                        }
-                    }
-
-                    // Tick timer for strategy evaluation
-                    _ = tick_timer.tick() => {
-                        tick_count += 1;
-                        let elapsed = last_tick.elapsed();
-                        last_tick = Instant::now();
-
-                        tracing::info!(tick = tick_count, elapsed_ms = elapsed.as_millis(), "Tick");
-
-                        // Periodic position reconcile against the data-api, every
-                        // 30 ENGINE TICKS — so ~1.5s under the launcher's 50ms
-                        // PMENGINE_TICK_INTERVAL_MS, 30s at the binary's own
-                        // 1000ms default. Incremental fill detection can miss
-                        // fills — notably partials that land in the MM's
-                        // cancel/replace window get attributed to an order the
-                        // engine no longer tracks and are dropped. The data-api
-                        // is ground truth, so we correct drift here. This keeps
-                        // MAX_POSITION enforcement honest even when a fill slips
-                        // past the trades poller.
-                        if tick_count.is_multiple_of(30) {
-                            for token_id in self.subscribed_tokens.clone() {
-                                if let Ok(Some((size, avg))) = self.client.get_position(&token_id).await {
-                                    let delta = self.positions.reconcile(&token_id, size, avg);
-                                    if delta != Decimal::ZERO {
-                                        tracing::warn!(
-                                            token_id = %token_id, corrected_to = %size, delta = %delta,
-                                            "Position reconcile: corrected drift from missed fill(s)"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // Drain TTL-scheduled cancels whose deadline has passed.
-                        // Runs before warmup checks so externally-placed orders
-                        // with TTLs still expire even if the engine isn't trading.
-                        if !self.pending_cancellations.is_empty() {
-                            let now = chrono::Utc::now();
-                            let (due, remaining): (Vec<_>, Vec<_>) = self
-                                .pending_cancellations
-                                .drain(..)
-                                .partition(|(at, _)| *at <= now);
-                            self.pending_cancellations = remaining;
-                            for (_, order_id) in due {
-                                match self.client.cancel_order(&order_id).await {
-                                    Ok(_) => {
-                                        self.external_orders.remove(&order_id);
-                                        self.risk_manager.release_order(&order_id);
-                                        tracing::info!(
-                                            order_id = %order_id,
-                                            "TTL cancel: order cancelled"
-                                        );
-                                    }
-                                    Err(e) => tracing::warn!(
-                                        error = %e,
-                                        order_id = %order_id,
-                                        "TTL cancel: cancel failed (order may already be filled or cancelled)"
-                                    ),
-                                }
-                            }
-                        }
-
-                        // Check max_ticks limit
-                        if max_ticks > 0 && tick_count >= max_ticks {
-                            tracing::info!(tick_count = tick_count, max_ticks = max_ticks, "Max ticks reached, shutting down");
-                            self.shutdown().await?;
-                            break 'reconnect;
-                        }
-
-                        // Skip trading during warmup period (unless skip_warmup is set
-                        // or REST polling has already populated every subscribed book).
-                        if !warmup_complete {
-                            if self.skip_warmup {
-                                warmup_complete = true;
-                                tracing::info!("Warmup skipped (--skip-warmup flag)");
-                            } else if warmup_started_at.elapsed() >= WARMUP_DEADLINE {
-                                warmup_complete = true;
-                                tracing::info!(
-                                    elapsed_s = warmup_started_at.elapsed().as_secs(),
-                                    "Warmup deadline reached, trading enabled (strategies guard their own None books)"
-                                );
-                            } else if ws_update_count >= WARMUP_WS_UPDATES {
-                                warmup_complete = true;
-                                tracing::info!(
-                                    ws_updates = ws_update_count,
-                                    "Warmup complete via WS, trading enabled"
-                                );
-                            } else if !self.subscribed_tokens.is_empty()
-                                && self.all_books_populated().await
-                            {
-                                warmup_complete = true;
-                                tracing::info!(
-                                    book_count = self.subscribed_tokens.len(),
-                                    "Warmup complete via REST polling, trading enabled"
-                                );
-                            } else {
-                                tracing::info!(
-                                    ws_updates = ws_update_count,
-                                    required = WARMUP_WS_UPDATES,
-                                    "Warmup in progress, skipping trading"
-                                );
-                                continue;
-                            }
-                        }
-
-                        // Check P&L for circuit breaker
-                        self.risk_manager.check_pnl(&self.positions);
-
-                        if self.risk_manager.is_halted() {
-                            tracing::warn!("Engine halted by circuit breaker");
-                            continue;
-                        }
-
-                        // Build strategy context with full-depth order books
-                        let ctx = StrategyContext {
-                            timestamp: chrono::Utc::now(),
-                            order_books: self.market_data.get_all_books().await,
-                            trade_history: self.market_data.get_all_trade_history().await,
-                            positions: self.positions.clone(),
-                            markets: self.market_info.clone(),
-                            unrealized_pnl: self.positions.total_unrealized_pnl(),
-                            realized_pnl: self.positions.total_realized_pnl(),
-                            usdc_balance: *self.usdc_balance.read().await,
-                        };
-
-                        // Run strategies
-                        let signals = self.strategy_runtime.tick(&ctx);
-
-                        // Bucket signals so we can do delta quoting. Strategies typically
-                        // emit Cancel + Buy + Sell every tick, but if the desired prices
-                        // haven't moved we want to LEAVE the existing orders alone — they
-                        // need to age before Polymarket counts them toward rewards
-                        // (`are_orders_scoring` returns false on orders <60s old, roughly).
-                        let mut shutdown_requested = false;
-                        let mut cancel_tokens: Vec<String> = Vec::new();
-                        let mut desired: Vec<(Signal, String, Decimal, Decimal)> = Vec::new(); // (signal, token, price, size)
-
-                        for signal in signals {
-                            match signal {
-                                Signal::Hold => continue,
-                                Signal::Shutdown { reason } => {
-                                    tracing::info!(reason = reason.as_str(), "Strategy requested shutdown");
-                                    shutdown_requested = true;
-                                }
-                                // Defensive arm: StrategyRuntime::tick handles
-                                // and consumes StrategyComplete before signals
-                                // ever reach the engine main loop. If one
-                                // somehow leaks through, treat it as a no-op
-                                // rather than panicking — the retirement was
-                                // already logged inside tick().
-                                Signal::StrategyComplete { .. } => continue,
-                                Signal::Subscribe { token_id } => {
-                                    self.subscribe_token(&token_id).await;
-                                }
-                                Signal::Unsubscribe { token_id } => {
-                                    self.unsubscribe_token(&token_id).await;
-                                }
-                                Signal::Alert { reason, suggested, ttl_secs, dedupe_key } => {
-                                    // The Box<Signal> inside the variant carries
-                                    // the order to dispatch on approval. We push
-                                    // it onto the queue (dedup by key); if the
-                                    // queue accepts it, fire a notifier — spawned
-                                    // so a slow/down ntfy.sh doesn't stall the
-                                    // tick.
-                                    let suggested_signal = *suggested;
-                                    match self.alert_queue.push(
-                                        reason.clone(),
-                                        suggested_signal,
-                                        ttl_secs,
-                                        dedupe_key.clone(),
-                                    ) {
-                                        Some(_id) => {
-                                            // Notify on the freshly inserted alert.
-                                            let alert = self
-                                                .alert_queue
-                                                .list()
-                                                .into_iter()
-                                                .find(|a| a.dedupe_key == dedupe_key);
-                                            if let Some(alert) = alert {
-                                                tracing::info!(
-                                                    alert_id = %alert.id,
-                                                    reason = %reason,
-                                                    "Alert raised"
-                                                );
-                                                let notifier = self.notifier.clone();
-                                                tokio::spawn(async move {
-                                                    notifier.notify(&alert).await;
-                                                });
-                                            }
-                                        }
-                                        None => {
-                                            tracing::debug!(
-                                                dedupe_key = %dedupe_key,
-                                                "Alert deduped (active key already present)"
-                                            );
-                                        }
-                                    }
-                                }
-                                Signal::Cancel { token_id } => {
-                                    cancel_tokens.push(token_id);
-                                }
-                                Signal::CancelOrder { order_id } => {
-                                    match self.client.cancel_order(&order_id).await {
-                                        Ok(_) => {
-                                            tracing::info!(order_id = %order_id, "CancelOrder signal: cancelled");
-                                            self.risk_manager.release_order(&order_id);
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(error = %e, order_id = %order_id, "CancelOrder signal: cancel failed");
-                                        }
-                                    }
-                                }
-                                Signal::Buy { token_id, price, size, urgency } => {
-                                    // Don't pre-round price here. OrderManager rounds to the
-                                    // per-market tick when actually placing; the delta-quote
-                                    // matcher below uses a half-tick tolerance so any
-                                    // sub-tick wobble in the strategy's target still matches
-                                    // an existing aged order.
-                                    let size = size.round_dp(2);
-                                    let sig = Signal::Buy {
-                                        token_id: token_id.clone(),
-                                        price,
-                                        size,
-                                        urgency,
-                                    };
-                                    desired.push((sig, token_id, price, size));
-                                }
-                                Signal::Sell { token_id, price, size, urgency } => {
-                                    let size = size.round_dp(2);
-                                    let sig = Signal::Sell {
-                                        token_id: token_id.clone(),
-                                        price,
-                                        size,
-                                        urgency,
-                                    };
-                                    desired.push((sig, token_id, price, size));
-                                }
-                            }
-                        }
-
-                        // For each token a Cancel signal touched: look at currently open
-                        // orders. If an open order matches one of the desired orders for
-                        // that token (same side + price + size), keep it alive and remove
-                        // it from the "to place" list — that order stays aged. Otherwise
-                        // cancel it.
-                        for token_id in &cancel_tokens {
-                            let active: Vec<(String, bool, Decimal, Decimal)> = self
-                                .order_manager
-                                .active_orders_for_token(token_id)
-                                .iter()
-                                .map(|o| (o.id.clone(), o.is_buy, o.price, o.size))
-                                .collect();
-                            for (id, is_buy, price, size) in active {
-                                // Find a desired order that matches this open order.
-                                // Tolerance: half a tick (0.0005) so a 0.1¢ mid wiggle
-                                // that shifts the target by 0.1¢ doesn't force a
-                                // cancel+replace and re-age. The reward score weight
-                                // changes very little inside ±0.5 tick anyway, but a
-                                // re-quote restarts the order-age timer from zero,
-                                // costing far more than the precision gained.
-                                let price_tol = rust_decimal::Decimal::new(5, 4); // 0.0005
-                                let matched_idx = desired.iter().position(|(s, t, p, sz)| {
-                                    t == token_id
-                                        && (*p - price).abs() <= price_tol
-                                        && *sz == size
-                                        && matches!(
-                                            (s, is_buy),
-                                            (Signal::Buy { .. }, true) | (Signal::Sell { .. }, false)
-                                        )
-                                });
-                                if let Some(i) = matched_idx {
-                                    // Already have this order — keep it, drop from desired.
-                                    desired.remove(i);
-                                    tracing::debug!(
-                                        order_id = %id,
-                                        token_id = %token_id,
-                                        price = %price,
-                                        size = %size,
-                                        "Keeping aged order (matches desired quote)"
+                    // Periodic position reconcile against the data-api, every
+                    // 30 ENGINE TICKS — so ~1.5s under the launcher's 50ms
+                    // PMENGINE_TICK_INTERVAL_MS, 30s at the binary's own
+                    // 1000ms default. Incremental fill detection can miss
+                    // fills — notably partials that land in the MM's
+                    // cancel/replace window get attributed to an order the
+                    // engine no longer tracks and are dropped. The data-api
+                    // is ground truth, so we correct drift here. This keeps
+                    // MAX_POSITION enforcement honest even when a fill slips
+                    // past the trades poller.
+                    if tick_count.is_multiple_of(30) {
+                        for token_id in self.subscribed_tokens.clone() {
+                            if let Ok(Some((size, avg))) = self.client.get_position(&token_id).await {
+                                let delta = self.positions.reconcile(&token_id, size, avg);
+                                if delta != Decimal::ZERO {
+                                    tracing::warn!(
+                                        token_id = %token_id, corrected_to = %size, delta = %delta,
+                                        "Position reconcile: corrected drift from missed fill(s)"
                                     );
-                                } else {
-                                    // No matching desired — cancel it.
-                                    if let Err(e) = self.order_manager.cancel_order(&id).await {
-                                        tracing::warn!(error = %e, "Cancel failed for stale order");
-                                    } else {
-                                        self.risk_manager.release_order(&id);
-                                    }
                                 }
                             }
                         }
+                    }
 
-                        // Drop the original `signals` iteration and place remaining desired.
-                        let signals_to_place: Vec<Signal> =
-                            desired.into_iter().map(|(s, _, _, _)| s).collect();
-
-                        for signal in signals_to_place {
-                            match self.risk_manager.check_signal(&signal, &self.positions) {
-                                RiskCheckResult::Approved(ref s) | RiskCheckResult::Reduced(ref s, _) => {
-                                    if let RiskCheckResult::Reduced(_, ref reason) = self.risk_manager.check_signal(&signal, &self.positions) {
-                                        tracing::warn!(reason = reason.as_str(), "Signal reduced by risk manager");
-                                    }
-
-                                    // Extract order details for tracking
-                                    let (token_id, price, size) = match s {
-                                        Signal::Buy { token_id, price, size, .. } => (token_id.clone(), *price, *size),
-                                        Signal::Sell { token_id, price, size, .. } => (token_id.clone(), *price, *size),
-                                        _ => continue,
-                                    };
-
-                                    let notional = price * size;
-
-                                    // CRITICAL: Reserve exposure BEFORE placing order
-                                    // This prevents race conditions where multiple signals
-                                    // pass the risk check in the same tick
-                                    let reservation_id = match self.risk_manager.reserve_exposure(
-                                        &token_id,
-                                        notional,
-                                        &self.positions,
-                                    ) {
-                                        Some(id) => id,
-                                        None => {
-                                            tracing::warn!(
-                                                token_id = token_id.as_str(),
-                                                notional = %notional,
-                                                "Skipping order: exposure reservation rejected"
-                                            );
-                                            continue;
-                                        }
-                                    };
-
-                                    match self.order_manager.execute(s.clone()).await {
-                                        Ok(Some(order_id)) => {
-                                            // Confirm the reservation as an open order
-                                            self.risk_manager.confirm_reservation(&reservation_id, &order_id);
-                                        }
-                                        Ok(None) => {
-                                            // Order was not placed (e.g., dry-run mode)
-                                            // Release the reservation
-                                            self.risk_manager.release_reservation(&reservation_id);
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(error = %e, "Order execution failed");
-                                            // Release the reservation on failure
-                                            self.risk_manager.release_reservation(&reservation_id);
-                                        }
-                                    }
+                    // Drain TTL-scheduled cancels whose deadline has passed.
+                    // Runs before warmup checks so externally-placed orders
+                    // with TTLs still expire even if the engine isn't trading.
+                    if !self.pending_cancellations.is_empty() {
+                        let now = chrono::Utc::now();
+                        let (due, remaining): (Vec<_>, Vec<_>) = self
+                            .pending_cancellations
+                            .drain(..)
+                            .partition(|(at, _)| *at <= now);
+                        self.pending_cancellations = remaining;
+                        for (_, order_id) in due {
+                            match self.client.cancel_order(&order_id).await {
+                                Ok(_) => {
+                                    self.external_orders.remove(&order_id);
+                                    self.risk_manager.release_order(&order_id);
+                                    tracing::info!(
+                                        order_id = %order_id,
+                                        "TTL cancel: order cancelled"
+                                    );
                                 }
-                                RiskCheckResult::Rejected(reason) => {
-                                    tracing::warn!(reason = reason, "Signal rejected by risk manager");
-                                }
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    order_id = %order_id,
+                                    "TTL cancel: cancel failed (order may already be filled or cancelled)"
+                                ),
                             }
                         }
-
-                        // Handle shutdown request from strategies
-                        if shutdown_requested {
-                            self.shutdown().await?;
-                            break 'reconnect;
-                        }
                     }
 
-                    // Process fills
-                    Some(fill) = self.fill_receiver.recv() => {
-                        tracing::info!(
-                            order_id = fill.order_id,
-                            token_id = fill.token_id,
-                            price = %fill.price,
-                            size = %fill.size,
-                            "Processing fill"
-                        );
-
-                        // Update positions
-                        self.positions.apply_fill(&fill);
-
-                        // Notify strategies
-                        self.strategy_runtime.on_fill(&fill);
-
-                        // Update risk manager - close tracked order
-                        self.risk_manager.order_closed(&fill.order_id);
-
-                        // Log current exposure
-                        let exposure = self.risk_manager.current_exposure(&self.positions);
-                        let remaining = self.risk_manager.remaining_capacity(&self.positions);
-                        tracing::info!(
-                            exposure = %exposure,
-                            remaining_capacity = %remaining,
-                            "Exposure after fill"
-                        );
+                    // Check max_ticks limit
+                    if max_ticks > 0 && tick_count >= max_ticks {
+                        tracing::info!(tick_count = tick_count, max_ticks = max_ticks, "Max ticks reached, shutting down");
+                        self.shutdown().await?;
+                        break;
                     }
 
-                    // Fill events from the trades poller — feed them to the
-                    // order manager so it can update its tracked order state
-                    // and emit a downstream Fill event for the arm above.
-                    Some(ev) = self.fill_event_receiver.recv() => {
-                        // Skip trades not involving an engine-placed order.
-                        if self.order_manager.get_order(&ev.order_id).is_none() {
-                            tracing::debug!(
-                                order_id = %ev.order_id,
-                                "Fill for untracked order (manual or other session); ignoring"
+                    // Skip trading during warmup period (unless skip_warmup is set
+                    // or REST polling has already populated every subscribed book).
+                    if !warmup_complete {
+                        if self.skip_warmup {
+                            warmup_complete = true;
+                            tracing::info!("Warmup skipped (--skip-warmup flag)");
+                        } else if warmup_started_at.elapsed() >= WARMUP_DEADLINE {
+                            warmup_complete = true;
+                            tracing::info!(
+                                elapsed_s = warmup_started_at.elapsed().as_secs(),
+                                "Warmup deadline reached, trading enabled (strategies guard their own None books)"
                             );
-                            continue;
-                        }
-                        if let Err(e) = self
-                            .order_manager
-                            .process_fill(&ev.order_id, ev.price, ev.size, ev.fee)
-                            .await
+                        } else if self.ws_health.events() >= WARMUP_WS_UPDATES {
+                            warmup_complete = true;
+                            tracing::info!(
+                                ws_updates = self.ws_health.events(),
+                                "Warmup complete via WS, trading enabled"
+                            );
+                        } else if !self.subscribed_tokens.is_empty()
+                            && self.all_books_populated().await
                         {
-                            tracing::warn!(error = %e, order_id = %ev.order_id, "process_fill failed");
+                            warmup_complete = true;
+                            tracing::info!(
+                                book_count = self.subscribed_tokens.len(),
+                                "Warmup complete via REST polling, trading enabled"
+                            );
                         } else {
                             tracing::info!(
-                                order_id = %ev.order_id,
-                                price = %ev.price,
-                                size = %ev.size,
-                                fee = %ev.fee,
-                                "Fill detected via trades poll"
+                                ws_updates = self.ws_health.events(),
+                                required = WARMUP_WS_UPDATES,
+                                "Warmup in progress, skipping trading"
                             );
+                            continue;
                         }
                     }
 
-                    // WebSocket market data
-                    Some(book_result) = async {
-                        match ws_stream.as_mut() {
-                            Some(stream) => stream.next().await,
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        match book_result {
-                            Ok(book) => {
-                                ws_update_count += 1;
-                                let token_id = book.asset_id.to_string();
+                    // Check P&L for circuit breaker
+                    self.risk_manager.check_pnl(&self.positions);
 
-                                // Log periodically to show WebSocket is receiving data
-                                if ws_update_count % 100 == 1 {
-                                    tracing::info!(
-                                        ws_update_count = ws_update_count,
-                                        books_populated = self.market_data.book_count().await,
-                                        "WebSocket updates received"
-                                    );
-                                }
-
-                                tracing::debug!(
-                                    token_id = %token_id,
-                                    best_bid = ?book.bids.first().map(|b| b.price),
-                                    best_ask = ?book.asks.first().map(|a| a.price),
-                                    bid_levels = book.bids.len(),
-                                    ask_levels = book.asks.len(),
-                                    update_count = ws_update_count,
-                                    "Orderbook update"
-                                );
-
-                                // Process through market data hub (full depth + broadcast)
-                                self.market_data.process_book_update(book).await;
-
-                                // Update position prices for P&L tracking
-                                if let Some(book) = self.market_data.get_book(&token_id).await {
-                                    if let Some(mid) = book.mid_price() {
-                                        let mut prices = HashMap::new();
-                                        prices.insert(token_id, mid);
-                                        self.positions.update_prices(&prices);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(error = %e, "WebSocket orderbook error");
-                            }
-                        }
+                    if self.risk_manager.is_halted() {
+                        tracing::warn!("Engine halted by circuit breaker");
+                        continue;
                     }
 
-                    // Control plane commands. Built inline against live
-                    // engine state so we never need to share the state via
-                    // Arc/RwLock — the select! is the synchronization point.
-                    Some(cmd) = cmd_rx.recv() => {
-                        match cmd {
-                            EngineCommand::GetStatus(reply) => {
-                                let report = StatusReport {
-                                    uptime_secs: start_instant.elapsed().as_secs(),
-                                    tick_count,
-                                    dry_run: self.is_dry_run(),
-                                    balance_usdc: *self.usdc_balance.read().await,
-                                    subscribed_tokens: self.subscribed_tokens.len(),
-                                    strategies: self.strategy_runtime.summaries().len(),
-                                    open_orders: self.risk_manager.total_open_orders(),
-                                    total_exposure_usd: self
-                                        .risk_manager
-                                        .current_exposure(&self.positions),
-                                    realized_pnl: self.positions.total_realized_pnl(),
-                                    unrealized_pnl: self.positions.total_unrealized_pnl(),
-                                    halted: self.risk_manager.is_halted(),
-                                };
-                                let _ = reply.send(report);
+                    // Mark positions off the live book. This used to ride on
+                    // the WS select arm; now that the feed owns its own task,
+                    // the tick is where engine state is mutable — and it runs
+                    // at 50ms, far tighter than the marks ever needed.
+                    let books = self.market_data.get_all_books().await;
+                    let marks: HashMap<String, Decimal> = books
+                        .iter()
+                        .filter_map(|(t, b)| b.mid_price().map(|m| (t.clone(), m)))
+                        .collect();
+                    if !marks.is_empty() {
+                        self.positions.update_prices(&marks);
+                    }
+
+                    // Build strategy context with full-depth order books
+                    let ctx = StrategyContext {
+                        timestamp: chrono::Utc::now(),
+                        order_books: books,
+                        trade_history: self.market_data.get_all_trade_history().await,
+                        positions: self.positions.clone(),
+                        markets: self.market_info.clone(),
+                        unrealized_pnl: self.positions.total_unrealized_pnl(),
+                        realized_pnl: self.positions.total_realized_pnl(),
+                        usdc_balance: *self.usdc_balance.read().await,
+                    };
+
+                    // Run strategies
+                    let signals = self.strategy_runtime.tick(&ctx);
+
+                    // Bucket signals so we can do delta quoting. Strategies typically
+                    // emit Cancel + Buy + Sell every tick, but if the desired prices
+                    // haven't moved we want to LEAVE the existing orders alone — they
+                    // need to age before Polymarket counts them toward rewards
+                    // (`are_orders_scoring` returns false on orders <60s old, roughly).
+                    let mut shutdown_requested = false;
+                    let mut cancel_tokens: Vec<String> = Vec::new();
+                    let mut desired: Vec<(Signal, String, Decimal, Decimal)> = Vec::new(); // (signal, token, price, size)
+
+                    for signal in signals {
+                        match signal {
+                            Signal::Hold => continue,
+                            Signal::Shutdown { reason } => {
+                                tracing::info!(reason = reason.as_str(), "Strategy requested shutdown");
+                                shutdown_requested = true;
                             }
-                            EngineCommand::ListStrategies(reply) => {
-                                let _ = reply.send(self.strategy_infos());
-                            }
-                            EngineCommand::ListOrders(reply) => {
-                                let orders: Vec<OrderInfo> = self
-                                    .order_manager
-                                    .active_orders_snapshot()
-                                    .into_iter()
-                                    .map(|o| OrderInfo {
-                                        id: o.id,
-                                        token_id: o.token_id,
-                                        side: if o.is_buy { "buy" } else { "sell" },
-                                        price: o.price,
-                                        size: o.size,
-                                        filled: o.filled_size,
-                                        status: format!("{:?}", o.status),
-                                        created_at: o.created_at,
-                                    })
-                                    .collect();
-                                let _ = reply.send(orders);
-                            }
-                            EngineCommand::ListAlerts(reply) => {
-                                self.alert_queue.prune_expired();
-                                let _ = reply.send(self.alert_queue.list());
-                            }
-                            EngineCommand::ApproveAlert { id, reply } => {
-                                let res = self.approve_alert(&id).await;
-                                let _ = reply.send(res);
-                            }
-                            EngineCommand::RejectAlert { id, reply } => {
-                                let res = match self.alert_queue.take(&id) {
-                                    None => Err(format!("alert {} not found", id)),
-                                    Some(_) => {
-                                        tracing::info!(alert_id = %id, "Alert rejected");
-                                        Ok(())
-                                    }
-                                };
-                                let _ = reply.send(res);
-                            }
-                            EngineCommand::ListSubscriptions(reply) => {
-                                let _ = reply.send(self.subscribed_tokens.clone());
-                            }
-                            EngineCommand::SubscribeToken { token_id, reply } => {
+                            // Defensive arm: StrategyRuntime::tick handles
+                            // and consumes StrategyComplete before signals
+                            // ever reach the engine main loop. If one
+                            // somehow leaks through, treat it as a no-op
+                            // rather than panicking — the retirement was
+                            // already logged inside tick().
+                            Signal::StrategyComplete { .. } => continue,
+                            Signal::Subscribe { token_id } => {
                                 self.subscribe_token(&token_id).await;
-                                let _ = reply.send(());
                             }
-                            EngineCommand::UnsubscribeToken { token_id, reply } => {
+                            Signal::Unsubscribe { token_id } => {
                                 self.unsubscribe_token(&token_id).await;
-                                let _ = reply.send(());
                             }
-                            EngineCommand::ListTrades { token_id, since_ts, reply } => {
-                                let cutoff = since_ts.unwrap_or(i64::MIN);
-                                let trades: Vec<TradeInfo> = self
-                                    .market_data
-                                    .recent_trades(&token_id)
-                                    .await
-                                    .into_iter()
-                                    .filter(|t| t.timestamp >= cutoff)
-                                    .map(|t| TradeInfo {
-                                        token_id: t.token_id,
-                                        price: t.price,
-                                        size: t.size,
-                                        side: t.side,
-                                        timestamp: t.timestamp,
-                                    })
-                                    .collect();
-                                let _ = reply.send(trades);
-                            }
-                            EngineCommand::RegisterExternalOrder { order, reply } => {
-                                tracing::info!(
-                                    order_id = %order.id,
-                                    token_id = %order.token_id,
-                                    source = %order.source,
-                                    "External order registered"
-                                );
-                                self.external_orders.insert(order.id.clone(), order);
-                                let _ = reply.send(());
-                            }
-                            EngineCommand::MarkExternalCancelled { order_id, reply } => {
-                                let removed = self.external_orders.remove(&order_id).is_some();
-                                if removed {
-                                    tracing::info!(
-                                        order_id = %order_id,
-                                        "External order marked cancelled"
-                                    );
+                            Signal::Alert { reason, suggested, ttl_secs, dedupe_key } => {
+                                // The Box<Signal> inside the variant carries
+                                // the order to dispatch on approval. We push
+                                // it onto the queue (dedup by key); if the
+                                // queue accepts it, fire a notifier — spawned
+                                // so a slow/down ntfy.sh doesn't stall the
+                                // tick.
+                                let suggested_signal = *suggested;
+                                match self.alert_queue.push(
+                                    reason.clone(),
+                                    suggested_signal,
+                                    ttl_secs,
+                                    dedupe_key.clone(),
+                                ) {
+                                    Some(_id) => {
+                                        // Notify on the freshly inserted alert.
+                                        let alert = self
+                                            .alert_queue
+                                            .list()
+                                            .into_iter()
+                                            .find(|a| a.dedupe_key == dedupe_key);
+                                        if let Some(alert) = alert {
+                                            tracing::info!(
+                                                alert_id = %alert.id,
+                                                reason = %reason,
+                                                "Alert raised"
+                                            );
+                                            let notifier = self.notifier.clone();
+                                            tokio::spawn(async move {
+                                                notifier.notify(&alert).await;
+                                            });
+                                        }
+                                    }
+                                    None => {
+                                        tracing::debug!(
+                                            dedupe_key = %dedupe_key,
+                                            "Alert deduped (active key already present)"
+                                        );
+                                    }
                                 }
-                                let _ = reply.send(());
                             }
-                            EngineCommand::ListAllOrders(reply) => {
-                                let _ = reply.send(self.all_orders());
+                            Signal::Cancel { token_id } => {
+                                cancel_tokens.push(token_id);
                             }
-                            EngineCommand::CancelOrderById { order_id, reply } => {
-                                let res = self.cancel_order_by_id(&order_id).await;
-                                let _ = reply.send(res);
+                            Signal::CancelOrder { order_id } => {
+                                match self.client.cancel_order(&order_id).await {
+                                    Ok(_) => {
+                                        tracing::info!(order_id = %order_id, "CancelOrder signal: cancelled");
+                                        self.risk_manager.release_order(&order_id);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, order_id = %order_id, "CancelOrder signal: cancel failed");
+                                    }
+                                }
                             }
-                            EngineCommand::ScheduleCancel { order_id, at, reply } => {
+                            Signal::Buy { token_id, price, size, urgency } => {
+                                // Don't pre-round price here. OrderManager rounds to the
+                                // per-market tick when actually placing; the delta-quote
+                                // matcher below uses a half-tick tolerance so any
+                                // sub-tick wobble in the strategy's target still matches
+                                // an existing aged order.
+                                let size = size.round_dp(2);
+                                let sig = Signal::Buy {
+                                    token_id: token_id.clone(),
+                                    price,
+                                    size,
+                                    urgency,
+                                };
+                                desired.push((sig, token_id, price, size));
+                            }
+                            Signal::Sell { token_id, price, size, urgency } => {
+                                let size = size.round_dp(2);
+                                let sig = Signal::Sell {
+                                    token_id: token_id.clone(),
+                                    price,
+                                    size,
+                                    urgency,
+                                };
+                                desired.push((sig, token_id, price, size));
+                            }
+                        }
+                    }
+
+                    // For each token a Cancel signal touched: look at currently open
+                    // orders. If an open order matches one of the desired orders for
+                    // that token (same side + price + size), keep it alive and remove
+                    // it from the "to place" list — that order stays aged. Otherwise
+                    // cancel it.
+                    for token_id in &cancel_tokens {
+                        let active: Vec<(String, bool, Decimal, Decimal)> = self
+                            .order_manager
+                            .active_orders_for_token(token_id)
+                            .iter()
+                            .map(|o| (o.id.clone(), o.is_buy, o.price, o.size))
+                            .collect();
+                        for (id, is_buy, price, size) in active {
+                            // Find a desired order that matches this open order.
+                            // Tolerance: half a tick (0.0005) so a 0.1¢ mid wiggle
+                            // that shifts the target by 0.1¢ doesn't force a
+                            // cancel+replace and re-age. The reward score weight
+                            // changes very little inside ±0.5 tick anyway, but a
+                            // re-quote restarts the order-age timer from zero,
+                            // costing far more than the precision gained.
+                            let price_tol = rust_decimal::Decimal::new(5, 4); // 0.0005
+                            let matched_idx = desired.iter().position(|(s, t, p, sz)| {
+                                t == token_id
+                                    && (*p - price).abs() <= price_tol
+                                    && *sz == size
+                                    && matches!(
+                                        (s, is_buy),
+                                        (Signal::Buy { .. }, true) | (Signal::Sell { .. }, false)
+                                    )
+                            });
+                            if let Some(i) = matched_idx {
+                                // Already have this order — keep it, drop from desired.
+                                desired.remove(i);
+                                tracing::debug!(
+                                    order_id = %id,
+                                    token_id = %token_id,
+                                    price = %price,
+                                    size = %size,
+                                    "Keeping aged order (matches desired quote)"
+                                );
+                            } else {
+                                // No matching desired — cancel it.
+                                if let Err(e) = self.order_manager.cancel_order(&id).await {
+                                    tracing::warn!(error = %e, "Cancel failed for stale order");
+                                } else {
+                                    self.risk_manager.release_order(&id);
+                                }
+                            }
+                        }
+                    }
+
+                    // Drop the original `signals` iteration and place remaining desired.
+                    let signals_to_place: Vec<Signal> =
+                        desired.into_iter().map(|(s, _, _, _)| s).collect();
+
+                    for signal in signals_to_place {
+                        match self.risk_manager.check_signal(&signal, &self.positions) {
+                            RiskCheckResult::Approved(ref s) | RiskCheckResult::Reduced(ref s, _) => {
+                                if let RiskCheckResult::Reduced(_, ref reason) = self.risk_manager.check_signal(&signal, &self.positions) {
+                                    tracing::warn!(reason = reason.as_str(), "Signal reduced by risk manager");
+                                }
+
+                                // Extract order details for tracking
+                                let (token_id, price, size) = match s {
+                                    Signal::Buy { token_id, price, size, .. } => (token_id.clone(), *price, *size),
+                                    Signal::Sell { token_id, price, size, .. } => (token_id.clone(), *price, *size),
+                                    _ => continue,
+                                };
+
+                                let notional = price * size;
+
+                                // CRITICAL: Reserve exposure BEFORE placing order
+                                // This prevents race conditions where multiple signals
+                                // pass the risk check in the same tick
+                                let reservation_id = match self.risk_manager.reserve_exposure(
+                                    &token_id,
+                                    notional,
+                                    &self.positions,
+                                ) {
+                                    Some(id) => id,
+                                    None => {
+                                        tracing::warn!(
+                                            token_id = token_id.as_str(),
+                                            notional = %notional,
+                                            "Skipping order: exposure reservation rejected"
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                match self.order_manager.execute(s.clone()).await {
+                                    Ok(Some(order_id)) => {
+                                        // Confirm the reservation as an open order
+                                        self.risk_manager.confirm_reservation(&reservation_id, &order_id);
+                                    }
+                                    Ok(None) => {
+                                        // Order was not placed (e.g., dry-run mode)
+                                        // Release the reservation
+                                        self.risk_manager.release_reservation(&reservation_id);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "Order execution failed");
+                                        // Release the reservation on failure
+                                        self.risk_manager.release_reservation(&reservation_id);
+                                    }
+                                }
+                            }
+                            RiskCheckResult::Rejected(reason) => {
+                                tracing::warn!(reason = reason, "Signal rejected by risk manager");
+                            }
+                        }
+                    }
+
+                    // Handle shutdown request from strategies
+                    if shutdown_requested {
+                        self.shutdown().await?;
+                        break;
+                    }
+                }
+
+                // Process fills
+                Some(fill) = self.fill_receiver.recv() => {
+                    tracing::info!(
+                        order_id = fill.order_id,
+                        token_id = fill.token_id,
+                        price = %fill.price,
+                        size = %fill.size,
+                        "Processing fill"
+                    );
+
+                    // Update positions
+                    self.positions.apply_fill(&fill);
+
+                    // Notify strategies
+                    self.strategy_runtime.on_fill(&fill);
+
+                    // Update risk manager - close tracked order
+                    self.risk_manager.order_closed(&fill.order_id);
+
+                    // Log current exposure
+                    let exposure = self.risk_manager.current_exposure(&self.positions);
+                    let remaining = self.risk_manager.remaining_capacity(&self.positions);
+                    tracing::info!(
+                        exposure = %exposure,
+                        remaining_capacity = %remaining,
+                        "Exposure after fill"
+                    );
+                }
+
+                // Fill events from the trades poller — feed them to the
+                // order manager so it can update its tracked order state
+                // and emit a downstream Fill event for the arm above.
+                Some(ev) = self.fill_event_receiver.recv() => {
+                    // Skip trades not involving an engine-placed order.
+                    if self.order_manager.get_order(&ev.order_id).is_none() {
+                        tracing::debug!(
+                            order_id = %ev.order_id,
+                            "Fill for untracked order (manual or other session); ignoring"
+                        );
+                        continue;
+                    }
+                    if let Err(e) = self
+                        .order_manager
+                        .process_fill(&ev.order_id, ev.price, ev.size, ev.fee)
+                        .await
+                    {
+                        tracing::warn!(error = %e, order_id = %ev.order_id, "process_fill failed");
+                    } else {
+                        tracing::info!(
+                            order_id = %ev.order_id,
+                            price = %ev.price,
+                            size = %ev.size,
+                            fee = %ev.fee,
+                            "Fill detected via trades poll"
+                        );
+                    }
+                }
+
+                // Control plane commands. Built inline against live
+                // engine state so we never need to share the state via
+                // Arc/RwLock — the select! is the synchronization point.
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        EngineCommand::GetStatus(reply) => {
+                            let books = self.market_data.book_age_stats().await;
+                            let report = StatusReport {
+                                uptime_secs: start_instant.elapsed().as_secs(),
+                                tick_count,
+                                dry_run: self.is_dry_run(),
+                                balance_usdc: *self.usdc_balance.read().await,
+                                subscribed_tokens: self.subscribed_tokens.len(),
+                                strategies: self.strategy_runtime.summaries().len(),
+                                open_orders: self.risk_manager.total_open_orders(),
+                                total_exposure_usd: self
+                                    .risk_manager
+                                    .current_exposure(&self.positions),
+                                realized_pnl: self.positions.total_realized_pnl(),
+                                unrealized_pnl: self.positions.total_unrealized_pnl(),
+                                halted: self.risk_manager.is_halted(),
+                                ws_connected: self.ws_health.is_connected(),
+                                ws_degraded: self.ws_health.degraded(),
+                                ws_tokens: self.ws_health.tokens(),
+                                ws_events: self.ws_health.events(),
+                                ws_last_event_age_ms: self.ws_health.last_event_age_ms(),
+                                ws_down_for_ms: self.ws_health.down_for_ms(),
+                                book_age_p50_ms: books.p50_ms,
+                                book_age_p90_ms: books.p90_ms,
+                                book_age_max_ms: books.max_ms,
+                                books_from_ws: books.from_ws,
+                                books_from_rest: books.from_rest,
+                            };
+                            let _ = reply.send(report);
+                        }
+                        EngineCommand::ListStrategies(reply) => {
+                            let _ = reply.send(self.strategy_infos());
+                        }
+                        EngineCommand::ListOrders(reply) => {
+                            let orders: Vec<OrderInfo> = self
+                                .order_manager
+                                .active_orders_snapshot()
+                                .into_iter()
+                                .map(|o| OrderInfo {
+                                    id: o.id,
+                                    token_id: o.token_id,
+                                    side: if o.is_buy { "buy" } else { "sell" },
+                                    price: o.price,
+                                    size: o.size,
+                                    filled: o.filled_size,
+                                    status: format!("{:?}", o.status),
+                                    created_at: o.created_at,
+                                })
+                                .collect();
+                            let _ = reply.send(orders);
+                        }
+                        EngineCommand::ListAlerts(reply) => {
+                            self.alert_queue.prune_expired();
+                            let _ = reply.send(self.alert_queue.list());
+                        }
+                        EngineCommand::ApproveAlert { id, reply } => {
+                            let res = self.approve_alert(&id).await;
+                            let _ = reply.send(res);
+                        }
+                        EngineCommand::RejectAlert { id, reply } => {
+                            let res = match self.alert_queue.take(&id) {
+                                None => Err(format!("alert {} not found", id)),
+                                Some(_) => {
+                                    tracing::info!(alert_id = %id, "Alert rejected");
+                                    Ok(())
+                                }
+                            };
+                            let _ = reply.send(res);
+                        }
+                        EngineCommand::ListSubscriptions(reply) => {
+                            let _ = reply.send(self.subscribed_tokens.clone());
+                        }
+                        EngineCommand::SubscribeToken { token_id, reply } => {
+                            self.subscribe_token(&token_id).await;
+                            let _ = reply.send(());
+                        }
+                        EngineCommand::UnsubscribeToken { token_id, reply } => {
+                            self.unsubscribe_token(&token_id).await;
+                            let _ = reply.send(());
+                        }
+                        EngineCommand::ListTrades { token_id, since_ts, reply } => {
+                            let cutoff = since_ts.unwrap_or(i64::MIN);
+                            let trades: Vec<TradeInfo> = self
+                                .market_data
+                                .recent_trades(&token_id)
+                                .await
+                                .into_iter()
+                                .filter(|t| t.timestamp >= cutoff)
+                                .map(|t| TradeInfo {
+                                    token_id: t.token_id,
+                                    price: t.price,
+                                    size: t.size,
+                                    side: t.side,
+                                    timestamp: t.timestamp,
+                                })
+                                .collect();
+                            let _ = reply.send(trades);
+                        }
+                        EngineCommand::RegisterExternalOrder { order, reply } => {
+                            tracing::info!(
+                                order_id = %order.id,
+                                token_id = %order.token_id,
+                                source = %order.source,
+                                "External order registered"
+                            );
+                            self.external_orders.insert(order.id.clone(), order);
+                            let _ = reply.send(());
+                        }
+                        EngineCommand::MarkExternalCancelled { order_id, reply } => {
+                            let removed = self.external_orders.remove(&order_id).is_some();
+                            if removed {
                                 tracing::info!(
                                     order_id = %order_id,
-                                    at = %at,
-                                    "TTL cancel scheduled"
+                                    "External order marked cancelled"
                                 );
-                                self.pending_cancellations.push((at, order_id));
-                                let _ = reply.send(());
                             }
-                            EngineCommand::PlaceOrder { token_id, side, price, size, reply } => {
-                                let res = self.place_order_for_cli(&token_id, &side, price, size).await;
-                                let _ = reply.send(res);
-                            }
-                            EngineCommand::PauseStrategy { id, reply } => {
-                                match self.strategy_runtime.pause(&id) {
-                                    Some(tokens) => {
-                                        // Pull the strategy's resting quotes so it
-                                        // stops sitting on the book (and stops the
-                                        // bid-erroring loop when cash is starved).
-                                        for token in &tokens {
-                                            let _ = self.order_manager.cancel_all(token).await;
-                                        }
-                                        tracing::info!(strategy_id = %id, "Strategy paused via control plane");
-                                        let _ = reply.send(Ok(()));
+                            let _ = reply.send(());
+                        }
+                        EngineCommand::ListAllOrders(reply) => {
+                            let _ = reply.send(self.all_orders());
+                        }
+                        EngineCommand::CancelOrderById { order_id, reply } => {
+                            let res = self.cancel_order_by_id(&order_id).await;
+                            let _ = reply.send(res);
+                        }
+                        EngineCommand::ScheduleCancel { order_id, at, reply } => {
+                            tracing::info!(
+                                order_id = %order_id,
+                                at = %at,
+                                "TTL cancel scheduled"
+                            );
+                            self.pending_cancellations.push((at, order_id));
+                            let _ = reply.send(());
+                        }
+                        EngineCommand::PlaceOrder { token_id, side, price, size, reply } => {
+                            let res = self.place_order_for_cli(&token_id, &side, price, size).await;
+                            let _ = reply.send(res);
+                        }
+                        EngineCommand::PauseStrategy { id, reply } => {
+                            match self.strategy_runtime.pause(&id) {
+                                Some(tokens) => {
+                                    // Pull the strategy's resting quotes so it
+                                    // stops sitting on the book (and stops the
+                                    // bid-erroring loop when cash is starved).
+                                    for token in &tokens {
+                                        let _ = self.order_manager.cancel_all(token).await;
                                     }
-                                    None => { let _ = reply.send(Err(format!("no strategy '{}'", id))); }
-                                }
-                            }
-                            EngineCommand::ResumeStrategy { id, reply } => {
-                                if self.strategy_runtime.resume(&id) {
-                                    tracing::info!(strategy_id = %id, "Strategy resumed via control plane");
+                                    tracing::info!(strategy_id = %id, "Strategy paused via control plane");
                                     let _ = reply.send(Ok(()));
-                                } else {
-                                    let _ = reply.send(Err(format!("no strategy '{}'", id)));
                                 }
-                            }
-                            EngineCommand::StopStrategy { id, reply } => {
-                                match self.strategy_runtime.stop(&id) {
-                                    Some(tokens) => {
-                                        // Full unsubscribe, not just cancels: stop is
-                                        // permanent, and skipping the exposure-ledger
-                                        // release re-created the a102366 ghost-exposure
-                                        // freeze through this side door (risk manager
-                                        // counting a dead strategy's positions forever).
-                                        for token in &tokens {
-                                            self.unsubscribe_token(token).await;
-                                        }
-                                        tracing::info!(strategy_id = %id, "Strategy stopped + removed via control plane");
-                                        let _ = reply.send(Ok(()));
-                                    }
-                                    None => { let _ = reply.send(Err(format!("no strategy '{}'", id))); }
-                                }
-                            }
-                            EngineCommand::StrategyCommand { id, body, reply } => {
-                                let res = self.strategy_runtime.command(&id, &body);
-                                if let Ok(ref v) = res {
-                                    tracing::info!(strategy_id = %id, reply = %v, "Strategy command handled");
-                                }
-                                let _ = reply.send(res);
+                                None => { let _ = reply.send(Err(format!("no strategy '{}'", id))); }
                             }
                         }
+                        EngineCommand::ResumeStrategy { id, reply } => {
+                            if self.strategy_runtime.resume(&id) {
+                                tracing::info!(strategy_id = %id, "Strategy resumed via control plane");
+                                let _ = reply.send(Ok(()));
+                            } else {
+                                let _ = reply.send(Err(format!("no strategy '{}'", id)));
+                            }
+                        }
+                        EngineCommand::StopStrategy { id, reply } => {
+                            match self.strategy_runtime.stop(&id) {
+                                Some(tokens) => {
+                                    // Full unsubscribe, not just cancels: stop is
+                                    // permanent, and skipping the exposure-ledger
+                                    // release re-created the a102366 ghost-exposure
+                                    // freeze through this side door (risk manager
+                                    // counting a dead strategy's positions forever).
+                                    for token in &tokens {
+                                        self.unsubscribe_token(token).await;
+                                    }
+                                    tracing::info!(strategy_id = %id, "Strategy stopped + removed via control plane");
+                                    let _ = reply.send(Ok(()));
+                                }
+                                None => { let _ = reply.send(Err(format!("no strategy '{}'", id))); }
+                            }
+                        }
+                        EngineCommand::StrategyCommand { id, body, reply } => {
+                            let res = self.strategy_runtime.command(&id, &body);
+                            if let Ok(ref v) = res {
+                                tracing::info!(strategy_id = %id, reply = %v, "Strategy command handled");
+                            }
+                            let _ = reply.send(res);
+                        }
                     }
+                }
 
-                    // Shutdown signal
-                    _ = shutdown_rx.recv() => {
-                        tracing::info!("Shutting down engine");
-                        self.shutdown().await?;
-                        break 'reconnect;
-                    }
+                // Shutdown signal
+                _ = shutdown_rx.recv() => {
+                    tracing::info!("Shutting down engine");
+                    self.shutdown().await?;
+                    break;
                 }
             }
         }
 
+        self.ws_feed.abort();
         poller_handle.abort();
         balance_handle.abort();
         trades_handle.abort();

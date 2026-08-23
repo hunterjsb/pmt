@@ -28,6 +28,7 @@ pub mod replay;
 pub mod risk;
 pub mod strategy;
 pub mod strategies;
+pub mod wsfeed;
 
 #[cfg(feature = "sigv4")]
 pub mod sigv4;
@@ -37,7 +38,7 @@ pub use config::Config;
 pub use engine::Engine;
 pub use gamma::{GammaClient, GammaError, GammaMarket};
 pub use order::OrderManager;
-pub use orderbook::{Level, MarketDataHub, MarketEvent, OrderBook};
+pub use orderbook::{BookAgeStats, BookSource, Level, MarketDataHub, MarketEvent, OrderBook};
 pub use position::{Fill, Position, PositionTracker};
 pub use risk::{RiskLimits, RiskManager};
 pub use strategy::{MarketInfo, Signal, Strategy, StrategyContext, StrategyRuntime, Urgency};

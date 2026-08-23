@@ -673,6 +673,20 @@ impl ArmState {
         let (up_ask, up_ask_sz) = level(&self.p.token_up, true);
         let (dn_bid, dn_bid_sz) = level(&self.p.token_down, false);
         let (dn_ask, dn_ask_sz) = level(&self.p.token_down, true);
+        // Which feed this sample came off, and how stale it was when read.
+        // Replay/analysis has to be able to tell a streamed book from a
+        // polled one — a "byte-identical consecutive samples" finding means
+        // something completely different on each.
+        let now_ms = crate::orderbook::now_ms();
+        let meta = |token: &str| -> (&'static str, Option<i64>) {
+            ctx.order_books
+                .get(token)
+                .map(|b| (b.source.as_str(), b.age_ms(now_ms)))
+                .unwrap_or(("none", None))
+        };
+        let (up_src, up_age_ms) = meta(&self.p.token_up);
+        let (dn_src, dn_age_ms) = meta(&self.p.token_down);
+        let src = if up_src == dn_src { up_src } else { "mixed" };
         // Tiny lock scope — copy the two floats out, don't hold the feed
         // mutex while formatting/writing JSON.
         let (spot, spot_ts) = {
@@ -688,6 +702,8 @@ impl ArmState {
             "up_tn": up_tn, "up_tbuy": up_tbuy, "up_tsell": up_tsell,
             "dn_tn": dn_tn, "dn_tbuy": dn_tbuy, "dn_tsell": dn_tsell,
             "spot": spot, "spot_age_s": now - spot_ts,
+            "src": src, "up_src": up_src, "dn_src": dn_src,
+            "up_age_ms": up_age_ms, "dn_age_ms": dn_age_ms,
         }));
     }
 
