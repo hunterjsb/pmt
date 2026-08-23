@@ -153,11 +153,23 @@ impl OrderManager {
             .map(|(id, _)| id.clone())
             .collect();
 
+        // Keep going past individual failures — `?` here abandoned every
+        // order AFTER the first failed cancel, silently leaving live quotes
+        // on the book while pause/stop reported success (2026-08-23 sweep).
         let count = to_cancel.len();
+        let mut failed = 0usize;
+        let mut last_err: Option<OrderError> = None;
         for order_id in to_cancel {
-            self.cancel_order(&order_id).await?;
+            if let Err(e) = self.cancel_order(&order_id).await {
+                failed += 1;
+                tracing::warn!(order_id = %order_id, error = %e, "Cancel failed — continuing");
+                last_err = Some(e);
+            }
         }
-
+        if let Some(e) = last_err {
+            tracing::warn!(token_id, failed, count, "cancel_all left orders live");
+            return Err(e);
+        }
         tracing::info!(token_id = token_id, count = count, "Cancelled orders");
         Ok(count)
     }

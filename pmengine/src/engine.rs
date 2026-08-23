@@ -672,10 +672,22 @@ impl Engine {
         let tick_duration = Duration::from_millis(self.config.tick_interval_ms);
         let mut tick_timer = interval(tick_duration);
 
-        // Set up ctrl-c handler
+        // Graceful shutdown on BOTH SIGINT and SIGTERM. Only ctrl_c was
+        // handled before, so `pmt engine kill` (SIGTERM) and the nightly
+        // systemd poweroff skipped shutdown entirely — resting orders and
+        // in-flight state were abandoned, not cancelled. At current fleet
+        // sizes that hole was worth up to PMENGINE_MAX_TOTAL_EXPOSURE, not
+        // the documented "one clip" (2026-08-23 config audit).
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            )
+            .expect("sigterm handler install");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
             tracing::info!("Received shutdown signal");
             shutdown_tx.send(()).await.ok();
         });
@@ -920,7 +932,10 @@ impl Engine {
                         {
                             Ok(t) => t,
                             Err(e) => {
-                                tracing::debug!(
+                                // warn, not debug: this poller feeds the
+                                // print-flow corpus — its silent failure is
+                                // how 22k tape rows recorded zeros unnoticed.
+                                tracing::warn!(
                                     condition_id = %cid,
                                     error = %e,
                                     "Public trade poll failed"
@@ -1898,8 +1913,13 @@ impl Engine {
                             EngineCommand::StopStrategy { id, reply } => {
                                 match self.strategy_runtime.stop(&id) {
                                     Some(tokens) => {
+                                        // Full unsubscribe, not just cancels: stop is
+                                        // permanent, and skipping the exposure-ledger
+                                        // release re-created the a102366 ghost-exposure
+                                        // freeze through this side door (risk manager
+                                        // counting a dead strategy's positions forever).
                                         for token in &tokens {
-                                            let _ = self.order_manager.cancel_all(token).await;
+                                            self.unsubscribe_token(token).await;
                                         }
                                         tracing::info!(strategy_id = %id, "Strategy stopped + removed via control plane");
                                         let _ = reply.send(Ok(()));

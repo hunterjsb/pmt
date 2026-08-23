@@ -209,7 +209,19 @@ pub(crate) fn eval_model(
             }
             let breakeven = (ref_px * window - banked_avg * banked_s) / rem;
             let sig_avg = sig_frac * ((rem / 60.0).max(0.02) / 3.0).sqrt();
-            let p_up = 1.0 - norm_cdf((breakeven / spot).ln() / sig_avg);
+            // breakeven <= 0: the banked mass is so far above the reference
+            // that NO positive remaining path can pull the average back —
+            // up has already won. Without this guard, ln(negative) is NaN,
+            // NaN comparisons all read false, and f64::min's NaN-eating
+            // then priced BOTH sides at fair 1.0 simultaneously (adversarial
+            // sweep 2026-08-23, compiled repro: 5% push on a heavily-banked
+            // window fired clips on both outcomes at once).
+            let p_up = if breakeven <= 0.0 {
+                1.0
+            } else {
+                1.0 - norm_cdf((breakeven / spot).ln() / sig_avg)
+            };
+            debug_assert!(p_up.is_finite());
             // Banked-decided: the banked contribution alone survives a full
             // reversion of the remaining path to the reference, with basis
             // noise + one sigma of remaining-average cushion on top.
@@ -531,5 +543,20 @@ mod tests {
         let (f, now) = feed_with(100.05, 100.05);
         let m = eval_model(&p, &f, now, p.basis_guard_bp).unwrap();
         assert_eq!(m.guard_bp, p.basis_guard_bp);
+    }
+
+    #[test]
+    fn negative_breakeven_is_certainty_not_nan() {
+        // 13min banked at +5% vs ref, 35s left: breakeven goes negative.
+        // Pre-fix this made p_up NaN and both sides priced fair 1.0 at
+        // once via f64::min's NaN-eating (compiled repro, 2026-08-23).
+        let p = params("s");
+        let (mut f, _) = feed_with(105.0, 105.0);
+        let now = p.end - 35.0;
+        f.spot_ts = now; // fresh at the late-window eval instant
+        let m = eval_model(&p, &f, now, p.basis_guard_bp).unwrap();
+        assert!(m.p_up.is_finite(), "p_up must never be NaN");
+        assert!((m.p_up - 1.0).abs() < 1e-9, "banked beyond reach = up certain");
+        assert!(m.banked_decided, "an unreachable margin is decided");
     }
 }

@@ -527,7 +527,14 @@ impl ArmState {
             ("up", &p.token_up, p_up, view.held_up, &view.up),
             ("down", &p.token_down, 1.0 - p_up, view.held_dn, &view.dn),
         ] {
-            if fair >= EXIT_FAIR || self.inflight.contains_key(token) {
+            // Only a pending EXIT (the 0-notional sentinel) blocks another
+            // exit — a pending BUY must not: its missed fill used to lock
+            // the ENTIRE held position out of evacuation for the inflight
+            // TTL, exactly while fair was collapsing (adversarial sweep
+            // 2026-08-23 — the safeguard re-enabling the loss it guards).
+            let exit_pending =
+                self.inflight.get(token).map(|(n, _)| *n == 0.0).unwrap_or(false);
+            if fair >= EXIT_FAIR || exit_pending {
                 continue;
             }
             if held < 5.0 {
@@ -671,6 +678,10 @@ impl ArmState {
         // clips stay live until FLIP_BUY_CUTOFF_S. Exits always stay live
         // until the final seconds.
         if now >= p.end - p.quiesce_secs {
+            // TTL-prune unconditionally: this only ran inside the flip_live
+            // branch before, so a stale entry from a missed fill froze the
+            // exit rule for the whole non-flip quiesce window.
+            self.inflight.retain(|_, (_, at)| now - *at < INFLIGHT_TTL_S);
             let model = model.ok();
             let flip_live = model.as_ref().map(|m| m.flip_proof).unwrap_or(false)
                 && now < p.end - FLIP_BUY_CUTOFF_S;
@@ -1488,6 +1499,37 @@ mod tests {
         let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.0);
         assert_eq!(buys(&out).len(), 1);
         assert!(arm.last_eval.as_ref().unwrap()["sides"][0].get("fair_raw").is_none());
+    }
+
+    #[test]
+    fn decide_pending_buy_does_not_block_exits() {
+        let mut arm = armed(params("s"));
+        // A buy is in flight (missed fill, notional > 0) while fair has
+        // collapsed on 50 held shares with a live bid near fair.
+        arm.inflight.insert("s-u".into(), (24.0, 1399.0));
+        let view = ArmView {
+            up: TopOfBook { bid: Some((0.30, 200.0)), ask: Some((0.32, 200.0)) },
+            held_up: 50.0,
+            position_floor: 40.0,
+            ..ArmView::default()
+        };
+        let collapsed = ModelEval { p_up: 0.30, banked_decided: false, ..locked_up_model() };
+        let out = arm.decide(&view, Ok(collapsed), 1400.0);
+        assert!(
+            out.actions.iter().any(|a| matches!(a, Action::Sell { .. })),
+            "held position must evacuate even with a buy pending"
+        );
+        // But a pending EXIT sentinel (notional 0.0) still blocks re-selling.
+        let mut arm2 = armed(params("s"));
+        arm2.inflight.insert("s-u".into(), (0.0, 1399.9));
+        let view2 = ArmView {
+            up: TopOfBook { bid: Some((0.30, 200.0)), ask: Some((0.32, 200.0)) },
+            held_up: 50.0,
+            ..ArmView::default()
+        };
+        let collapsed2 = ModelEval { p_up: 0.30, banked_decided: false, ..locked_up_model() };
+        let out2 = arm2.decide(&view2, Ok(collapsed2), 1400.0);
+        assert!(!out2.actions.iter().any(|a| matches!(a, Action::Sell { .. })));
     }
 
     #[test]
