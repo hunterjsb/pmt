@@ -794,9 +794,11 @@ def test_composed_frame_puts_each_fact_in_its_own_place():
     first_close = next(i for i, l in enumerate(lines) if "╰" in l)
     head_body = "\n".join(lines[:first_close])
     assert "9W-2L" in head_body and "capital" in head_body and "all-time" in head_body
-    assert "committed" in head_body and "riding" in head_body
+    assert "un-decided" in head_body and "riding" in head_body
     rest = "\n".join(lines[first_close:])
-    assert "committed" not in rest, "exposure renders exactly once, in the panel"
+    # "committed" alone also names an arms-table column; the exposure
+    # phrase is the unambiguous fingerprint
+    assert "un-decided" not in rest, "exposure renders exactly once, in the panel"
     assert "capital" not in risk and "all-time" not in risk and "W-" not in risk
 
 class _FakeStdin:
