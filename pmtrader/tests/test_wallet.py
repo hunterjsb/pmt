@@ -89,7 +89,7 @@ def test_fetch_wallet_activity_floor_zero_walks_full_history(monkeypatch):
     # floor=0 must never trip the "oldest row < floor" early-stop — only an
     # empty/short final page ends pagination (the all-time ledger case).
     page1 = [{"timestamp": 500 - i} for i in range(wallet.PAGE_SIZE)]
-    page2 = [{"timestamp": 5}]  # short final page
+    page2 = [{"timestamp": 5, "transactionHash": "0xfinal"}]  # short final page
     pages = [page1, page2]
     calls = []
 
