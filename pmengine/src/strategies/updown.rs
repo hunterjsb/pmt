@@ -45,6 +45,14 @@ const VOL_FAST_WINDOW: usize = 12;
 const INFLIGHT_TTL_S: f64 = 12.0;
 /// Speculative clips still need the model leaning clearly one way.
 const EARLY_MIN_FAIR: f64 = 0.55;
+/// Book-distrust brake: net above this is the book pricing in something the
+/// model hasn't caught, not free edge — every blown-up window tonight
+/// entered on huge claimed edge into a collapsing book. Banked-decided
+/// TWAPs are exempt: the edge there is math, not a book mispricing.
+const BOOK_DISTRUST_NET: f64 = 0.15;
+/// No-averaging-down brake: our side getting cheaper after a clip is the
+/// market repricing against the thesis, not a discount to chase.
+const AVG_DOWN_TOL: f64 = 0.02;
 
 // Private on purpose: the registry generator registers the first `pub
 // struct` in the file, which must be Updown.
@@ -96,10 +104,16 @@ struct ArmParams {
     /// Net edge an early (speculative) clip must clear.
     #[serde(default = "d_early_min_edge")]
     pub early_min_edge: f64,
-    /// Elapsed fraction where the full budget unlocks regardless of
-    /// banked-decidedness.
+    /// DEPRECATED, unused: superseded by late_rem_s. Kept only so in-flight
+    /// arm payloads still deserialize.
+    #[allow(dead_code)]
     #[serde(default = "d_late_frac")]
     pub late_frac: f64,
+    /// Full budget unlocks with this many seconds left, regardless of
+    /// banked-decidedness — absolute risk time, not window fraction: 60%
+    /// elapsed leaves 2min on a 5m window but 6min on a 15m one.
+    #[serde(default = "d_late_rem")]
+    pub late_rem_s: f64,
     /// Lag-1 autocorrelation of 1m returns below which the tape counts as
     /// mean-reverting chop: speculative clips are disabled entirely.
     #[serde(default = "d_rho_block")]
@@ -131,6 +145,7 @@ fn d_clip_cooldown() -> f64 { 2.0 }
 fn d_early_frac() -> f64 { 0.2 }
 fn d_early_min_edge() -> f64 { 0.08 }
 fn d_late_frac() -> f64 { 0.6 }
+fn d_late_rem() -> f64 { 120.0 }
 fn d_rho_block() -> f64 { -0.25 }
 fn d_manip_push() -> f64 { 25.0 }
 /// Flip-proof buys stay live until this close to resolution.
@@ -183,6 +198,9 @@ struct ArmState {
     inflight: std::collections::HashMap<String, (f64, f64)>,
     /// token -> last clip time, enforcing the per-side clip cadence.
     last_clip: std::collections::HashMap<String, f64>,
+    /// token -> ask price of the last clip, feeding the no-averaging-down
+    /// brake. New windows use new token ids so this resets per window.
+    last_clip_ask: std::collections::HashMap<String, f64>,
     last_eval: Option<serde_json::Value>,
     /// Throttle for eval/gated lines in the durable tape.
     last_tape_at: f64,
@@ -296,6 +314,7 @@ impl ArmState {
             filled_usdc: 0.0,
             inflight: std::collections::HashMap::new(),
             last_clip: std::collections::HashMap::new(),
+            last_clip_ask: std::collections::HashMap::new(),
             last_eval: None,
             last_tape_at: 0.0,
         }
@@ -694,7 +713,7 @@ impl ArmState {
         // Exposure envelope: small speculative clips until the window is
         // either late or banked-decided; then the full budget eases into
         // the safe bet clip by clip.
-        let unlocked = elapsed_frac >= p.late_frac || m.banked_decided;
+        let unlocked = budget_unlocked(now, p.end, p.late_rem_s, m.banked_decided);
         let cap = p.size_usdc * if unlocked { 1.0 } else { p.early_frac };
         let mut room = (cap - committed - inflight_usdc).min(budget);
         let (edge_req, fair_req) = if unlocked {
@@ -723,11 +742,24 @@ impl ArmState {
             };
             let fee = p.fee_rate * ask.min(1.0 - ask);
             let net = fair - ask - fee;
-            evals.push(serde_json::json!({"side": side, "fair": fair, "ask": ask, "net": net}));
+            let brake = if distrust_blocks(net, m.banked_decided) {
+                Some("distrust")
+            } else if avg_down_blocks(ask, self.last_clip_ask.get(token).copied(), m.banked_decided)
+            {
+                Some("avg_down")
+            } else {
+                None
+            };
+            let mut eval = serde_json::json!({"side": side, "fair": fair, "ask": ask, "net": net});
+            if let Some(b) = brake {
+                eval["brake"] = serde_json::json!(b);
+            }
+            evals.push(eval);
 
             let cooled =
                 now - self.last_clip.get(token).copied().unwrap_or(0.0) >= p.clip_cooldown_s;
-            let firing = !chop_blocked
+            let firing = brake.is_none()
+                && !chop_blocked
                 && fair >= fair_req
                 && net >= edge_req
                 && ask <= p.max_price
@@ -754,6 +786,7 @@ impl ArmState {
             }));
             room -= size * ask;
             self.last_clip.insert(token.clone(), now);
+            self.last_clip_ask.insert(token.clone(), ask);
             self.inflight.insert(token.clone(), (size * ask, now));
             signals.push(Signal::Cancel { token_id: token.clone() });
             signals.push(Signal::Buy {
@@ -1119,6 +1152,29 @@ fn position_floor(ctx: &StrategyContext, p: &ArmParams) -> f64 {
         .sum()
 }
 
+/// Book-distrust brake predicate: a book handing over more than
+/// BOOK_DISTRUST_NET net is pricing in something the model missed, unless
+/// the TWAP math itself has already decided the window.
+fn distrust_blocks(net: f64, banked_decided: bool) -> bool {
+    net > BOOK_DISTRUST_NET && !banked_decided
+}
+
+/// No-averaging-down brake predicate: the ask dropping more than
+/// AVG_DOWN_TOL below our last clip on this token means the market is
+/// repricing against the thesis, unless the TWAP math has already decided.
+fn avg_down_blocks(ask: f64, last_clip_ask: Option<f64>, banked_decided: bool) -> bool {
+    match last_clip_ask {
+        Some(prev) => ask < prev - AVG_DOWN_TOL && !banked_decided,
+        None => false,
+    }
+}
+
+/// Full-budget unlock: absolute seconds left, not window fraction — a 15m
+/// window's 60%-elapsed mark still leaves 6 minutes of risk on the table.
+fn budget_unlocked(now: f64, end: f64, late_rem_s: f64, banked_decided: bool) -> bool {
+    (end - now) <= late_rem_s || banked_decided
+}
+
 /// Lag-1 autocorrelation of log-returns over the last `n` closes.
 fn lag1_autocorr(closes: &[f64], n: usize) -> f64 {
     let m = closes.len().min(n + 1);
@@ -1196,7 +1252,51 @@ mod tests {
         assert_eq!(p.early_frac, 0.2);
         assert_eq!(p.early_min_edge, 0.08);
         assert_eq!(p.late_frac, 0.6);
+        assert_eq!(p.late_rem_s, 120.0);
         assert_eq!(p.rho_block, -0.25);
+    }
+
+    #[test]
+    fn distrust_brake_blocks_outsized_net_unless_banked() {
+        assert!(distrust_blocks(0.16, false));
+        assert!(!distrust_blocks(0.16, true), "banked-decided is exempt");
+        assert!(!distrust_blocks(0.15, false), "at the threshold, not over it");
+        assert!(!distrust_blocks(0.05, false));
+    }
+
+    #[test]
+    fn avg_down_brake_blocks_cheapening_ask_unless_banked() {
+        assert!(avg_down_blocks(0.50, Some(0.53), false), "3c cheaper clears tolerance");
+        assert!(!avg_down_blocks(0.50, Some(0.53), true), "banked-decided is exempt");
+        assert!(!avg_down_blocks(0.52, Some(0.53), false), "within tolerance");
+        assert!(!avg_down_blocks(0.55, Some(0.53), false), "richer ask, not cheaper");
+        assert!(!avg_down_blocks(0.50, None, false), "no prior clip on this token");
+    }
+
+    #[test]
+    fn late_rem_s_default_matches_old_late_frac_on_a_300s_window() {
+        // 300s window: old 60% mark and the new 120s-remaining default land
+        // on the same instant.
+        let (start, end) = (0.0, 300.0);
+        let old_unlock_now = start + (end - start) * 0.6;
+        assert!(budget_unlocked(old_unlock_now, end, d_late_rem(), false));
+        assert!(!budget_unlocked(old_unlock_now - 1.0, end, d_late_rem(), false));
+    }
+
+    #[test]
+    fn late_rem_s_unlocks_a_900s_window_at_two_minutes_left_not_six() {
+        let end = 900.0;
+        // old late_frac 0.6 would have unlocked at rem=360s (6min); the
+        // absolute-time brake holds until rem=120s (2min).
+        assert!(!budget_unlocked(end - 360.0, end, d_late_rem(), false));
+        assert!(!budget_unlocked(end - 121.0, end, d_late_rem(), false));
+        assert!(budget_unlocked(end - 120.0, end, d_late_rem(), false));
+        assert!(budget_unlocked(end - 119.0, end, d_late_rem(), false));
+    }
+
+    #[test]
+    fn late_rem_s_banked_decided_unlocks_regardless_of_time() {
+        assert!(budget_unlocked(0.0, 900.0, 120.0, true));
     }
 
     fn armed_with_feed(banked_px: f64, spot: f64) -> (ArmState, f64) {
