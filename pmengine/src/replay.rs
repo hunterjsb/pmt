@@ -66,6 +66,13 @@ pub struct ReplayOpts {
     /// Defaults to `~/.pmt/corpus/rtds`; loaded only when a matched window
     /// is actually stream-fed.
     pub rtds_corpus: Option<PathBuf>,
+    /// Replay-only decision trace: every tape record `decide()` produced,
+    /// written as JSONL. Full mode only. The model reads a study needs to
+    /// attribute a gate (`banked_bp`, `cushion_bp`, `term_bp`, the per-side
+    /// `brake`) exist inside the run and reached nothing before this — a
+    /// gate-attribution ladder could only bound them by relaxing knobs one
+    /// at a time and reading fire counts. Costs nothing when unset.
+    pub trace: Option<PathBuf>,
     /// R7: `Some(cap)` switches to the interleaved fleet driver (every
     /// matched window stepped in one global timestamp order, sharing one
     /// un-decided pool). `Some(0.0)` is that same driver with no cap — the
@@ -988,6 +995,20 @@ pub(crate) fn replay_full_window_with(
     (build_report(&p.slug, "full", &sim, real, outcome, pnl), trace)
 }
 
+/// Dump the decision trace, one JSON record per line. `None` writes nothing
+/// and costs nothing — a study opts in.
+fn write_trace(path: Option<&Path>, trace: &[Value]) -> Result<(), String> {
+    let Some(path) = path else { return Ok(()) };
+    let mut out = String::new();
+    for r in trace {
+        out.push_str(&r.to_string());
+        out.push('\n');
+    }
+    std::fs::write(path, out).map_err(|e| format!("write {}: {}", path.display(), e))?;
+    eprintln!("[replay] trace: {} record(s) -> {}", trace.len(), path.display());
+    Ok(())
+}
+
 fn run_full(opts: &ReplayOpts) -> Result<(), String> {
     let book_path = opts.book_tape.clone().unwrap_or_else(default_book_tape_path);
     let tape_path = opts.tape.clone().unwrap_or_else(default_eval_tape_path);
@@ -1006,6 +1027,7 @@ fn run_full(opts: &ReplayOpts) -> Result<(), String> {
     let corpus = load_rtds_corpus(opts, &rtds_symbols_needed(matched()))?;
 
     let mut reports = Vec::new();
+    let mut traced: Vec<Value> = Vec::new();
     for (slug, recs) in &windows {
         let Some((p, tun)) = params_map.get(slug).cloned() else {
             eprintln!("[replay] skipping '{}': no --params entry for this slug", slug);
@@ -1022,7 +1044,7 @@ fn run_full(opts: &ReplayOpts) -> Result<(), String> {
                 continue;
             }
         };
-        let (report, _) = replay_full_window_with(
+        let (report, trace) = replay_full_window_with(
             &mut feed_src,
             &p,
             tun,
@@ -1030,8 +1052,10 @@ fn run_full(opts: &ReplayOpts) -> Result<(), String> {
             outcomes.get(slug).cloned(),
             &real,
         );
+        traced.extend(trace);
         reports.push(report);
     }
+    write_trace(opts.trace.as_deref(), &traced)?;
     finalize(&opts.slug, "full", &reports, opts.out.as_deref())
 }
 
@@ -1224,6 +1248,7 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
 
     let ordered = interleave(&recs_by_arm);
     let mut room_low = f64::INFINITY;
+    let mut traced: Vec<Value> = Vec::new();
     for (now, i, rec) in ordered {
         let mut fleet_room = if cap > 0.0 {
             let undecided: f64 = arms.iter().map(|a| a.undecided(now)).sum();
@@ -1265,6 +1290,9 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
             }
         };
         let Some(out) = out else { continue };
+        if opts.trace.is_some() {
+            traced.extend(out.tape.iter().cloned());
+        }
         let fee_rate = a.p.fee_rate;
         apply_fills(&mut a.arm, &mut a.sim, &out, now, fee_rate);
         if a.fleet_braked() {
@@ -1272,6 +1300,7 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
         }
     }
 
+    write_trace(opts.trace.as_deref(), &traced)?;
     let mode = if full { "full" } else { "evals" };
     let mut reports = Vec::new();
     for a in &mut arms {
@@ -1559,6 +1588,7 @@ mod tests {
             params: Some(params.to_path_buf()),
             outcomes: None,
             out: Some(out.to_path_buf()),
+            trace: None,
             fleet_cap: Some(cap),
             rtds_corpus: None,
         }
