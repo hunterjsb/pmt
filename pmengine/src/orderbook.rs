@@ -558,15 +558,23 @@ impl MarketDataHub {
 
         let arc = {
             let mut books = self.books.write().await;
-            if let Some(existing) = books.get(&token_id) {
-                if !rest_supersedes(existing, event_ts, now) {
-                    return false;
-                }
-                // Carry the running count forward — it's per-token, not
-                // per-snapshot, and the tape reads it as "how much have we
-                // actually seen on this book".
-                book.update_count = existing.update_count + 1;
+            // Same rule as the WS path: an id with no book must not create
+            // one. The poller snapshots its rotation and then fetches
+            // serially, so a token unsubscribed mid-sweep still has one
+            // snapshot in flight — inserting it here resurrected the
+            // removed book into the rotation FOREVER (measured live: 45
+            // zombie books over 29min, 82% of REST polls wasted, and the
+            // book-age p50 poisoned to minutes).
+            let Some(existing) = books.get(&token_id) else {
+                return false;
+            };
+            if !rest_supersedes(existing, event_ts, now) {
+                return false;
             }
+            // Carry the running count forward — it's per-token, not
+            // per-snapshot, and the tape reads it as "how much have we
+            // actually seen on this book".
+            book.update_count = existing.update_count + 1;
             let arc = Arc::new(book);
             books.insert(token_id.clone(), arc.clone());
             arc
@@ -905,6 +913,19 @@ mod tests {
     }
 
     // --- hub authority ---------------------------------------------------
+
+    #[tokio::test]
+    async fn rest_snapshot_never_resurrects_a_removed_book() {
+        // The poller snapshots its rotation then fetches serially, so a
+        // token unsubscribed mid-sweep still has one snapshot in flight.
+        // Inserting it would re-enlist the dead book for polling forever
+        // (measured live: 45 zombies in 29min).
+        let hub = MarketDataHub::new(16);
+        hub.init_book(TOKEN).await;
+        hub.remove_book(TOKEN).await;
+        assert!(!hub.apply_rest_book(rest_book(TOKEN, 100, dec!(0.4), dec!(0.5))).await);
+        assert_eq!(hub.book_count().await, 0, "the zombie must stay dead");
+    }
 
     #[tokio::test]
     async fn ws_writes_only_reach_subscribed_tokens() {
