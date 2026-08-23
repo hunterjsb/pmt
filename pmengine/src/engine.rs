@@ -962,14 +962,22 @@ impl Engine {
                     // MAX_POSITION enforcement honest even when a fill slips
                     // past the trades poller.
                     if tick_count.is_multiple_of(30) {
-                        for token_id in self.subscribed_tokens.clone() {
-                            if let Ok(Some((size, avg))) = self.client.get_position(&token_id).await {
-                                let delta = self.positions.reconcile(&token_id, size, avg);
-                                if delta != Decimal::ZERO {
-                                    tracing::warn!(
-                                        token_id = %token_id, corrected_to = %size, delta = %delta,
-                                        "Position reconcile: corrected drift from missed fill(s)"
-                                    );
+                        // One whole-account fetch, then map lookups — the
+                        // per-token variant re-downloaded the same body once
+                        // per subscribed token and darkened the control plane
+                        // for whole seconds under load (analysis/watch_load.md).
+                        // Absent from the map = data-api reports no position =
+                        // skip, same as get_position's Ok(None).
+                        if let Ok(all) = self.client.get_all_positions().await {
+                            for token_id in self.subscribed_tokens.clone() {
+                                if let Some(&(size, avg)) = all.get(&token_id) {
+                                    let delta = self.positions.reconcile(&token_id, size, avg);
+                                    if delta != Decimal::ZERO {
+                                        tracing::warn!(
+                                            token_id = %token_id, corrected_to = %size, delta = %delta,
+                                            "Position reconcile: corrected drift from missed fill(s)"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1635,8 +1643,12 @@ impl Engine {
                         }
                         EngineCommand::StrategyCommand { id, body, reply } => {
                             let res = self.strategy_runtime.command(&id, &body);
-                            if let Ok(ref v) = res {
-                                tracing::info!(strategy_id = %id, reply = %v, "Strategy command handled");
+                            if res.is_ok() {
+                                // The full reply used to be echoed here at INFO —
+                                // 83% of the engine log (181MB/day) was watch's own
+                                // polls reflected back, written synchronously on
+                                // the trading thread. Debug keeps it reachable.
+                                tracing::debug!(strategy_id = %id, "Strategy command handled");
                             }
                             let _ = reply.send(res);
                         }

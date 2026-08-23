@@ -759,6 +759,59 @@ impl PolymarketClient {
         Ok(None)
     }
 
+    /// Every position in one fetch, keyed by asset (token_id) -> (size, avg).
+    ///
+    /// The endpoint only answers whole-account, so per-token reconcile loops
+    /// calling get_position() N times re-download the same ~30KB body N times
+    /// per pass — measured at 1.93GB/2h and 9s control-plane blackouts under
+    /// load. A token absent from the map means the data-api reports no
+    /// position, same as get_position's Ok(None): the caller skips it.
+    pub async fn get_all_positions(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (Decimal, Decimal)>, ClientError> {
+        let Some(funder) = self.funder_address.as_ref() else {
+            return Ok(std::collections::HashMap::new());
+        };
+        let url = format!(
+            "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0",
+            funder
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ClientError::OrderError(format!("positions request failed: {}", e)))?;
+        if !resp.status().is_success() {
+            return Err(ClientError::OrderError(format!(
+                "positions HTTP {}",
+                resp.status()
+            )));
+        }
+        let positions: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| ClientError::OrderError(format!("positions parse: {}", e)))?;
+        let mut out = std::collections::HashMap::new();
+        for p in positions {
+            let Some(asset) = p.get("asset").and_then(|a| a.as_str()) else {
+                continue;
+            };
+            let size = p
+                .get("size")
+                .and_then(|s| s.as_f64())
+                .and_then(Decimal::from_f64_retain)
+                .unwrap_or(Decimal::ZERO);
+            let avg = p
+                .get("avgPrice")
+                .and_then(|s| s.as_f64())
+                .and_then(Decimal::from_f64_retain)
+                .unwrap_or(Decimal::ZERO);
+            out.insert(asset.to_string(), (size, avg));
+        }
+        Ok(out)
+    }
+
     /// Cancel every open user-side order on a token (asset_id).
     ///
     /// Used by the engine at startup to clear orphans left from a previous
