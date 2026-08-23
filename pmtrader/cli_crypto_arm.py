@@ -120,6 +120,11 @@ def _resolve_basis_guard(explicit: float | None, symbol: str) -> tuple[float, st
                    "(|banked|/cushion, sign-matched to the side) at least this "
                    "high. 0 disables; ~0.3 blocked both 2026-08-23 post-brake "
                    "losses in replay; 1.0 = require banked-decided to enter")
+@click.option("--settle-tw", type=float, default=0.0, show_default=True,
+              help="Settlement TWAP width (seconds) the model prices against. "
+                   "0 keeps the engine's duration default; 60 is the measured "
+                   "truth at 5m (analysis/settle_width.md). Only terminal-"
+                   "aware paths consult it; range_avg arms ignore it.")
 @click.option("--pay-up", type=float, default=0.0, show_default=True,
               help="Fill-chase buffer: a clip's limit may sit up to this many "
                    "cents above the decision ask, funded only by surplus edge "
@@ -154,7 +159,8 @@ def _resolve_basis_guard(explicit: float | None, symbol: str) -> tuple[float, st
 def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
                side: str | None, quiesce: float, min_fair: float, min_elapsed: float,
                roll: bool, clip: float, basis_guard: float | None, theta: float,
-               pay_up: float, p_cap: float, maker_bid: bool, feed: str) -> None:
+               pay_up: float, p_cap: float, maker_bid: bool, feed: str,
+               settle_tw: float) -> None:
     """Arm the pmengine updown trigger on a market.
 
     Prices the market (semantics, vol, fee) and hands the parameters to the
@@ -189,7 +195,7 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         "quiesce_secs": quiesce, "min_fair": min_fair, "min_elapsed_frac": min_elapsed,
         "roll": roll, "clip_usdc": clip, "basis_guard_bp": guard_bp,
         "theta": theta, "pay_up_max": pay_up, "p_cap": p_cap, "feed": feed,
-        "maker_bid": maker_bid,
+        "maker_bid": maker_bid, "settle_tw_s": settle_tw,
     }
     if side:
         payload["side_filter"] = side

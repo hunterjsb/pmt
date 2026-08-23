@@ -71,8 +71,14 @@ def window_universe(slugs: Iterable[str], since: float, now: float) -> list[dict
 
 
 def ck_settlement_width_s(dur_s: int) -> int:
-    """Settlement TWAP width, R1 convention: 30s at 5m closes, 60s at everything wider."""
-    return 30 if dur_s <= 300 else 60
+    """Settlement TWAP width: 60s at every duration.
+
+    The old R1 convention assumed 30s at 5m closes; the measured record says
+    otherwise — book-graded 283/284 at 60s vs 277/284 at 30s, and all 6
+    windows where the widths disagree resolve the 60s way (analysis/
+    settle_width.md). One width, every duration.
+    """
+    return 60
 
 
 # ---------- (a) wallet truth — strict priority source ----------
