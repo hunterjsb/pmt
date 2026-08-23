@@ -770,8 +770,8 @@ def _frame_text(width: int = 160) -> str:
     snap = {"status": status, "bal": {"total": _CAP}, "sb": sb, "sb_stale": False,
             "sb_fetched_at": 1700000000.0, "err": None}
     c = Console(record=True, width=width)
+    # the exposure line lives INSIDE the header panel now — no standalone row
     c.print(cc.build_header_panel(snap, "since 08-23 04:00Z", None))
-    c.print(Text.from_markup(cc.build_risk_header(status, sb)))
     c.print(cc.build_arms_table(_FRAME_ARMS, now=1700000000.0))
     c.print(Panel(Text.from_markup(cc.build_windows_strip(sb["windows"])),
                   title="recent windows", border_style="dim"))
@@ -799,7 +799,6 @@ def test_composed_frame_puts_each_fact_in_its_own_place():
     # "committed" alone also names an arms-table column; the exposure
     # phrase is the unambiguous fingerprint
     assert "un-decided" not in rest, "exposure renders exactly once, in the panel"
-    assert "capital" not in risk and "all-time" not in risk and "W-" not in risk
 
 class _FakeStdin:
     def __init__(self, isatty=True, chars=""):
