@@ -1,8 +1,8 @@
 # freq_funnel — where the fleet's trades die
 
-corpus window   : 05:00:00Z -> 08:40:10Z  (3.67h, theta era)
-windows armed   : 175   cadence ticks: 12167   armed window-minutes: 1014
-fires on tape   : 164 clips across 42 windows (44.7 clips/h)
+corpus window   : 05:00:00Z -> 08:41:36Z  (3.69h, theta era)
+windows armed   : 175   cadence ticks: 12235   armed window-minutes: 1020
+fires on tape   : 164 clips across 42 windows (44.4 clips/h)
 outcomes joined : 137/175 windows
 clip notional   : median observed fire $24.50 (used for windows that never fired)
 rerun           : cd pmtrader && uv run python ../analysis/freq_funnel.py --out ../analysis/freq_funnel_report.md
@@ -12,7 +12,7 @@ THE ANSWER, IN FIVE LINES
 ------------------------------------------------------------------------------
 
 1. The BASIS GUARD is the binding gate on every single series. It eats 60% of
-   armed time (610 of 1014 window-minutes) — more than every other gate combined.
+   armed time (614 of 1020 window-minutes) — more than every other gate combined.
 
 2. But most of what it blocks is not a trade. Of its refused moments, only
    the theta-survivable slice is real: L1 = 61 episodes, 80% hit, NET $284.37,
@@ -22,7 +22,7 @@ THE ANSWER, IN FIVE LINES
    window-minutes) the side our model wants has NO ASK ON THE BOOK — bid ~0.99,
    nothing offered. No taker parameter reaches that time; a maker quote does.
 
-4. min_fair is a non-event (1 tick of 12,167), and the edge bar is not the
+4. min_fair is a non-event (1 tick of 12,235), and the edge bar is not the
    problem either. In SAFE mode the median ask on edge-refused moments is
    ~0.99 — the market already priced it — and trimming min_edge 0.015 ->
    0.008 tests NET-NEGATIVE with a CI that clears $0 the wrong way. Only
@@ -69,33 +69,33 @@ stopped it, so no gate is billed for work a gate upstream already did.
 
 --- POOLED (all series) ---
 stage                                          ticks  win-min  %survive   %armed
-armed (window-minutes on tape)                 12167   1013.9    100.0%   100.0%
-live model (feed not stale)                    11960    996.7     98.3%    98.3%
-basis guard cleared                             4642    386.8     38.8%    38.2%
-model side quoted (has an ask)                  3468    289.0     74.7%    28.5%
-theta / safety gate cleared                     1852    154.3     53.4%    15.2%
-no distrust / avg_down / latched brake           919     76.6     49.6%     7.6%
-rho chop filter (spec mode only)                 919     76.6    100.0%     7.6%
+armed (window-minutes on tape)                 12235   1019.6    100.0%   100.0%
+live model (feed not stale)                    12028   1002.3     98.3%    98.3%
+basis guard cleared                             4662    388.5     38.8%    38.1%
+model side quoted (has an ask)                  3488    290.7     74.8%    28.5%
+theta / safety gate cleared                     1852    154.3     53.1%    15.1%
+no distrust / avg_down / latched brake           919     76.6     49.6%     7.5%
+rho chop filter (spec mode only)                 919     76.6    100.0%     7.5%
 fair >= min_fair                                 918     76.5     99.9%     7.5%
 net >= min_edge                                  330     27.5     35.9%     2.7%
 ask <= max_price                                 330     27.5    100.0%     2.7%
 FIRED (budget/cooldown/inflight allowed it)      147     12.2     44.5%     1.2%
-BINDING GATE: basis_guard  (7318 ticks = 60.1% of armed time, 610 window-minutes)
+BINDING GATE: basis_guard  (7366 ticks = 60.2% of armed time, 614 window-minutes)
 
 --- bnb 5m ---
 stage                                          ticks  win-min  %survive   %armed
-armed (window-minutes on tape)                   704     58.7    100.0%   100.0%
-live model (feed not stale)                      689     57.4     97.9%    97.9%
-basis guard cleared                              154     12.8     22.4%    21.9%
-model side quoted (has an ask)                    65      5.4     42.2%     9.2%
-theta / safety gate cleared                       30      2.5     46.2%     4.3%
-no distrust / avg_down / latched brake            24      2.0     80.0%     3.4%
-rho chop filter (spec mode only)                  24      2.0    100.0%     3.4%
-fair >= min_fair                                  24      2.0    100.0%     3.4%
+armed (window-minutes on tape)                   721     60.1    100.0%   100.0%
+live model (feed not stale)                      706     58.8     97.9%    97.9%
+basis guard cleared                              155     12.9     22.0%    21.5%
+model side quoted (has an ask)                    66      5.5     42.6%     9.2%
+theta / safety gate cleared                       30      2.5     45.5%     4.2%
+no distrust / avg_down / latched brake            24      2.0     80.0%     3.3%
+rho chop filter (spec mode only)                  24      2.0    100.0%     3.3%
+fair >= min_fair                                  24      2.0    100.0%     3.3%
 net >= min_edge                                   13      1.1     54.2%     1.8%
 ask <= max_price                                  13      1.1    100.0%     1.8%
 FIRED (budget/cooldown/inflight allowed it)        7      0.6     53.8%     1.0%
-BINDING GATE: basis_guard  (535 ticks = 76.0% of armed time, 45 window-minutes)
+BINDING GATE: basis_guard  (551 ticks = 76.4% of armed time, 46 window-minutes)
 
 --- btc 15m ---
 stage                                          ticks  win-min  %survive   %armed
@@ -114,18 +114,18 @@ BINDING GATE: basis_guard  (1085 ticks = 50.4% of armed time, 90 window-minutes)
 
 --- btc 5m ---
 stage                                          ticks  win-min  %survive   %armed
-armed (window-minutes on tape)                  2393    199.4    100.0%   100.0%
-live model (feed not stale)                     2342    195.2     97.9%    97.9%
-basis guard cleared                              734     61.2     31.3%    30.7%
-model side quoted (has an ask)                   459     38.2     62.5%    19.2%
-theta / safety gate cleared                      203     16.9     44.2%     8.5%
+armed (window-minutes on tape)                  2410    200.8    100.0%   100.0%
+live model (feed not stale)                     2359    196.6     97.9%    97.9%
+basis guard cleared                              740     61.7     31.4%    30.7%
+model side quoted (has an ask)                   465     38.8     62.8%    19.3%
+theta / safety gate cleared                      203     16.9     43.7%     8.4%
 no distrust / avg_down / latched brake           116      9.7     57.1%     4.8%
 rho chop filter (spec mode only)                 116      9.7    100.0%     4.8%
 fair >= min_fair                                 115      9.6     99.1%     4.8%
 net >= min_edge                                   28      2.3     24.3%     1.2%
 ask <= max_price                                  28      2.3    100.0%     1.2%
 FIRED (budget/cooldown/inflight allowed it)       14      1.2     50.0%     0.6%
-BINDING GATE: basis_guard  (1608 ticks = 67.2% of armed time, 134 window-minutes)
+BINDING GATE: basis_guard  (1619 ticks = 67.2% of armed time, 135 window-minutes)
 
 --- eth 15m ---
 stage                                          ticks  win-min  %survive   %armed
@@ -144,39 +144,39 @@ BINDING GATE: basis_guard  (1078 ticks = 50.3% of armed time, 90 window-minutes)
 
 --- eth 5m ---
 stage                                          ticks  win-min  %survive   %armed
-armed (window-minutes on tape)                  2391    199.2    100.0%   100.0%
-live model (feed not stale)                     2340    195.0     97.9%    97.9%
-basis guard cleared                              747     62.2     31.9%    31.2%
-model side quoted (has an ask)                   503     41.9     67.3%    21.0%
-theta / safety gate cleared                      264     22.0     52.5%    11.0%
+armed (window-minutes on tape)                  2408    200.7    100.0%   100.0%
+live model (feed not stale)                     2357    196.4     97.9%    97.9%
+basis guard cleared                              753     62.8     31.9%    31.3%
+model side quoted (has an ask)                   509     42.4     67.6%    21.1%
+theta / safety gate cleared                      264     22.0     51.9%    11.0%
 no distrust / avg_down / latched brake           156     13.0     59.1%     6.5%
 rho chop filter (spec mode only)                 156     13.0    100.0%     6.5%
 fair >= min_fair                                 156     13.0    100.0%     6.5%
 net >= min_edge                                   55      4.6     35.3%     2.3%
 ask <= max_price                                  55      4.6    100.0%     2.3%
 FIRED (budget/cooldown/inflight allowed it)       28      2.3     50.9%     1.2%
-BINDING GATE: basis_guard  (1593 ticks = 66.6% of armed time, 133 window-minutes)
+BINDING GATE: basis_guard  (1604 ticks = 66.6% of armed time, 134 window-minutes)
 
 --- sol 5m ---
 stage                                          ticks  win-min  %survive   %armed
-armed (window-minutes on tape)                  2382    198.5    100.0%   100.0%
-live model (feed not stale)                     2332    194.3     97.9%    97.9%
-basis guard cleared                              913     76.1     39.2%    38.3%
-model side quoted (has an ask)                   658     54.8     72.1%    27.6%
-theta / safety gate cleared                      309     25.8     47.0%    13.0%
-no distrust / avg_down / latched brake           197     16.4     63.8%     8.3%
-rho chop filter (spec mode only)                 197     16.4    100.0%     8.3%
-fair >= min_fair                                 197     16.4    100.0%     8.3%
+armed (window-minutes on tape)                  2399    199.9    100.0%   100.0%
+live model (feed not stale)                     2349    195.8     97.9%    97.9%
+basis guard cleared                              920     76.7     39.2%    38.3%
+model side quoted (has an ask)                   665     55.4     72.3%    27.7%
+theta / safety gate cleared                      309     25.8     46.5%    12.9%
+no distrust / avg_down / latched brake           197     16.4     63.8%     8.2%
+rho chop filter (spec mode only)                 197     16.4    100.0%     8.2%
+fair >= min_fair                                 197     16.4    100.0%     8.2%
 net >= min_edge                                   29      2.4     14.7%     1.2%
 ask <= max_price                                  29      2.4    100.0%     1.2%
 FIRED (budget/cooldown/inflight allowed it)       14      1.2     48.3%     0.6%
-BINDING GATE: basis_guard  (1419 ticks = 59.6% of armed time, 118 window-minutes)
+BINDING GATE: basis_guard  (1429 ticks = 59.6% of armed time, 119 window-minutes)
 
 Where the armed time goes, pooled (share of all cadence ticks):
-  basis_guard        7318   60.1%      610 window-min
-  theta              1616   13.3%      135 window-min
+  basis_guard        7366   60.2%      614 window-min
+  theta              1636   13.4%      136 window-min
   book_quoted        1174    9.6%       98 window-min
-  brakes              933    7.7%       78 window-min
+  brakes              933    7.6%       78 window-min
   min_edge            588    4.8%       49 window-min
   live_model          207    1.7%       17 window-min
   last_mile           183    1.5%       15 window-min
@@ -195,9 +195,9 @@ avoided losses: NET>0 means the gate cost us money tonight.
 
 gate            eps priced    hit         95% CI  med ask     missed    avoided        NET
 ------------------------------------------------------------------------------------------
-basis_guard     529    425  58.1%       [53-63%]    0.520  $5,529.08  $4,540.69    $988.39
+basis_guard     535    425  58.1%       [53-63%]    0.520  $5,529.08  $4,540.69    $988.39
 book_quoted     103      0      -              -        -      $0.00      $0.00      $0.00
-theta           169    149  73.2%       [66-80%]    0.740  $1,083.07    $960.48    $122.59
+theta           173    149  73.2%       [66-80%]    0.740  $1,083.07    $960.48    $122.59
 brakes           53     47  85.1%       [72-93%]    0.870    $356.53    $136.78    $219.75
 min_fair          1      1 100.0%      [21-100%]    0.960      $1.92      $0.00      $1.92
 min_edge         80     67  89.6%       [80-95%]    0.990     $59.88    $136.94    -$77.06
@@ -205,12 +205,12 @@ last_mile        38     31  83.9%       [67-93%]    0.950     $55.16     $88.23 
 
 --- basis_guard: by series ---
 series        eps priced    hit     missed    avoided        NET
-bnb 5m         34     16    62%    $221.63    $146.97     $74.66
+bnb 5m         36     16    62%    $221.63    $146.97     $74.66
 btc 15m        73     62    47%    $601.63    $764.26   -$162.63
-btc 5m        129    106    60%  $1,248.71  $1,078.74    $169.97
+btc 5m        130    106    60%  $1,248.71  $1,078.74    $169.97
 eth 15m        65     61    52%  $1,107.39    $922.06    $185.33
-eth 5m        113     93    63%  $1,189.56    $806.27    $383.28
-sol 5m        115     87    61%  $1,160.17    $822.38    $337.78
+eth 5m        115     93    63%  $1,189.56    $806.27    $383.28
+sol 5m        116     87    61%  $1,160.17    $822.38    $337.78
 
 --- brakes: by series ---
 series        eps priced    hit     missed    avoided        NET
@@ -223,12 +223,12 @@ sol 5m         14     13    85%     $40.22     $48.99     -$8.77
 
 --- theta: by series ---
 series        eps priced    hit     missed    avoided        NET
-bnb 5m          6      2   100%      $9.72      $0.00      $9.72
+bnb 5m          7      2   100%      $9.72      $0.00      $9.72
 btc 15m        26     22    59%    $125.90    $187.77    -$61.87
-btc 5m         36     31    81%    $222.70    $171.94     $50.76
+btc 5m         37     31    81%    $222.70    $171.94     $50.76
 eth 15m        24     23    65%    $318.80    $242.61     $76.19
-eth 5m         32     29    76%    $165.65    $113.77     $51.89
-sol 5m         45     42    76%    $240.30    $244.39     -$4.09
+eth 5m         33     29    76%    $165.65    $113.77     $51.89
+sol 5m         46     42    76%    $240.30    $244.39     -$4.09
 
 --- brakes: which one ---
 brake         ticks  eps priced    hit     missed    avoided        NET
@@ -279,7 +279,7 @@ so we can carry the counterfactual one step further:
       (ask <= 0.951)
 
 layer         eps priced    hit         95% CI     missed    avoided        NET          boot 95% CI on NET
-L0 all        529    425  58.1%       [53-63%]  $5,529.08  $4,540.69    $988.39       [-$146.90, $2,195.07]
+L0 all        535    425  58.1%       [53-63%]  $5,529.08  $4,540.69    $988.39       [-$146.90, $2,195.07]
 L1 +theta      91     61  80.3%       [69-88%]    $578.31    $293.94    $284.37          [-$56.03, $655.27]
 L2 +edge       68     53  75.5%       [62-85%]    $575.95    $318.44    $257.51          [-$83.00, $632.29]
 
@@ -320,11 +320,11 @@ sol 5m          10      7   19     16    81%     $90.11     $73.48     $16.63
 (each row = the moments a LOWER theta would have released, priced the
  same way. NET>0 = the trim would have made money on tonight's tape.)
 trial theta     eps priced    hit         95% CI     missed    avoided        NET          boot 95% CI on NET
-0.25             46     36    81%       [65-90%]    $112.83    $159.29    -$46.46          [-$189.19, $75.46]
-0.2              65     53    85%       [73-92%]    $265.46    $172.89     $92.57          [-$73.44, $245.24]
-0.15             88     71    86%       [76-92%]    $364.18    $221.60    $142.58          [-$40.96, $318.20]
-0.1             111     93    84%       [75-90%]    $533.45    $332.18    $201.27          [-$32.32, $425.01]
-0.0             167    147    73%       [66-80%]  $1,065.56    $952.94    $112.62         [-$322.06, $516.31]
+0.25             47     36    81%       [65-90%]    $112.83    $159.29    -$46.46          [-$189.19, $75.46]
+0.2              68     53    85%       [73-92%]    $265.46    $172.89     $92.57          [-$73.44, $245.24]
+0.15             91     71    86%       [76-92%]    $364.18    $221.60    $142.58          [-$40.96, $318.20]
+0.1             114     93    84%       [75-90%]    $533.45    $332.18    $201.27          [-$32.32, $425.01]
+0.0             171    147    73%       [66-80%]  $1,065.56    $952.94    $112.62         [-$322.06, $516.31]
 
 --- edge-bar trim sweeps (the two bars, separately) ---
 bar / trial                     eps priced    hit         95% CI     missed    avoided        NET          boot 95% CI on NET
@@ -338,17 +338,17 @@ early_min_edge (spec) -> 0.03    32     24    96%       [80-99%]     $50.83     
 early_min_edge (spec) -> 0.02    35     26    96%       [81-99%]     $49.14     $24.21     $24.93           [-$36.72, $68.26]
 
 --- spec mode: does it still exist post-theta? ---
-cadence ticks in spec mode (locked budget) : 8274 (68.0% of armed)
-  ...of which reached the side gates       : 2896
+cadence ticks in spec mode (locked budget) : 8342 (68.2% of armed)
+  ...of which reached the side gates       : 2916
 cadence ticks in safe mode (unlocked)      : 3686
-  spec-mode side-gate deaths: {'theta': 1606, 'brakes': 805, 'min_edge': 329, 'book_quoted': 137, 'fired': 12, 'last_mile': 7}
+  spec-mode side-gate deaths: {'theta': 1626, 'brakes': 805, 'min_edge': 329, 'book_quoted': 137, 'fired': 12, 'last_mile': 7}
 fires by mode: spec=20  safe=143  flip=1
   last spec fire at 08:07:59Z
 spec-mode deaths at EARLY_MIN_FAIR 0.55: 0   at early_min_edge 0.08: 329
 
 VERDICT: spec mode is NOT dead post-theta — 20 of 164 clips tonight (12%)
 fired in spec mode, the last at 08:07:59Z. What killed spec
-moments is theta (1606 ticks) and the brakes (805), both UPSTREAM of the
+moments is theta (1626 ticks) and the brakes (805), both UPSTREAM of the
 spec bars — EARLY_MIN_FAIR 0.55 refused 0 moments all night. Re-tuning the
 spec bars is re-tuning a gate that is barely reached.
 
@@ -377,10 +377,10 @@ capped by the size really resting at that ask (uncapped, a $24 clip at ask
 --- ZERO-FIRE windows (n=133) ---
   windows with no outcome or no book: 30 (23%)
 
-  measure     n  no edge  edge, gated  % gated  $ ceiling (depth-capped)
-  A ANY     103        0          103      77%                 $8,239.45
-  B LATE     97       31           66      50%                 $6,252.70
-  C KNEW    101        0          101      76%                 $1,668.01
+  measure     n  no edge  edge, gated   % of n  $ ceiling (depth-capped)
+  A ANY     103        0          103     100%                 $8,239.45
+  B LATE     97       31           66      68%                 $6,252.70
+  C KNEW    101        0          101     100%                 $1,668.01
 
   A ANY winner min-ask: p10 0.090  p25 0.260  median 0.350  p75 0.480  p90 0.610
   B LATE winner min-ask: p10 0.150  p25 0.470  median 0.780  p75 0.950  p90 0.980
@@ -399,13 +399,13 @@ capped by the size really resting at that ask (uncapped, a $24 clip at ask
     sol-updown-5m-1787467800         ask 0.380 x100 sh @ 20% elapsed -> $38.25
     sol-updown-5m-1787469000         ask 0.380 x50 sh @  6% elapsed -> $29.67
 
---- basis guard NEVER cleared (n=54) ---
-  windows with no outcome or no book: 20 (37%)
+--- basis guard NEVER cleared (n=50) ---
+  windows with no outcome or no book: 16 (32%)
 
-  measure     n  no edge  edge, gated  % gated  $ ceiling (depth-capped)
-  A ANY      34        0           34      63%                 $3,396.81
-  B LATE     34        7           27      50%                 $2,731.98
-  C KNEW     34        0           34      63%                   $618.33
+  measure     n  no edge  edge, gated   % of n  $ ceiling (depth-capped)
+  A ANY      34        0           34     100%                 $3,396.81
+  B LATE     34        7           27      79%                 $2,731.98
+  C KNEW     34        0           34     100%                   $618.33
 
   A ANY winner min-ask: p10 0.090  p25 0.290  median 0.340  p75 0.440  p90 0.510
   B LATE winner min-ask: p10 0.200  p25 0.440  median 0.660  p75 0.840  p90 0.950
@@ -450,12 +450,12 @@ sol 5m             45     10     35     78%            25     $480.92
 
 --- |projected margin| vs the guard ---
 series       guard      n    p25    p50    p75    p90  <guard  within 1bp  within 2bp
-bnb 5m           8    689    3.4    5.7    7.8   13.3     77%         11%         30%
+bnb 5m           8    706    3.2    5.6    7.7   13.3     78%         11%         29%
 btc 15m          6   2132    2.4    5.9   13.0   16.3     50%         10%         18%
-btc 5m           6   2342    1.7    3.9    7.3   12.4     68%         11%         25%
+btc 5m           6   2359    1.7    3.9    7.3   12.4     68%         11%         25%
 eth 15m          8   2125    2.8    7.8   14.0   26.2     51%          6%         15%
-eth 5m           8   2340    2.4    4.8   10.3   16.4     68%          5%         14%
-sol 5m          10   2332    4.0    7.8   15.1   21.8     61%          8%         16%
+eth 5m           8   2357    2.4    4.8   10.3   16.3     68%          5%         14%
+sol 5m          10   2349    4.0    7.8   15.1   21.8     61%          8%         17%
   (%<guard is over ticks with a known margin; 'within Nbp' is the share
    of BLOCKED ticks that a guard N bp lower would have released.)
 
@@ -472,19 +472,19 @@ sol              9.9      3.2      4.2      5.9      8.7      81%
 
 --- engine-reported sig_bp (eval tape) by series, tonight ---
 series            n     p25     p50     p75
-bnb 5m          154     7.6     8.5    10.0
+bnb 5m          155     7.6     8.5    10.0
 btc 15m        1047     4.8     5.4     6.2
-btc 5m          734     5.0     5.5     6.6
+btc 5m          740     5.0     5.5     6.5
 eth 15m        1047     6.1     6.7    15.6
-eth 5m          747     6.2     7.0    15.3
-sol 5m          913     9.3    10.6    14.8
+eth 5m          753     6.2     7.0    15.2
+sol 5m          920     9.3    10.6    14.7
 
 --- fires/hour by policy era (whole tape, not just the theta era) ---
 era                  from         to  hours  clips  clips/h  armed w  fired w  fired w %
 pre-brake       22:02:17Z  02:18:46Z   4.27    397     92.9       82       58        71%
 brake           02:18:46Z  05:00:00Z   2.69    378    140.7      123       65        53%
 theta           05:00:00Z  06:00:00Z   1.00     56     56.0       44       13        30%
-theta+payup     06:00:00Z  08:41:00Z   2.68    108     40.2      131       29        22%
+theta+payup     06:00:00Z  08:42:27Z   2.71    108     39.9      131       29        22%
   ('armed w' counts every window with a tape record in the era, so a
    window spanning two eras is counted in both — read the % as a rate,
    not a ledger.)

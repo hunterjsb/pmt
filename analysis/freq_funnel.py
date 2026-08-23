@@ -1006,7 +1006,7 @@ def render(t0: float, t1: float, wins: dict, rows: list[dict], book: dict,
             f"({100.0 * unknown / tot:.0f}%)")
         add("")
         add(f"  {'measure':<8}{'n':>5}{'no edge':>9}{'edge, gated':>13}"
-            f"{'% gated':>9}{'$ ceiling (depth-capped)':>26}")
+            f"{'% of n':>9}{'$ ceiling (depth-capped)':>26}")
         for k, name in (("any", "A ANY"), ("late", "B LATE"), ("knew", "C KNEW")):
             v = got[k]
             if not v:
@@ -1016,7 +1016,7 @@ def render(t0: float, t1: float, wins: dict, rows: list[dict], book: dict,
             money = sum(depth_capped_win(d["ask"], d["size"], default_clip)
                         for _sl, d in cheap)
             add(f"  {name:<8}{len(v):>5}{len(v) - len(cheap):>9}{len(cheap):>13}"
-                f"{100.0 * len(cheap) / tot:>8.0f}%"
+                f"{100.0 * len(cheap) / len(v):>8.0f}%"
                 f"{_f(money, dollar=True):>26}")
         add("")
         for k, name in (("any", "A ANY"), ("late", "B LATE"), ("knew", "C KNEW")):
