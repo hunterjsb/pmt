@@ -11,7 +11,7 @@ import datetime
 from collections import defaultdict
 
 SYMS = ["btc", "eth", "sol", "bnb", "xrp"]
-VARIANTS = ["base", "rtds_liveguard", "rtds_streamguard"]
+VARIANTS = ["base", "rtds_liveguard", "rtds_streamguard", "rtds_floorguard"]
 WARMUP_S = 7200.0
 
 
@@ -75,6 +75,7 @@ def row(name, t, base=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", required=True)
+    ap.add_argument("--outcomes", default=str(pathlib.Path.home() / ".pmt/corpus/outcomes.jsonl"))
     args = ap.parse_args()
     work = pathlib.Path(args.work)
     meta = json.load(open(work / "meta.json"))
@@ -132,7 +133,7 @@ def main():
     print("| symbol | truth | variant | clips | notional $ | pnl $ |")
     print("|---|---|---|---|---|---|")
     outcomes = {}
-    for line in open(pathlib.Path.home() / ".pmt/corpus/outcomes.jsonl"):
+    for line in open(args.outcomes):
         d = json.loads(line)
         outcomes[d["slug"]] = d["winner"]
     for sym in SYMS:
@@ -166,6 +167,79 @@ def main():
         print(f"| `{slug}` | {z(t)} | {outcomes.get(slug,'?')} | "
               f"{rb['sim']['fires']} / {rb['sim'].get('pnl') or 0.0:+.2f} | "
               f"{rv['sim']['fires']} / {rv['sim'].get('pnl') or 0.0:+.2f} | {d:+.2f} |")
+
+    print("\n## Every losing window, by variant\n")
+    print("The fleet wins ~95% of the windows it enters, so the P&L is decided "
+          "by the few it loses. This is that list.\n")
+    print("| variant | losing windows | total loss $ | winning windows | total win $ |")
+    print("|---|---|---|---|---|")
+    for v in VARIANTS:
+        losers, winners = [], []
+        for sym in SYMS:
+            for slug, r in data[(sym, v)].items():
+                pnl = r["sim"].get("pnl")
+                if not r["sim"]["fires"] or pnl is None:
+                    continue
+                (losers if pnl < -1e-9 else winners).append((pnl, slug))
+        losers.sort()
+        print(f"| {v} | {len(losers)} | {sum(p for p, _ in losers):+.2f} | "
+              f"{len(winners)} | {sum(p for p, _ in winners):+.2f} |")
+    print()
+    for v in VARIANTS:
+        losers = []
+        for sym in SYMS:
+            for slug, r in data[(sym, v)].items():
+                pnl = r["sim"].get("pnl")
+                if r["sim"]["fires"] and pnl is not None and pnl < -1e-9:
+                    losers.append((pnl, slug))
+        losers.sort()
+        s = ", ".join(f"`{slug}` {z(float(slug.rsplit('-',1)[1]))} {p:+.0f}"
+                      for p, slug in losers)
+        print(f"- **{v}**: {s}")
+
+    print("\n## Robustness of the per-symbol Δnet\n")
+    print("The A/B is one day and the P&L is concentrated. For each variant: how "
+          "many windows moved at all, how the paired per-window Δ splits by sign, "
+          "and what Δnet becomes with the single largest-|Δ| window dropped.\n")
+    print("| symbol | variant | windows moved | Δ>0 | Δ<0 | Δnet | Δnet less top mover |")
+    print("|---|---|---|---|---|---|---|")
+    for sym in SYMS:
+        for v in VARIANTS[1:]:
+            ds = []
+            for slug, rb in data[(sym, "base")].items():
+                rv = data[(sym, v)].get(slug)
+                if not rv:
+                    continue
+                d = (rv["sim"].get("pnl") or 0.0) - (rb["sim"].get("pnl") or 0.0)
+                if abs(d) > 1e-6:
+                    ds.append(d)
+            tot = sum(ds)
+            top = max(ds, key=abs) if ds else 0.0
+            print(f"| {sym} | {v} | {len(ds)} | {sum(1 for d in ds if d > 0)} | "
+                  f"{sum(1 for d in ds if d < 0)} | {tot:+.2f} | {tot - top:+.2f} |")
+
+    print("\n## Refusal census (every graded 5m window, stream-fed)\n")
+    for name in ("census-rtds", "census-base"):
+        path = work / f"stderr-{name}.txt"
+        if not path.exists():
+            continue
+        noparams = defaultdict(int)
+        corpus = defaultdict(int)
+        for line in open(path):
+            if "skipping" not in line:
+                continue
+            slug = line.split("skipping '")[1].split("'")[0]
+            sym = slug.split("-")[0]
+            dur = slug.split("-")[2]
+            if "no --params entry" in line:
+                noparams[(sym, dur)] += 1
+            else:
+                corpus[sym] += 1
+        print(f"- **{name}** — out of scope (no params entry): "
+              f"{sum(noparams.values())} "
+              f"[{', '.join(f'{k[0]} {k[1]}: {v}' for k, v in sorted(noparams.items()))}]")
+        print(f"  - refused for want of corpus: {sum(corpus.values())} "
+              f"[{', '.join(f'{k}: {v}' for k, v in sorted(corpus.items()))}]")
 
     print("\n## Sim vs live (baseline fidelity check)\n")
     print("| symbol | live fires | sim fires | live notional | sim notional |")

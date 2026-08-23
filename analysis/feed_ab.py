@@ -64,11 +64,12 @@ def med(xs):
 # ---------------------------------------------------------------- corpus
 
 
-def load_corpus():
+def load_corpus(rtds_dir):
     """(samples, gaps). samples[sym][topic] = [(t_recv, ts_s, value)] sorted."""
-    files = sorted((CORPUS / "rtds").glob(RTDS_FILE_GLOB))
+    rtds_dir = pathlib.Path(rtds_dir)
+    files = sorted(rtds_dir.glob(RTDS_FILE_GLOB))
     if not files:
-        sys.exit(f"no {RTDS_FILE_GLOB} under {CORPUS/'rtds'}")
+        sys.exit(f"no {RTDS_FILE_GLOB} under {rtds_dir}")
     want_sym = set(RTDS_SYMBOL.values())
     samples = {s: {TOPIC_TWAP60: [], TOPIC_SPOT: []} for s in SYMS}
     inv = {v: k for k, v in RTDS_SYMBOL.items()}
@@ -398,6 +399,8 @@ def main():
     ap.add_argument("--book-tape", default=str(PMT / "engine" / "book-tape.jsonl"))
     ap.add_argument("--arms-state", default=str(PMT / "engine" / "arms-state.json"))
     ap.add_argument("--outcomes", default=str(CORPUS / "outcomes.jsonl"))
+    ap.add_argument("--rtds-dir", default=str(CORPUS / "rtds"))
+    ap.add_argument("--tape", default=str(PMT / "engine" / "updown-tape.jsonl"))
     ap.add_argument("--settle-tw", type=float, default=60.0)
     args = ap.parse_args()
 
@@ -405,7 +408,7 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
 
     print("[1/4] loading RTDS corpus ...", flush=True)
-    samples, gaps, lines, files = load_corpus()
+    samples, gaps, lines, files = load_corpus(args.rtds_dir)
     span, per_sym_span = corpus_span(samples)
     print(f"      {lines} line(s) over {len(files)} file(s); {len(gaps)} recorder gap(s), "
           f"{sum(g[2] for g in gaps):.0f}s total")
@@ -500,13 +503,23 @@ def main():
     for a in arms_state["arms"]:
         if "-updown-5m-" in a["slug"]:
             live_guard[a["slug"].split("-")[0]] = a["basis_guard_bp"]
-    size_tbl, firemax = as_armed_sizes(str(PMT / "engine" / "updown-tape.jsonl"))
+    size_tbl, firemax = as_armed_sizes(args.tape)
     clip_lvl = clip_by_size_level(size_tbl, firemax, arms_state)
 
+    # The noise measurement sets a FLOOR on the guard, not a target: it says
+    # how thin a margin the feed can no longer distinguish from nothing. It
+    # says nothing about whether a margin the feed CAN resolve is worth
+    # trading. So the third variant keeps the live guard wherever the live
+    # guard already clears the floor, and raises it to the floor where it
+    # does not — never looser than the measurement supports, and never
+    # looser than what is deployed today.
+    floor_guard = {s: max(stream_guard[s], live_guard.get(s, 0.0)) for s in SYMS}
+    print(f"      guard floor  (max(live, ceil p90)): {floor_guard}")
     variants = {
         "base": ("binance", None),
         "rtds_liveguard": ("rtds", None),
         "rtds_streamguard": ("rtds", stream_guard),
+        "rtds_floorguard": ("rtds", floor_guard),
     }
     armed = {}
     fleet = defaultdict(list)
@@ -552,6 +565,7 @@ def main():
         "gap_hit": {s: gap_hit[s] for s in SYMS},
         "guard_rows": guard_rows,
         "stream_guard": stream_guard,
+        "floor_guard": floor_guard,
         "live_guard": live_guard,
         "as_armed": armed,
         "settle_tw_s": args.settle_tw,
