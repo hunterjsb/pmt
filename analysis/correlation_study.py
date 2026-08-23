@@ -83,9 +83,18 @@ KLINES = os.path.join(CORPUS, "klines-1m-%s.jsonl")
 CACHE = os.environ.get("PMT_STUDY_CACHE", "/tmp/claude-1000/-var-home-hunter/"
                        "35f80f35-e0c9-4e4d-80ea-9c5602f70444/scratchpad/corrcache")
 
-# The incident.
+# The incident: all five fired DOWN, all settled UP (unanimous LOSS).
 INCIDENT_EPOCH = 1787505300
 INCIDENT_DUR = 300
+
+# The counter-example: 50 minutes later, eth and xrp both fired DOWN in one
+# epoch; eth settled DOWN (won), xrp flipped UP (lost). A SPLIT — the same
+# macro window resolving oppositely per symbol, because the terminal rule reads
+# each symbol's own final 30s. Operator-reported wallet P&L: eth +$8.50,
+# xrp -$23.20. This is the window that shows a same-side cap cannot tell a
+# winning leg from a losing one ex ante.
+SPLIT_EPOCH = 1787508300
+SPLIT_DUR = 300
 
 # Arms that actually trade 5m. doge/hype/zec are carried as correlation
 # instruments only — hype/zec are on the stream and have never been armed,
@@ -186,13 +195,28 @@ def is_post_theta(epoch):
 
 # ------------------------------------------------------------------ loaders
 
-def _cached(name, build):
+def _stamp(paths):
+    """(size, mtime) per source file. The corpora are APPEND-ONLY and live
+    (L33), so a cache keyed on the filename alone silently serves yesterday's
+    span — which is exactly how the 14:05 window first came back 'no stream
+    coverage' from a pickle written twenty minutes earlier."""
+    out = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+            out.append((p, st.st_size, int(st.st_mtime)))
+        except OSError:
+            out.append((p, -1, -1))
+    return tuple(out)
+
+
+def _cached(name, build, sources=()):
     path = "%s-%s.pkl" % (CACHE, name)
-    src_mtimes = None
+    stamp = _stamp(sources)
     try:
         with open(path, "rb") as fh:
             blob = pickle.load(fh)
-        if blob.get("v") == 3:
+        if blob.get("v") == 4 and blob.get("stamp") == stamp:
             return blob["data"]
     except Exception:
         pass
@@ -200,7 +224,7 @@ def _cached(name, build):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as fh:
-            pickle.dump({"v": 3, "data": data, "m": src_mtimes}, fh, -1)
+            pickle.dump({"v": 4, "data": data, "stamp": stamp}, fh, -1)
     except Exception:
         pass
     return data
@@ -234,7 +258,7 @@ def load_rtds():
                     vs.append(x)
             out[k] = (ts, vs)
         return out
-    return _cached("rtds", build)
+    return _cached("rtds", build, sources=(RTDS,))
 
 
 def load_klines():
@@ -256,7 +280,8 @@ def load_klines():
             ts = sorted(seen)
             out[sym] = (ts, [seen[t][0] for t in ts], [seen[t][1] for t in ts])
         return out
-    return _cached("klines", build)
+    return _cached("klines", build,
+                   sources=tuple(KLINES % v for v in sorted(KLINE_SYMS.values())))
 
 
 def load_outcomes():
@@ -522,6 +547,67 @@ def s1b_incident(ser):
             continue
         say("  %-5s range_avg %+8.2fbp   terminal %+8.2fbp   %s" %
             (sym, ra, t6, "SAME FLIP" if (ra < 0 < t6) else "-"))
+
+
+def s1c_split(ser, tape):
+    rule("S1c  THE COUNTER-EXAMPLE — a SPLIT in one epoch (14:05 local, 18:05Z)")
+    ep, dur = SPLIT_EPOCH, SPLIT_DUR
+    say("epoch %d (%s) = %sZ. eth and xrp BOTH fired DOWN in this one 5m window."
+        % (ep, era_of(ep), time.strftime("%H:%M:%S", time.gmtime(ep))))
+    say("")
+    say("%-6s %8s %11s %11s  %s" % ("sym", "fired", "range_avg", "terminal", "settled"))
+    fired = {}
+    for slug in sorted(tape):
+        r0 = tape[slug][0]
+        if r0["_epoch"] != ep or r0["_dur"] != "5m":
+            continue
+        fires = [r for r in tape[slug] if r.get("ev") == "fire"]
+        if not fires:
+            continue
+        sym = r0["_sym"]
+        side = fires[0]["side"]
+        ra = settle_margin(ser, sym, ep, dur, "range_avg")
+        t3 = settle_margin(ser, sym, ep, dur, "terminal")
+        if ra is None or t3 is None:
+            say("  %-6s %8s %11s %11s  (no stream coverage)" % (sym, side, "-", "-"))
+            continue
+        won = "up" if t3 > 0 else "down"
+        fired[sym] = (side, won, ra, t3, fires)
+        say("  %-6s %8s %+10.2fbp %+10.2fbp  %-4s  %s" %
+            (sym, side, ra, t3, won.upper(),
+             "WIN" if won == side else "LOSS"))
+    say("")
+    say("Same epoch, same fired side (DOWN), OPPOSITE settlements:")
+    say("  eth: range_avg DOWN, terminal DOWN  -> settled DOWN, WON.  (~+$8.50 wallet)")
+    say("  xrp: range_avg DOWN, terminal UP    -> settled UP,   LOST. (~-$23.20 wallet)")
+    say("")
+    say("xrp is the SAME failure as the 13:15 incident — range_avg and the")
+    say("terminal rule name different winners, and the terminal rule is right.")
+    say("eth simply did not hit that disagreement this time. The error is")
+    say("PER-SYMBOL: the terminal rule reads each symbol's own final 30s, so one")
+    say("macro-ish window settles DOWN for eth and UP for xrp.")
+    say("")
+    # fire order — the thing a same-side cap keys on
+    order = []
+    for sym, (side, won, ra, t3, fires) in fired.items():
+        order.append((fires[0]["t"], sym, won == side))
+    order.sort()
+    say("Fire order (what a same-side cap decides on):")
+    for t, sym, w in order:
+        say("  %+4.0fs  %-6s  %s" % (t - ep, sym, "WINNER" if w else "loser"))
+    if order and not order[0][2]:
+        say("")
+        say("  The FIRST-fired leg here is the LOSER (xrp). A 'keep first-fired,")
+        say("  cap the rest' same-side cap would have KEPT xrp and BLOCKED the")
+        say("  winning eth leg. A 'keep last-fired' cap would do the opposite —")
+        say("  but nothing in the fire order correlates with which leg wins, so")
+        say("  either rule is a coin flip on a split. The cap cannot tell them")
+        say("  apart ex ante, because ex ante they are one macro bet.")
+    say("")
+    say("13:15 and 14:05 bracket the whole tension: 13:15 is the perfect-")
+    say("correlation tail (all five wrong at once, a cap's best case) and 14:05")
+    say("is the split (a cap forfeits a real winner). S3h prices how often each")
+    say("shape actually occurs.")
 
 
 # ------------------------------------------------ S2 correlation structure
@@ -1520,6 +1606,164 @@ def s3f_fleet_cap(F, tape):
     say("because the positions had exempted themselves.")
 
 
+def s3h_splits(F):
+    """How often does a same-side pile SPLIT at settlement, and what does a cap
+    forfeit when it does? This is the 14:05 window generalised."""
+    rule("S3h  SPLITS — what a same-side cap forfeits, and how often")
+    say("A same-side PILE is one (epoch, side) with >=2 arms fired, every one of")
+    say("them graded. Three shapes at settlement:")
+    say("  unanimous WIN  — every leg won. A cap here forfeits pure profit.")
+    say("  unanimous LOSS — every leg lost. A cap here is pure saving. (13:15)")
+    say("  SPLIT          — at least one win AND at least one loss. (14:05)")
+    say("A cap is blind to which shape it is in: ex ante all three look like the")
+    say("same thing, N arms agreeing on a side.")
+    say("")
+    for scope, filt in (("all eras", lambda e: True), ("post-theta", is_post_theta)):
+        piles = collections.defaultdict(list)
+        for w in F.windows.values():
+            if w["dur"] != "5m" or not filt(w["epoch"]):
+                continue
+            piles[(w["epoch"], w["side"])].append(w)
+        multi = [(k, g) for k, g in piles.items()
+                 if len(g) >= 2 and all(x["winner"] for x in g)]
+        if not multi:
+            continue
+        shapes = {"win": [], "loss": [], "split": []}
+        for k, g in multi:
+            wins = [x for x in g if x["winner"] == x["side"]]
+            loss = [x for x in g if x["winner"] != x["side"]]
+            shapes["split" if (wins and loss) else
+                   ("win" if wins else "loss")].append((k, g, wins, loss))
+        n = len(multi)
+        say("--- %s: %d same-side multi-arm piles" % (scope, n))
+        say("  %-18s %6s %8s %13s %13s" %
+            ("shape", "piles", "share", "winning legs $", "losing legs $"))
+        for lab, key in (("unanimous WIN", "win"), ("unanimous LOSS", "loss"),
+                         ("SPLIT", "split")):
+            rowsx = shapes[key]
+            wp = sum(x["pnl"] for _, _, wins, _ in rowsx for x in wins)
+            lp = sum(x["pnl"] for _, _, _, loss in rowsx for x in loss)
+            say("  %-18s %6d %7.0f%% %+13.2f %+13.2f" %
+                (lab, len(rowsx), 100 * len(rowsx) / n, wp, lp))
+        say("  SPLIT FRACTION: %d/%d = %.0f%%" %
+            (len(shapes["split"]), n, 100 * len(shapes["split"]) / n))
+        if shapes["split"]:
+            say("")
+            say("  every split, and what a cap would have forfeited on it:")
+            for k, g, wins, loss in sorted(shapes["split"], key=lambda x: x[0][0]):
+                mark = "  <<< 14:05" if k[0] == SPLIT_EPOCH else ""
+                say("    epoch %d %-4s  WIN[%s] %+.2f   LOSS[%s] %+.2f%s" %
+                    (k[0], k[1], ",".join(x["sym"] for x in wins),
+                     sum(x["pnl"] for x in wins),
+                     ",".join(x["sym"] for x in loss),
+                     sum(x["pnl"] for x in loss), mark))
+        say("")
+    say("THE POINT THE SPLIT FRACTION MAKES IS NOT THE SPLIT FRACTION.")
+    say("Splits are a minority. The dominant shape is unanimous WIN — ~90% of")
+    say("same-side piles — and a cap forfeits profit on every one of those too.")
+    say("Splits merely make the blindness vivid: in the 14:05 pile the two legs")
+    say("fired on identical evidence and settled opposite ways, so no ex-ante")
+    say("rule keyed on 'how many arms agree' could have kept one and dropped the")
+    say("other. The cap's whole case rests on the unanimous-LOSS row, which is")
+    say("ONE pile in the post-theta corpus.")
+    say("")
+    say("--- the same-side cap ledger, decomposed (post-theta 5m)")
+    say("  Splitting the counterfactual into what it GIVES UP and what it SAVES,")
+    say("  instead of reporting only the net (which hides that both are large).")
+    say("")
+    piles = collections.defaultdict(list)
+    for w in F.windows.values():
+        if w["dur"] != "5m" or not is_post_theta(w["epoch"]) or not w["winner"]:
+            continue
+        piles[(w["epoch"], w["side"])].append(w)
+    say("  %-24s %13s %12s %11s %9s" %
+        ("cap", "forfeit wins", "avoid loss", "net", "arms cut"))
+    for N in (1, 2, 3, 4):
+        fwin = aloss = 0.0
+        cut = 0
+        from_unan = 0.0
+        for k, g in piles.items():
+            gg = sorted(g, key=lambda x: x["clips"][0]["t"])
+            losers_present = any(x["winner"] != x["side"] for x in gg)
+            for x in gg[N:]:
+                cut += 1
+                if x["winner"] == x["side"]:
+                    fwin += x["pnl"]
+                    if not losers_present:
+                        from_unan += x["pnl"]
+                else:
+                    aloss += -x["pnl"]
+        say("  max %-20d %+13.2f %+12.2f %+11.2f %9d" %
+            (N, -fwin, aloss, aloss - fwin, cut))
+    say("")
+    say("  'forfeit wins' is money the cap hands back on legs that went on to")
+    say("  win. It is real and it is not small. The net looks positive only")
+    say("  because ONE unanimous-loss pile (13:15) supplies the entire")
+    say("  'avoid loss' column — see the attribution under S5.")
+
+
+def s3i_what_predicts_the_loss(F, ser):
+    """The 14:05 split generalised: does 'how many arms agree' predict a loss,
+    or does 'range_avg disagrees with the terminal rule' predict it?"""
+    rule("S3i  WHAT ACTUALLY PREDICTS A LOSING LEG")
+    say("14:05 split the two legs along the settle-rule disagreement, not along")
+    say("anything about the fleet:")
+    say("    eth  range_avg -8.64bp / terminal -1.77bp   AGREE     -> WON")
+    say("    xrp  range_avg -6.80bp / terminal +7.36bp   DISAGREE  -> LOST")
+    say("Testing that across every fired, graded window the stream covers.")
+    say("")
+    rows = []
+    for w in F.windows.values():
+        if not w["winner"] or w["fill"] <= 0:
+            continue
+        ra = settle_margin(ser, w["sym"], w["epoch"], w["dursec"], "range_avg")
+        te = settle_margin(ser, w["sym"], w["epoch"], w["dursec"], "terminal")
+        if ra is None or te is None:
+            continue
+        rows.append((w, (ra > 0) != (te > 0), w["winner"] != w["side"]))
+    if not rows:
+        return
+    n = len(rows)
+    tp = sum(1 for _, d, l in rows if d and l)
+    fp = sum(1 for _, d, l in rows if d and not l)
+    fn = sum(1 for _, d, l in rows if not d and l)
+    tn = sum(1 for _, d, l in rows if not d and not l)
+    say("  n = %d fired+filled+graded windows inside the stream span" % n)
+    say("")
+    say("  %-30s %10s %10s" % ("", "LOST", "won"))
+    say("  %-30s %10d %10d" % ("rules DISAGREE on this window", tp, fp))
+    say("  %-30s %10d %10d" % ("rules agree", fn, tn))
+    say("")
+    losses = tp + fn
+    if losses:
+        say("  of %d losing windows, %d (%.0f%%) are rule disagreements" %
+            (losses, tp, 100 * tp / losses))
+    if tp + fp:
+        say("  of %d disagreement windows, %d (%.0f%%) lost" %
+            (tp + fp, tp, 100 * tp / (tp + fp)))
+    say("  $ lost on disagreement windows : %+.2f" %
+        sum(w["pnl"] for w, d, l in rows if d))
+    say("  $ made on agreement windows    : %+.2f" %
+        sum(w["pnl"] for w, d, l in rows if not d))
+    say("")
+    say("READ THIS CAREFULLY — it is partly TAUTOLOGICAL and saying so is the")
+    say("point. We fire the side range_avg names; the terminal rule decides the")
+    say("payout; so 'the rules disagree' and 'we lost' are close to the same")
+    say("event by construction. That is not a predictive model — it is a")
+    say("LOCALISATION. It says every dollar of loss in this corpus lives in the")
+    say("rule mismatch and none of it lives anywhere else, which is precisely")
+    say("what a fleet-level correlation brake does not address.")
+    say("")
+    say("The open question the tautology leaves is the only one that matters:")
+    say("is the disagreement visible EARLY ENOUGH to act on? Policy (e) below")
+    say("answers no for the raw mid-window terminal margin (CI-significantly")
+    say("negative — the settlement TWAP has not formed yet, so the signal is a")
+    say("single noisy print). That is exactly why the candidate is hybrid's")
+    say("CUSHION — stop issuing `banked_decided` until the settlement TWAP")
+    say("starts locking — and not a terminal-rule entry signal. Do not confuse")
+    say("the two: one withholds a false certificate, the other trades on noise.")
+
+
 def s5_policies(F, ser, groups, lo_s, hi_s, grid, Ngrid):
     rule("S5  Q4 — POLICY COUNTERFACTUALS")
     say("Every row: which windows change, the notional the policy REFUSES, the")
@@ -1808,11 +2052,14 @@ def main():
 
     s1_settle_rule(ser, oc)
     s1b_incident(ser)
+    s1c_split(ser, tape)
     rows, keep5, cols5, f5, srows = s2_correlation(kl, ser, oc)
     F = Fires(tape, oc, ser)
     groups = s3_concentration(F)
     s3e_case_study(F, tape, ser)
     s3f_fleet_cap(F, tape)
+    s3h_splits(F)
+    s3i_what_predicts_the_loss(F, ser)
     catalog, lo_s, hi_s, grid, Ngrid = s4_impulses(ser)
     s5_policies(F, ser, groups, lo_s, hi_s, grid, Ngrid)
     rule("done in %.1fs" % (time.time() - t0))

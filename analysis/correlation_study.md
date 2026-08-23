@@ -7,10 +7,26 @@ this study clears the bar — the only two CI-significant rows in the whole
 policy table are NEGATIVE, and every positive point estimate is the incident
 window wearing a policy's name.**
 
+**The 14:05 split settles the ranking.** Correlation is high but not lockstep:
+same epoch, same fired side, eth won and xrp lost — and they split precisely
+along whether each symbol's `range_avg` matched its own terminal margin. Across
+the corpus that separation is perfect (6/6 losses are rule disagreements, 92/92
+wins are agreements). **The defect is per-symbol settlement-rule correctness, not
+fleet-level correlation**, and a cap keyed on "how many arms agree" is blind to
+the axis that actually decides the outcome — in the one split we can inspect, its
+only tiebreak (fire order) keeps the loser.
+
 Trigger: window epoch `1787505300` (2026-08-23 17:15:00Z, 5m). All five 5m arms
 (btc/eth/sol/xrp/bnb) fired DOWN on banked evidence; a macro impulse in the
 final ~90s carried every one of them to an UP settlement. ~$230 gone at once,
 107-win streak over.
+
+**Second data point, 50 minutes later**, epoch `1787508300` (18:05Z / 14:05
+local): eth and xrp both fired DOWN in one epoch and settled **opposite ways** —
+eth DOWN (won, ~+$8.50), xrp UP (lost, ~−$23.20). A *split*. It is the direct
+counter-example to a same-side cap, and it splits along the settle-rule
+disagreement rather than along anything about the fleet. §Result 1b and §Result
+2b.
 
 Driver: `analysis/correlation_study.py`. Full output:
 `analysis/correlation_study.txt`. Read-only over `~/.pmt`; no engine, no orders,
@@ -25,16 +41,18 @@ filenames meaningless on their own:
 
 | instrument | span | size |
 |---|---|---|
-| `updown-tape.jsonl` | 1787436137 → 1787507705 (19.9h) | 912 slugs, 267 fired, 1163 clips |
+| `updown-tape.jsonl` | 1787436137 → 1787510330 (20.6h) | 961 slugs, 274 fired, 1177 clips |
 | `outcomes.jsonl` (L36-clean) | epochs 1787436000 → 1787501100 | 734 graded (222 wallet / 376 book / 136 chainlink) |
-| `rtds-20260823.jsonl` | 08:28:54 → 17:39:36Z (9.18h) | 8 symbols × 3 topics, ~0.9Hz |
+| `rtds-20260823.jsonl` | 08:28:54 → 18:38:50Z (10.2h) | 8 symbols × 3 topics, ~0.9Hz |
 | `klines-1m-*.jsonl` | 2026-05-25 → 2026-08-23 (90.0d) | 6 symbols, 25,927 complete 5m windows |
 
-L33 bit while this was being written: the live tape grew from 889 to 912 slugs
-between the first run of the driver and the last. The tables below are all from
-the final run, and none of the new slugs is in the policy population (they post-
-date the incident and are ungraded). A study that needs to be quoted rather than
-re-run should point `TAPE` at a frozen copy first.
+**L33 bit hard twice while this was being written.** The live tape grew from 889
+to 961 slugs across runs; the tables below are all from the final run. Worse, the
+driver's own parse cache was keyed on filename alone, so the 14:05 window first
+came back *"no stream coverage"* off a pickle written twenty minutes earlier —
+a study reading an append-only corpus can be stale against itself. `_cached` now
+keys on (path, size, mtime) and rebuilds when the corpus moves. A study that
+needs to be *quoted* rather than re-run should point at a frozen copy first.
 
 The tape **stops at t=1787505516, elapsed_frac 0.72 of the incident window** —
 the engine stopped writing before the window closed. The 80% and 100% evals the
@@ -47,7 +65,7 @@ engine's `committed` tracker between a fire and the next observation of
 `r7_fleet_cap.py`'s convention and it exists because fire sizes lie: that study
 found a $2,500 xrp fire at ask 0.01 that never moved `committed` past $106.58.
 A clip that never filled is worth zero to every policy here and cannot flatter
-one. Reconstructed against the tracker's own per-window peak: n=240, median
+one. Reconstructed against the tracker's own per-window peak: n=247, median
 delta −$0.17.
 
 **Valuation.** Hold-to-settlement, gross of fees, identical on every variant, so
@@ -122,6 +140,45 @@ impulse was macro.**
 
 ---
 
+## Result 1b — the 14:05 split, and why it kills the cap
+
+Epoch `1787508300` (18:05Z). eth and xrp **both fired DOWN**:
+
+| sym | fired | range_avg | terminal | settled | |
+|---|---|---|---|---|---|
+| eth | down | −8.64bp | **−1.77bp** | DOWN | **WIN** (~+$8.50) |
+| xrp | down | −6.80bp | **+7.36bp** | UP | **LOSS** (~−$23.20) |
+
+Same epoch, same fired side, same evidence class, **opposite settlements**.
+
+xrp is the 13:15 failure in miniature — range_avg and the terminal rule name
+different winners and the terminal rule is right. eth simply did not hit that
+disagreement this time. **The error is per-symbol**: the terminal rule reads each
+symbol's *own* final 30 seconds, so one broadly-correlated window still settles
+DOWN for eth and UP for xrp.
+
+**Fire order — the only thing a same-side cap can key on:**
+
+```
++221s  xrp     loser      <- fired FIRST
++248s  eth     WINNER
+```
+
+A "keep first-fired, cap the rest" same-side cap would have **kept the losing xrp
+leg and blocked the winning eth leg** — strictly worse than doing nothing. A
+"keep last-fired" cap inverts that, but nothing in the fire order correlates with
+which leg wins, so either tiebreak is a coin flip. **The cap cannot tell the legs
+apart ex ante, because ex ante they are one macro bet — and the thing that
+separates them ex post is a per-symbol rule mismatch the cap never looks at.**
+
+13:15 and 14:05 bracket the entire tension: 13:15 is the perfect-correlation tail
+(the cap's best case) and 14:05 is the split (the cap forfeits a real winner).
+Result 2b prices how often each shape actually occurs. Note also that all five
+14:05 clips fired at elapsed 0.74–0.93 in `safe` mode on the *late* unlock, not
+the banked_decided one — so policy (f) correctly leaves this window alone.
+
+---
+
 ## Result 1 — Q1: the correlation, and it is enormous
 
 **90 days, 25,927 complete 5m windows, 6 symbols, Pearson on settlement margin
@@ -190,13 +247,13 @@ common factor is the market, not the symbol selection.
 
 | same-side arms | epochs | windows | wins | hit rate | P&L | $filled | $/window |
 |---|---|---|---|---|---|---|---|
-| 1 | 72 | 74 | 70 | 94.6% | −306.07 | 3,345 | −4.14 |
-| 2 | 38 | 74 | 73 | 98.6% | +274.81 | 4,731 | +3.71 |
-| 3 | 18 | 54 | 51 | 94.4% | −31.06 | 3,894 | −0.58 |
+| 1 | 73 | 75 | 71 | 94.7% | −292.48 | 3,504 | −3.90 |
+| 2 | 42 | 82 | 80 | 97.6% | +273.54 | 5,078 | +3.34 |
+| 3 | 19 | 57 | 54 | 94.7% | −26.11 | 3,962 | −0.46 |
 | 4 | **2** | 8 | 7 | 87.5% | +107.97 | 1,015 | +13.50 |
 | 5 | **2** | 10 | 5 | 50.0% | −209.05 | 411 | −20.90 |
 
-**Count the episodes, not the windows.** In 19.3h of tape there are **two**
+**Count the episodes, not the windows.** In 20.6h of tape there are **two**
 four-arm epochs and **two** five-arm epochs. One five-arm epoch won all five
 (1787499300); one lost all five (the incident). The 50% hit rate in that row is
 `n=2`. No threshold may be fitted to it — this is the L37 shape, caught before
@@ -206,14 +263,14 @@ it became a knob.
 
 | population | windows | hit rate | P&L | $/window | worst window |
 |---|---|---|---|---|---|
-| solo (1 arm this side) | 43 | 100.0% | +117.16 | +2.72 | +0.00 |
-| 2 same side | 38 | 100.0% | +180.01 | +4.74 | +0.00 |
-| 3 same side | 33 | 93.9% | −117.24 | −3.55 | −114.94 |
+| solo (1 arm this side) | 44 | 100.0% | +130.74 | +2.97 | +0.00 |
+| 2 same side | 46 | 97.8% | +178.74 | +3.89 | −13.76 |
+| 3 same side | 36 | 94.4% | −112.29 | −3.12 | −114.94 |
 | ≥4 same side | 14 | 64.3% | −180.93 | −12.92 | −173.94 |
 
-Solo 100% vs concentrated 91.8% — a −8.2pp gap, **permutation p = 0.098, not
+Solo 100% vs concentrated 91.7% — a −8.3pp gap, **permutation p = 0.056, not
 distinguishable from noise at this n.** The hit rate is the wrong statistic
-anyway (L27): the money runs monotonically from +$2.72/window solo to
+anyway (L27): the money runs monotonically from +$2.97/window solo to
 −$12.92/window at ≥4 same side, and only the concentrated rows have a worst-case
 worth naming.
 
@@ -225,14 +282,14 @@ monotonically, and not significantly.**
 Buy $1 at price p. Win → +$(1−p)/p. Lose → −$1. Refusing is +EV exactly when the
 loss probability q exceeds **q\* = 1 − p**.
 
-Fill-weighted entry price on post-theta 5m clips: **p = 0.934 → q\* = 6.6%.**
+Fill-weighted entry price on post-theta 5m clips: **p = 0.935 → q\* = 6.5%.**
 
 | population | windows | losses | loss rate | vs q* |
 |---|---|---|---|---|
-| 1 arm same side | 43 | 0 | 0.0% | below |
-| 2 arms | 38 | 0 | 0.0% | below |
-| 3 arms | 33 | 2 | 6.1% | below (at it) |
-| **≥4 arms** | 14 | 5 | **35.7%** | **ABOVE, 5.4×** |
+| 1 arm same side | 44 | 0 | 0.0% | below |
+| 2 arms | 46 | 1 | 2.2% | below |
+| 3 arms | 36 | 2 | 5.6% | below (at it) |
+| **≥4 arms** | 14 | 5 | **35.7%** | **ABOVE, 5.5×** |
 
 The gradient is monotone and crosses break-even **exactly at N=4**. A cap at
 N≤3 would destroy value; a cap at N=4 has the right shape. What is missing is n:
@@ -285,6 +342,87 @@ window. Sound arithmetic about the wrong number.
 
 ---
 
+## Result 2b — splits: what a same-side cap forfeits, and how often
+
+A **same-side pile** is one (epoch, side) with ≥2 arms fired and every leg graded.
+Three shapes at settlement, and a cap is blind to which one it is in — ex ante all
+three look identical, N arms agreeing on a side.
+
+| shape | piles | share | winning legs $ | losing legs $ |
+|---|---|---|---|---|
+| **all eras (63 piles)** | | | | |
+| unanimous WIN | 57 | **90%** | +703.25 | 0.00 |
+| unanimous LOSS | 1 | 2% | 0.00 | −220.41 |
+| SPLIT | 5 | **8%** | +158.77 | −504.59 |
+| **post-theta (38 piles)** | | | | |
+| unanimous WIN | 35 | **92%** | +337.75 | 0.00 |
+| unanimous LOSS | 1 | 3% | 0.00 | −220.41 |
+| SPLIT | 2 | **5%** | +7.30 | −239.11 |
+
+**Split fraction: 5% post-theta (2/38), 8% all-eras (5/63).**
+
+Every split, with what a cap forfeits on it:
+
+```
+1787444700 up    WIN[btc]         +1.25    LOSS[eth]      -97.68
+1787449200 down  WIN[btc,eth]    +29.10    LOSS[xrp]     -126.54
+1787449500 up    WIN[btc,eth,sol]+121.12   LOSS[xrp]      -41.27
+1787462100 down  WIN[btc]         +4.04    LOSS[eth,sol] -225.35
+1787508300 down  WIN[eth]         +3.25    LOSS[xrp]      -13.76   <<< 14:05
+```
+
+**The point the split fraction makes is not the split fraction.** Splits are a
+minority and their forfeited winnings are small (+$7.30 post-theta). The
+*dominant* shape is **unanimous WIN — 90-92% of all same-side piles** — and a cap
+forfeits profit on every one of those too. Splits merely make the blindness
+vivid: in the 14:05 pile the two legs fired on identical evidence and settled
+opposite ways, so no ex-ante rule keyed on "how many arms agree" could have kept
+one and dropped the other.
+
+### The cap ledger, decomposed (post-theta 5m)
+
+Reporting only the net hides that both sides are large:
+
+| cap | forfeit wins | avoid loss | net | arms cut |
+|---|---|---|---|---|
+| max 1 same-side arm | **−173.83** | +330.07 | +156.24 | 58 |
+| max 2 | **−53.51** | +195.99 | +142.48 | 20 |
+| max 3 | −3.33 | +191.44 | +188.10 | 5 |
+| max 4 | −2.08 | +17.49 | +15.41 | 2 |
+
+`forfeit wins` is money handed back on legs that went on to win — real, and at
+tighter caps not small. And the entire `avoid loss` column is **one pile**: at
+max-3 the +191.44 saved *is* the 13:15 incident, exactly (attribution under
+Result 5). Strip that one window and every cap in this table is negative.
+
+## Result 2c — what actually predicts a losing leg
+
+The 14:05 split generalised across all 98 fired + filled + graded windows the
+stream covers:
+
+| | LOST | won |
+|---|---|---|
+| range_avg and terminal **DISAGREE** | **6** | 0 |
+| rules agree | 0 | **92** |
+
+**All 6 losses are rule disagreements. All 92 wins are rule agreements. Perfect
+separation.** −$234.17 on disagreement windows; +$392.43 on agreement windows.
+
+This is **partly tautological and saying so is the point**: we fire the side
+range_avg names, the terminal rule decides the payout, so "the rules disagree"
+and "we lost" are nearly the same event by construction. It is not a predictive
+model — it is a **localisation**. It says every dollar of loss in this corpus
+lives in the rule mismatch and none lives anywhere else, which is precisely what
+a fleet-level correlation brake does not address.
+
+The open question the tautology leaves is the only one that matters: *is the
+disagreement visible early enough to act on?* Policy (e) answers **no** for the
+raw mid-window terminal margin (CI-significantly negative — the settlement TWAP
+has not formed, so the signal is one noisy print). That is exactly why the
+candidate is hybrid's **cushion** — stop issuing `banked_decided` until the
+settlement TWAP starts locking — and not a terminal-rule entry signal. One
+withholds a false certificate; the other trades on noise.
+
 ## Result 3 — the fleet cap could not have stopped this at any cap value
 
 The cap was armed. It is not `PMENGINE_MAX_TOTAL_EXPOSURE` — it is
@@ -304,7 +442,7 @@ moment `last_banked_decided` is set. **A banked-decided arm neither counts
 against the cap nor can be capped by it.** eth had been banked_decided since
 elapsed 0.51 and was carrying **zero** against the cap while it grew to $169.
 
-Across the whole tape, **464 fires / $11,240 of intended notional (38%) were
+Across the whole tape, **468 fires / $11,454 of intended notional (39%) were
 fired while banked_decided** — structurally invisible to the cap.
 
 So "the fleet cap never addressed same-side concentration" understates it.
@@ -376,24 +514,24 @@ means one epoch exceeds the whole result and everything else nets against it.
 
 | policy | eps ch | $refused | net delta | CI95 | top |
 |---|---|---|---|---|---|
-| **(a)** same-side cap max 1 | 33 | 2,711 | +163.59 | [−211, +712] | 132% |
-| **(a)** same-side cap max 2 | 14 | 766 | +142.60 | [−116, +570] | 137% |
+| **(a)** same-side cap max 1 | 38 | 2,993 | +156.24 | [−221, +713] | 138% |
+| **(a)** same-side cap max 2 | 15 | 772 | +142.48 | [−119, +572] | 138% |
 | **(a)** same-side cap max 3 | 3 | 300 | +188.10 | [−9.6, +574] | **102%** |
 | **(a)** same-side cap max 4 | 2 | 67 | +15.41 | [−6.2, +52] | 113% |
-| **(a$)** $100/epoch | 19 | 2,976 | +100.17 | [−217, +532] | 140% |
+| **(a$)** $100/epoch | 21 | 3,187 | +93.73 | [−229, +520] | 149% |
 | **(a$)** $300/epoch | 5 | 509 | −0.00 | [−54, +66] | — |
-| **(b)** $100 cap, banked EXEMPT (as built) | 4 | 248 | **−28.65** | **[−68.2, −1.70]** | 48% |
-| **(b)** $100 cap, no exemption | 19 | 2,976 | +100.17 | [−217, +532] | 140% |
+| **(b)** $100 cap, banked EXEMPT (as built) | 4 | 248 | **−28.65** | **[−69.0, −1.70]** | 48% |
+| **(b)** $100 cap, no exemption | 21 | 3,187 | +93.73 | [−229, +520] | 149% |
 | **(b)** $350 cap, no exemption | 1 | 237 | −14.34 | [−43, +0] | 100% |
-| **(c)** btc veto T=20s Y=4bp | 9 | 276 | +38.05 | [−96, +223] | 203% |
-| **(c)** btc veto T=30s Y=4bp | 11 | 497 | +50.46 | [−142, +332] | 243% |
-| **(c)** btc veto T=60s Y=2bp | 22 | 1,679 | −7.60 | [−310, +417] | 2337% |
-| **(d)** corr≥0.50 → clip ×0 | 51 | 4,648 | −138.23 | [−509, +393] | 159% |
+| **(c)** btc veto T=20s Y=4bp | 10 | 331 | +41.97 | [−91, +226] | 184% |
+| **(c)** btc veto T=30s Y=4bp | 12 | 657 | +47.21 | [−148, +330] | 260% |
+| **(c)** btc veto T=60s Y=2bp | 25 | 1,912 | −8.71 | [−312, +421] | 2041% |
+| **(d)** corr≥0.50 → clip ×0 | 57 | 5,222 | −155.50 | [−525, +382] | 142% |
 | **(d)** corr≥0.85 → clip ×0 | 3 | 48 | +28.32 | [−1.5, +87] | 102% |
-| **(e)** terminal-margin gate ≥0bp | 2 | 179 | −63.47 | [−181, +0] | 85% |
-| **(e)** terminal-margin gate ≥5bp | 7 | 388 | **−103.16** | **[−254, −5.0]** | 59% |
-| **(f)** no banked_decided-only unlock | 4 | 275 | **+71.33** | [−17.7, +234] | 110% |
-| **(f2)** banked-only unlock at half size | 4 | 138 | +35.66 | [−8.9, +117] | 110% |
+| **(e)** terminal-margin gate ≥0bp | 3 | 179 | −63.47 | [−181, +0] | 85% |
+| **(e)** terminal-margin gate ≥5bp | 8 | 498 | **−105.40** | **[−257, −7.0]** | 58% |
+| **(f)** no banked_decided-only unlock | 4 | 275 | **+71.33** | [−18.2, +235] | 110% |
+| **(f2)** banked-only unlock at half size | 4 | 138 | +35.66 | [−9.1, +117] | 110% |
 
 **Not one positive row's CI excludes zero. The only two CI-significant rows in
 the entire table are negative:** the same-side cap *as the engine would actually
@@ -408,15 +546,17 @@ terminal-margin gate at 5bp at **−$103.16 [−254, −5.0]**.
     epoch 1787499300   stream     -3.18
     epoch 1787486700   stream     -0.15
 
-(a) same-side cap: max 2 arms   net +142.60, top epoch = 137% of it
+(a) same-side cap: max 2 arms   net +142.48, top epoch = 138% of it
     epoch 1787505300   stream   +195.99   <<< THE INCIDENT
     epoch 1787493900   stream    -35.08
     epoch 1787462400   theta      -4.66
     ...
 
-(f) no banked_decided-only unlock  [stream era]  net +77.74, top = 101%
+(f) no banked_decided-only unlock  [post-theta]  net +71.33, top = 110%
     epoch 1787505300   stream    +78.40   <<< THE INCIDENT
+    epoch 1787465700   theta      -5.91
     epoch 1787504700   stream     -0.66
+    epoch 1787462400   theta      -0.50
 ```
 
 **Every positive same-side-cap number in this study is the incident window and
@@ -469,7 +609,7 @@ macro, and `banked_decided` — the certificate that both passes the theta gate 
 belongs in LESSONS regardless of what ships.
 
 **3. The fleet cap's `banked_decided` exemption is a real structural hole and
-the cheapest thing to look at next.** 38% of all fired notional was invisible to
+the cheapest thing to look at next.** 39% of all fired notional was invisible to
 the cap. Removing the exemption is a **tightening** and would be deployable on
 that basis — except that measured here it is not worth anything ((b) "no
 exemption" rows are +$100 [−217, +532] and −$14 [−43, +0], i.e. noise), and
@@ -477,7 +617,15 @@ leaving the exemption in place while capping is **CI-significantly negative**.
 So: do not arm the cap against same-side piles on this evidence. Do note in the
 code that the exemption's soundness is inherited entirely from `settle_rule`.
 
-**4. Re-run the hybrid A/B. This is the recommendation with the most behind it.**
+**4. Re-run the hybrid A/B — the per-symbol settlement-rule fix. This is the
+recommendation with the most behind it, and the 14:05 split strengthened it.**
+The split is the cleanest available demonstration that the defect is per-symbol
+and not fleet-level: one epoch, two arms, identical evidence, and the leg that
+lost is exactly the leg whose range_avg disagreed with its own terminal margin.
+Generalised (Result 2c) that separation is perfect on this corpus — 6/6 losses
+are rule disagreements, 92/92 wins are agreements. A fleet-level correlation
+brake cannot see that axis at all; a per-symbol settle-rule correction is the
+axis.
 `hybrid_ab.md` parked hybrid because "the minute-grain per_min feed sees the
 forming 60s settlement TWAP as ONE sample — the lock is invisible until the
 wire. **Sub-minute RTDS feed is the unlock.**" That feed shipped on 2026-08-23 at
@@ -487,12 +635,28 @@ size of the prize. This **needs a replay A/B** — it replaces a gate's arithmet
 — run as `pmengine replay --mode full` over a frozen corpus, `settle_rule`
 range_avg vs hybrid, bootstrap over epochs, the `r7_fleet_ab.py` shape.
 
-**5. A same-side concentration cap at N=4 is the right shape and the wrong time.**
-The break-even arithmetic (q\* = 6.6% vs 35.7% observed at ≥4 same side) says a
-cap would pay if that loss rate is real. Three epochs cannot establish that it
-is. **Do not deploy. Do instrument**: the tape already carries everything needed
-to count same-side piles per epoch, so the count can accumulate at zero risk
-until the row has an n worth reading. Revisit at ≥20 four-arm epochs.
+**5. A same-side concentration cap is now REFUSED, not merely unproven — the
+14:05 split downgraded it.** Before that window the honest reading was "right
+shape, wrong time": the break-even arithmetic (q\* = 6.5% vs 35.7% observed at ≥4
+same-side) said a cap would pay *if* that loss rate were real, and three epochs
+could not establish it. The split adds a mechanism-level objection that no amount
+of extra n repairs:
+
+- A cap keys on **how many arms agree**. What separates a winning leg from a
+  losing one is **whether that symbol's range_avg matches its own terminal
+  margin** — a per-symbol quantity the cap never looks at (Result 2c: 6/6 losses
+  are rule disagreements, 92/92 wins are agreements, perfect separation).
+- In the one split we can inspect at clip level, the cap's only available
+  tiebreak — fire order — **points the wrong way**: xrp fired first and lost, eth
+  fired second and won, so "keep first-fired" keeps the loser.
+- 90–92% of same-side piles are **unanimous wins**, so the cap's normal operating
+  mode is forfeiting profit (−$173.83 at max-1 post-theta), and its entire
+  positive column is one pile.
+
+**Do not deploy, and do not queue it behind more data either** — a bigger n makes
+the loss-rate estimate sharper without making the cap able to distinguish the
+legs. Keep counting same-side piles as free instrumentation, but the decision
+rule to revisit is Result 2c's separation, not the four-arm loss rate.
 
 **6. Kill the leader-veto idea.** There is no leader. Every cross-correlation
 peaks at k=0 in both directions and every measured warning window is at or below
@@ -534,7 +698,7 @@ is parameterised on exactly that width.
 > windows**, and range_avg is the one that is wrong. Second, `banked_decided` is
 > arithmetic over range_avg, and a banked-decided arm is *exempt* from the fleet
 > cap by construction (`fleet_bound = if m.banked_decided { INFINITY }`;
-> `undecided_committed` returns 0.0). 38% of all fired notional was therefore
+> `undecided_committed` returns 0.0). 39% of all fired notional was therefore
 > invisible to the cap. The largest position in the event had been banked_decided
 > since elapsed 0.51 and carried **zero** against the cap while it grew to $169.
 > (`fleet_room` on that arm's last eval: 483 of 500.)
@@ -546,14 +710,30 @@ is parameterised on exactly that width.
 > the fleet has arms, and that the one gate sized to ration fleet-wide exposure
 > hands out an exemption keyed on that same model.
 >
+> Fifty minutes later the same day, one epoch settled BOTH ways: eth and xrp both
+> fired DOWN, eth won and xrp lost. That split is the control the incident lacked.
+> The two legs carried identical fleet-level evidence and separated on a
+> per-symbol quantity — xrp's range_avg disagreed with xrp's own terminal margin,
+> eth's did not. Across every fired, filled, graded window the stream covers, that
+> separation is perfect: **6 of 6 losses are rule disagreements, 92 of 92 wins are
+> agreements.**
+>
 > **Changed:** nothing yet — deliberately. Every same-side concentration cap
 > priced against the recorded tape (`analysis/correlation_study.md`) turns out to
 > be this one window wearing a policy's name: the best row is +$188 of which
 > +$191 is the incident and the remainder is negative, and the only
-> CI-significant rows in the whole table are negative. The lesson recorded here
-> is the mismatch, not a knob. The actionable follow-up is the hybrid A/B that
-> `hybrid_ab.md` parked for want of a sub-minute feed — the RTDS stream removed
-> that blocker on the same day this window traded.
+> CI-significant rows in the whole table are negative. The split then shows the
+> cap could not work even with more data — 90% of same-side piles are unanimous
+> WINS, so its normal operating mode is forfeiting profit, and its only tiebreak
+> (fire order) kept the LOSING leg in the one split we can inspect. The lesson
+> recorded here is the mismatch, not a knob. The actionable follow-up is the
+> hybrid A/B that `hybrid_ab.md` parked for want of a sub-minute feed — the RTDS
+> stream removed that blocker on the same day this window traded.
+>
+> **Also changed (tooling):** the study's own parse cache was keyed on filename
+> alone and served a stale pickle for the 14:05 window, reporting "no stream
+> coverage" for data that was on disk. A cache over an append-only corpus must
+> key on (path, size, mtime). L33 applies to analysis caches, not just to tapes.
 
 ---
 

@@ -23,8 +23,8 @@ loading ...
   rtds series   24 (topic,symbol) pairs
   klines        bnb:129776, btc:129787, doge:129641, eth:129785, sol:129782, xrp:129643
   outcomes      734 graded windows
-  tape          912 slugs, t 1787436137..1787507705
-  loaded in 0.6s
+  tape          961 slugs, t 1787436137..1787510330
+  loaded in 4.0s
 
 ==============================================================================
 S1  WHICH RULE ACTUALLY SETTLES THESE MARKETS
@@ -141,6 +141,41 @@ Non-fleet control symbols on the same stream (never armed):
   zec   range_avg   -15.55bp   terminal   +14.69bp   SAME FLIP
 
 ==============================================================================
+S1c  THE COUNTER-EXAMPLE — a SPLIT in one epoch (14:05 local, 18:05Z)
+==============================================================================
+epoch 1787508300 (stream) = 18:05:00Z. eth and xrp BOTH fired DOWN in this one 5m window.
+
+sym       fired   range_avg    terminal  settled
+  eth        down      -8.64bp      -1.77bp  DOWN  WIN
+  xrp        down      -6.80bp      +7.36bp  UP    LOSS
+
+Same epoch, same fired side (DOWN), OPPOSITE settlements:
+  eth: range_avg DOWN, terminal DOWN  -> settled DOWN, WON.  (~+$8.50 wallet)
+  xrp: range_avg DOWN, terminal UP    -> settled UP,   LOST. (~-$23.20 wallet)
+
+xrp is the SAME failure as the 13:15 incident — range_avg and the
+terminal rule name different winners, and the terminal rule is right.
+eth simply did not hit that disagreement this time. The error is
+PER-SYMBOL: the terminal rule reads each symbol's own final 30s, so one
+macro-ish window settles DOWN for eth and UP for xrp.
+
+Fire order (what a same-side cap decides on):
+  +221s  xrp     loser
+  +248s  eth     WINNER
+
+  The FIRST-fired leg here is the LOSER (xrp). A 'keep first-fired,
+  cap the rest' same-side cap would have KEPT xrp and BLOCKED the
+  winning eth leg. A 'keep last-fired' cap would do the opposite —
+  but nothing in the fire order correlates with which leg wins, so
+  either rule is a coin flip on a split. The cap cannot tell them
+  apart ex ante, because ex ante they are one macro bet.
+
+13:15 and 14:05 bracket the whole tension: 13:15 is the perfect-
+correlation tail (all five wrong at once, a cap's best case) and 14:05
+is the split (a cap forfeits a real winner). S3h prices how often each
+shape actually occurs.
+
+==============================================================================
 S2  Q1 — CORRELATION STRUCTURE
 ==============================================================================
 --- S2a  kline proxy calibration (does the 1m proxy grade like the corpus?)
@@ -248,50 +283,50 @@ doge    0.762  0.782  0.790  0.787  0.738  1.000
   Same quantity computed the way the market settles (terminal 60s TWAP),
   including hype/zec which the fleet has NEVER armed — if they move with
   the fleet the driver is macro, not anything about our symbol picks.
-  n = 103 5m windows, 8.6h of stream
+  n = 113 5m windows, 9.4h of stream
 
   Pearson r, terminal-rule margin (bp):
            btc     eth     sol     xrp     bnb    doge    hype     zec
-btc    +1.00 +0.80 +0.88 +0.80 +0.86 +0.83 +0.62 +0.40
-eth    +0.80 +1.00 +0.86 +0.72 +0.83 +0.74 +0.57 +0.43
-sol    +0.88 +0.86 +1.00 +0.77 +0.84 +0.81 +0.72 +0.42
-xrp    +0.80 +0.72 +0.77 +1.00 +0.80 +0.81 +0.56 +0.38
-bnb    +0.86 +0.83 +0.84 +0.80 +1.00 +0.77 +0.58 +0.40
-doge   +0.83 +0.74 +0.81 +0.81 +0.77 +1.00 +0.56 +0.48
-hype   +0.62 +0.57 +0.72 +0.56 +0.58 +0.56 +1.00 +0.31
-zec    +0.40 +0.43 +0.42 +0.38 +0.40 +0.48 +0.31 +1.00
+btc    +1.00 +0.81 +0.87 +0.79 +0.85 +0.83 +0.62 +0.41
+eth    +0.81 +1.00 +0.85 +0.71 +0.82 +0.74 +0.56 +0.42
+sol    +0.87 +0.85 +1.00 +0.77 +0.83 +0.81 +0.71 +0.42
+xrp    +0.79 +0.71 +0.77 +1.00 +0.79 +0.81 +0.56 +0.39
+bnb    +0.85 +0.82 +0.83 +0.79 +1.00 +0.77 +0.56 +0.40
+doge   +0.83 +0.74 +0.81 +0.81 +0.77 +1.00 +0.56 +0.49
+hype   +0.62 +0.56 +0.71 +0.56 +0.56 +0.56 +1.00 +0.33
+zec    +0.41 +0.42 +0.42 +0.39 +0.40 +0.49 +0.33 +1.00
 
   P(same settlement direction):
            btc     eth     sol     xrp     bnb    doge    hype     zec
-btc     1.000  0.883  0.883  0.767  0.845  0.845  0.728  0.748
-eth     0.883  1.000  0.864  0.786  0.825  0.825  0.728  0.728
-sol     0.883  0.864  1.000  0.767  0.845  0.825  0.748  0.728
-xrp     0.767  0.786  0.767  1.000  0.864  0.786  0.670  0.670
-bnb     0.845  0.825  0.845  0.864  1.000  0.845  0.689  0.709
-doge    0.845  0.825  0.825  0.786  0.845  1.000  0.709  0.670
-hype    0.728  0.728  0.748  0.670  0.689  0.709  1.000  0.631
-zec     0.748  0.728  0.728  0.670  0.709  0.670  0.631  1.000
+btc     1.000  0.876  0.885  0.761  0.841  0.823  0.717  0.735
+eth     0.876  1.000  0.867  0.761  0.823  0.805  0.717  0.699
+sol     0.885  0.867  1.000  0.752  0.850  0.814  0.726  0.708
+xrp     0.761  0.761  0.752  1.000  0.850  0.779  0.673  0.673
+bnb     0.841  0.823  0.850  0.850  1.000  0.841  0.681  0.699
+doge    0.823  0.805  0.814  0.779  0.841  1.000  0.699  0.681
+hype    0.717  0.717  0.726  0.673  0.681  0.699  1.000  0.646
+zec     0.735  0.699  0.708  0.673  0.699  0.681  0.646  1.000
 
-  fleet-internal mean |r|   : 0.816
-  fleet-vs-never-armed |r|  : 0.508   (hype/zec)
+  fleet-internal mean |r|   : 0.810
+  fleet-vs-never-armed |r|  : 0.505   (hype/zec)
 
 ==============================================================================
 S3  Q2 — CONCENTRATION EPISODES ON THE TAPE
 ==============================================================================
-fired windows: 267   clips: 1163   filled $22810.71   reconstructed P&L $-610.75
-grading sources: {'wallet': 222, 'chainlink': 13, 'ungraded': 9, 'book': 7, 'rtds_terminal': 16}
+fired windows: 274   clips: 1177   filled $23160.49   reconstructed P&L $-593.48
+grading sources: {'wallet': 222, 'chainlink': 13, 'ungraded': 4, 'book': 7, 'rtds_terminal': 28}
 
 Fill reconstruction check (per window, tracker peak vs summed clips):
-  n=240  median delta $-0.17  p90 |delta| $50.23
+  n=247  median delta $-0.17  p90 |delta| $50.23
   (a clip credited with more than the tracker ever held would be a
    fabricated fill; the summed clips track the tracker's own peak.)
 
 --- S3a  same-epoch, same-duration concentration
 
 dur    N arms groups  windows     wins   hit rate        P&L  $filled
-5m     1         68       67       64      95.5%    -296.52     3043
-5m     2         40       76       74      97.4%    +246.38     4892
-5m     3         18       51       49      96.1%      +6.63     3118
+5m     1         69       68       65      95.6%    -282.94     3202
+5m     2         43       84       81      96.4%    +245.12     5239
+5m     3         18       54       52      96.3%     +11.58     3186
 5m     4          4       16       14      87.5%     +89.16     1931
 5m     5          2       10        5      50.0%    -209.05      411
 15m    1         13       12        9      75.0%    -430.81     2527
@@ -301,9 +336,9 @@ dur    N arms groups  windows     wins   hit rate        P&L  $filled
 --- S3b  SAME-SIDE concentration (the quantity the fleet cap never saw)
 
 dur    same-side  groups  windows     wins   hit rate         P&L    $filled  $/window
-5m     1 arms         72       74       70      94.6%     -306.07       3345     -4.14
-5m     2 arms         38       74       73      98.6%     +274.81       4731      3.71
-5m     3 arms         18       54       51      94.4%      -31.06       3894     -0.58
+5m     1 arms         73       75       71      94.7%     -292.48       3504     -3.90
+5m     2 arms         42       82       80      97.6%     +273.54       5078      3.34
+5m     3 arms         19       57       54      94.7%      -26.11       3962     -0.46
 5m     4 arms          2        8        7      87.5%     +107.97       1015     13.50
 5m     5 arms          2       10        5      50.0%     -209.05        411    -20.90
 15m    1 arms         13       14       10      71.4%     -433.77       2673    -30.98
@@ -312,8 +347,8 @@ dur    same-side  groups  windows     wins   hit rate         P&L    $filled  $/
 
   HOW THIN THIS IS. Count the EPISODES, not the windows — a five-arm
   epoch is one draw of one macro factor, not five:
-    1 arms same side:  70 epochs in the whole tape
-    2 arms same side:  39 epochs in the whole tape
+    1 arms same side:  71 epochs in the whole tape
+    2 arms same side:  42 epochs in the whole tape
     3 arms same side:  19 epochs in the whole tape
     4 arms same side:   2 epochs in the whole tape
     5 arms same side:   2 epochs in the whole tape
@@ -325,20 +360,20 @@ dur    same-side  groups  windows     wins   hit rate         P&L    $filled  $/
   5m windows only, post-theta only (the decision basis).
 
   population             windows    wins   hit rate          P&L    $/window
-  solo (1 arm this side)      43      43     100.0%      +117.16        2.72
-  2 same side                 38      38     100.0%      +180.01        4.74
-  3 same side                 33      31      93.9%      -117.24       -3.55
+  solo (1 arm this side)      44      44     100.0%      +130.74        2.97
+  2 same side                 46      45      97.8%      +178.74        3.89
+  3 same side                 36      34      94.4%      -112.29       -3.12
   >=4 same side               14       9      64.3%      -180.93      -12.92
 
-  solo hit 100.0%  vs  concentrated hit 91.8%   (delta -8.2 pp)
-  permutation p (two-sided, labels shuffled, 20k reps): 0.098
+  solo hit 100.0%  vs  concentrated hit 91.7%   (delta -8.3 pp)
+  permutation p (two-sided, labels shuffled, 20k reps): 0.056
   -> the hit-rate difference is NOT distinguishable from noise at this n
 
   Note the direction the MONEY runs, which the hit rate hides (L27):
                             $/window worst window
-  solo (1 arm this side)       +2.72       +0.00
-  2 same side                  +4.74       +0.00
-  3 same side                  -3.55     -114.94
+  solo (1 arm this side)       +2.97       +0.00
+  2 same side                  +3.89      -13.76
+  3 same side                  -3.12     -114.94
   >=4 same side               -12.92     -173.94
 
 --- S3g  WHAT WOULD JUSTIFY A CAP AT ALL (the arithmetic, not the n=2)
@@ -353,13 +388,13 @@ dur    same-side  groups  windows     wins   hit rate         P&L    $filled  $/
   excess loss rate to pay. It is also why the hit-rate table above is
   the wrong statistic to decide on.
 
-  fill-weighted entry price on post-theta 5m clips: p = 0.934
-  -> break-even loss rate q* = 6.6%
+  fill-weighted entry price on post-theta 5m clips: p = 0.935
+  -> break-even loss rate q* = 6.5%
 
   population                windows   losses  loss rate        vs q*
-  1 arms same side               43        0       0.0%        below
-  2 arms same side               38        0       0.0%        below
-  3 arms same side               33        2       6.1%        below
+  1 arms same side               44        0       0.0%        below
+  2 arms same side               46        1       2.2%        below
+  3 arms same side               36        2       5.6%        below
   4 arms same side +             14        5      35.7%        ABOVE
 
   So the SHAPE of the case for a cap is sound — >=4-same-side is far
@@ -389,7 +424,7 @@ dur    same-side  groups  windows     wins   hit rate         P&L    $filled  $/
   1787493900   down       3     262.08      +42.42 stream    
   1787484900   up         3     240.89      +16.45 stream    
 
-  total same-side 5m notional across the tape: $13639 in 137 (epoch,side) piles
+  total same-side 5m notional across the tape: $13989 in 141 (epoch,side) piles
 
 ==============================================================================
 S3e  THE 17:15Z EVENT — EVIDENCE TRAIL
@@ -448,10 +483,10 @@ S3f  WHY THE FLEET CAP DID NOT SEE ANY OF THIS
 ==============================================================================
 `fleet_room` appears on an eval only when a cap is armed
 (updown.rs:1489-1492). Reconstructing the cap from the tape:
-  8072 eval rows carry fleet_room; first t=1787482412, last t=1787507464
+  8778 eval rows carry fleet_room; first t=1787482412, last t=1787510330
   inferred cap (un-decided committed + fleet_room), most common:
     $350    on 2718 ticks
-    $500    on 304 ticks
+    $500    on 533 ticks
     $345    on 50 ticks
     $301    on 30 ticks
   minimum fleet_room ever observed: $0.00
@@ -468,8 +503,8 @@ rations UN-decided dollars, and `banked_decided` is computed under
 range_avg — the rule S1 shows is wrong on ~1 window in 8.
 
 How much of the fleet's fired notional was invisible to the cap:
-  banked_decided=True    464 fires, $   11240 intended notional (38%)
-  banked_decided=False   673 fires, $   16890 intended notional (58%)
+  banked_decided=True    468 fires, $   11454 intended notional (39%)
+  banked_decided=False   683 fires, $   17031 intended notional (58%)
   banked_decided=None     26 fires, $    1081 intended notional (4%)
 
 The incident's five arms, at their last recorded eval:
@@ -490,22 +525,119 @@ it. The cap could not have addressed this event at ANY cap value,
 because the positions had exempted themselves.
 
 ==============================================================================
+S3h  SPLITS — what a same-side cap forfeits, and how often
+==============================================================================
+A same-side PILE is one (epoch, side) with >=2 arms fired, every one of
+them graded. Three shapes at settlement:
+  unanimous WIN  — every leg won. A cap here forfeits pure profit.
+  unanimous LOSS — every leg lost. A cap here is pure saving. (13:15)
+  SPLIT          — at least one win AND at least one loss. (14:05)
+A cap is blind to which shape it is in: ex ante all three look like the
+same thing, N arms agreeing on a side.
+
+--- all eras: 63 same-side multi-arm piles
+  shape               piles    share winning legs $ losing legs $
+  unanimous WIN          57      90%       +703.25         +0.00
+  unanimous LOSS          1       2%         +0.00       -220.41
+  SPLIT                   5       8%       +158.77       -504.59
+  SPLIT FRACTION: 5/63 = 8%
+
+  every split, and what a cap would have forfeited on it:
+    epoch 1787444700 up    WIN[btc] +1.25   LOSS[eth] -97.68
+    epoch 1787449200 down  WIN[btc,eth] +29.10   LOSS[xrp] -126.54
+    epoch 1787449500 up    WIN[btc,eth,sol] +121.12   LOSS[xrp] -41.27
+    epoch 1787462100 down  WIN[btc] +4.04   LOSS[eth,sol] -225.35
+    epoch 1787508300 down  WIN[eth] +3.25   LOSS[xrp] -13.76  <<< 14:05
+
+--- post-theta: 38 same-side multi-arm piles
+  shape               piles    share winning legs $ losing legs $
+  unanimous WIN          35      92%       +337.75         +0.00
+  unanimous LOSS          1       3%         +0.00       -220.41
+  SPLIT                   2       5%         +7.30       -239.11
+  SPLIT FRACTION: 2/38 = 5%
+
+  every split, and what a cap would have forfeited on it:
+    epoch 1787462100 down  WIN[btc] +4.04   LOSS[eth,sol] -225.35
+    epoch 1787508300 down  WIN[eth] +3.25   LOSS[xrp] -13.76  <<< 14:05
+
+THE POINT THE SPLIT FRACTION MAKES IS NOT THE SPLIT FRACTION.
+Splits are a minority. The dominant shape is unanimous WIN — ~90% of
+same-side piles — and a cap forfeits profit on every one of those too.
+Splits merely make the blindness vivid: in the 14:05 pile the two legs
+fired on identical evidence and settled opposite ways, so no ex-ante
+rule keyed on 'how many arms agree' could have kept one and dropped the
+other. The cap's whole case rests on the unanimous-LOSS row, which is
+ONE pile in the post-theta corpus.
+
+--- the same-side cap ledger, decomposed (post-theta 5m)
+  Splitting the counterfactual into what it GIVES UP and what it SAVES,
+  instead of reporting only the net (which hides that both are large).
+
+  cap                       forfeit wins   avoid loss         net  arms cut
+  max 1                          -173.83      +330.07     +156.24        58
+  max 2                           -53.51      +195.99     +142.48        20
+  max 3                            -3.33      +191.44     +188.10         5
+  max 4                            -2.08       +17.49      +15.41         2
+
+  'forfeit wins' is money the cap hands back on legs that went on to
+  win. It is real and it is not small. The net looks positive only
+  because ONE unanimous-loss pile (13:15) supplies the entire
+  'avoid loss' column — see the attribution under S5.
+
+==============================================================================
+S3i  WHAT ACTUALLY PREDICTS A LOSING LEG
+==============================================================================
+14:05 split the two legs along the settle-rule disagreement, not along
+anything about the fleet:
+    eth  range_avg -8.64bp / terminal -1.77bp   AGREE     -> WON
+    xrp  range_avg -6.80bp / terminal +7.36bp   DISAGREE  -> LOST
+Testing that across every fired, graded window the stream covers.
+
+  n = 98 fired+filled+graded windows inside the stream span
+
+                                       LOST        won
+  rules DISAGREE on this window           6          0
+  rules agree                             0         92
+
+  of 6 losing windows, 6 (100%) are rule disagreements
+  of 6 disagreement windows, 6 (100%) lost
+  $ lost on disagreement windows : -234.17
+  $ made on agreement windows    : +392.43
+
+READ THIS CAREFULLY — it is partly TAUTOLOGICAL and saying so is the
+point. We fire the side range_avg names; the terminal rule decides the
+payout; so 'the rules disagree' and 'we lost' are close to the same
+event by construction. That is not a predictive model — it is a
+LOCALISATION. It says every dollar of loss in this corpus lives in the
+rule mismatch and none of it lives anywhere else, which is precisely
+what a fleet-level correlation brake does not address.
+
+The open question the tautology leaves is the only one that matters:
+is the disagreement visible EARLY ENOUGH to act on? Policy (e) below
+answers no for the raw mid-window terminal margin (CI-significantly
+negative — the settlement TWAP has not formed yet, so the signal is a
+single noisy print). That is exactly why the candidate is hybrid's
+CUSHION — stop issuing `banked_decided` until the settlement TWAP
+starts locking — and not a terminal-rule entry signal. Do not confuse
+the two: one withholds a false certificate, the other trades on noise.
+
+==============================================================================
 S4  Q3 — THE IMPULSE CLASS, AND WHETHER ANYTHING LEADS
 ==============================================================================
-stream span 08:28:54 .. 17:39:36 UTC (9.18h), 8 symbols
+stream span 08:28:54 .. 18:38:49 UTC (10.17h), 8 symbols
 
-1Hz grid: 33042 seconds, 31882 with every symbol present (96.5%)
+1Hz grid: 36595 seconds, 35373 with every symbol present (96.7%)
 
 --- S4a  1Hz cross-correlation, contemporaneous
            btc     eth     sol     xrp     bnb    doge    hype     zec
-btc      1.000   0.680   0.650   0.540   0.598   0.581   0.267   0.286
-eth      0.680   1.000   0.680   0.579   0.613   0.616   0.277   0.291
-sol      0.650   0.680   1.000   0.634   0.600   0.664   0.326   0.329
-xrp      0.540   0.579   0.634   1.000   0.521   0.633   0.280   0.296
-bnb      0.598   0.613   0.600   0.521   1.000   0.563   0.277   0.254
-doge     0.581   0.616   0.664   0.633   0.563   1.000   0.290   0.309
-hype     0.267   0.277   0.326   0.280   0.277   0.290   1.000   0.231
-zec      0.286   0.291   0.329   0.296   0.254   0.309   0.231   1.000
+btc      1.000   0.677   0.645   0.539   0.592   0.574   0.267   0.275
+eth      0.677   1.000   0.678   0.580   0.609   0.612   0.278   0.285
+sol      0.645   0.678   1.000   0.636   0.595   0.662   0.325   0.323
+xrp      0.539   0.580   0.636   1.000   0.520   0.632   0.280   0.289
+bnb      0.592   0.609   0.595   0.520   1.000   0.557   0.276   0.246
+doge     0.574   0.612   0.662   0.632   0.557   1.000   0.288   0.302
+hype     0.267   0.278   0.325   0.280   0.276   0.288   1.000   0.224
+zec      0.275   0.285   0.323   0.289   0.246   0.302   0.224   1.000
 
   Even at ONE SECOND the fleet moves together: btc-eth 0.68, btc-sol
   0.65. hype/zec sit near 0.28 — lower, but a long way from zero for
@@ -516,23 +648,23 @@ zec      0.286   0.291   0.329   0.296   0.254   0.309   0.231   1.000
   r(btc_t-k , alt_t) for k = 0..10 seconds. A leader shows a peak at k>0.
 
   alt        k=0    k=1    k=2    k=3    k=4    k=5    k=6    k=7    k=8    k=9   k=10
-  eth      0.743  0.702  0.640  0.572  0.512  0.462  0.414  0.360  0.295  0.224  0.161   peak k=0
-  sol      0.758  0.710  0.639  0.565  0.498  0.440  0.381  0.317  0.246  0.174  0.112   peak k=0
-  xrp      0.625  0.581  0.523  0.463  0.410  0.364  0.321  0.276  0.226  0.173  0.128   peak k=0
-  bnb      0.752  0.719  0.657  0.588  0.522  0.460  0.400  0.336  0.265  0.193  0.130   peak k=0
-  doge     0.675  0.630  0.565  0.498  0.439  0.389  0.343  0.294  0.238  0.180  0.129   peak k=0
-  hype     0.466  0.459  0.437  0.408  0.377  0.340  0.300  0.257  0.210  0.164  0.124   peak k=0
-  zec      0.399  0.373  0.338  0.299  0.262  0.228  0.198  0.167  0.134  0.104  0.079   peak k=0
+  eth      0.742  0.701  0.638  0.570  0.510  0.459  0.410  0.355  0.290  0.221  0.158   peak k=0
+  sol      0.754  0.706  0.635  0.561  0.493  0.434  0.375  0.310  0.239  0.167  0.107   peak k=0
+  xrp      0.625  0.581  0.522  0.462  0.408  0.361  0.317  0.272  0.221  0.168  0.124   peak k=0
+  bnb      0.743  0.709  0.648  0.579  0.514  0.452  0.392  0.328  0.258  0.187  0.125   peak k=0
+  doge     0.669  0.625  0.561  0.493  0.435  0.385  0.338  0.289  0.233  0.175  0.125   peak k=0
+  hype     0.464  0.457  0.434  0.404  0.372  0.336  0.296  0.252  0.206  0.160  0.121   peak k=0
+  zec      0.394  0.367  0.330  0.292  0.254  0.220  0.188  0.157  0.124  0.094  0.071   peak k=0
 
   Symmetric check — does the ALT lead btc? r(alt_t-k, btc_t):
   alt        k=0    k=1    k=2    k=3    k=4    k=5    k=6    k=7    k=8    k=9   k=10
-  eth      0.743  0.711  0.653  0.588  0.530  0.479  0.430  0.372  0.306  0.236  0.170   peak k=0
-  sol      0.758  0.738  0.687  0.628  0.569  0.514  0.461  0.401  0.332  0.258  0.189   peak k=0
-  xrp      0.625  0.611  0.570  0.521  0.476  0.432  0.389  0.342  0.289  0.228  0.168   peak k=0
-  bnb      0.752  0.721  0.665  0.601  0.540  0.481  0.423  0.361  0.293  0.221  0.159   peak k=0
-  doge     0.675  0.655  0.611  0.562  0.517  0.473  0.430  0.380  0.320  0.254  0.192   peak k=0
-  hype     0.466  0.446  0.412  0.372  0.332  0.293  0.257  0.221  0.187  0.152  0.123   peak k=0
-  zec      0.399  0.392  0.367  0.336  0.304  0.274  0.242  0.208  0.169  0.129  0.089   peak k=0
+  eth      0.742  0.711  0.654  0.590  0.533  0.481  0.432  0.374  0.308  0.238  0.173   peak k=0
+  sol      0.754  0.734  0.685  0.626  0.568  0.512  0.458  0.398  0.330  0.256  0.187   peak k=0
+  xrp      0.625  0.610  0.570  0.522  0.476  0.432  0.389  0.342  0.288  0.227  0.167   peak k=0
+  bnb      0.743  0.712  0.657  0.595  0.535  0.476  0.419  0.357  0.290  0.220  0.158   peak k=0
+  doge     0.669  0.650  0.607  0.558  0.513  0.468  0.425  0.374  0.315  0.249  0.188   peak k=0
+  hype     0.464  0.445  0.411  0.372  0.332  0.294  0.257  0.222  0.187  0.152  0.123   peak k=0
+  zec      0.394  0.389  0.367  0.337  0.306  0.276  0.245  0.211  0.173  0.132  0.093   peak k=0
 
   VERDICT ON LEAD-LAG: there is no leader. Every pair peaks at k=0 and
   decays monotonically in BOTH directions, and the two directions are
@@ -549,11 +681,11 @@ zec      0.286   0.291   0.329   0.296   0.254   0.309   0.231   1.000
   >= X bp in the SAME direction. Counted on non-overlapping 10s starts.
 
   thresh     events   per hour in final 90s   of those 5-of-5 fleet
-  >=3     bp      710      77.36          213        30%            4
-  >=5     bp      435      47.39          123        28%            3
-  >=8     bp      216      23.53           63        29%            3
-  >=12    bp       92      10.02           25        27%            1
-  >=20    bp       23       2.51            5        22%            0
+  >=3     bp      791      77.81          235        30%            7
+  >=5     bp      479      47.12          136        28%            5
+  >=8     bp      237      23.31           70        30%            4
+  >=12    bp      100       9.84           28        28%            2
+  >=20    bp       23       2.26            5        22%            0
 
   'in final 90s' = the impulse landed inside the last 90s of a 5m window,
   which is the only place it can flip a terminal-TWAP settlement that the
@@ -582,13 +714,13 @@ zec      0.286   0.291   0.329   0.296   0.254   0.309   0.231   1.000
   first crosses +/-3bp of its 30s-trailing level.
 
   alt         n    median      mean       p25       p75
-  eth        84     -1.0s     -4.1s     -6.0s      0.0s
-  sol        85     -2.0s     -6.0s     -9.0s      0.0s
-  xrp        84     -4.0s     -8.9s    -17.0s      0.0s
-  bnb        79      0.0s     -1.6s     -4.0s      0.0s
-  doge       86     -5.0s     -7.7s    -15.0s      0.0s
-  hype       78      0.0s     -3.8s    -10.0s      1.0s
-  zec        83     -2.0s     -8.0s    -21.0s      0.0s
+  eth        89     -1.0s     -4.5s     -7.0s      0.0s
+  sol        90     -2.0s     -6.0s     -9.0s      0.0s
+  xrp        89     -5.0s     -8.9s    -17.0s      0.0s
+  bnb        84      0.0s     -1.6s     -4.0s      0.0s
+  doge       91     -5.0s     -7.8s    -17.0s      0.0s
+  hype       83      0.0s     -4.0s    -10.0s      1.0s
+  zec        88     -3.0s     -8.2s    -21.0s      0.0s
 
   Positive = btc crossed first, i.e. the alt arm would have had that many
   seconds of warning. A median at or below zero means there is no lead to
@@ -611,47 +743,47 @@ Charges taken, stated once:
   * A policy that blocks a clip does not change the book that clip would
     have traded in. Nobody can replay that.
 
-  --- all eras: 220 graded 5m windows, $13396 filled, base P&L -163.39
+  --- all eras: 232 graded 5m windows, $13970 filled, base P&L -146.12
   policy                             eps ch   $refused    net delta         bootstrap CI95   top
   ('top' = |largest single epoch| / |net delta|. Above 100% means one
    epoch exceeds the whole result and everything else nets against it
    — the policy is that epoch, not a policy.)
-  (a) same-side cap: max 1 arms          58       5271      +67.80  [ -384.40,  +684.44]  317% 
-  (a) same-side cap: max 2 arms          22       1681     +100.89  [ -185.46,  +558.05]  194% 
-  (a) same-side cap: max 3 arms           4        341     +229.37  [   -6.51,  +656.70]   83% 
+  (a) same-side cap: max 1 arms          63       5553      +60.45  [ -397.01,  +679.01]  356% 
+  (a) same-side cap: max 2 arms          23       1687     +100.77  [ -186.15,  +573.99]  194% 
+  (a) same-side cap: max 3 arms           4        341     +229.37  [   -6.51,  +656.85]   83% 
   (a) same-side cap: max 4 arms           2         67      +15.41  [   -6.24,   +52.48]  113% 
-  (a$) same-side cap: $50/epoch          74       9322     +353.33  [ -399.21, +1301.60]   84% 
-  (a$) same-side cap: $100/epoch         43       6459     +388.11  [ -274.85, +1241.81]   76% 
-  (a$) same-side cap: $150/epoch         32       4584     +363.67  [ -249.80, +1168.95]   81% 
-  (a$) same-side cap: $200/epoch         20       3146     +222.82  [ -275.80,  +977.87]  133% 
-  (a$) same-side cap: $300/epoch         11       1366      -42.10  [ -240.62,  +113.36]  175% 
-  (b) same-side cap $100, banked EXEMPT (as built)     12        853     +392.38  [  -80.34, +1147.40]   75% 
+  (a$) same-side cap: $50/epoch          79       9722     +335.65  [ -428.95, +1294.55]   88% 
+  (a$) same-side cap: $100/epoch         45       6670     +381.67  [ -286.64, +1245.04]   78% 
+  (a$) same-side cap: $150/epoch         34       4795     +357.23  [ -258.84, +1172.57]   83% 
+  (a$) same-side cap: $200/epoch         20       3146     +222.82  [ -273.98,  +970.05]  133% 
+  (a$) same-side cap: $300/epoch         11       1366      -42.10  [ -239.39,  +117.33]  175% 
+  (b) same-side cap $100, banked EXEMPT (as built)     12        853     +392.38  [  -80.59, +1147.49]   75% 
   (b) same-side cap $200, banked EXEMPT (as built)      1        296     +296.24  [   +0.00,  +888.72]  100% 
   (b) same-side cap $350, banked EXEMPT (as built)      0          0       -0.00  [   +0.00,    +0.00]     - 
-  (b) same-side cap $100, no exemption     43       6459     +388.11  [ -274.85, +1241.81]   76% 
-  (b) same-side cap $200, no exemption     20       3146     +222.82  [ -275.80,  +977.87]  133% 
-  (b) same-side cap $350, no exemption      5        827      -80.80  [ -247.42,   +16.84]   87% 
-  (c) btc veto T=20s Y=2bp               24       1391      +29.96  [ -175.99,  +360.65]  471% (212 clips in stream span)
-  (c) btc veto T=20s Y=4bp                9        276      +38.05  [  -94.14,  +224.02]  203% (212 clips in stream span)
-  (c) btc veto T=20s Y=8bp                2         18      -30.08  [  -89.95,    +0.00]   99% (212 clips in stream span)
-  (c) btc veto T=30s Y=2bp               23       1449       +6.42  [ -224.11,  +341.00] 2126% (212 clips in stream span)
-  (c) btc veto T=30s Y=4bp               11        497      +50.46  [ -141.17,  +333.00]  243% (212 clips in stream span)
-  (c) btc veto T=30s Y=8bp                3         28      -20.58  [  -89.65,   +27.89]  145% (212 clips in stream span)
-  (c) btc veto T=60s Y=2bp               22       1679       -7.60  [ -307.63,  +429.75] 2337% (212 clips in stream span)
-  (c) btc veto T=60s Y=4bp               15       1128      +19.77  [ -255.69,  +408.85]  805% (212 clips in stream span)
-  (c) btc veto T=60s Y=8bp                6        366      +21.97  [ -179.59,  +280.40]  473% (212 clips in stream span)
-  [trailing 15m mean pairwise fleet corr over the fired clips: p10 0.60 p50 0.70 p90 0.81, n=207]
-  (d) corr>=0.50 -> clip x0.5            51       2324      -69.11  [ -253.14,  +200.69]  159% 
-  (d) corr>=0.50 -> clip x0.0            51       4648     -138.23  [ -506.28,  +401.38]  159% 
-  (d) corr>=0.70 -> clip x0.5            31       1196       +5.74  [ -163.91,  +266.95] 1921% 
-  (d) corr>=0.70 -> clip x0.0            31       2392      +11.47  [ -327.82,  +533.90] 1921% 
+  (b) same-side cap $100, no exemption     45       6670     +381.67  [ -286.64, +1245.04]   78% 
+  (b) same-side cap $200, no exemption     20       3146     +222.82  [ -273.98,  +970.05]  133% 
+  (b) same-side cap $350, no exemption      5        827      -80.80  [ -246.63,   +17.03]   87% 
+  (c) btc veto T=20s Y=2bp               26       1610      +28.70  [ -183.74,  +366.78]  491% (239 clips in stream span)
+  (c) btc veto T=20s Y=4bp               10        331      +41.97  [  -91.14,  +230.17]  184% (239 clips in stream span)
+  (c) btc veto T=20s Y=8bp                2         18      -30.08  [  -89.95,    +0.00]   99% (239 clips in stream span)
+  (c) btc veto T=30s Y=2bp               27       1688       +3.46  [ -226.44,  +343.59] 3939% (239 clips in stream span)
+  (c) btc veto T=30s Y=4bp               12        657      +47.21  [ -146.40,  +355.83]  260% (239 clips in stream span)
+  (c) btc veto T=30s Y=8bp                3         28      -20.58  [  -89.65,   +27.89]  145% (239 clips in stream span)
+  (c) btc veto T=60s Y=2bp               25       1912       -8.71  [ -311.53,  +432.92] 2041% (239 clips in stream span)
+  (c) btc veto T=60s Y=4bp               16       1292      +21.44  [ -259.19,  +419.57]  742% (239 clips in stream span)
+  (c) btc veto T=60s Y=8bp                7        366      +21.97  [ -179.99,  +285.24]  473% (239 clips in stream span)
+  [trailing 15m mean pairwise fleet corr over the fired clips: p10 0.60 p50 0.70 p90 0.81, n=234]
+  (d) corr>=0.50 -> clip x0.5            57       2611      -77.75  [ -266.47,  +198.17]  142% 
+  (d) corr>=0.50 -> clip x0.0            57       5222     -155.50  [ -532.94,  +396.34]  142% 
+  (d) corr>=0.70 -> clip x0.5            35       1302       -1.10  [ -174.95,  +264.38] 10008% 
+  (d) corr>=0.70 -> clip x0.0            35       2604       -2.20  [ -349.90,  +528.77] 10008% 
   (d) corr>=0.85 -> clip x0.5             3         24      +14.16  [   -0.73,   +43.46]  102% 
   (d) corr>=0.85 -> clip x0.0             3         48      +28.32  [   -1.45,   +86.92]  102% 
-  (e) terminal-margin gate >= 0bp         2        179      -63.47  [ -180.86,    +0.00]   85% (207 clips in stream span)
-  (e) terminal-margin gate >= 2bp         3        212      -93.57  [ -239.67,    +0.00]   61% (207 clips in stream span)
-  (e) terminal-margin gate >= 5bp         7        388     -103.16  [ -254.33,    -4.64]   59% (207 clips in stream span)
-  (f) no banked_decided-only unlock      13        724      +94.23  [  -26.49,  +289.61]   83% (rem > 120s)
-  (f2) banked-only unlock at half size     13        362      +47.11  [  -13.24,  +144.80]   83% 
+  (e) terminal-margin gate >= 0bp         3        179      -63.47  [ -180.86,    +0.00]   85% (232 clips in stream span)
+  (e) terminal-margin gate >= 2bp         4        212      -93.57  [ -237.26,    +0.00]   61% (232 clips in stream span)
+  (e) terminal-margin gate >= 5bp         8        498     -105.40  [ -258.10,    -6.91]   58% (232 clips in stream span)
+  (f) no banked_decided-only unlock      13        724      +94.23  [  -26.39,  +292.24]   83% (rem > 120s)
+  (f2) banked-only unlock at half size     13        362      +47.11  [  -13.19,  +146.12]   83% 
 
   ATTRIBUTION — the epochs supplying each policy's delta. A policy whose
   number is one window is not a policy, it is that window (L37).
@@ -663,21 +795,21 @@ Charges taken, stated once:
       epoch 1787499900   stream        -13.85
       epoch 1787486700   stream        -11.10
 
-    (a$) same-side cap: $100/epoch   net +388.11, top epoch = 76% of it
+    (a$) same-side cap: $100/epoch   net +381.67, top epoch = 78% of it
       epoch 1787436000   pre-brake    +296.24
       epoch 1787436900   pre-brake    +152.88
       epoch 1787462100   theta        +139.78
       epoch 1787505300   stream       +127.35  <<< THE INCIDENT
       epoch 1787449500   pre-brake     -63.97
 
-    (b) same-side cap $100, no exemption   net +388.11, top epoch = 76% of it
+    (b) same-side cap $100, no exemption   net +381.67, top epoch = 78% of it
       epoch 1787436000   pre-brake    +296.24
       epoch 1787436900   pre-brake    +152.88
       epoch 1787462100   theta        +139.78
       epoch 1787505300   stream       +127.35  <<< THE INCIDENT
       epoch 1787449500   pre-brake     -63.97
 
-    (a$) same-side cap: $150/epoch   net +363.67, top epoch = 81% of it
+    (a$) same-side cap: $150/epoch   net +357.23, top epoch = 83% of it
       epoch 1787436000   pre-brake    +296.24
       epoch 1787436900   pre-brake    +152.88
       epoch 1787449500   pre-brake    -107.47
@@ -687,6 +819,7 @@ Charges taken, stated once:
     (e) terminal-margin gate >= 0bp   net -63.47, top epoch = 85% of it
       epoch 1787504400   stream        -53.93
       epoch 1787497500   stream         -9.54
+      epoch 1787508300   stream         +0.00
 
     (f) no banked_decided-only unlock   net +94.23, top epoch = 83% of it
       epoch 1787505300   stream        +78.40  <<< THE INCIDENT
@@ -695,46 +828,46 @@ Charges taken, stated once:
       epoch 1787450100   pre-brake      -4.71
       epoch 1787451000   pre-brake      -1.99
 
-  --- post-theta: 128 graded 5m windows, $6367 filled, base P&L -1.00
+  --- post-theta: 140 graded 5m windows, $6941 filled, base P&L +16.27
   policy                             eps ch   $refused    net delta         bootstrap CI95   top
   ('top' = |largest single epoch| / |net delta|. Above 100% means one
    epoch exceeds the whole result and everything else nets against it
    — the policy is that epoch, not a policy.)
-  (a) same-side cap: max 1 arms          33       2711     +163.59  [ -211.16,  +712.31]  132% 
-  (a) same-side cap: max 2 arms          14        766     +142.60  [ -115.66,  +570.48]  137% 
+  (a) same-side cap: max 1 arms          38       2993     +156.24  [ -221.30,  +712.99]  138% 
+  (a) same-side cap: max 2 arms          15        772     +142.48  [ -119.10,  +572.31]  138% 
   (a) same-side cap: max 3 arms           3        300     +188.10  [   -9.55,  +574.16]  102% 
   (a) same-side cap: max 4 arms           2         67      +15.41  [   -6.24,   +52.48]  113% 
-  (a$) same-side cap: $50/epoch          35       4428     +119.05  [ -276.80,  +672.30]  145% 
-  (a$) same-side cap: $100/epoch         19       2976     +100.17  [ -217.43,  +532.08]  140% 
-  (a$) same-side cap: $150/epoch         14       2011      +60.60  [ -120.71,  +308.10]  129% 
-  (a$) same-side cap: $200/epoch         11       1426      +41.25  [  -97.15,  +249.07]  205% 
-  (a$) same-side cap: $300/epoch          5        509       -0.00  [  -53.61,   +66.12] 1167310% 
-  (b) same-side cap $100, banked EXEMPT (as built)      4        248      -28.65  [  -68.21,    -1.70]   48% 
+  (a$) same-side cap: $50/epoch          40       4827     +101.37  [ -298.57,  +658.37]  171% 
+  (a$) same-side cap: $100/epoch         21       3187      +93.73  [ -228.64,  +520.27]  149% 
+  (a$) same-side cap: $150/epoch         16       2222      +54.16  [ -129.40,  +300.11]  145% 
+  (a$) same-side cap: $200/epoch         11       1426      +41.25  [  -98.07,  +254.00]  205% 
+  (a$) same-side cap: $300/epoch          5        509       -0.00  [  -53.61,   +66.15] 1167310% 
+  (b) same-side cap $100, banked EXEMPT (as built)      4        248      -28.65  [  -69.01,    -1.70]   48% 
   (b) same-side cap $200, banked EXEMPT (as built)      0          0       -0.00  [   +0.00,    +0.00]     - 
   (b) same-side cap $350, banked EXEMPT (as built)      0          0       -0.00  [   +0.00,    +0.00]     - 
-  (b) same-side cap $100, no exemption     19       2976     +100.17  [ -217.43,  +532.08]  140% 
-  (b) same-side cap $200, no exemption     11       1426      +41.25  [  -97.15,  +249.07]  205% 
+  (b) same-side cap $100, no exemption     21       3187      +93.73  [ -228.64,  +520.27]  149% 
+  (b) same-side cap $200, no exemption     11       1426      +41.25  [  -98.07,  +254.00]  205% 
   (b) same-side cap $350, no exemption      1        237      -14.34  [  -43.02,    +0.00]  100% 
-  (c) btc veto T=20s Y=2bp               24       1391      +29.96  [ -181.52,  +353.60]  471% (212 clips in stream span)
-  (c) btc veto T=20s Y=4bp                9        276      +38.05  [  -95.88,  +223.01]  203% (212 clips in stream span)
-  (c) btc veto T=20s Y=8bp                2         18      -30.08  [  -89.95,    +0.00]   99% (212 clips in stream span)
-  (c) btc veto T=30s Y=2bp               23       1449       +6.42  [ -220.14,  +331.84] 2126% (212 clips in stream span)
-  (c) btc veto T=30s Y=4bp               11        497      +50.46  [ -141.85,  +332.15]  243% (212 clips in stream span)
-  (c) btc veto T=30s Y=8bp                3         28      -20.58  [  -89.65,   +27.89]  145% (212 clips in stream span)
-  (c) btc veto T=60s Y=2bp               22       1679       -7.60  [ -310.23,  +417.09] 2337% (212 clips in stream span)
-  (c) btc veto T=60s Y=4bp               15       1128      +19.77  [ -260.26,  +404.09]  805% (212 clips in stream span)
-  (c) btc veto T=60s Y=8bp                6        366      +21.97  [ -180.62,  +279.55]  473% (212 clips in stream span)
-  (d) corr>=0.50 -> clip x0.5            51       2324      -69.11  [ -254.72,  +196.43]  159% 
-  (d) corr>=0.50 -> clip x0.0            51       4648     -138.23  [ -509.44,  +392.87]  159% 
-  (d) corr>=0.70 -> clip x0.5            31       1196       +5.74  [ -168.71,  +264.46] 1921% 
-  (d) corr>=0.70 -> clip x0.0            31       2392      +11.47  [ -337.42,  +528.91] 1921% 
+  (c) btc veto T=20s Y=2bp               26       1610      +28.70  [ -181.99,  +350.98]  491% (239 clips in stream span)
+  (c) btc veto T=20s Y=4bp               10        331      +41.97  [  -90.55,  +226.07]  184% (239 clips in stream span)
+  (c) btc veto T=20s Y=8bp                2         18      -30.08  [  -89.95,    +0.00]   99% (239 clips in stream span)
+  (c) btc veto T=30s Y=2bp               27       1688       +3.46  [ -226.76,  +329.40] 3939% (239 clips in stream span)
+  (c) btc veto T=30s Y=4bp               12        657      +47.21  [ -148.29,  +330.17]  260% (239 clips in stream span)
+  (c) btc veto T=30s Y=8bp                3         28      -20.58  [  -89.65,   +27.89]  145% (239 clips in stream span)
+  (c) btc veto T=60s Y=2bp               25       1912       -8.71  [ -311.61,  +421.35] 2041% (239 clips in stream span)
+  (c) btc veto T=60s Y=4bp               16       1292      +21.44  [ -258.04,  +405.60]  742% (239 clips in stream span)
+  (c) btc veto T=60s Y=8bp                7        366      +21.97  [ -179.99,  +279.51]  473% (239 clips in stream span)
+  (d) corr>=0.50 -> clip x0.5            57       2611      -77.75  [ -262.40,  +190.82]  142% 
+  (d) corr>=0.50 -> clip x0.0            57       5222     -155.50  [ -524.79,  +381.64]  142% 
+  (d) corr>=0.70 -> clip x0.5            35       1302       -1.10  [ -171.83,  +258.99] 10008% 
+  (d) corr>=0.70 -> clip x0.0            35       2604       -2.20  [ -343.65,  +517.97] 10008% 
   (d) corr>=0.85 -> clip x0.5             3         24      +14.16  [   -0.73,   +43.34]  102% 
   (d) corr>=0.85 -> clip x0.0             3         48      +28.32  [   -1.45,   +86.67]  102% 
-  (e) terminal-margin gate >= 0bp         2        179      -63.47  [ -180.86,    +0.00]   85% (207 clips in stream span)
-  (e) terminal-margin gate >= 2bp         3        212      -93.57  [ -235.14,    +0.00]   61% (207 clips in stream span)
-  (e) terminal-margin gate >= 5bp         7        388     -103.16  [ -253.70,    -5.04]   59% (207 clips in stream span)
-  (f) no banked_decided-only unlock       4        275      +71.33  [  -17.73,  +234.20]  110% (rem > 120s)
-  (f2) banked-only unlock at half size      4        138      +35.66  [   -8.87,  +117.10]  110% 
+  (e) terminal-margin gate >= 0bp         3        179      -63.47  [ -180.86,    +0.00]   85% (232 clips in stream span)
+  (e) terminal-margin gate >= 2bp         4        212      -93.57  [ -235.14,    +0.00]   61% (232 clips in stream span)
+  (e) terminal-margin gate >= 5bp         8        498     -105.40  [ -256.54,    -7.02]   58% (232 clips in stream span)
+  (f) no banked_decided-only unlock       4        275      +71.33  [  -18.23,  +234.53]  110% (rem > 120s)
+  (f2) banked-only unlock at half size      4        138      +35.66  [   -9.12,  +117.27]  110% 
 
   ATTRIBUTION — the epochs supplying each policy's delta. A policy whose
   number is one window is not a policy, it is that window (L37).
@@ -744,30 +877,31 @@ Charges taken, stated once:
       epoch 1787499300   stream         -3.18
       epoch 1787486700   stream         -0.15
 
-    (a) same-side cap: max 1 arms   net +163.59, top epoch = 132% of it
+    (a) same-side cap: max 1 arms   net +156.24, top epoch = 138% of it
       epoch 1787505300   stream       +215.13  <<< THE INCIDENT
       epoch 1787462100   theta        +110.90
       epoch 1787493900   stream        -41.90
       epoch 1787486700   stream        -18.29
       epoch 1787491500   stream        -13.65
 
-    (a) same-side cap: max 2 arms   net +142.60, top epoch = 137% of it
-      epoch 1787505300   stream       +195.99  <<< THE INCIDENT
-      epoch 1787493900   stream        -35.08
-      epoch 1787462400   theta          -4.66
-      epoch 1787462100   theta          -4.04
-      epoch 1787499300   stream         -3.45
-
-    (d) corr>=0.50 -> clip x0.0   net -138.23, top epoch = 159% of it
+    (d) corr>=0.50 -> clip x0.0   net -155.50, top epoch = 142% of it
       epoch 1787505300   stream       +220.41  <<< THE INCIDENT
       epoch 1787504400   stream        -60.76
       epoch 1787493900   stream        -42.42
       epoch 1787497500   stream        -33.14
       epoch 1787499900   stream        -30.66
 
+    (a) same-side cap: max 2 arms   net +142.48, top epoch = 138% of it
+      epoch 1787505300   stream       +195.99  <<< THE INCIDENT
+      epoch 1787493900   stream        -35.08
+      epoch 1787462400   theta          -4.66
+      epoch 1787462100   theta          -4.04
+      epoch 1787499300   stream         -3.45
+
     (e) terminal-margin gate >= 0bp   net -63.47, top epoch = 85% of it
       epoch 1787504400   stream        -53.93
       epoch 1787497500   stream         -9.54
+      epoch 1787508300   stream         +0.00
 
     (f) no banked_decided-only unlock   net +71.33, top epoch = 110% of it
       epoch 1787505300   stream        +78.40  <<< THE INCIDENT
@@ -775,44 +909,44 @@ Charges taken, stated once:
       epoch 1787504700   stream         -0.66
       epoch 1787462400   theta          -0.50
 
-  --- stream era: 84 graded 5m windows, $4421 filled, base P&L +123.28
+  --- stream era: 96 graded 5m windows, $4995 filled, base P&L +140.55
   policy                             eps ch   $refused    net delta         bootstrap CI95   top
   ('top' = |largest single epoch| / |net delta|. Above 100% means one
    epoch exceeds the whole result and everything else nets against it
    — the policy is that epoch, not a policy.)
-  (a) same-side cap: max 1 arms          22       2041      +81.78  [ -213.13,  +574.52]  263% 
-  (a) same-side cap: max 2 arms          12        527     +151.31  [ -111.25,  +581.49]  130% 
+  (a) same-side cap: max 1 arms          27       2323      +74.43  [ -218.73,  +575.79]  289% 
+  (a) same-side cap: max 2 arms          13        533     +151.18  [ -110.22,  +582.82]  130% 
   (a) same-side cap: max 3 arms           3        300     +188.10  [   -9.55,  +574.31]  102% 
   (a) same-side cap: max 4 arms           2         67      +15.41  [   -6.24,   +52.48]  113% 
-  (a$) same-side cap: $50/epoch          25       3271      -13.69  [ -269.79,  +406.56] 1265% 
-  (a$) same-side cap: $100/epoch         13       2195      -19.84  [ -236.12,  +303.76]  642% 
-  (a$) same-side cap: $150/epoch         10       1466       -3.92  [ -129.16,  +183.30] 1851% 
-  (a$) same-side cap: $200/epoch          8       1109      -33.74  [ -103.98,   +40.05]   70% 
+  (a$) same-side cap: $50/epoch          30       3670      -31.37  [ -289.25,  +391.04]  552% 
+  (a$) same-side cap: $100/epoch         15       2406      -26.28  [ -241.84,  +303.78]  485% 
+  (a$) same-side cap: $150/epoch         12       1677      -10.36  [ -134.96,  +176.87]  701% 
+  (a$) same-side cap: $200/epoch          8       1109      -33.74  [ -102.44,   +40.22]   70% 
   (a$) same-side cap: $300/epoch          3        483      -24.15  [  -62.01,    +0.00]   65% 
-  (b) same-side cap $100, banked EXEMPT (as built)      4        248      -28.65  [  -67.76,    -1.70]   48% 
+  (b) same-side cap $100, banked EXEMPT (as built)      4        248      -28.65  [  -67.46,    -1.70]   48% 
   (b) same-side cap $200, banked EXEMPT (as built)      0          0       -0.00  [   +0.00,    +0.00]     - 
   (b) same-side cap $350, banked EXEMPT (as built)      0          0       -0.00  [   +0.00,    +0.00]     - 
-  (b) same-side cap $100, no exemption     13       2195      -19.84  [ -236.12,  +303.76]  642% 
-  (b) same-side cap $200, no exemption      8       1109      -33.74  [ -103.98,   +40.05]   70% 
+  (b) same-side cap $100, no exemption     15       2406      -26.28  [ -241.84,  +303.78]  485% 
+  (b) same-side cap $200, no exemption      8       1109      -33.74  [ -102.44,   +40.22]   70% 
   (b) same-side cap $350, no exemption      1        237      -14.34  [  -43.02,    +0.00]  100% 
-  (c) btc veto T=20s Y=2bp               22       1357      +31.72  [ -173.80,  +371.10]  445% (186 clips in stream span)
-  (c) btc veto T=20s Y=4bp                8        252      +39.61  [  -93.46,  +227.02]  195% (186 clips in stream span)
-  (c) btc veto T=20s Y=8bp                2         18      -30.08  [  -89.95,    +0.00]   99% (186 clips in stream span)
-  (c) btc veto T=30s Y=2bp               20       1351      +12.14  [ -211.57,  +354.49] 1124% (186 clips in stream span)
-  (c) btc veto T=30s Y=4bp               10        488      +51.36  [ -139.93,  +362.14]  239% (186 clips in stream span)
-  (c) btc veto T=30s Y=8bp                3         28      -20.58  [  -89.65,   +28.20]  145% (186 clips in stream span)
-  (c) btc veto T=60s Y=2bp               19       1607       -3.15  [ -299.09,  +450.00] 5650% (186 clips in stream span)
-  (c) btc veto T=60s Y=4bp               13       1075      +22.83  [ -249.71,  +427.26]  697% (186 clips in stream span)
-  (c) btc veto T=60s Y=8bp                6        366      +21.97  [ -178.92,  +303.04]  473% (186 clips in stream span)
-  (d) corr>=0.50 -> clip x0.5            42       2193      -61.08  [ -239.32,  +217.93]  180% 
-  (d) corr>=0.50 -> clip x0.0            42       4387     -122.17  [ -478.63,  +435.86]  180% 
-  (d) corr>=0.70 -> clip x0.5            26       1147      +10.14  [ -159.51,  +279.52] 1086% 
-  (d) corr>=0.70 -> clip x0.0            26       2295      +20.29  [ -319.03,  +559.04] 1086% 
+  (c) btc veto T=20s Y=2bp               24       1576      +30.46  [ -177.43,  +370.16]  463% (213 clips in stream span)
+  (c) btc veto T=20s Y=4bp                9        306      +43.53  [  -88.44,  +232.54]  178% (213 clips in stream span)
+  (c) btc veto T=20s Y=8bp                2         18      -30.08  [  -89.95,    +0.00]   99% (213 clips in stream span)
+  (c) btc veto T=30s Y=2bp               24       1591       +9.18  [ -217.61,  +354.40] 1486% (213 clips in stream span)
+  (c) btc veto T=30s Y=4bp               11        648      +48.11  [ -143.62,  +359.16]  255% (213 clips in stream span)
+  (c) btc veto T=30s Y=8bp                3         28      -20.58  [  -89.65,   +28.20]  145% (213 clips in stream span)
+  (c) btc veto T=60s Y=2bp               22       1840       -4.25  [ -303.62,  +450.34] 4182% (213 clips in stream span)
+  (c) btc veto T=60s Y=4bp               14       1239      +24.50  [ -250.08,  +432.08]  649% (213 clips in stream span)
+  (c) btc veto T=60s Y=8bp                7        366      +21.97  [ -178.61,  +307.05]  473% (213 clips in stream span)
+  (d) corr>=0.50 -> clip x0.5            48       2480      -69.72  [ -252.46,  +213.74]  158% 
+  (d) corr>=0.50 -> clip x0.0            48       4961     -139.44  [ -504.91,  +427.48]  158% 
+  (d) corr>=0.70 -> clip x0.5            30       1254       +3.31  [ -166.57,  +276.80] 3333% 
+  (d) corr>=0.70 -> clip x0.0            30       2508       +6.61  [ -333.14,  +553.60] 3333% 
   (d) corr>=0.85 -> clip x0.5             3         24      +14.16  [   -0.73,   +43.46]  102% 
   (d) corr>=0.85 -> clip x0.0             3         48      +28.32  [   -1.45,   +86.92]  102% 
-  (e) terminal-margin gate >= 0bp         2        179      -63.47  [ -180.86,    +0.00]   85% (185 clips in stream span)
-  (e) terminal-margin gate >= 2bp         3        212      -93.57  [ -235.14,    +0.00]   61% (185 clips in stream span)
-  (e) terminal-margin gate >= 5bp         7        388     -103.16  [ -249.09,    -5.04]   59% (185 clips in stream span)
+  (e) terminal-margin gate >= 0bp         3        179      -63.47  [ -180.86,    +0.00]   85% (210 clips in stream span)
+  (e) terminal-margin gate >= 2bp         4        212      -93.57  [ -235.14,    +0.00]   61% (210 clips in stream span)
+  (e) terminal-margin gate >= 5bp         8        498     -105.40  [ -253.03,    -7.31]   58% (210 clips in stream span)
   (f) no banked_decided-only unlock       2        111      +77.74  [   -1.99,  +235.20]  101% (rem > 120s)
   (f2) banked-only unlock at half size      2         55      +38.87  [   -0.99,  +117.60]  101% 
 
@@ -824,35 +958,36 @@ Charges taken, stated once:
       epoch 1787499300   stream         -3.18
       epoch 1787486700   stream         -0.15
 
-    (a) same-side cap: max 2 arms   net +151.31, top epoch = 130% of it
+    (a) same-side cap: max 2 arms   net +151.18, top epoch = 130% of it
       epoch 1787505300   stream       +195.99  <<< THE INCIDENT
       epoch 1787493900   stream        -35.08
       epoch 1787499300   stream         -3.45
       epoch 1787484900   stream         -2.70
       epoch 1787500800   stream         -1.02
 
-    (d) corr>=0.50 -> clip x0.0   net -122.17, top epoch = 180% of it
+    (d) corr>=0.50 -> clip x0.0   net -139.44, top epoch = 158% of it
       epoch 1787505300   stream       +220.41  <<< THE INCIDENT
       epoch 1787504400   stream        -60.76
       epoch 1787493900   stream        -42.42
       epoch 1787497500   stream        -33.14
       epoch 1787499900   stream        -30.66
 
-    (e) terminal-margin gate >= 5bp   net -103.16, top epoch = 59% of it
+    (e) terminal-margin gate >= 5bp   net -105.40, top epoch = 58% of it
       epoch 1787504400   stream        -60.76
       epoch 1787493900   stream        -26.50
       epoch 1787497500   stream        -11.23
       epoch 1787499300   stream         -2.52
-      epoch 1787498700   stream         -2.12
+      epoch 1787508300   stream         -2.25
 
     (e) terminal-margin gate >= 0bp   net -63.47, top epoch = 85% of it
       epoch 1787504400   stream        -53.93
       epoch 1787497500   stream         -9.54
+      epoch 1787508300   stream         +0.00
 
     (f) no banked_decided-only unlock   net +77.74, top epoch = 101% of it
       epoch 1787505300   stream        +78.40  <<< THE INCIDENT
       epoch 1787504700   stream         -0.66
 
 ==============================================================================
-done in 123.3s
+done in 203.8s
 ==============================================================================
