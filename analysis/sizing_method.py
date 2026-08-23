@@ -59,8 +59,11 @@ THE FORMULAS
 
    With l = 1 and g = (1-c)/c this is exactly `(p - c)/(1 - c)`, i.e. the same
    closed form as analysis/r2_kelly_sim.py::size_usdc, which derives it from the
-   ask side. Here `c` is the wallet's REALIZED cost per share, so the fee is
-   already inside it rather than modelled.
+   ask side. The difference is where the numbers come from: r2 models the fee
+   and reads the ask off the tape, this reads `g` off the wallet's REALIZED
+   returns, so the fee, the slippage and the partial fills are all already
+   inside it. `c = 1/(1+g)` is then the break-even, i.e. the price the winners
+   were actually bought at.
 
 2. Small-sample honesty — a Beta prior centred on the arm's OWN break-even:
 
@@ -93,21 +96,25 @@ THE FORMULAS
            N_eff = N / (1 + (N-1)*rho)
            bottom_up = N_eff/N * sum_i(f_qtr_i) * bankroll
 
-       With N=5 and rho=0.767, N_eff = 1.21 — the fleet is one and a fifth bets
-       wearing five hats, and every arm's standalone Kelly gets the same 0.24x
-       haircut.
+       N is the count of arms that will actually be CONCURRENTLY EXPOSED, not
+       the number in the arms table — an arm sized to zero adds no correlated
+       exposure. At N=4 and rho=0.767, N_eff = 1.21: the fleet is one and a
+       fifth bets wearing four hats, and every arm's standalone Kelly takes the
+       same 0.30x haircut.
 
    (b) TOP-DOWN, and this one needs no correlation assumption at all because the
        correlation is already inside the data. Group every graded window into
-       FLEET SLOTS (maximal clusters of windows that overlap in time), and treat
-       each slot as ONE bet with its own notional and its own P&L. Then measure
-       (p, g, l) across slots and quarter-Kelly that. A slot in which four arms
-       lost together shows up as one bad bet with a near -100% return, which is
-       exactly the event the bottom-up view cannot see.
+       FLEET SLOTS (maximal clusters of windows that overlap in time) and treat
+       each slot as ONE bet with its own notional and its own P&L. A slot in
+       which five arms lost together is then simply one bad bet at -100%, which
+       is exactly the event the bottom-up view cannot see. Sizing uses the
+       EMPIRICAL Kelly over the slot-return distribution, never a two-outcome
+       (p, g, l) summary of it — see empirical_kelly() for why the summary
+       recommends betting the entire bankroll and the empirical form cannot.
 
-   The fleet budget is min(a, b). Allocation within it is proportional to each
-   arm's own f_qtr, so the evidence decides the ranking and the fleet decides
-   the scale.
+   The fleet budget is min(a, b). Within it the measurement line is paid first
+   and the Kelly arms share the rest in proportion to their own f_qtr, so the
+   evidence decides the ranking and the fleet decides the scale.
 
 5. Three states, not one dial. An arm whose measured edge is positive gets a
    Kelly slice. An arm whose edge is negative but inside the noise gets a
@@ -190,6 +197,19 @@ ERA_WEIGHT = {
     "stream": 1.0,
 }
 
+# PENDING BOUNDARY, not yet in polymarket/eras.py. e182e04 @ 1787517763 =
+# 2026-08-23T20:42:43Z bumped pmt-strategies to c8b0e53: the `decided_k = 1.25`
+# law on 15m arms (analysis/carveout_ab.md — the banked_decided carve-out is
+# +$89.70 at 5m and -$649.15 at 15m, so it gets capped at 15m and nowhere else).
+# It changes NOTHING here today for two reasons worth checking on every re-run:
+#   * it is 15m-scoped, and every 5m arm's evidence is untouched by it;
+#   * the 15m arms are parked, so the corpus holds ZERO windows under it — the
+#     last graded window starts 20:30Z, twelve minutes before the deploy.
+# The moment a 15m arm is unparked this needs a real era row, and every 15m
+# number in this study becomes pre-law evidence about a policy that was changed
+# in exactly the place it was bleeding.
+DECIDED_K_LAW_T = 1787517763.0
+
 # An arm that reads the Chainlink settlement stream is not the arm that read a
 # Binance proxy plus a basis guess. Half weight, not zero, because the DECISION
 # core (theta, brakes, cushion) is unchanged across the migration — except for
@@ -236,8 +256,8 @@ def walk() -> list[dict]:
     each window with the era whose policy priced it.
     """
     env.load_project_env()
-    import cli_crypto_stats as stats  # noqa: PLC0415 - needs sys.path first
-    from polymarket import wallet  # noqa: PLC0415
+    import cli_crypto_stats as stats  # local import: needs sys.path set up above
+    from polymarket import wallet  # local import: needs sys.path set up above
 
     rows = wallet.fetch_wallet_activity(wallet.funder_address(), 0.0)
     sb = stats.score_activity(rows, 0.0, tape_records=stats._fire_roll_records())
@@ -292,6 +312,28 @@ def wilson_lo(wins: float, n: float, z: float = WILSON_Z) -> float:
     centre = p + z * z / (2 * n)
     margin = z * math.sqrt(max(p * (1 - p), 0.0) / n + z * z / (4 * n * n))
     return max(0.0, (centre - margin) / d)
+
+
+def windows_to_gate(p_hat: float, c: float, n_now: float,
+                    cap: int = 5000) -> int | None:
+    """How many effective windows at the CURRENT win rate before the size-increase
+    gate opens — i.e. before wilson_lo(p_hat*n, n) clears break-even `c`.
+
+    This is the calibration gate expressed in the unit the operator can act on.
+    "No size increases without a calibration pass" is unfalsifiable until someone
+    says how many windows the pass needs, and the answer is wildly different per
+    arm: it scales with 1/edge^2, so an arm 3pp above its break-even gets there an
+    order of magnitude sooner than one 1pp above. None means never at this win
+    rate — the arm is not slow, it is wrong.
+    """
+    if p_hat is None or c is None or p_hat <= c:
+        return None
+    n = max(1, int(n_now))
+    while n <= cap:
+        if wilson_lo(p_hat * n, n) > c:
+            return n
+        n += 1
+    return None
 
 
 def kelly(p: float, g: float, loss: float = 1.0) -> float:
@@ -364,6 +406,7 @@ def arm_evidence(windows: list[dict]) -> dict[str, dict]:
             "ron_w": (pnl / usd) if usd else None,
             "f_full": f_full, "f_qtr": KELLY_FRAC * f_full,
             "feed": ARM_FEED.get(series, "?"), "state": state,
+            "n_to_gate": windows_to_gate(p_raw, c, n_eff),
         }
     return out
 
@@ -449,7 +492,7 @@ def bootstrap_kelly(returns: list[float], weights: list[float],
     applies to p-buckets. Coarse grid on purpose — n_boot x a fine grid buys
     precision the corpus cannot support.
     """
-    import random  # noqa: PLC0415 - only this function needs it
+    import random  # local import: only this function needs it
 
     if len(returns) < 5:
         return 0.0
@@ -681,6 +724,28 @@ def report(windows: list[dict], bankroll: float, bankroll_eu: float,
     print("  p_w90 = one-sided 90% Wilson lower bound on the weighted record.")
     print(f"  state: kelly = shrunk edge > 0 | measure = raw edge within "
           f"{NOISE_BAND_PP:.0f}pp of break-even | off = clearly below")
+    print()
+    print("  SIZE-INCREASE GATE — an arm may only go UP once its 90% Wilson")
+    print("  lower bound clears its own break-even. Today NO arm does. At each")
+    print("  arm's current win rate, effective windows needed before it can:")
+    for a in sorted(ev, key=lambda k: -ev[k]["n_eff"]):
+        e = ev[a]
+        n2g = e["n_to_gate"]
+        if n2g is None:
+            why = ("win rate is at or below break-even — more windows never open "
+                   "the gate" if e["p_raw"] is not None else "no data")
+            print(f"    {a:9s} n_eff {e['n_eff']:>5.1f}  ->  never ({why})")
+        else:
+            print(f"    {a:9s} n_eff {e['n_eff']:>5.1f}  ->  {n2g:>4d} "
+                  f"({n2g - e['n_eff']:+.0f} more)")
+    print()
+    post_law = [w for w in windows if w["start"] >= DECIDED_K_LAW_T]
+    print(f"  PENDING ERA BOUNDARY: decided_k 1.25 law at 15m, e182e04 @ "
+          f"{DECIDED_K_LAW_T:.0f} ({_ts(DECIDED_K_LAW_T)}).")
+    print(f"    windows in this corpus at or after it: {len(post_law)} — "
+          f"15m-scoped, and the 15m arms are parked, so nothing here is weighted")
+    print("    by it. Every 15m row below is PRE-law evidence about a carve-out")
+    print("    that has since been capped at exactly the duration it was losing.")
     print()
     print("  per-era window counts (W-L), unweighted:")
     for a in sorted(ev):

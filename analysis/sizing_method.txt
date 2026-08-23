@@ -20,6 +20,24 @@ xrp 15m     1W-0       0.0        ?       —       —       —  0.0000      �
   p_w90 = one-sided 90% Wilson lower bound on the weighted record.
   state: kelly = shrunk edge > 0 | measure = raw edge within 2pp of break-even | off = clearly below
 
+  SIZE-INCREASE GATE — an arm may only go UP once its 90% Wilson
+  lower bound clears its own break-even. Today NO arm does. At each
+  arm's current win rate, effective windows needed before it can:
+    sol 5m    n_eff  40.5  ->   124 (+84 more)
+    eth 5m    n_eff  37.4  ->   560 (+523 more)
+    xrp 5m    n_eff  26.0  ->    81 (+55 more)
+    btc 5m    n_eff  17.4  ->  never (win rate is at or below break-even — more windows never open the gate)
+    bnb 5m    n_eff   9.0  ->  never (win rate is at or below break-even — more windows never open the gate)
+    btc 15m   n_eff   4.8  ->  never (win rate is at or below break-even — more windows never open the gate)
+    eth 15m   n_eff   4.5  ->  never (win rate is at or below break-even — more windows never open the gate)
+    sol 15m   n_eff   0.5  ->  never (win rate is at or below break-even — more windows never open the gate)
+    xrp 15m   n_eff   0.0  ->  never (no data)
+
+  PENDING ERA BOUNDARY: decided_k 1.25 law at 15m, e182e04 @ 1787517763 (08-23 20:42Z).
+    windows in this corpus at or after it: 0 — 15m-scoped, and the 15m arms are parked, so nothing here is weighted
+    by it. Every 15m row below is PRE-law evidence about a carve-out
+    that has since been capped at exactly the duration it was losing.
+
   per-era window counts (W-L), unweighted:
     bnb 5m    theta 2-0  ws+scale 1-0  stream 6-1
     btc 15m   pre-brake 10-1  brakes 7-2  theta 4-1
