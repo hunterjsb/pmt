@@ -22,6 +22,7 @@ import tty
 import click
 from rich.table import Table
 
+import stats_render
 from engine import post as _engine_post
 
 from cli_common import console, _api, _pnl_color
@@ -742,50 +743,10 @@ def effectiveness_summary(sb: dict, bal: dict | None) -> dict:
 
 
 def _eff_table(s: dict) -> Table:
-    """The effectiveness block: each corrected number beside what it means."""
-    def signed(v: float | None, unit: str = "", pct: bool = True, digits: int = 2) -> str:
-        if v is None:
-            return "[dim]—[/dim]"
-        x = v * 100 if pct else v
-        return f"[{'green' if x >= 0 else 'red'}]{x:+,.{digits}f}{unit}[/]"
-
-    def rate(v: float | None, digits: int = 0) -> str:
-        return "[dim]—[/dim]" if v is None else f"{v * 100:.{digits}f}%"
-
-    rorc, bgr = s.get("rorc") or {}, s.get("bgr") or {}
-    wr, be = s.get("win_rate"), s.get("breakeven_win_rate")
-    # Show the growth denominator in the unit it actually has: "over 0.1d"
-    # hides that a %/day figure is extrapolated from three hours.
-    span = (f"{s['span_h'] / 24:.1f}d" if s["span_h"] >= 24 else f"{s['span_h']:.1f}h")
-    hold_m = (rorc.get("avg_hold_h") or 0) * 60
-    t = Table(title="Effectiveness — the win rate, corrected for size and time")
-    t.add_column("metric"); t.add_column("value", justify="right"); t.add_column("means")
-    t.add_row("$-weighted win rate", rate(s["mww_rate"]),
-              "share of DOLLARS at risk that won"
-              + (f" [dim](count: {wr * 100:.0f}%)[/dim]" if wr is not None else ""))
-    # The bar the headline has to clear: with -100% losses against +2-8%
-    # wins it sits in the nineties, which is the whole reason 92% flatters.
-    t.add_row("break-even win rate",
-              "[dim]—[/dim]" if be is None else
-              f"[{'red' if wr is not None and wr < be else 'green'}]{be * 100:.1f}%[/]",
-              "what THIS payoff shape needs just to stay flat")
-    t.add_row("profit factor",
-              "[dim]—[/dim]" if s["profit_factor"] is None else
-              f"[{'green' if s['profit_factor'] >= 1 else 'red'}]{s['profit_factor']:.2f}[/]",
-              f"gross wins ${s['gross_win']:,.0f} / gross losses ${s['gross_loss']:,.0f}"
-              " — under 1.00 the book loses")
-    t.add_row("return on notional", signed(s["return_on_notional"], "%"),
-              f"P&L per dollar put at risk (${s['notional']:,.0f} traded), time ignored")
-    t.add_row("RoRC", signed(rorc.get("per_hour"), "%/h"),
-              "return per dollar-HOUR at risk — [bold]trade quality[/bold]"
-              + (f" [dim](avg hold {hold_m:.1f}m)[/dim]" if hold_m else ""))
-    t.add_row("bankroll growth", signed(bgr.get("per_day_pct"), "%/d", pct=False),
-              "log growth of the whole book per calendar day — "
-              f"[bold]capital effectiveness[/bold] [dim](over {span})[/dim]")
-    t.add_row("utilization", rate(s["utilization"], 2),
-              "share of bankroll-hours actually at risk (the bridge: "
-              "growth ≈ RoRC × utilization)")
-    return t
+    """The effectiveness block. Lives in stats_render now — kept here as the
+    name every caller already imports, so there is exactly one implementation
+    of the block rather than two that can drift."""
+    return stats_render.effectiveness_table(s)
 
 
 @crypto_group.command("stats")
@@ -830,60 +791,7 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
         }, indent=2))
         return
 
-    n = wins + losses
-    wr = f"{wins / n * 100:.0f}%" if n else "—"
-    cap = f"${bal['total']:,.2f}" if bal else "?"
-    # "estimated" now covers two distinct cases sharing one dim-~ convention:
-    # gamma unreachable (old assume-LOSS heuristic) AND a gamma-confirmed win
-    # whose real redeem hasn't posted yet (pnl imputed) — see _tape_scoreboard.
-    est = f" · [dim]{estimated} ~estimated (gamma unreachable or pending redeem)[/dim]" if estimated else ""
-    from datetime import datetime, timezone
-    if floor <= 0:
-        floor_label = "all time"
-    else:
-        floor_label = f"windows since {datetime.fromtimestamp(floor, tz=timezone.utc).strftime('%m-%d %H:%MZ')}"
-    console.print(f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L "
-                  f"[{_pnl_color(net)}]{net:+,.2f}[/] · "
-                  f"{rolls} rolls · capital {cap} · [dim]{floor_label}[/dim]{est}")
-
-    if eff_s["n"]:
-        console.print(_eff_table(eff_s))
-
-    t = Table(title="By series (wallet-graded)")
-    for col in ("series", "record", "P&L", "notional"):
-        t.add_column(col, justify="right")
-    for k in sorted(series):
-        s = series[k]
-        rec = (f"{s['w']}-{s['l']}" + (f" ({s['open']} open)" if s["open"] else "")
-               + (f" [dim]~{s['est']}[/dim]" if s["est"] else ""))
-        t.add_row(k, rec, f"{s['pnl']:+,.2f}", f"${s['usd']:,.0f}")
-    console.print(t)
-
-    if cal:
-        t = Table(title="Calibration: clips fired at stated fair vs realized")
-        for col in ("fair ≥", "clips", "hit rate"):
-            t.add_column(col, justify="right")
-        for b in sorted(cal):
-            tot, hit = cal[b]
-            t.add_row(f"{b:.2f}", str(tot), f"{hit}/{tot} ({hit / tot * 100:.0f}%)")
-        console.print(t)
-
-    arms = status.get("arms", {})
-    if arms:
-        t = Table(title="Live arms")
-        for col in ("window", "state", "committed", "fair", "roll"):
-            t.add_column(col, justify="right")
-        for slug, a in arms.items():
-            e = a.get("eval") or {}
-            state = e.get("state", "?")
-            if state == "gated":
-                state = (e.get("reason") or "gated")[:40]
-            fair = f"{e['p_up']:.4f}" if "p_up" in e else "—"
-            t.add_row(_tape_slug(slug), state, f"${e.get('committed', a.get('filled_usdc', 0)):,.2f}",
-                      fair, "⟳" if a.get("roll") else "·")
-        console.print(t)
-        if status.get("pending_rolls"):
-            console.print(f"[dim]pending rolls: {', '.join(status['pending_rolls'])}[/dim]")
+    console.print(stats_render.render_stats(sb, eff_s, bal, status, floor))
 
 
 _UNDECIDED_YELLOW_USD = 300.0  # R7 speculative-exposure threshold zone
