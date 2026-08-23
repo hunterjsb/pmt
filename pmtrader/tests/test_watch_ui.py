@@ -315,57 +315,121 @@ def test_header_carries_the_stream_state_when_an_arm_reads_it():
     assert cc.feed_row(binance) is None
 
 
-def test_arms_table_marks_which_feed_an_arm_reads():
-    from rich.console import Console
-
+def test_the_arm_cell_marks_which_feed_an_arm_reads():
+    # The arms table's flag column folded into the arm cell; the markers are
+    # what the fold may not lose.
     arms = {
         "xrp-updown-5m-9999999999": {"filled_usdc": 1.0, "roll": True,
                                       "feed": "rtds", "eval": None},
         "btc-updown-5m-9999999999": {"filled_usdc": 1.0, "roll": True,
                                       "feed": "binance", "eval": None},
     }
-    c = Console(record=True, width=160)
-    c.print(cc.build_arms_table(arms, now=1000.0))
-    out = c.export_text().splitlines()
-    xrp = next(ln for ln in out if "xrp" in ln)
-    btc = next(ln for ln in out if "btc" in ln)
-    assert "≈" in xrp, xrp
-    assert "≈" not in btc, btc
+    by_slug = {r["slug"]: cc._arm_cell(r) for r in cc.live_rows(arms)}
+    assert "≈" in by_slug["xrp-updown-5m-9999999999"]
+    assert "≈" not in by_slug["btc-updown-5m-9999999999"]
 
 
-def test_flag_column_fits_every_marker_at_once():
-    # ⟳ + ≈ + ◇ on one arm is a real state (a rolling, stream-fed, maker
-    # arm). The column was sized for "roll" alone and silently ellipsised the
-    # third marker when maker step 0 added it.
+def test_the_arm_cell_fits_every_marker_at_once():
+    """⟳ + ≈ + ◇ on one arm is a real state (a rolling, stream-fed, maker
+    arm), and the widest label the fleet has is "doge 15m" — together they are
+    what the `arm` column is sized for."""
     from rich.console import Console
 
-    arms = {"xrp-updown-5m-1700000000": {"filled_usdc": 1.0, "roll": True,
-                                          "feed": "rtds", "maker_bid": True,
-                                          "eval": None}}
-    c = Console(record=True, width=160)
-    c.print(cc.build_arms_table(arms, now=1700000100.0))
-    out = c.export_text().splitlines()
-    row = next(ln for ln in out if "xrp" in ln)
-    # last cell, i.e. between the final two column separators
-    flags = row.rsplit("│", 3)[-2]
-    assert flags.strip() == "⟳≈◇", row
-    assert "…" not in flags, row
-    # ...and the header still names what the column now holds.
-    header = next(ln for ln in out if "T-" in ln and "flags" in ln)
-    assert "arm" in header and "roll" not in header
+    arms = {"doge-updown-15m-1700000000": {"filled_usdc": 1.0, "roll": True,
+                                            "feed": "rtds", "maker_bid": True,
+                                            "eval": None}}
+    row = cc.live_rows(arms)[0]
+    assert cc._arm_flags({"roll": True, "feed": "rtds", "maker_bid": True}) == "⟳≈◇"
+    c = Console(record=True, width=200)
+    c.print(cc.build_windows_table({}, 1700000100.0, arms=arms))
+    line = next(ln for ln in c.export_text().splitlines() if "doge" in ln)
+    cell = [x.strip() for x in line.strip("│").split("│")][0]
+    assert cell == "○ doge 15m ⟳≈◇", cell
+    assert "…" not in cell, cell
+    assert row["flags"] == "⟳≈◇"
 
 
-def test_committed_column_fits_a_resting_bid_beside_a_four_figure_fill():
-    # The resting $ was added into the committed cell without widening it.
+def test_a_non_rolling_arm_keeps_the_roll_slot_occupied():
+    # "·" holds the place so the feed/maker markers never shift between rows.
+    assert cc._arm_flags({}) == "·"
+    assert cc._arm_flags({"feed": "rtds"}) == "·≈"
+
+
+def test_the_money_cell_fits_a_resting_bid_beside_a_four_figure_fill():
+    # The resting $ shares the committed cell, same as the arms table's did.
     from rich.console import Console
 
     arms = {"btc-updown-5m-9999999999": {
         "filled_usdc": 1204.50, "roll": True, "resting_usdc": 450.0,
         "eval": {"state": "armed", "committed": 1204.50, "resting": 450.0}}}
-    c = Console(record=True, width=160)
-    c.print(cc.build_arms_table(arms, now=1000.0))
+    c = Console(record=True, width=200)
+    c.print(cc.build_windows_table({}, 1000.0, arms=arms))
     row = next(ln for ln in c.export_text().splitlines() if "btc" in ln)
     assert "$1,204.50 ◇$450" in row, row
+
+
+_FOLD_ARM = {"btc-updown-5m-1700000300": {
+    "roll": True, "feed": "rtds", "maker_bid": True, "filled_usdc": 1204.50,
+    "resting_usdc": 450.0,
+    "eval": {"state": "armed", "mode": "safe", "p_up": 0.87, "rho": 0.4,
+             "banked_bp": 12.3, "cushion_bp": 9.3, "banked_decided": True,
+             "committed": 1204.50, "resting": 450.0,
+             "sides": [{"side": "up", "safety": 0.9, "brake": None},
+                       {"side": "down", "safety": -0.3, "brake": "distrust"}]}}}
+
+
+def test_nothing_the_arms_table_showed_became_invisible_in_the_fold():
+    """THE pin on killing the second table. Every field the arms table had a
+    column for must still be legible on the live row: countdown, state word,
+    gate reason / safety+brake badges, evidence, p_up, mode, rho, committed $
+    (with its resting bid) and the roll/feed/maker flags."""
+    from rich.console import Console
+
+    c = Console(record=True, width=200)
+    c.print(cc.build_windows_table({}, 1700000000.0, arms=_FOLD_ARM))
+    row = next(ln for ln in c.export_text().splitlines() if "btc 5m" in ln)
+    for was_a_column in (
+        "10:00",                    # T-
+        "armed",                    # state
+        "safe",                     # mode
+        "saf +0.90/-0.30",          # per-side safety badge
+        "down:distrust",            # brake badge
+        "+12.3/9.3bp",              # evidence
+        "p↑0.87",                   # p_up
+        "ρ+0.40",                   # rho
+        "$1,204.50 ◇$450",          # committed + the resting maker bid
+        "⟳≈◇",                      # flags
+    ):
+        assert was_a_column in row, (was_a_column, row)
+    assert "…" not in row, row
+
+
+def test_the_gate_reason_survives_the_fold_at_full_length():
+    # The arms table's widest cell; the compact form has to still fit.
+    from rich.console import Console
+
+    arms = {"btc-updown-5m-1700000300": {"roll": True, "eval": {
+        "state": "gated", "margin_bp": -4.9, "guard_bp": 6.0,
+        "reason": "basis guard: projected margin -4.9bp inside 6.0bp noise band"}}}
+    c = Console(record=True, width=200)
+    c.print(cc.build_windows_table({}, 1700000000.0, arms=arms))
+    row = next(ln for ln in c.export_text().splitlines() if "btc 5m" in ln)
+    assert "gated  margin -4.9 vs 6.0bp" in row, row
+
+
+def test_an_unreachable_engine_still_announces_itself_after_the_fold():
+    """The arms table's red placeholder was the only thing that said the engine
+    had stopped answering. With no arms table it moved to the header — the
+    windows table would otherwise keep painting an hour-old decided tail while
+    the exposure row read a confident "committed $0.00"."""
+    assert cc.engine_row({}) is not None
+    assert cc.engine_row(None) is not None
+    assert cc.engine_row({"arms": {}}) is not None
+    row = cc.engine_row({"arms": {}})
+    assert row[0] == "engine" and "unreachable or no arms" in row[1]
+    assert "[red]" in row[1]
+    # ...and it gets out of the way the moment something is armed.
+    assert cc.engine_row({"arms": {"btc-updown-5m-1": {}}}) is None
 
 
 # ---------- the merged windows table ----------
@@ -380,7 +444,9 @@ def test_committed_column_fits_a_resting_bid_beside_a_four_figure_fill():
 # strip's at-a-glance ✓/✗ sequence and its ◆ riding chips must still be
 # readable off the merged table, in the same order.
 
-def _trades_text(sb, now=1787510500.0, width=100, limit=None, odds=None,
+# 160 by default: the folded table's natural width is ~135, and Rich squeezes
+# columns (and therefore glyphs) on a console narrower than that.
+def _trades_text(sb, now=1787510500.0, width=160, limit=None, odds=None,
                  arms=None):
     from rich.console import Console
 
@@ -390,15 +456,18 @@ def _trades_text(sb, now=1787510500.0, width=100, limit=None, odds=None,
 
 
 def _glyph_column(out: str) -> str:
-    """The lifecycle column read straight down — what the chip strip used to
-    be, and the thing the merge is not allowed to lose."""
-    return "".join(ln.strip("│").split("│")[0].strip()
+    """The lifecycle glyphs read straight down — what the chip strip used to
+    be, and the thing the merge is not allowed to lose. They lead the `arm`
+    cell rather than owning a column, so they sit at a fixed offset on every
+    row and still read as a column by eye."""
+    return "".join(ln.strip("│").split("│")[0].strip()[0]
                    for ln in out.splitlines() if ln.startswith("│"))
 
 
 def _decided(slug, pnl, end_ts, **kw):
     row = {"slug": slug, "won": pnl >= 0, "pnl": pnl, "est": False, "end_ts": end_ts,
-           "notional": 10.0, "shares": 10.0, "entry_px": 0.96, "side": "up"}
+           "notional": 10.0, "shares": 10.0, "entry_px": 0.96, "side": "up",
+           "entry_ts": end_ts - 200, "exit_ts": end_ts + 20}
     row.update(kw)
     return row
 
@@ -437,7 +506,7 @@ def test_the_merged_table_carries_the_riding_chips_identity():
     out = _trades_text(sb)
     assert _glyph_column(out) == "◆✓"
     row = next(ln for ln in out.splitlines() if "bnb 5m" in ln)
-    assert "◆" in row and "$19.44" in row and "riding" in row
+    assert "◆ bnb 5m" in row and "$19.44" in row and "riding" in row
 
 
 def test_an_estimated_verdict_is_dim_in_the_glyph_column_like_its_chip_was():
@@ -506,7 +575,8 @@ def test_windows_title_states_the_retention_cap():
 
 def _riding(slug, end_ts, notional=19.44):
     return {"slug": slug, "won": None, "pnl": None, "end_ts": end_ts,
-            "notional": notional, "entry_px": 0.97, "side": "up"}
+            "notional": notional, "entry_px": 0.97, "side": "up",
+            "shares": 20.0, "entry_ts": end_ts - 180, "exit_ts": 0.0}
 
 
 def test_a_fresh_fill_tops_the_panel_and_a_short_panel_keeps_it():
@@ -553,7 +623,9 @@ def test_a_live_arm_holds_a_row_before_anything_has_filled():
     assert all(r["live"] and r["won"] is None for r in rows)
     out = _trades_text({}, arms=_LIVE_ARMS, now=1787510800.0)
     assert "armed" in out and "gated" in out
-    assert "live" in out  # the window has not ended: age reads as live, not 0s
+    # the window has not ended, so `t` counts DOWN to its close (the arms
+    # table's T-) rather than up from it
+    assert "3:20" in out, out
 
 
 def test_a_fire_fills_the_row_that_is_already_there_instead_of_adding_one():
@@ -586,7 +658,7 @@ def test_the_engines_committed_is_dim_until_the_wallet_confirms_it():
     slug = "btc-updown-5m-1787510700"
 
     def row_ansi(sb):
-        c = Console(record=True, width=100)
+        c = Console(record=True, width=200)
         c.print(cc.build_windows_table(sb, 1787510800.0, arms=_LIVE_ARMS))
         return next(ln for ln in c.export_text(styles=True).splitlines()
                     if "btc 5m" in ln)
@@ -663,11 +735,21 @@ def test_the_merged_table_fits_a_narrow_terminal_without_losing_a_column():
     paints the same on an 80-column terminal as on a 200-column one."""
     sb = {"windows": [_decided("btc-updown-5m-1787500000", -12436.76, 1787500300)],
           "riding_windows": [_riding("bnb-updown-5m-1787510100", 1787510400)]}
-    for width in (80, 100, 200):
+    for width in (90, 100, 120, 140, 200):
         out = _trades_text(sb, width=width, arms=_LIVE_ARMS)
         rows = [ln for ln in out.splitlines() if ln.startswith("│")]
         assert all(len(ln) <= width for ln in rows), width
+        # One row per window at every width, and the lifecycle glyph survives
+        # the squeeze: Rich shrinks every no_wrap column equally, so a glyph
+        # with a column of its own would collapse to nothing on exactly the
+        # terminals that can least afford to lose it. Riding at the head of
+        # the `arm` cell it is the last thing to go.
+        assert len(rows) == 4, (width, rows)
         assert _glyph_column(out) == "○⊘◆✗", width
+    # ...and at its natural width nothing is ellipsised, five-figure P&L
+    # included.
+    wide = _trades_text(sb, width=200, arms=_LIVE_ARMS)
+    assert "…" not in wide and "-12,436.76" in wide
 
 
 def test_the_column_geometry_is_identical_across_every_stage():
@@ -691,11 +773,14 @@ def test_a_riding_row_says_what_we_paid_and_what_it_is_worth_now():
     sb = {"windows": [], "riding_windows": [
         {"slug": "bnb-updown-5m-1787510100", "won": None, "pnl": None, "est": False,
          "end_ts": 1787510400, "notional": 19.44, "shares": 20.0,
-         "entry_px": 0.972, "side": "up"}]}
+         "entry_px": 0.972, "side": "up", "entry_ts": 1787510200,
+         "exit_ts": 0.0}]}
     out = _trades_text(sb, odds={("bnb-updown-5m-1787510100", "up"): 0.99})
     row = next(ln for ln in out.splitlines() if "bnb 5m" in ln)
     cells = [c.strip() for c in row.strip("│").split("│")]
-    assert cells == ["◆", "1m", "bnb 5m", "up", "0.97", "0.99", "$19.44", "riding"]
+    assert cells[:3] == ["◆ bnb 5m", "1m", "held 5m00s"]
+    assert cells[3].startswith("20sh in ")   # wall clock is the reader's own tz
+    assert cells[4:] == ["up 0.97→0.99", "$19.44", "riding"]
 
 
 def test_the_now_column_is_blank_when_the_marks_feed_has_nothing():
@@ -707,7 +792,7 @@ def test_the_now_column_is_blank_when_the_marks_feed_has_nothing():
         out = _trades_text(sb, odds=odds)
         row = next(ln for ln in out.splitlines() if "bnb 5m" in ln)
         cells = [c.strip() for c in row.strip("│").split("│")]
-        assert cells[4] == "0.97" and cells[5] == "—", (odds, cells)
+        assert cells[4] == "up 0.97→—", (odds, cells)
 
 
 def test_the_now_column_colors_by_which_side_is_winning():
@@ -740,55 +825,52 @@ def test_trades_table_marks_an_estimated_pnl_and_never_shows_negative_zero():
 
 # ---------- arms table: missing/partial eval tolerance (4d) ----------
 
-def test_build_arms_table_no_arms_shows_placeholder():
-    from rich.console import Console
-
-    t = cc.build_arms_table({}, now=1000.0)
-    c = Console(record=True, width=140)
-    c.print(t)
-    assert "engine unreachable or no arms" in c.export_text()
-
-
-def test_build_arms_table_tolerates_none_and_partial_eval():
+def test_live_rows_tolerate_none_and_partial_evals():
+    """The arms table's hard rule, inherited: an engine restart mid-watch
+    leaves last_eval None or half-built, and the row must keep painting."""
     from rich.console import Console
 
     arms = {
         "btc-updown-5m-9999999999": {"filled_usdc": 10.0, "roll": True, "eval": None},
         "eth-updown-15m-8888888888": {"filled_usdc": 5.0, "roll": False,
                                        "eval": {"state": "armed"}},  # no p_up/rho/sides
-        "not-a-real-slug": {},  # missing filled_usdc/roll entirely
+        "sol-updown-5m-9999999999": {},        # no filled_usdc/roll/eval at all
+        "not-a-real-slug": {"eval": {"state": "armed"}},   # not a window
     }
-    t = cc.build_arms_table(arms, now=1000.0)  # must not raise
-    c = Console(record=True, width=160)
-    c.print(t)
+    c = Console(record=True, width=200)
+    c.print(cc.build_windows_table({}, 1000.0, arms=arms))   # must not raise
     out = c.export_text()
-    assert "—" in out  # missing fields degrade gracefully, not a traceback
+    assert "—" in out           # missing fields degrade, never a traceback
     assert "$10.00" in out
+    assert "not-a-real" not in out  # this table's unit is a window
 
 
-def test_build_arms_table_column_geometry_is_identical_across_states():
+def test_the_folded_table_keeps_the_arms_tables_column_geometry_rule():
+    """Fixed widths so nothing jitters as a gate reason or a stage changes —
+    now across live AND settled rows, which is the whole risk of repurposing a
+    cell by stage."""
     from rich.console import Console
 
-    def col_boundaries(arms):
-        t = cc.build_arms_table(arms, now=1700000000.0)
-        c = Console(record=True, width=140)
-        c.print(t)
-        lines = [ln for ln in c.export_text().splitlines() if ln.startswith("│")]
-        return [[i for i, ch in enumerate(ln) if ch == "│"] for ln in lines]
-
-    short = col_boundaries({"btc-updown-5m-1700000300": {"filled_usdc": 1.0, "eval": None}})
     long_reason = ("basis guard: projected margin -4.9bp inside 6.0bp noise band "
                    "[banked -3.2bp cushion 9.3bp] and then some extra unexpected text")
-    long_ = col_boundaries({
-        "btc-updown-5m-1700000300": {"filled_usdc": 1.0,
+    arms = {
+        "btc-updown-5m-1700000300": {"filled_usdc": 1.0, "roll": True,
                                       "eval": {"state": "gated", "reason": long_reason}},
-        "eth-updown-15m-1700000900": {"filled_usdc": 2.0, "eval": {
+        "eth-updown-15m-1700000900": {"filled_usdc": 2.0, "feed": "rtds",
+                                       "maker_bid": True, "resting_usdc": 45.0,
+                                       "eval": {
             "state": "armed", "p_up": 0.8732, "mode": "safe", "rho": 0.4,
             "banked_bp": 12.3, "cushion_bp": 9.3, "banked_decided": True,
-            "committed": 2.0, "sides": [{"side": "up", "safety": 0.9}],
-        }},
-    })
-    assert short[0] == long_[0] == long_[1]
+            "committed": 2.0, "sides": [{"side": "up", "safety": 0.9}]}},
+        "sol-updown-5m-1700000300": {"eval": None},
+    }
+    sb = {"windows": [_decided("xrp-updown-5m-1699990000", -12436.76, 1699990300)],
+          "riding_windows": [_riding("bnb-updown-5m-1699999000", 1699999300)]}
+    c = Console(record=True, width=200)
+    c.print(cc.build_windows_table(sb, 1700000000.0, arms=arms))
+    lines = [ln for ln in c.export_text().splitlines() if ln.startswith("│")]
+    bounds = {tuple(i for i, ch in enumerate(ln) if ch == "│") for ln in lines}
+    assert len(lines) == 5 and len(bounds) == 1, lines
 
 
 # ---------- tape run-collapsing ----------
@@ -1231,9 +1313,10 @@ _FRAME_ARMS = {
 }
 
 
-def _frame_text(width: int = 160) -> str:
+def _frame_text(width: int = 200) -> str:
     """Every panel one watch frame paints, rendered into one string — the only
-    place a fact duplicated ACROSS builders is visible."""
+    place a fact duplicated ACROSS builders is visible. Two panels now: the
+    header and the ONE table."""
     from rich.console import Console
     from rich.panel import Panel
 
@@ -1246,7 +1329,6 @@ def _frame_text(width: int = 160) -> str:
     c = Console(record=True, width=width)
     # the exposure line lives INSIDE the header panel now — no standalone row
     c.print(cc.build_header_panel(snap, "since 08-23 04:00Z", None))
-    c.print(cc.build_arms_table(_FRAME_ARMS, now=1700000000.0))
     c.print(Panel(cc.build_windows_table(sb, 1700000000.0, arms=_FRAME_ARMS),
                   title=cc.windows_title(sb, _FRAME_ARMS), border_style="dim"))
     return c.export_text()
@@ -1514,6 +1596,6 @@ def test_committed_never_renders_negative_zero():
     from rich.console import Console
     arms = {"btc-updown-5m-1000": {"eval": {"state": "armed", "committed": -1e-9,
             "p_up": 0.5, "rho": 0.0, "sides": []}, "roll": True}}
-    c = Console(record=True, width=160)
-    c.print(wu.build_arms_table(arms, now=1000.0))
+    c = Console(record=True, width=200)
+    c.print(wu.build_windows_table({}, 1000.0, arms=arms))
     assert "-$0.00" not in c.export_text()

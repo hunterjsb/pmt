@@ -751,14 +751,16 @@ def render_stats(sb: dict, eff: dict, bal: dict | None, status: dict | None,
 
     arms = status.get("arms") or {}
     if arms:
-        # watch's own arms table, not a second one: a static snapshot that
-        # drifts from the live dashboard is worse than no snapshot.
+        # watch's own table, not a second one: a static snapshot that drifts
+        # from the live dashboard is worse than no snapshot. Handed the arms
+        # and NO scoreboard, so it paints exactly the live head — the rows the
+        # arms table used to be, from the builder that replaced it.
         import time as _t
 
-        from watch_ui import build_arms_table
+        from watch_ui import build_windows_table
 
         parts += [section("live arms", "a snapshot — `pmt crypto watch` for live"),
-                  build_arms_table(arms, _t.time())]
+                  build_windows_table({}, _t.time(), arms=arms)]
         if status.get("pending_rolls"):
             parts.append(f"[dim]pending rolls: {', '.join(status['pending_rolls'])}[/dim]")
     return Group(*parts)

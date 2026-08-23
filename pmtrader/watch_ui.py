@@ -10,7 +10,7 @@ The two hard rules the dashboard is built on:
   * every cell tolerates a missing or half-built eval — an engine restart
     mid-watch leaves `last_eval` None or partial, and the dashboard must keep
     painting rather than raise;
-  * column geometry is fixed (see _HEAD_*, _ARMS_COLUMNS, _WINDOWS_COLUMNS,
+  * column geometry is fixed (see _HEAD_*, _WINDOWS_COLUMNS,
     _TAPE_TAG_WIDTH, _TAPE_AGG_WIDTH), so the layout never jitters as
     state/reason text changes tick to tick, and every panel puts a given
     kind of figure at the same offset every frame.
@@ -854,14 +854,17 @@ def feed_row(status: dict | None) -> tuple | None:
 
 # ---------- the windows table: the fleet's state, one row per window ----------
 #
-# DESIGN NOTE (2026-08-23) — why the recent-windows chip strip and the trades
-# table are now ONE table.
+# DESIGN NOTE (2026-08-23) — the dashboard's ONE table. The recent-windows chip
+# strip, the trades table and the arms table are all folded in here; nothing
+# else on the dashboard is a table.
 #
-# The dashboard used to carry both a chip strip (`✓ btc5 +12  ✗ eth15 -44
-# ◆ bnb5 $19`) and a trades table (age/arm/side/entry/now/size/P&L). The strip
-# was a projection of the table's own rows — same source, same order — so it
-# spent three terminal rows restating them less precisely, and the two could
-# only ever agree or be a bug.
+# The strip was a projection of the trades table's own rows — same source, same
+# order — so it spent three terminal rows restating them less precisely. The
+# arms table was the same window seen from the other side: its rows and the
+# trades panel's newest rows named the SAME windows, one panel apart, in two
+# vocabularies, with `committed` and `size` quietly answering the same question
+# from two sources. Two tables for one fleet is the thing this file no longer
+# does.
 #
 # What replaces them is not a log of trades. It is the STRATEGY'S STATE. Its
 # unit is the WINDOW, and a window has exactly one life:
@@ -897,41 +900,73 @@ def feed_row(status: dict | None) -> tuple | None:
 #     was ordered by these rows already), plus ◆ for a riding position and ○/⊘
 #     for the live head. Nothing the strip said is gone; the arm label, the
 #     P&L and the notional it compressed into a chip are now their own columns.
+#     Glyph and the arms table's ⟳/≈/◇ flags share the `arm` cell — both are
+#     properties of the row, not of a column of their own, and the glyph is
+#     safe there from Rich's narrow-console squeeze (see _WINDOWS_COLUMNS).
+#
+#  4. EVERY COLUMN IS REPURPOSED BY STAGE rather than duplicated. This is what
+#     made folding the arms table possible: a live un-filled window's money
+#     cells are dead space, and a rolled-away window's model cells are dead
+#     space, so the two sets share the SAME columns and the stage decides which
+#     meaning is showing. The column count never changes, so the geometry never
+#     jitters:
+#
+#       col       live (armed/gated)            settled (riding/decided)
+#       ───────── ───────────────────────────── ─────────────────────────
+#       t         T- countdown to the close     age since the close
+#       state     armed/gated + mode + badges   held 3m12s (exposure time)
+#                 or the compact gate reason
+#       read      evidence · p↑ · ρ             20sh in 14:38 (what we took)
+#       position  — (nothing held yet)          up 0.97→0.99 (entry → mark)
+#       $         engine committed (dim)        wallet notional
+#       P&L       —                             riding, or the signed P&L
+#
+#     `position`'s right-hand price is the one number that walks the whole
+#     lifecycle in one place: the live mark while the window rides, and the
+#     binary's own 1.00/0.00 once it settles.
 #
 # Grouping is FLAT, not by arm: a window belongs to a moment, not to an arm —
 # an arm that rolled away still owns its riding position, and per-arm grouping
 # would file that position under whichever arm happens to be alive now. The
 # `arm` column carries the grouping the eye needs at a dozen rows.
 #
-# The arms table deliberately did NOT fold in. It answers a different question
-# — what is the ENGINE THINKING about its current window (banked-vs-cushion
-# evidence, p_up, mode, rho, brake badges, the full gate reason) — and those
-# columns exist only while a window is live, i.e. for two or three of a dozen
-# rows. Folding them in hangs five permanently-empty columns off 80% of the
-# table and pushes it past 140 columns wide, which is worse on every terminal.
-# Instead the two tables share a row identity and split the vocabulary: this
-# table's live rows ARE the arms table's rows, it repeats none of the model
-# read, and it carries only the two facts a lifecycle needs from an arm —
-# whether it is gated, and how much is in.
+# The money question the two tables used to answer twice is now answered once:
+# `$` is the ENGINE's committed figure while the wallet has never seen the
+# window (dim, because it is not ground truth yet) and the WALLET's notional
+# from the moment it has. They can legitimately differ for a few seconds
+# across a fill; which one wins is never in doubt.
 #
-# The one figure that appears in both is the money: the arms table's
-# `committed` is what the ENGINE says it has spent on its current window, this
-# table's `size` is what the WALLET says the position cost. They answer the
-# same question from the two sides of a fill and can legitimately disagree for
-# a few seconds; which one is authoritative is never in doubt (the wallet), and
-# an engine figure the wallet has not confirmed renders dim to say so.
+# The arms table's one thing that is not a row — its red "engine unreachable or
+# no arms" placeholder — moved to the header panel (see `engine_row`), because
+# with no arms there are no live rows to hang it on and the exposure row would
+# otherwise read a confident $0.00 committed.
 
 _WINDOWS_COLUMNS = (
-    ("·", "left", 1),        # stage glyph — _STAGE_LEGEND
-    ("age", "right", 5),
-    ("arm", "left", 8),
-    ("side", "left", 4),
-    ("entry", "right", 5),
-    ("now", "right", 5),
-    ("size", "right", 9),
+    # Stage glyph + series + flags in ONE cell: "◆ doge 15m ⟳≈◇" is 14. The
+    # glyph does NOT get a column of its own — Rich squeezes every no_wrap
+    # column equally on a console narrower than the table, and a 1-wide column
+    # collapses to nothing, so the lifecycle would silently vanish first on
+    # exactly the terminals that can least afford to lose it. Riding at the
+    # head of a 14-wide cell it survives longest, and the cell ellipsises from
+    # the right, which sheds the flags before the label and the label before
+    # the glyph — the right order of importance.
+    ("arm", "left", 14),
+    ("t", "right", 6),         # T- past "59:59" on a not-yet-open window
+    # Sized for the arms table's own worst case, which is a normal state and
+    # not a corner: an armed arm with both sides' safety read AND a brake on
+    # one of them — "armed safe  saf +0.90/-0.30  down:distrust" is 42. The
+    # gate reason ("gated  margin -4.9 vs 6.0bp", 27) fits well inside that.
+    # This and `read` are the two widest cells, so a console narrower than the
+    # table's natural ~149 squeezes THEM first — which is the right place for
+    # it to land: they are diagnostic prose, and every money column is sized to
+    # its longest value and must never lose a digit.
+    ("state", "left", 42),
+    ("read", "right", 25),     # "+12.3/9.3bp p↑0.87 ρ+0.40" is 25
+    ("position", "right", 15),  # "down 0.97→0.99" is 15
+    ("$", "right", 15),        # "$1,234.56 ◇$450" is 15
     # 10, not 9: "-12,436.76" is a P&L this fleet has actually printed, and at
     # 9 the cell ellipsised a digit off it — the one failure a money column may
-    # not have. It also fits the empty-table placeholder without a "no windo…".
+    # not have.
     ("P&L", "right", 10),
 )
 
@@ -985,25 +1020,109 @@ def _age_label(sec: float) -> str:
     return f"{h}h{m:02d}"
 
 
-_STAGE_WORD_STYLE = {"riding": "cyan", "armed": "green", "gated": "yellow"}
-
-
 def _window_pnl_cell(w: dict) -> str:
-    """Signed P&L once the window is decided; otherwise the stage word itself
-    — `riding`, `armed`, `gated`, `quiesce`. `~` marks an estimated figure
+    """Signed P&L once the window is decided, `riding` while a position has no
+    verdict, `—` while nothing is at risk at all. `~` marks an estimated figure
     (imputed win / gamma-unreachable), same convention as the header's
     "N ~estimated".
 
-    One column, one question: "what has this window come to so far". A live
-    row saying `gated` here is the stage, never the reason — the arms table one
-    panel up owns the diagnostic ("gated  margin -4.9 vs 6.0bp"), and a
-    ten-column cell could only ellipsize it.
+    Deliberately NOT the armed/gated word: the `state` cell two columns left
+    already says it, in colour and with its reason, and the same word twice in
+    one row is the duplication the fold exists to end.
     """
     stage = _stage(w)
+    if stage == "riding":
+        return "[cyan]riding[/cyan]"
     if stage not in ("won", "lost"):
-        return f"[{_STAGE_WORD_STYLE.get(stage, 'dim')}]{stage}[/]"
+        return "[dim]—[/dim]"
     v = _zero(float(w.get("pnl") or 0.0))
     return f"[{_pnl_color(v)}]{'~' if w.get('est') else ''}{v:+,.2f}[/{_pnl_color(v)}]"
+
+
+def _dur_label(sec: float) -> str:
+    """`45s` / `3m12s` / `1h04` — a duration, not a time-since (_age_label)."""
+    if sec < 60:
+        return f"{int(sec)}s"
+    if sec < 3600:
+        m, s = divmod(int(sec), 60)
+        return f"{m}m{s:02d}s"
+    h, m = divmod(int(sec // 60), 60)
+    return f"{h}h{m:02d}"
+
+
+def _t_cell(w: dict, now: float) -> str:
+    """One column, one axis: how far this window is from its own end — the T-
+    countdown while it is still open (the arms table's column, verbatim), the
+    age since it closed after that. A live arm and a decided trade are asking
+    the same question from opposite sides of the same instant."""
+    end_ts = float(w.get("end_ts") or 0.0)
+    if not end_ts:
+        return "[dim]—[/dim]"
+    if end_ts > now:
+        return _countdown_markup(w.get("slug", ""), now)
+    return _age_label(now - end_ts)
+
+
+def _live_state_text(e: dict) -> str:
+    """The arms table's `state` cell: the compact gate reason for a gated arm,
+    the regime label plus safety/brake badges for an armed one. Every branch
+    tolerates a missing or half-built eval — an engine restart mid-watch leaves
+    last_eval None or partial, and the row must keep painting."""
+    state = e.get("state", "?")
+    if state == "gated":
+        return f"[yellow]gated[/yellow]  {_gated_reason_compact(e.get('reason'), e)}"
+    if state == "armed":
+        mode = _mode_text(e)
+        head = "[green]armed[/green]" + (f" [dim]{mode}[/dim]" if mode != "—" else "")
+        sides = e.get("sides") or []
+        badges = "  ".join(x for x in (_safety_rich(sides, e.get("p_up")),
+                                        _brake_rich(sides)) if x)
+        return f"{head}  {badges}" if badges else head
+    # flip/quiesce ARE the mode, and an unknown state is printed as itself
+    # rather than swallowed.
+    return str(state)
+
+
+def _state_cell(w: dict, now: float) -> str:
+    """What this row is about right now: the ENGINE's posture while the window
+    is live, the position's exposure once the arm has left it behind.
+
+    The stage-repurposing that let the arms table fold in — an armed window has
+    no exposure to report and a rolled-away one has no engine reading it, so
+    one column carries whichever of the two exists.
+    """
+    if w.get("live"):
+        return _live_state_text(w.get("eval") or {})
+    start = float(w.get("entry_ts") or 0.0)
+    if not start:
+        return "[dim]—[/dim]"
+    # Exposure time: what polymarket.effectiveness grades on, and what the
+    # dashboard could never show while these were two tables.
+    end = now if w.get("won") is None else (float(w.get("exit_ts") or 0.0)
+                                            or float(w.get("end_ts") or 0.0) or now)
+    return f"[dim]held[/dim] {_dur_label(max(end - start, 0.0))}"
+
+
+def _read_cell(w: dict) -> str:
+    """The model's case while the window is live — banked-vs-cushion evidence,
+    p↑ and ρ, the three arms-table columns that only mean anything before a
+    verdict — and what we actually took once it is settled."""
+    if w.get("live"):
+        e = w.get("eval") or {}
+        bits = []
+        if e.get("banked_bp") is not None and e.get("cushion_bp") is not None:
+            bits.append(_evidence_markup(e))
+        if "p_up" in e:
+            bits.append(f"[dim]p↑{e['p_up']:.2f}[/dim]")
+        if "rho" in e:
+            bits.append(f"[dim]ρ{e['rho']:+.2f}[/dim]")
+        # A pre-model eval (quiesce, or a half-built one after a restart) has
+        # none of these; "— p↑— ρ—" is noise where "—" is the fact.
+        return " ".join(bits) if bits else "[dim]—[/dim]"
+    shares, ts = w.get("shares"), float(w.get("entry_ts") or 0.0)
+    if not shares or not ts:
+        return "[dim]—[/dim]"
+    return f"{shares:,.0f}sh [dim]in[/dim] {time.strftime('%H:%M', time.localtime(ts))}"
 
 
 def position_odds(odds: dict | None, w: dict) -> float | None:
@@ -1034,6 +1153,43 @@ def _odds_cell(w: dict, odds: dict | None) -> str:
     return f"[{style}]{px:.2f}[/{style}]"
 
 
+def _mark_cell(w: dict, odds: dict | None) -> str:
+    """What the held side is worth now — the live mark while it rides, and the
+    binary's own 1.00/0.00 once it has settled. One number, walked all the way
+    to the end of the lifecycle instead of going blank at the verdict."""
+    won = w.get("won")
+    if won is None:
+        return _odds_cell(w, odds)
+    style = "dim" if w.get("est") else ("green" if won else "red")
+    return f"[{style}]{1.0 if won else 0.0:.2f}[/{style}]"
+
+
+def _position_cell(w: dict, odds: dict | None) -> str:
+    """`up 0.97→0.99` — the side we hold, what the average dollar paid for it,
+    and what it is worth now. `—` for a window nothing is held in, which is
+    every live row until its arm fires."""
+    px = w.get("entry_px")
+    if not px:
+        return "[dim]—[/dim]"
+    return f"{w.get('side') or '?'} {px:.2f}[dim]→[/dim]{_mark_cell(w, odds)}"
+
+
+def _money_cell(w: dict) -> str:
+    """Notional in this window, plus any resting maker bid sharing the cell.
+
+    Dim while the figure is the ENGINE's own committed number on a window the
+    wallet has not graded — it is a real figure and belongs on screen the
+    instant the engine reports it, but the wallet is what makes it true.
+    """
+    money = f"${_zero(float(w.get('notional') or 0.0)):,.2f}"
+    resting = float(w.get("resting") or 0.0)
+    if resting > 0.005:
+        money += f" [cyan]◇${resting:,.0f}[/cyan]"
+    if not w.get("held") and w.get("won") is None:
+        return f"[dim]{money}[/dim]"
+    return money
+
+
 def live_rows(arms: dict | None) -> list[dict]:
     """The fleet's CURRENT windows as window rows — the head of every chain.
 
@@ -1050,16 +1206,23 @@ def live_rows(arms: dict | None) -> list[dict]:
     for slug, a in (arms or {}).items():
         parsed = updown_slugs.parse_updown_slug(slug)
         if parsed is None:
-            continue  # not a window; the arms table still shows it as itself
+            continue  # not a window: this table's unit is one, so it has no row
         a = a if isinstance(a, dict) else {}
         e = a.get("eval")
         e = e if isinstance(e, dict) else {}
         committed = e.get("committed", a.get("filled_usdc")) or 0.0
         out.append({"slug": slug, "won": None, "pnl": None, "est": False,
                     "end_ts": float(parsed["end"]), "notional": committed,
-                    "entry_px": None, "side": None, "held": False,
-                    "state": e.get("state") or "armed", "live": True})
+                    "entry_px": None, "side": None, "shares": None, "held": False,
+                    "state": e.get("state") or "armed", "live": True, "eval": e,
+                    "flags": _arm_flags(a),
+                    "resting": a.get("resting_usdc") or e.get("resting") or 0.0})
     return out
+
+
+# What the engine adds to a window the wallet already priced: posture, never
+# money or a verdict.
+_LIVE_OVERLAY = ("live", "state", "eval", "flags", "resting")
 
 
 def window_rows(sb: dict | None, arms: dict | None = None,
@@ -1093,7 +1256,7 @@ def window_rows(sb: dict | None, arms: dict | None = None,
             continue
         # Posture only. The wallet already has money and a verdict for this
         # window and outranks the engine on both.
-        cur["live"], cur["state"] = True, lr["state"]
+        cur.update({k: lr[k] for k in _LIVE_OVERLAY})
     rows.sort(key=lambda r: float(r.get("end_ts") or 0.0), reverse=True)
     return rows if limit is None else rows[:limit]
 
@@ -1122,130 +1285,105 @@ def build_windows_table(sb: dict | None, now: float,
                         arms: dict | None = None,
                         limit: int | None = None,
                         odds: dict | None = None) -> Table:
-    """The fleet's state: stage, age, arm, side, avg entry, current mark,
-    notional, P&L — one row per window, newest first. See the design note
-    above for why this is one table and not two panels.
+    """The dashboard's ONE table — every window the fleet is in or has been
+    in, newest first, each cell reading whichever of its two meanings the
+    row's stage calls for. See the design note above.
+
+        ⊘  xrp 5m ⟳≈   3:41  gated  margin -4.9 vs 6.0bp   -3.2/9.3bp p↑0.44 ρ-0.10   —              $0.00       —
+        ◆  bnb 5m       1m   held 3m12s                    20sh in 14:38              up 0.97→0.41   $19.44   riding
+        ✓  eth 5m      10m   held 2m45s                    10sh in 14:31              down 0.95→1.00 $95.00   +12.30
 
     Renders EVERY row it is handed (the caller caps via `limit`), so a window
     the scoreboard knows about is always on screen somewhere — the guarantee
     the chip strip could not make, because it only ever carried decided
-    windows.
+    windows. A riding row has to survive the arm rolling AWAY from that
+    window: the position stays ours until the wallet grades it, and this is
+    where the operator watches it land.
 
-    A riding row reads `◆ · 12s · bnb 5m · up · 0.97 · 0.99 · $19.44 ·
-    riding`: what we got it for, what it is worth now, and how much of it
-    there is. It has to survive the arm rolling AWAY from that window — the
-    position stays ours until the wallet grades it, and this is where the
-    operator watches it land.
+    Every cell tolerates a missing or half-built eval — an engine restart
+    mid-watch leaves last_eval None or partial, and the row must keep painting
+    rather than raise.
 
-    `odds` is the optional current-mark map (polymarket.positions), fetched on
-    the watch worker's slow cadence. Absent, empty or stale it degrades to `—`
-    in the `now` column and changes nothing else.
+    `arms` is the engine's already-fetched /status arms mapping: it supplies
+    the live head and each live row's posture, and nothing else. `odds` is the
+    optional current-mark map (polymarket.positions), fetched on the watch
+    worker's slow cadence; absent, empty or stale it degrades to `—` on the
+    right of the `position` cell and changes nothing else.
     """
-    # Natural widths, not expand=True: eight narrow columns stretched across
-    # 160 terminal columns puts a metre of whitespace between a window's size
-    # and its P&L. The arms table expands because it genuinely fills the row.
+    # Natural widths, not expand=True: the columns are sized to their longest
+    # value, and stretching them across a 200-column terminal puts a metre of
+    # whitespace between a window's size and its P&L.
     t = Table(expand=False, pad_edge=False)
     for col, justify, width in _WINDOWS_COLUMNS:
         t.add_column(col, justify=justify, width=width, no_wrap=True, overflow="ellipsis")
     rows = window_rows(sb, arms, limit)
     for w in rows:
-        px = w.get("entry_px")
-        end_ts = float(w.get("end_ts") or 0.0)
-        size = f"${_zero(float(w.get('notional') or 0.0)):,.2f}"
-        if not w.get("held") and w.get("won") is None:
-            # The engine's committed figure on a window the wallet has not
-            # graded yet — dim, because ground truth hasn't confirmed it.
-            size = f"[dim]{size}[/dim]"
         t.add_row(
-            _stage_cell(w),
-            _age_label(now - end_ts) if end_ts else "—",
-            _arm_label(w.get("slug", "")),
-            w.get("side") or "—",
-            f"{px:.2f}" if px else "—",
-            _odds_cell(w, odds),
-            size,
+            _arm_cell(w),
+            _t_cell(w, now),
+            _state_cell(w, now),
+            _read_cell(w),
+            _position_cell(w, odds),
+            _money_cell(w),
             _window_pnl_cell(w),
         )
     if not rows:
-        # In the P&L cell, not a wider one: every column here is narrow, and a
-        # placeholder that ellipsizes is worse than a short honest one.
-        t.add_row("—", "—", "—", "—", "—", "—", "—", "[dim]no windows[/dim]")
+        # In the state cell, the widest one: a placeholder that ellipsizes is
+        # worse than a short honest one, and this is the only column with room.
+        t.add_row("—", "—", "[dim]no windows[/dim]", "—", "—", "—", "—")
     return t
 
 
-# Fixed widths (+ ellipsis overflow below) so the arms table's geometry never
-# jitters as state/reason text length changes tick to tick. `committed` is
-# sized for "$1,234.56 ◇$450" — the resting bid shares the cell — and `flags`
-# for all three markers at once plus its header; both were paid for out of the
-# slack in evidence/p_up/mode/rho, each of which is now its longest value
-# ("-100.0/100.0bp", "0.87", "quiesce", "+0.40") rather than a round number.
-# T- keeps 6: an arm placed on a not-yet-open window counts down past "59:59".
 def _arm_label(slug: str) -> str:
-    """`btc 5m` — symbol + duration only. The start clock the tape lines
-    carry would be redundant here: T- counts down to the same instant, and
-    an arms row is always the CURRENT window."""
+    """`btc 5m` — symbol + duration only. The window's own start clock (which
+    the tape lines carry) would be redundant: the `t` column counts down to,
+    or up from, that same window's end."""
     parts = slug.split("-")
     return f"{parts[0]} {parts[2]}" if len(parts) >= 3 else slug
 
 
-_ARMS_COLUMNS = (
-    ("arm", "left", 8),
-    ("T-", "right", 6),
-    ("state", "left", 40),
-    ("evidence", "right", 14),
-    ("p_up", "right", 5),
-    ("mode", "left", 7),
-    ("rho", "right", 5),
-    ("committed", "right", 16),
-    ("flags", "right", 6),
-)
-
-_ARMS_FLAG_LEGEND = "⟳ roll · ≈ stream-fed · ◇ maker bid"
+_FLAG_LEGEND = "⟳ roll · ≈ stream-fed · ◇ maker bid"
 
 
-def build_arms_table(arms: dict | None, now: float) -> Table:
-    """Live-arms table: countdown, state (compact gate reason for a gated
-    arm, safety/brake badges for an armed one), banked-vs-cushion evidence,
-    model read (p_up/mode/rho), committed $ (+ any resting maker bid), and
-    the roll/feed/maker flags (_ARMS_FLAG_LEGEND). Every cell tolerates a
-    missing/partial eval — an engine restart mid-watch leaves last_eval None
-    or half-built.
+def _arm_flags(a: dict) -> str:
+    """`⟳≈◇` — the arm's roll/feed/maker markers (_FLAG_LEGEND), in that
+    order. "·" keeps the roll slot occupied so the feed and maker markers never
+    shift place between rows."""
+    return (("⟳" if a.get("roll") else "·")
+            + ("≈" if a.get("feed") == "rtds" else "")
+            + ("◇" if a.get("maker_bid") else ""))
+
+
+def _arm_cell(w: dict) -> str:
+    """`◆ btc 5m ⟳≈◇` — the row's whole identity: where the window is in its
+    life, which series it belongs to, and (while some arm is actually on it)
+    that arm's flags. A rolled-away window is just glyph + series: the markers
+    describe a live arm, and there is no longer one here.
+
+    Glyph and flags ride in this cell rather than columns of their own because
+    both are properties of the row — and because a 1-wide glyph column is the
+    first thing Rich squeezes out of existence on a narrow console.
     """
-    t = Table(expand=True, pad_edge=False)
-    for col, justify, width in _ARMS_COLUMNS:
-        t.add_column(col, justify=justify, width=width, no_wrap=True, overflow="ellipsis")
-    arms = arms or {}
-    for slug, a in arms.items():
-        if not isinstance(a, dict):
-            a = {}
-        e = a.get("eval")
-        e = e if isinstance(e, dict) else {}
-        state = e.get("state", "?")
-        if state == "gated":
-            state = f"[yellow]gated[/yellow]  {_gated_reason_compact(e.get('reason'), e)}"
-        elif state == "armed":
-            sides = e.get("sides") or []
-            badges = "  ".join(x for x in (_safety_rich(sides, e.get("p_up")),
-                                            _brake_rich(sides)) if x)
-            state = f"[green]armed[/green]  {badges}" if badges else "[green]armed[/green]"
-        p_up = f"{e['p_up']:.2f}" if "p_up" in e else "—"
-        rho = f"{e['rho']:+.2f}" if "rho" in e else "—"
-        committed = e.get("committed", a.get("filled_usdc"))
-        committed_s = f"${_zero(committed):,.2f}" if committed is not None else "—"
-        resting = a.get("resting_usdc") or e.get("resting") or 0.0
-        if resting > 0.005:
-            committed_s += f" [cyan]◇${resting:,.0f}[/cyan]"
-        # _ARMS_FLAG_LEGEND, in that order. "·" keeps the roll slot occupied so
-        # the feed/maker markers never shift column between arms.
-        flags = (("⟳" if a.get("roll") else "·")
-                 + ("≈" if a.get("feed") == "rtds" else "")
-                 + ("◇" if a.get("maker_bid") else ""))
-        t.add_row(_arm_label(slug), _countdown_markup(slug, now), state,
-                  _evidence_markup(e), p_up, _mode_text(e), rho, committed_s, flags)
-    if not arms:
-        t.add_row("—", "—", "[red]engine unreachable or no arms[/red]",
-                   "—", "—", "—", "—", "—", "—")
-    return t
+    label = _arm_label(w.get("slug", ""))
+    flags = w.get("flags") or ""
+    cell = f"{_stage_cell(w)} {label}"
+    return f"{cell} [dim]{flags}[/dim]" if flags else cell
+
+
+def engine_row(status: dict | None) -> tuple | None:
+    """The arms table's red "engine unreachable or no arms" placeholder, kept
+    alive as a header row after the fold, or None while something is armed.
+
+    It has to live somewhere: with no arms there are no live rows for the
+    windows table to hang it on, the decided tail below keeps painting exactly
+    as it did an hour ago, and the exposure row would read a confident
+    "committed $0.00" — which is the one reading an unreachable engine and an
+    idle fleet must never share.
+    """
+    if (status or {}).get("arms"):
+        return None
+    return ("engine", "[red]unreachable or no arms[/red]",
+            "[dim]nothing is armed right now[/dim]", "")
 
 
 def _cbreak_stdin() -> tuple[int, list] | None:
@@ -1361,10 +1499,18 @@ def build_help_modal(width: int | None = None):
     legend = Table(box=None, pad_edge=False, padding=(0, 2), show_header=False)
     legend.add_column("what", justify="right", width=7, style="dim")
     legend.add_column("meaning", justify="left", overflow="fold")
-    legend.add_row("windows", f"[cyan]{_STAGE_LEGEND}[/cyan]")
-    legend.add_row("", "[dim]entry/now are the held side's price when we "
-                       "bought and right now · ~ marks an estimated figure[/dim]")
-    legend.add_row("arms", f"[cyan]{_ARMS_FLAG_LEGEND}[/cyan]")
+    legend.add_row("stage", f"[cyan]{_STAGE_LEGEND}[/cyan] [dim]— it leads "
+                            "every `arm` cell[/dim]")
+    legend.add_row("flags", f"[cyan]{_FLAG_LEGEND}[/cyan] [dim]— trailing the "
+                            "arm that is on this window right now[/dim]")
+    # The columns that change meaning with the stage are the whole trick of the
+    # one-table fold, so the modal is where they are spelled out.
+    legend.add_row("columns", "[dim]state · read: the engine's posture while a "
+                              "window is live (gate reason, evidence, p↑, ρ), "
+                              "what we took once it is settled[/dim]")
+    legend.add_row("", "[dim]position: entry→mark, and →1.00/0.00 once the "
+                       "binary settles · $ dims while it is the engine's own "
+                       "figure · ~ marks an estimated P&L[/dim]")
     legend.add_row("refresh", f"[dim]{_REFRESH_LINE}[/dim]")
     legend.add_row("--since", "[dim]moves the header's `recent` floor only "
                               "(default 6h) — all-time, riding and the windows "
@@ -1409,9 +1555,10 @@ def header_rows(snap: dict, render_err: str | None = None) -> list[tuple]:
     """The top panel's rows as `(label, v1, v2, v3)` tuples.
 
     Row order is the order the question is asked: how are we doing lately,
-    how are we doing overall, what is at risk right now, is the feed alive,
-    and what broke. A row with nothing to say is dropped, never padded with a
-    zero — which is why the panel's height is `header_height`, not a constant.
+    how are we doing overall, what is at risk right now, is the engine there,
+    is the feed alive, and what broke. A row with nothing to say is dropped,
+    never padded with a zero — which is why the panel's height is
+    `header_height`, not a constant.
     """
     sb = snap.get("sb") or {}
     sliding = sb.get("sliding") or _SB_EMPTY_SLIDING
@@ -1432,9 +1579,9 @@ def header_rows(snap: dict, render_err: str | None = None) -> list[tuple]:
          _pnl_cell(sb.get("net", 0.0)), cap),
     ]
     rows += exposure_rows(snap.get("status"), sb)
-    feed = feed_row(snap.get("status"))
-    if feed:
-        rows.append(feed)
+    for extra in (engine_row(snap.get("status")), feed_row(snap.get("status"))):
+        if extra:
+            rows.append(extra)
     return rows
 
 

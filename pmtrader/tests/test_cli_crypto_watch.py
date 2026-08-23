@@ -83,7 +83,7 @@ def test_a_graded_trade_always_reaches_the_watch_windows_table(monkeypatch):
     cw.WatchFetcher(state, sliding_floor=0.0).fetch_sb()   # the real stats walk
     sb = state.read()["sb"]
 
-    c = Console(record=True, width=90)
+    c = Console(record=True, width=200)   # the folded table's natural width
     c.print(watch_ui.build_windows_table(sb, time.time(), limit=cw.WINDOWS_MAX_ROWS))
     out = c.export_text()
     assert "eth 5m" in out, "a decided trade vanished between the grade and the table"
@@ -131,7 +131,7 @@ def test_a_riding_position_stays_on_the_panel_through_a_roll_until_it_grades(mon
         sb = state.read()["sb"]
         arms = {live: {"filled_usdc": 0.0, "roll": True,
                        "eval": {"state": "armed", "committed": 0.0}}}
-        c = Console(record=True, width=100)
+        c = Console(record=True, width=200)
         c.print(watch_ui.build_windows_table(sb, time.time(), arms=arms,
                                              limit=cw.WINDOWS_MAX_ROWS))
         return sb, c.export_text()
@@ -165,35 +165,59 @@ def test_windows_panel_never_starves_the_tape_and_never_paints_a_clipped_box():
     Layout slot that overflows, and a table cut off below its last row (no
     bottom border) reads as a crash rather than as a cap."""
     # Roomy screen, plenty of windows: the view cap is what bites.
-    assert cw.windows_rows_shown(50, 12, 16) == cw.WINDOWS_MAX_ROWS
+    assert cw.windows_rows_shown(50, 20) == cw.WINDOWS_MAX_ROWS
     # Few windows: don't reserve rows for windows that don't exist.
-    assert cw.windows_rows_shown(50, 12, 2) == 2
+    assert cw.windows_rows_shown(50, 2) == 2
     # Cramped screen: the tape keeps its floor, one window row still survives.
-    assert cw.windows_rows_shown(30, 12, 16) == 1
-    for h in range(20, 60):
+    assert cw.windows_rows_shown(16, 20) == 1
+    for h in range(16, 60):
         for head_h in (cw.HEAD_MIN_H, cw.HEAD_MIN_H + 2):
-            n = cw.windows_rows_shown(h, 12, 16, head_h)
+            n = cw.windows_rows_shown(h, 20, head_h)
             assert 1 <= n <= cw.WINDOWS_MAX_ROWS
-            # head + arms + panel: what's left is the tape's.
-            left = h - head_h - 12 - (n + cw.WINDOWS_CHROME)
+            # head + panel: everything left over is the tape's.
+            left = h - head_h - (n + cw.WINDOWS_CHROME)
             assert left >= cw.MIN_TAPE_ROWS or n == 1
 
 
-def test_the_deleted_strip_paid_for_the_panels_extra_rows():
-    """The merge freed the strip's three terminal rows, and the panel spends
-    them on itself: it now carries the fleet's LIVE windows above the tail the
-    old panel showed, so the decided tail must not have got shorter."""
-    assert cw.WINDOWS_MAX_ROWS == 11  # was 8 + the strip's 3
-    assert not hasattr(cw, "STRIP_H")
+def test_the_folded_away_panels_paid_for_the_tables_rows():
+    """The one table inherited the strip's three rows and the arms table's
+    whole slot; the decided tail may not have got shorter now that the live
+    head sits above it."""
+    assert cw.WINDOWS_MAX_ROWS == 16   # 8 + the strip's 3 + the arms slot's 5
+    for gone in ("STRIP_H", "TRADES_MAX_ROWS"):
+        assert not hasattr(cw, gone), gone
+    import watch_ui
+    # The arms table is not merely unused: it is gone, so nothing can quietly
+    # bring a second table back.
+    assert not hasattr(watch_ui, "build_arms_table")
+    assert not hasattr(watch_ui, "build_windows_strip")
+
+
+def test_the_dashboard_paints_exactly_one_table():
+    """The operator's ask, and the thing that regressed once already: header,
+    ONE table, tape — nothing else builds a Table."""
+    import inspect
+
+    import watch_ui
+
+    src = inspect.getsource(cw.crypto_watch.callback)
+    assert src.count("split_column") == 1
+    assert 'Layout(name="arms"' not in src
+    assert [n for n in ("head", "windows", "tape") if f'name="{n}"' in src] == [
+        "head", "windows", "tape"]
+    builders = [n for n in dir(watch_ui)
+                if n.startswith("build_") and n.endswith("_table")]
+    assert builders == ["build_windows_table"], builders
 
 
 def test_a_taller_header_costs_the_tape_rows_not_the_windows_floor():
-    # The header grows a row for the settlement feed and one for a render
-    # error; the windows panel keeps its floor of one row either way.
-    roomy = cw.windows_rows_shown(50, 12, 16, cw.HEAD_MIN_H)
-    taller = cw.windows_rows_shown(50, 12, 16, cw.HEAD_MIN_H + 2)
+    # The header grows a row for the settlement feed, one for an unreachable
+    # engine and one for a render error; the windows panel keeps its floor of
+    # one row either way.
+    roomy = cw.windows_rows_shown(50, 20, cw.HEAD_MIN_H)
+    taller = cw.windows_rows_shown(50, 20, cw.HEAD_MIN_H + 2)
     assert roomy == taller == cw.WINDOWS_MAX_ROWS  # a roomy screen absorbs it
-    assert cw.windows_rows_shown(28, 12, 16, cw.HEAD_MIN_H + 2) == 1
+    assert cw.windows_rows_shown(16, 20, cw.HEAD_MIN_H + 2) == 1
 
 
 # ---------- the controls modal: keys in, dashboard back ----------
