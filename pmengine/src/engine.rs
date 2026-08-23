@@ -550,6 +550,13 @@ impl Engine {
                     // Use blocking approach for sync context
                     futures::executor::block_on(self.market_data.init_book(&token_id));
                     self.subscribed_tokens.push(token_id.clone());
+                    // The WS feed must hear about these too — recovery-restored
+                    // arms come back subscribed=true and never re-emit
+                    // Signal::Subscribe, so this sync path was leaving every
+                    // recovered token REST-only (found on the first live boot:
+                    // 8 books, ws_tokens=0). subscribe() is a channel send,
+                    // safe from sync context.
+                    self.ws_feed.subscribe(&token_id);
                 }
                 futures::executor::block_on(self.ensure_condition_id(&token_id));
             }
