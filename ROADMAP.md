@@ -117,7 +117,10 @@ R3 → R5/R6/R1 → R7/R8/R9.
   - Tooling (aab232b): `pmt crypto basis --aligned` = the weekly re-measurement;
     `pmt crypto outcomes` = wallet-first validated outcomes for every replay A/B (stale
     Chainlink is dropped, never guessed — a stale step-extension mislabeled 9/37 windows
-    on 2026-08-23 and briefly justified a guard change with wrong numbers).
+    on 2026-08-23 and briefly justified a guard change with wrong numbers). `outcomes`
+    tops the Chainlink corpus up itself before grading (`--fetch-only` for the fetch
+    alone); an RPC failure warns and falls back to the on-disk corpus, where the
+    staleness guard still refuses what it can't cover.
   - Corrected guard A/B for the record (validated outcomes): on the calm 2026-08-23 night,
     btc guard 3 went 12-0 +$282 vs guard 6's 6-0 +$71 — the 6bp tightening cost winners and
     saved nothing THAT night. Kept at 6 on the 48h non-stationary measurement; revisit

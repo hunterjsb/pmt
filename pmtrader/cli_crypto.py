@@ -38,15 +38,6 @@ def crypto_group() -> None:
     """Crypto up/down market pricing against Binance/Chainlink data."""
 
 
-@crypto_group.command("spot")
-@click.argument("symbol", default="BTCUSDT")
-def crypto_spot(symbol: str) -> None:
-    """Live Binance spot price (default BTCUSDT)."""
-    from polymarket.crypto import spot_price
-
-    console.print(f"{symbol.upper()}: {spot_price(symbol.upper()):,.2f}")
-
-
 @crypto_group.command("updown")
 @click.argument("ref")
 @click.option("--json", "as_json", is_flag=True, help="Emit the full eval as JSON")
@@ -1435,34 +1426,6 @@ def _tape_schema(recs: list[dict]) -> dict:
 _ORACLE_SYMBOLS = ["btc", "eth", "sol", "xrp", "doge", "bnb", "all"]  # keep in sync with chainlink.SYMBOLS
 
 
-@crypto_group.command("oracle")
-@click.option("--symbol", type=click.Choice(_ORACLE_SYMBOLS), default="all", show_default=True)
-@click.option("--hours", type=float, default=24.0, show_default=True, help="History window to fetch")
-def crypto_oracle(symbol: str, hours: float) -> None:
-    """Fetch Chainlink Polygon oracle rounds, append new ones to the corpus.
-
-    Ground truth for the Chainlink-vs-Binance basis (`pmt crypto basis`) —
-    corpus lives at ~/.pmt/corpus/chainlink-{symbol}.jsonl, append-only.
-    """
-    from polymarket.chainlink import SYMBOLS, corpus_path, fetch_rounds, append_corpus
-
-    symbols = SYMBOLS if symbol == "all" else [symbol]
-    for sym in symbols:
-        try:
-            rounds = fetch_rounds(sym, hours=hours)
-        except Exception as e:
-            console.print(f"[red]{sym.upper():5s} RPC error — {e}[/red]")
-            continue
-        new_n = append_corpus(sym, rounds)
-        if rounds:
-            span_h = (rounds[-1]["updated_at"] - rounds[0]["updated_at"]) / 3600
-            span = f"{span_h:.1f}h span"
-        else:
-            span = "no rounds"
-        console.print(f"{sym.upper():5s} fetched {len(rounds):4d} · new {new_n:4d} · "
-                      f"{span} · {corpus_path(sym)}")
-
-
 def _print_aligned_basis(symbol: str, hours: float, no_fetch: bool) -> None:
     """TWAP-vs-TWAP aligned basis (ROADMAP.md R1) — per-minute + settlement-shaped,
     the report that measures the error which actually decides wins/losses at the wire.
@@ -1485,7 +1448,7 @@ def _print_aligned_basis(symbol: str, hours: float, no_fetch: bool) -> None:
         report = aligned_basis_report(sym, hours=hours)
         if not report["per_minute"]:
             console.print(f"[bold]{sym.upper()}/USD[/bold]  [dim]no corpus data — "
-                           f"run: pmt crypto oracle --symbol {sym}[/dim]\n")
+                           f"run without --no-fetch to build it[/dim]\n")
             continue
 
         t = Table(title=f"{sym.upper()}/USD aligned basis — last {hours:g}h "
@@ -1514,10 +1477,10 @@ def _print_aligned_basis(symbol: str, hours: float, no_fetch: bool) -> None:
 def crypto_basis(symbol: str, hours: float, aligned: bool, no_fetch: bool) -> None:
     """Chainlink-vs-Binance basis distribution — the R1 decision input for per-symbol guards.
 
-    Joins stored Chainlink rounds (`pmt crypto oracle`) against Binance 1m
-    closes and reports basis_bp = (chainlink/binance - 1) * 1e4 per round.
-    --aligned switches to the TWAP-vs-TWAP method (ROADMAP.md R1), which
-    strips out the point-in-time method's up-to-60s timing noise.
+    Joins the stored Chainlink rounds against Binance 1m closes and reports
+    basis_bp = (chainlink/binance - 1) * 1e4 per round. --aligned switches to
+    the TWAP-vs-TWAP method (ROADMAP.md R1), which strips out the point-in-time
+    method's up-to-60s timing noise, and extends the corpus itself first.
     """
     if aligned:
         _print_aligned_basis(symbol, hours, no_fetch)
@@ -1535,7 +1498,7 @@ def crypto_basis(symbol: str, hours: float, aligned: bool, no_fetch: bool) -> No
         stats = report["stats"]
         if not stats:
             console.print(f"[bold]{sym.upper()}/USD[/bold]  [dim]no corpus data — "
-                           f"run: pmt crypto oracle --symbol {sym}[/dim]\n")
+                           f"build it with: pmt crypto basis --aligned --symbol {sym}[/dim]\n")
             continue
 
         t = Table(title=f"{sym.upper()}/USD basis — last {hours:g}h")
@@ -1557,13 +1520,43 @@ def crypto_basis(symbol: str, hours: float, aligned: bool, no_fetch: bool) -> No
             console.print(f"[red]guard {guard:.1f}bp TOO TIGHT — p95 |basis| {p95abs:.1f}bp[/red]\n")
 
 
+def _refresh_oracle_corpus(symbols: list[str], since: float, now: float) -> dict[str, dict]:
+    """Top the Chainlink corpus up for the symbols we're about to grade, and say so.
+
+    Degrades on purpose: a dead Polygon RPC prints a warning and grading
+    proceeds against whatever is already on disk, where outcomes.py's
+    staleness guards refuse the windows the corpus can't cover. Losing a
+    refresh must not cost us the wallet-graded windows in the same run.
+    """
+    from polymarket.chainlink import refresh_corpus
+
+    result = refresh_corpus(symbols, since, now)
+    for sym, r in result.items():
+        if r["error"]:
+            console.print(f"[yellow]{sym.upper():5s} oracle refresh failed ({r['error']}) — "
+                          f"grading against the existing corpus[/yellow]")
+    fetched = [f"{s.upper()} +{r['new']}" for s, r in result.items() if not r["error"]]
+    if fetched:
+        console.print(f"[dim]oracle corpus: {' · '.join(fetched)} rounds[/dim]")
+    return result
+
+
 @crypto_group.command("outcomes")
 @click.option("--since", type=float, default=0.0, show_default=True,
               help="Epoch: only windows starting at/after this time")
 @click.option("--out", "out_path", type=str, default=None,
               help="Outcomes file to append/update (default: ~/.pmt/corpus/outcomes.jsonl)")
-def crypto_outcomes(since: float, out_path: str | None) -> None:
+@click.option("--fetch-only", is_flag=True,
+              help="Refresh the Chainlink corpus for the windows in range, then stop (no grading)")
+def crypto_outcomes(since: float, out_path: str | None, fetch_only: bool) -> None:
     """Build the validated outcomes file the replay harness needs (JSONL: slug/winner/source).
+
+    Refreshes the Chainlink round corpus (~/.pmt/corpus/chainlink-{sym}.jsonl,
+    append-only) for the symbols it is about to grade first — grading is only
+    as good as the corpus, and a window that closed since the last run has no
+    rounds behind it otherwise. An RPC failure warns and grades off the corpus
+    already on disk; it never grades stale silently, because the staleness
+    guards in polymarket.outcomes still refuse anything the corpus can't prove.
 
     Strict priority: wallet redemption (we traded it, Polymarket already
     settled and paid) beats Chainlink corpus inference (windows we never
@@ -1580,7 +1573,6 @@ def crypto_outcomes(since: float, out_path: str | None) -> None:
         merge_outcomes, wallet_outcomes, window_universe, write_outcomes,
     )
 
-    addr = _funder_or_usage_error()
     out_file = Path(out_path) if out_path else OUTCOMES_PATH
 
     now = _t.time()
@@ -1596,6 +1588,12 @@ def crypto_outcomes(since: float, out_path: str | None) -> None:
         console.print("[dim]No closed updown windows in range.[/dim]")
         return
 
+    symbols = {w["symbol"] for w in windows}
+    _refresh_oracle_corpus(sorted(symbols), windows[0]["start"], now)
+    if fetch_only:
+        return
+
+    addr = _funder_or_usage_error()
     try:
         activity = wallet.fetch_wallet_activity(addr, windows[0]["start"])
     except Exception as e:
@@ -1603,7 +1601,6 @@ def crypto_outcomes(since: float, out_path: str | None) -> None:
         sys.exit(1)
     wallet_wins = wallet_outcomes(activity)
 
-    symbols = {w["symbol"] for w in windows}
     rounds_by_symbol = {sym: ck.load_corpus(sym) for sym in symbols}
 
     # terminal-book fallback source: only samples near each window's end matter,
