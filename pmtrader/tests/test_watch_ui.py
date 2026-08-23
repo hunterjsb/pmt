@@ -122,16 +122,20 @@ def test_mode_text_missing_is_dash():
 # ---------- tape log fixed-width alignment ----------
 
 def test_tape_head_is_fixed_width_regardless_of_slug_length():
-    short = cc._tape_head({"t": 1700000100, "slug": "btc-updown-5m-1700000000"})
-    long = cc._tape_head({"t": 1700000100, "slug": "doge-updown-60m-1700000000"})
-    assert len(short) == len(long) == 24  # "HH:MM:SS  " (10) + slug padded to 14
+    rec = {"t": 1700000100, "slug": "btc-updown-5m-1700000000"}
+    short = cc._tape_head(rec)
+    long = cc._tape_head({**rec, "slug": "doge-updown-60m-1700000000"})
+    # "HH:MM:SS " (9) + the aggregation cell + " " + slug padded to 14
+    assert len(short) == len(long) == 8 + 1 + cc._TAPE_AGG_WIDTH + 1 + 14
+    # ...and a collapsed head is the same width as an uncollapsed one
+    assert len(cc._tape_head(rec, 4, 1700000000)) == len(short)
 
 
 def _agg_col() -> int:
-    """Column the collapse counter occupies on EVERY tape line: after the
-    fixed head and the fixed tag. Derived, never hard-coded, so widening
-    either moves the expectation with it."""
-    return len(cc._tape_head({"t": 0, "slug": ""})) + 1 + cc._TAPE_TAG_WIDTH
+    """Column the aggregation cell (`→HH:MM:SS ×N`) occupies on EVERY tape
+    line: straight after the line's own clock, inside the fixed head. Derived,
+    never hard-coded, so widening either moves the expectation with it."""
+    return len(cc._hms(0)) + 1
 
 
 def test_tape_render_columns_align_across_event_types():
@@ -157,10 +161,11 @@ def test_tape_render_columns_align_across_event_types():
     for name, line in rendered.items():
         assert line[:len(head)] == head, name
         assert line[len(head)] == " ", name
-        # the field after the fixed-width event tag starts at the same offset
-        # for every event type — this is the actual alignment claim.
-        assert line[len(head) + 1 + cc._TAPE_TAG_WIDTH] == " ", name
-        # ...and the aggregation column is present (blank) on every one of
+        # the event tag fills exactly its fixed width, so the body after it
+        # starts at the same offset for every event type — the alignment claim.
+        tag = line[len(head) + 1:len(head) + 1 + cc._TAPE_TAG_WIDTH]
+        assert tag == tag.rstrip().ljust(cc._TAPE_TAG_WIDTH), (name, tag)
+        # ...and the aggregation cell is present (blank) on every one of
         # them, so a collapsed line never shifts the body of an uncollapsed one.
         assert line[_agg_col():_agg_col() + cc._TAPE_AGG_WIDTH].strip() == "", name
 
@@ -926,15 +931,21 @@ def _fire(i=0, slug=_BTC, **over):
     return r
 
 
-# --- basis guard: the shape that already shipped, unchanged ---
+# --- basis guard: grouped per-arm, exactly like an eval ---
 
-def test_basis_guard_run_collapses_every_arm_onto_one_line():
+def test_basis_gates_collapse_per_arm_exactly_like_evals():
+    """ONE grouping rule for both line types. A basis gate joins its OWN arm's
+    run and never another's — the same lane rule two arms' evals live by. It
+    used to collapse fleet-wide on a lane of its own, which read as a second
+    mechanism and lost the collapse entirely whenever another arm spoke."""
     out = _collapse(_basis(0, _BTC, margin=1.0), _basis(1, _ETH, margin=-4.9),
-                    _basis(2, _BTC, margin=2.0))
-    assert len(out) == 1
-    assert out[0][_agg_col():].startswith("×3")
-    # freshest margin per symbol, sorted, on one line — the pre-abstraction shape
-    assert "basis bp/guard: btc +2.0/6 · eth -4.9/6" in out[0]
+                    _basis(2, _BTC, margin=1.2))
+    assert len(out) == 2, out
+    btc = next(ln for ln in out if "btc" in ln)
+    eth = next(ln for ln in out if "eth" in ln)
+    assert btc[_agg_col():].startswith(f"→{cc._hms(_T0 + 2)} ×2")
+    assert "×" not in eth  # one record, and no other arm folded into it
+    assert "  +1.2/ 6.0bp" in btc and "  -4.9/ 6.0bp" in eth  # freshest margin
 
 
 def test_basis_guard_run_ends_on_any_other_event():
@@ -949,7 +960,7 @@ def test_basis_guard_falls_back_to_the_regex_on_a_pre_structured_record():
     out = _collapse(_basis(0, margin_bp=None, guard_bp=None,
                             reason=("basis guard: projected margin -4.9bp inside "
                                     "6.0bp noise band")))
-    assert "btc -4.9/6" in out[0]
+    assert "  -4.9/ 6.0bp" in out[0]
 
 
 # --- eval runs ---
@@ -957,9 +968,9 @@ def test_basis_guard_falls_back_to_the_regex_on_a_pre_structured_record():
 def test_eval_run_collapses_with_a_count_and_its_span():
     out = _collapse(*[_eval(i) for i in range(4)])
     assert len(out) == 1
-    assert "×4" in out[0]
-    span = f"⟨{cc._hms(_T0)}→{cc._hms(_T0 + 3)}⟩"
-    assert span in out[0], out[0]
+    # the line opens on the run's FIRST record and closes the span beside the
+    # count, so "when + how many" is one glance
+    assert out[0].startswith(f"{cc._hms(_T0)} →{cc._hms(_T0 + 3)} ×4"), out[0]
     assert "p↑0.9800" in out[0]  # freshest values, rendered as a normal eval line
 
 
@@ -1088,26 +1099,24 @@ def test_a_gate_run_is_per_arm_not_fleet_wide():
     assert len(out) == 2 and all("×2" in ln for ln in out)
 
 
-# --- the aggregation marker's ONE column ---
+# --- the aggregation cell's ONE column ---
 #
-# The operator's complaint, verbatim: "i cant tell which ones are aggregated bc
-# i dont know where to look for the x, its in the middle for gated but im not
-# sure where it is for eval". The count now has exactly one home on every line
-# type, and these tests are what keeps it there.
+# The count used to be findable only per line type, so the operator could not
+# tell at a glance which lines were aggregated. Span and count now have exactly
+# one home on every line type, and these tests are what keeps them there.
 
-def test_the_collapse_counter_sits_in_the_same_column_for_every_line_type():
+def test_the_aggregation_cell_sits_in_the_same_column_for_every_line_type():
     runs = {
         "basis": [_basis(i) for i in range(3)],
         "eval": [_eval(i) for i in range(3)],
         "gate": [_gate(i) for i in range(3)],
     }
-    cols = {}
+    want = f"{'→' + cc._hms(_T0 + 2) + ' ×3':<{cc._TAPE_AGG_WIDTH}}"
     for name, recs in runs.items():
         out = _collapse(*recs)
         assert len(out) == 1, (name, out)
-        cols[name] = out[0].index("×")
-    assert len(set(cols.values())) == 1, f"ragged ×N column: {cols}"
-    assert set(cols.values()) == {_agg_col()}
+        cell = out[0][_agg_col():_agg_col() + cc._TAPE_AGG_WIDTH]
+        assert cell == want, (name, cell)
 
 
 def test_the_counter_column_is_blank_but_reserved_on_an_uncollapsed_line():
@@ -1120,21 +1129,25 @@ def test_the_counter_column_is_blank_but_reserved_on_an_uncollapsed_line():
         assert "×" not in line
 
 
-def test_the_span_still_trails_the_line_it_belongs_to():
-    # The count moved to its column; the span (variable-position by nature)
-    # stays where it was, after the body — read second, never instead.
+def test_the_span_sits_beside_the_count_and_never_trails_the_body():
+    # It used to trail a variable-width body, so it landed at a different
+    # column on every line and only repeated the clock the line already had.
     out = _collapse(*[_eval(i) for i in range(3)])
-    assert out[0].rstrip().endswith(f"⟨{cc._hms(_T0)}→{cc._hms(_T0 + 2)}⟩")
+    cell = out[0][_agg_col():_agg_col() + cc._TAPE_AGG_WIDTH]
+    assert cell.strip() == f"→{cc._hms(_T0 + 2)} ×3", cell
+    assert out[0].startswith(cc._hms(_T0))      # the clock opens the span
+    assert "⟨" not in out[0] and not out[0].rstrip().endswith("⟩")
 
 
-def test_the_fleet_wide_basis_line_carries_no_span_because_it_cannot_afford_one():
-    # Five arms' margins is already the widest line the tape emits; the
-    # ⟨from→to⟩ tail pushed it past the panel and cost a second row.
+def test_a_basis_gate_line_reports_its_aggregation_like_every_other_line():
+    # The fleet-wide basis line was the one collapsed line with no span at all:
+    # every arm's margin on one row left no width for it. Per-arm it fits, so
+    # no line type reports its aggregation differently any more.
     out = _collapse(*[_basis(i, slug=s) for i in range(3)
                       for s in (_BTC, _ETH, "sol-updown-5m-1700000000")])
-    assert len(out) == 1
-    assert "⟨" not in out[0]
-    assert out[0][_agg_col():].startswith("×9")
+    assert len(out) == 3, out
+    for ln in out:
+        assert ln[_agg_col():].startswith(f"→{cc._hms(_T0 + 2)} ×3"), ln
 
 
 # --- roll + window-close consolidation ---
