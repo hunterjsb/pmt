@@ -1,0 +1,283 @@
+==============================================================================
+R2 CALIBRATED QUARTER-KELLY SIZING STUDY (v2)
+==============================================================================
+corpus cutoff t >= 1787452500 (post-brake / post-R9)
+bankroll $1,300 | kelly_frac 0.25 | fee_rate 0.07 (edge model)
+
+post-brake FIRE records:            512  across 94 windows
+  ... in DECIDED windows:           466  across 87 windows
+  ... in UNDECIDED windows:         21  across 3 windows (excluded from P&L — validated or dropped)
+      sol-updown-5m-1787462100           bought $106.12 side=down last_ask=0.10
+      eth-updown-5m-1787462100           bought $147.91 side=down last_ask=0.01
+      btc-updown-15m-1787470200          bought $54.59 side=down last_ask=0.98
+  ... fired but NOTHING crossed:    25  across 4 windows (eth-updown-15m-1787452200, btc-updown-15m-1787452200, sol-updown-5m-1787458500, btc-updown-5m-1787460300)
+  open (un-redeemed) exposure in those undecided windows: $308.63
+  of which $254.03 sits in 2 window(s) whose book collapsed below $0.50 on our own side and which have not paid out hours later. If those settle as losses the night's realized P&L is -$279.40, not the headline below. Excluded here per the corpus rule (validated or dropped, never guessed) — not because they look benign.
+
+------------------------------------------------------------------------------
+OUTCOME AUDIT — wallet vs outcomes.jsonl disagreement (wallet wins)
+------------------------------------------------------------------------------
+  btc-updown-15m-1787457600: wallet says winner=up (wallet:zero-redeem), outcomes.jsonl says down; we bought $265.21 and received $0 -> it is a LOSS.
+    -> outcomes.jsonl mislabels this window; `pmt crypto stats` already grades it correctly. Fix belongs in polymarket/outcomes.py::wallet_outcomes (a $0 REDEEM row whose `outcome` field names the WINNER, not our held side, gets flipped the wrong way).
+
+------------------------------------------------------------------------------
+actual (flat-clip) per-series ledger, post-brake, wallet-graded
+------------------------------------------------------------------------------
+  series       W-L  n_win   bought $        P&L  worst win
+  btc15m       9-3     12   2,717.12    -301.78    -265.21
+  btc5m       20-0     20   1,575.75     110.24       0.95
+  eth15m      11-1     12   2,488.76     123.74     -18.32
+  eth5m       17-0     17   1,154.51      69.26       0.19
+  sol15m       1-1      2     277.15    -139.15    -142.45
+  sol5m       24-0     24   1,231.18     112.32       0.14
+  TOTAL       82-5     87   9,444.46     -25.37
+
+------------------------------------------------------------------------------
+fill reality (why v1's size*ask baseline was wrong)
+------------------------------------------------------------------------------
+  intended taker notional (sum size*ask):  $13,502.05
+  actually crossed (wallet BUY usdcSize):  $9,753.09   = 72.2% of intent
+  per-window fill ratio: median 0.802, min 0.000, max 1.017
+  realized cost per share / quoted ask: median 1.0014 -> the taker fee+slippage drag we actually paid is ~0.14%, far under the engine's modeled 7%*min(ask,1-ask). The edge model here keeps the engine's conservative fee; P&L uses the measured cost.
+
+------------------------------------------------------------------------------
+WINDOW-LEVEL calibration — first-fire fair (primary)
+------------------------------------------------------------------------------
+  one Bernoulli draw per decided window (v1 fit this per CLIP, which overweighted many-clip windows)
+            bucket    n  wins     raw  isotonic  wilson95lo  >=30?
+     [0.900,0.950)    3     3   1.000     0.667       0.438   fail
+     [0.950,0.970)    3     1   0.333     0.667       0.061   fail
+     [0.970,0.980)    5     4   0.800     0.800       0.376   fail
+     [0.980,0.990)   11    11   1.000     0.975       0.741   fail
+     [0.990,0.995)    5     5   1.000     0.975       0.566   fail
+     [0.995,0.999)    6     6   1.000     0.975       0.610   fail
+     [0.999,1.000)   57    55   0.965     0.975       0.881   PASS
+  decided windows in fit: 90
+
+------------------------------------------------------------------------------
+WINDOW-LEVEL calibration — notional-weighted fair (sensitivity)
+------------------------------------------------------------------------------
+  one Bernoulli draw per decided window (v1 fit this per CLIP, which overweighted many-clip windows)
+            bucket    n  wins     raw  isotonic  wilson95lo  >=30?
+     [0.950,0.970)    2     2   1.000     0.800       0.342   fail
+     [0.970,0.980)    3     2   0.667     0.800       0.208   fail
+     [0.980,0.990)    5     5   1.000     0.917       0.566   fail
+     [0.990,0.995)    8     7   0.875     0.917       0.529   fail
+     [0.995,0.999)   11    10   0.909     0.917       0.623   fail
+     [0.999,1.000)   61    59   0.967     0.967       0.888   PASS
+  decided windows in fit: 90
+
+------------------------------------------------------------------------------
+R2 BAR CHECK — decided windows per (series, stated-fair bucket), bar = 30
+------------------------------------------------------------------------------
+  (calibration draws — a window with a validated outcome is a draw whether or not its clip crossed, so this counts 90 where the money ledger counts 87)
+  btc15m   n=13  FAIL pooled-over-buckets | 0.950+:1(0W)  0.980+:1(1W)  0.995+:1(1W)  0.999+:10(8W)
+  btc5m    n=20  FAIL pooled-over-buckets | 0.970+:1(1W)  0.980+:2(2W)  0.990+:1(1W)  0.999+:16(16W)
+  eth15m   n=13  FAIL pooled-over-buckets | 0.970+:1(0W)  0.980+:1(1W)  0.990+:1(1W)  0.995+:1(1W)  0.999+:9(9W)
+  eth5m    n=17  FAIL pooled-over-buckets | 0.900+:1(1W)  0.950+:1(1W)  0.970+:1(1W)  0.980+:2(2W)  0.990+:1(1W)  0.995+:2(2W)  0.999+:9(9W)
+  sol15m   n=2   FAIL pooled-over-buckets | 0.950+:1(0W)  0.999+:1(1W)
+  sol5m    n=25  FAIL pooled-over-buckets | 0.900+:2(2W)  0.970+:2(2W)  0.980+:5(5W)  0.990+:2(2W)  0.995+:2(2W)  0.999+:12(12W)
+  NOTE: no single (series, bucket) cell reaches 30 on the post-brake corpus. Pooling across series is what gets any bucket over the bar, and pooling assumes the arms share one calibration curve.
+
+------------------------------------------------------------------------------
+fidelity check — the 'actual' policy must reproduce the wallet
+------------------------------------------------------------------------------
+  wallet realized P&L (decided windows): -$25.37
+  sim 'actual' policy P&L:               -$25.27   delta $0.10
+  wallet bought notional:                $9,444.46
+  sim 'actual' notional:                 $9,444.36
+  peak concurrent committed (actual):    $928.63  -> utilization 71.4% of $1,300
+  peak concurrent UN-DECIDED (actual):   $237.16  -> the ~$423 number in the brief is this one, not the total. Total committed capital already peaks near three-quarters of bankroll; it is the SPECULATIVE slice that is small.
+
+==============================================================================
+SWEEP — calibrated quarter-Kelly, per-clip sub-cap x per-window cap   [min_ask = 0.00]
+==============================================================================
+  cap_frac   win$  clipM  clipm  clips   notional       P&L    maxDD   worstW    peak$   util  undec$
+      0.10    130     25     10    304      4,170   -139.43  -223.18  -130.01      419   32%     156
+      0.10    130     25     25    300      4,831   -154.51  -277.42  -130.01      490   38%     220
+      0.10    130     50     10    255      5,347    -48.73  -180.98  -130.05      510   39%     255
+      0.10    130     50     25    251      6,008    -63.81  -252.04  -130.05      581   45%     270
+      0.10    130     75     10    239      6,022     -0.35  -180.99  -130.09      545   42%     329
+      0.10    130     75     25    235      6,683    -15.44  -252.06  -130.09      616   47%     344
+      0.10    130    100     10    234      6,418     25.07  -181.10  -130.05      556   43%     358
+      0.10    130    100     25    230      7,079      9.99  -252.18  -130.05      628   48%     372
+      0.15    195     25     10    348      5,064   -221.72  -342.98  -195.03      548   42%     156
+      0.15    195     25     25    348      5,872   -239.20  -414.31  -195.03      636   49%     238
+      0.15    195     50     10    285      6,523   -154.48  -284.95  -195.07      640   49%     276
+      0.15    195     50     25    285      7,331   -171.95  -356.28  -195.07      728   56%     329
+      0.15    195     75     10    260      7,562    -74.41  -249.16  -195.07      727   56%     377
+      0.15    195     75     25    260      8,370    -91.88  -330.23  -195.07      816   63%     392
+      0.15    195    100     10    247      8,364    -16.16  -242.47  -195.15      776   60%     465
+      0.15    195    100     25    247      9,172    -33.63  -330.63  -195.15      865   67%     480
+      0.25    325     25     10    386      5,990   -321.84  -521.87  -324.55      684   53%     156
+      0.25    325     25     25    386      6,803   -338.69  -593.20  -324.55      773   59%     238
+      0.25    325     50     10    333      8,409   -360.07  -520.23  -325.07      899   69%     282
+      0.25    325     50     25    333      9,222   -376.92  -591.56  -325.07      987   76%     329
+      0.25    325     75     10    298      9,781   -297.04  -463.14  -325.04      988   76%     407
+      0.25    325     75     25    298     10,595   -313.89  -534.47  -325.04    1,076   83%     452
+      0.25    325    100     10    277     10,979   -201.19  -417.15  -325.04    1,076   83%     500
+      0.25    325    100     25    277     11,793   -218.04  -488.48  -325.04    1,164   90%     515
+
+==============================================================================
+SWEEP — calibrated quarter-Kelly, per-clip sub-cap x per-window cap   [min_ask = 0.70]
+==============================================================================
+  cap_frac   win$  clipM  clipm  clips   notional       P&L    maxDD   worstW    peak$   util  undec$
+      0.10    130     25     10    291      4,060    -29.63  -193.79  -130.01      390   30%     156
+      0.10    130     25     25    287      4,694    -17.72  -221.04  -130.01      434   33%     220
+      0.10    130     50     10    246      5,267     31.31  -151.59  -130.05      480   37%     255
+      0.10    130     50     25    242      5,901     43.22  -195.66  -130.05      524   40%     270
+      0.10    130     75     10    232      5,967     54.68  -151.60  -130.09      516   40%     329
+      0.10    130     75     25    228      6,601     66.59  -195.68  -130.09      560   43%     344
+      0.10    130    100     10    227      6,387     55.57  -151.72  -130.05      527   41%     358
+      0.10    130    100     25    223      7,021     67.48  -195.80  -130.05      571   44%     372
+      0.15    195     25     10    333      4,916    -73.53  -293.84  -194.65      518   40%     156
+      0.15    195     25     25    333      5,680    -46.92  -321.09  -194.65      562   43%     238
+      0.15    195     50     10    274      6,378     -9.59  -255.56  -195.07      611   47%     276
+      0.15    195     50     25    274      7,142     17.02  -282.81  -195.07      655   50%     329
+      0.15    195     75     10    251      7,442     45.72  -219.77  -195.07      698   54%     377
+      0.15    195     75     25    251      8,205     72.33  -256.76  -195.07      742   57%     392
+      0.15    195    100     10    240      8,269     78.74  -213.08  -195.15      747   57%     465
+      0.15    195    100     25    240      9,033    105.35  -257.16  -195.15      791   61%     480
+      0.25    325     25     10    366      5,781   -118.37  -416.20  -323.39      654   50%     156
+      0.25    325     25     25    366      6,550    -91.14  -443.45  -323.39      698   54%     238
+      0.25    325     50     10    319      8,181   -132.57  -490.85  -325.07      870   67%     282
+      0.25    325     50     25    319      8,950   -105.34  -518.10  -325.07      914   70%     329
+      0.25    325     75     10    286      9,532    -47.44  -433.75  -325.04      959   74%     407
+      0.25    325     75     25    286     10,301    -20.20  -461.00  -325.04    1,003   77%     452
+      0.25    325    100     10    267     10,755     23.41  -387.76  -325.04    1,046   80%     500
+      0.25    325    100     25    267     11,524     50.64  -415.01  -325.04    1,090   84%     515
+
+  clips dropped by calibrated Kelly returning <=0 (ask too rich for a calibrated p): 100 of 512
+  -> R3 odds discipline falls out of R2 for free: a calibrated p of ~0.975 cannot pay a 0.98 ask. Calibration does not just shrink sizes, it refuses the expensive end of the book outright.
+
+  READ THE min_ask=0.00 TABLE AS A FAILURE MODE, NOT A RECOMMENDATION.
+  Calibrated Kelly on a stated fair is a function of (p_cal - c)/(1-c), and
+  c is the BOOK's ask. Every loss window in this corpus has the same shape:
+  the book collapses on our side while the model stays pinned near 1.0. A
+  collapsed ask therefore reads to Kelly as a gigantic edge, so uncapped
+  calibrated Kelly puts its LARGEST bets into precisely the windows that
+  lose. That is why the min_ask=0.00 cells lose more than the flat clips the
+  engine actually traded, and why the per-clip sub-cap alone cannot fix it:
+  the sub-cap limits one clip, but a collapsing book emits many clips.
+
+------------------------------------------------------------------------------
+DEPTH GATE — is a bigger clip actually fillable at the fire tick?
+------------------------------------------------------------------------------
+  top-of-book notional on our side at fire time (n=480 fires matched to a book tick within 15s):
+    p25 $18.80  median $49.48  p75 $134.94
+    a $10 clip is covered by top-of-book alone in 83% of fires
+    a $25 clip is covered by top-of-book alone in 70% of fires
+    a $50 clip is covered by top-of-book alone in 50% of fires
+    a $75 clip is covered by top-of-book alone in 40% of fires
+    a $100 clip is covered by top-of-book alone in 31% of fires
+  Above that, the clip walks the book and pays worse than the tape's quoted ask — the sim's per-window measured cost does NOT model that extra slippage, so large-clip P&L here is an upper bound.
+
+------------------------------------------------------------------------------
+PER-SERIES: actual vs policy at the chosen cell
+------------------------------------------------------------------------------
+  cell: cap_frac=0.15 clip_major=$100 clip_minor=$25 min_ask=0.70
+  series     n    W-L |    act $  act P&L act peak |    pol $  pol P&L  pol DD pol worst pol peak
+  btc15m    12    9-3 |    2,717  -301.68      352 |    2,165  -349.17    -402   -195.15      195
+  btc5m     20   20-0 |    1,576   110.24      150 |    2,079   163.52       0      0.00      196
+  eth15m    12   11-1 |    2,489   123.74      355 |    1,712   110.97       0      0.00      195
+  eth5m     17   17-0 |    1,155    69.26      189 |    1,800   135.27       0      0.00      197
+  sol15m     2    1-1 |      277  -139.15      142 |       97   -72.88     -73    -73.47       73
+  sol5m     24   24-0 |    1,231   112.32      155 |    1,179   117.65       0      0.00      195
+
+==============================================================================
+LOSS WINDOWS under the chosen cell cap_frac=0.15 clip_major=$100 clip_minor=$25 min_ask=0.70
+==============================================================================
+  slug                                actual $   act P&L  policy $   pol P&L     delta
+  btc-updown-15m-1787457600             265.21   -265.21    194.67   -194.67    +70.54
+  btc-updown-15m-1787454000             169.84   -169.84    195.15   -195.15    -25.32
+  sol-updown-15m-1787457600             142.45   -142.45     73.47    -73.47    +68.98
+  btc-updown-15m-1787464800             100.39   -100.39    128.87   -128.87    -28.48
+  eth-updown-15m-1787453100              18.32    -18.32      0.00      0.00    +18.32
+  TOTAL                                          -696.20             -592.16   +104.03
+
+------------------------------------------------------------------------------
+UNCERTAINTY — window bootstrap on the chosen cell's P&L edge
+------------------------------------------------------------------------------
+  chosen cell P&L $105.35 vs actual -$25.27 -> delta $130.62
+  90% CI on the delta, resampling the 90 decided windows: [-$60.65, $345.89] (median $120.19)
+
+------------------------------------------------------------------------------
+R2-COMPLIANT CELL — resize ONLY clips in buckets that cleared the >=30-window bar
+------------------------------------------------------------------------------
+  passing buckets: [0.999,1.000)  (everything else keeps today's flat clip)
+                 variant  clips   notional       P&L    maxDD   worstW    peak$  undec$
+     actual (flat clips)    485      9,444    -25.27  -399.00  -265.21      929     237
+         bar-gated Kelly    266      8,765     58.62  -261.72  -195.06      781     439
+  P&L delta vs actual: $83.89   window-bootstrap 90% CI [-$98.91, $287.80] (median $73.99)
+  If that interval straddles zero, tonight's improvement is not distinguishable from which five windows happened to lose.
+
+------------------------------------------------------------------------------
+R7 CONSTRAINT CELL — same sizing, plus a $250 fleet-wide cap on UN-DECIDED committed notional
+------------------------------------------------------------------------------
+  cell: cap_frac=0.15 clip_major=$100 clip_minor=$25 min_ask=0.70
+           variant  clips   notional       P&L    maxDD   worstW    peak$  undec$
+      no fleet cap    240      9,033    105.35  -257.16  -195.15      791     480
+    fleet cap $250    231      8,307     31.25  -266.39  -195.01      709     250
+  clips shrunk/blocked by the fleet cap: 15
+  R7 caveat: a per-series recommendation that ignores fleet concurrency overstates safe size. Same-duration arms fire within seconds of each other on the same macro move, so their un-decided capital is one position, not six.
+
+------------------------------------------------------------------------------
+LIFETIME BAR CHECK — same buckets, the whole tape (not just post-brake)
+------------------------------------------------------------------------------
+            bucket    n  wins    rate  >=30?
+  [0.000,0.900)    7     6   0.857   fail
+  [0.900,0.950)    9     7   0.778   fail
+  [0.950,0.970)    6     3   0.500   fail
+  [0.970,0.980)   10     9   0.900   fail
+  [0.980,0.990)   15    15   1.000   fail
+  [0.990,0.995)   13    10   0.769   fail
+  [0.995,0.999)   12    12   1.000   fail
+  [0.999,1.000)   80    78   0.975   PASS
+  total decided windows with fires, whole tape: 152
+  Spending the ENTIRE tape still clears exactly one bucket. More nights will not fix the thin buckets quickly: this policy fires at fair>=0.999 most of the time by construction, so the sub-0.999 bins fill slowly.
+
+------------------------------------------------------------------------------
+WHAT QUARTER-KELLY ASKS FOR — bucket [0.999,1.000) (n=57, 55W), bankroll $1,300
+------------------------------------------------------------------------------
+     ask |      p=raw 0.965      p=fit 0.975     p=wilson95lo 0.881
+    0.70 |             $284             $296                   $186
+    0.80 |             $264             $281                   $117
+    0.85 |             $243             $266                    $47
+    0.90 |             $202             $237                 no bet
+    0.93 |             $150             $199                 no bet
+    0.95 |              $80             $148                 no bet
+    0.97 |           no bet              $30                 no bet
+    0.98 |           no bet           no bet                 no bet
+  The right-hand column is the number a risk officer would sign: at the
+  95% lower bound of a 57-window sample, quarter-Kelly declines every ask
+  the fleet actually pays. The middle column is the point estimate. Sizing
+  policy has to live between them, and 57 windows is not enough to narrow
+  the gap — that is what the >=30-per-bucket bar is really protecting.
+
+==============================================================================
+RECOMMENDATION — per series, what the data supports TODAY
+==============================================================================
+  ROADMAP bar: no size increase without calibration over >=30 decided windows PER p-BUCKET.
+  Buckets clearing it on the post-brake corpus: [0.999,1.000) (pooled across all six arms).
+  Per-(series,bucket) cells clearing it: NONE — the largest is 16 windows.
+
+  series   n_dec    W-L  top-bucket n  current size/clip        RECOMMENDED
+  btc15m      13   10-3            10             350/25          UNCHANGED
+  btc5m       20   20-0            16             400/50          UNCHANGED
+  eth15m      13   12-1             9             350/50          UNCHANGED
+  eth5m       17   17-0             9             350/50          UNCHANGED
+  sol15m       2    1-1             1             150/25          UNCHANGED
+  sol5m       25   25-0            12             150/25          UNCHANGED
+
+  CAPITAL-UTILIZATION EFFECT (peak concurrent committed / bankroll):
+    actual flat clips           $928.63 = 71%   un-decided slice $237.16
+    bar-gated Kelly (R2-legal)   $780.80 = 60%   un-decided slice $439.03
+    full calibrated Kelly        $791.19 = 61%   un-decided slice $479.74
+    -> every R2 policy here LOWERS peak committed capital, because a
+       cap_frac-of-bankroll window ceiling (0.15*1300 = $195) is SMALLER
+       than the $350-400 window budgets already armed, and because
+       calibration refuses the >=0.98 asks the fleet currently pays.
+       R2 is a risk-REALLOCATION lever on this corpus, not a utilization
+       lever. It raises the un-decided (speculative) slice while lowering
+       total committed — the opposite of what the brief assumed.
+
