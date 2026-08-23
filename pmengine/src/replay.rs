@@ -30,9 +30,9 @@
 //! No wall-clock reads: every `now` used for a decide() call comes from a
 //! record's own `t` field, so a replay run is deterministic and repeatable.
 
-use crate::strategies::updown::{
-    eval_model, lag1_autocorr, Action, ArmParams, ArmState, ArmView, DecideOut, FeedState,
-    ModelEval, TopOfBook, Tunables,
+use crate::strategies::updown::{Action, ArmParams, ArmState, ArmView, DecideOut, TopOfBook};
+use crate::strategies::updown_model::{
+    eval_model, lag1_autocorr, FeedState, ModelEval, Tunables, EV_EVAL, EV_FIRE, EV_GATED,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -212,7 +212,7 @@ fn load_real_tally(path: &Path) -> HashMap<String, RealTally> {
     };
     let mut out: HashMap<String, RealTally> = HashMap::new();
     for rec in &records {
-        if rec.get("ev").and_then(|v| v.as_str()) != Some("fire") {
+        if rec.get("ev").and_then(|v| v.as_str()) != Some(EV_FIRE) {
             continue;
         }
         let Some(slug) = rec.get("slug").and_then(|v| v.as_str()) else { continue };
@@ -434,7 +434,7 @@ fn replay_evals_window(
     for rec in recs {
         let now = rec["t"].as_f64().unwrap_or(0.0);
         match rec.get("ev").and_then(|v| v.as_str()).unwrap_or("") {
-            "eval" => {
+            EV_EVAL => {
                 let p_up = rec["p_up"].as_f64().unwrap_or(0.5);
                 last_p_up = Some(p_up);
                 let model = ModelEval {
@@ -455,7 +455,7 @@ fn replay_evals_window(
                 let out = arm.decide(&view, Ok(model), now);
                 apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate);
             }
-            "gated" => {
+            EV_GATED => {
                 // decide()'s Err branch never reads `view` — a default is
                 // fine, we're only here to keep gate bookkeeping faithful.
                 let reason = rec["reason"].as_str().unwrap_or("gated").to_string();

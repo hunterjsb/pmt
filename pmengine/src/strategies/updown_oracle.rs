@@ -4,7 +4,8 @@
 //! lower it — the measured basis distribution is non-stationary (BTC's
 //! p95 basis halved between two consecutive days), so a guard set from a
 //! 48h-old snapshot under- or over-trusts depending which regime printed
-//! it. See `eval_model` in updown.rs for where the effective guard lands.
+//! it. See `eval_model` in updown_model.rs for where the effective guard
+//! lands.
 //!
 //! No plain `pub struct` in this file on purpose: `pmstrat transpile --all`
 //! registers the first `pub struct` it finds in every file it scans in
@@ -20,7 +21,7 @@
 //! radius to "one arm owns its own oracle state," matching how each arm
 //! already owns its own Binance FeedState.
 
-use super::updown::FeedState;
+use super::updown_model::FeedState;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,7 +29,7 @@ use std::sync::{Arc, Mutex};
 /// Rolling window length — ~30min at the 20s poll cadence.
 pub(crate) const OBS_WINDOW: usize = 90;
 /// Samples needed before the live estimate is trusted over the arm-time
-/// param — mirrors updown.rs's SIGMA_SLOW_MIN pattern for the vol floor.
+/// param — mirrors updown_model.rs's SIGMA_SLOW_MIN pattern for the vol floor.
 pub(crate) const OBS_MIN_SAMPLES: usize = 30;
 const POLL_INTERVAL_S: u64 = 20;
 const RPC_TIMEOUT_MS: u64 = 3000;
@@ -81,7 +82,7 @@ fn feed_for_binance_symbol(symbol: &str) -> Option<ChainlinkFeed> {
 /// change (see ROADMAP R1); loosening the guard below it needs a human and
 /// a replay A/B, never an unattended live estimate. Below `min_samples`
 /// (cold start / dead poller) the param governs alone, same shape as
-/// updown.rs's `vol_floor_bp`.
+/// updown_model.rs's `vol_floor_bp`.
 pub(crate) fn live_guard_bp(samples: &[f64], param_bp: f64, min_samples: usize) -> f64 {
     if samples.len() < min_samples {
         return param_bp;
@@ -217,19 +218,10 @@ fn poll_once(client: &reqwest::blocking::Client, feed: &ChainlinkFeed) -> Result
 
 /// Append one JSONL basis-sample record to ~/.pmt/engine/oracle-tape.jsonl
 /// — the recorded corpus a future replay A/B of this feature needs (see
-/// `book_tape` in updown.rs for the identical append-only pattern).
+/// `book_tape` in updown.rs for the identical append-only pattern; both
+/// share `updown_model::append_jsonl`).
 fn oracle_tape(record: serde_json::Value) {
-    use std::io::Write;
-    let Ok(home) = std::env::var("HOME") else { return };
-    let dir = std::path::PathBuf::from(home).join(".pmt/engine");
-    let _ = std::fs::create_dir_all(&dir);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("oracle-tape.jsonl"))
-    {
-        let _ = writeln!(f, "{}", record);
-    }
+    super::updown_model::append_jsonl("oracle-tape.jsonl", record);
 }
 
 fn unix_now() -> f64 {
