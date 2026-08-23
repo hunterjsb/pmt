@@ -2321,6 +2321,80 @@ def crypto_window(slug: str) -> None:
         click.echo(line)
 
 
+_ORACLE_SYMBOLS = ["btc", "eth", "sol", "xrp", "doge", "all"]
+
+
+@crypto_group.command("oracle")
+@click.option("--symbol", type=click.Choice(_ORACLE_SYMBOLS), default="all", show_default=True)
+@click.option("--hours", type=float, default=24.0, show_default=True, help="History window to fetch")
+def crypto_oracle(symbol: str, hours: float) -> None:
+    """Fetch Chainlink Polygon oracle rounds, append new ones to the corpus.
+
+    Ground truth for the Chainlink-vs-Binance basis (`pmt crypto basis`) —
+    corpus lives at ~/.pmt/corpus/chainlink-{symbol}.jsonl, append-only.
+    """
+    from polymarket.chainlink import SYMBOLS, corpus_path, fetch_rounds, append_corpus
+
+    symbols = SYMBOLS if symbol == "all" else [symbol]
+    for sym in symbols:
+        try:
+            rounds = fetch_rounds(sym, hours=hours)
+        except Exception as e:
+            console.print(f"[red]{sym.upper():5s} RPC error — {e}[/red]")
+            continue
+        new_n = append_corpus(sym, rounds)
+        if rounds:
+            span_h = (rounds[-1]["updated_at"] - rounds[0]["updated_at"]) / 3600
+            span = f"{span_h:.1f}h span"
+        else:
+            span = "no rounds"
+        console.print(f"{sym.upper():5s} fetched {len(rounds):4d} · new {new_n:4d} · "
+                      f"{span} · {corpus_path(sym)}")
+
+
+@crypto_group.command("basis")
+@click.option("--symbol", type=click.Choice(_ORACLE_SYMBOLS), default="all", show_default=True)
+@click.option("--hours", type=float, default=24.0, show_default=True, help="Corpus window to analyze")
+def crypto_basis(symbol: str, hours: float) -> None:
+    """Chainlink-vs-Binance basis distribution — the R1 decision input for per-symbol guards.
+
+    Joins stored Chainlink rounds (`pmt crypto oracle`) against Binance 1m
+    closes and reports basis_bp = (chainlink/binance - 1) * 1e4 per round.
+    """
+    from polymarket.chainlink import SYMBOLS, GUARD_BP, basis_report
+
+    symbols = SYMBOLS if symbol == "all" else [symbol]
+    for sym in symbols:
+        try:
+            report = basis_report(sym, hours=hours)
+        except Exception as e:
+            console.print(f"[red]{sym.upper()}: {e}[/red]\n")
+            continue
+        stats = report["stats"]
+        if not stats:
+            console.print(f"[bold]{sym.upper()}/USD[/bold]  [dim]no corpus data — "
+                           f"run: pmt crypto oracle --symbol {sym}[/dim]\n")
+            continue
+
+        t = Table(title=f"{sym.upper()}/USD basis — last {hours:g}h")
+        for col in ("n", "mean bp", "std bp", "p5 bp", "p50 bp", "p95 bp", "max|bp|"):
+            t.add_column(col, justify="right")
+        t.add_row(str(stats["n"]), f"{stats['mean']:+.2f}", f"{stats['std']:.2f}",
+                  f"{stats['p5']:+.2f}", f"{stats['p50']:+.2f}", f"{stats['p95']:+.2f}",
+                  f"{stats['max_abs']:.2f}")
+        console.print(t)
+
+        guard = GUARD_BP.get(sym)
+        p95abs = stats["p95_abs"]
+        if guard is None:
+            console.print(f"[dim]no live guard set (arm disabled) — "
+                           f"p95 |basis| {p95abs:.1f}bp is the re-entry gate[/dim]\n")
+        elif guard >= p95abs:
+            console.print(f"[green]guard {guard:.1f}bp covers p95 |basis| {p95abs:.1f}bp ✓[/green]\n")
+        else:
+            console.print(f"[red]guard {guard:.1f}bp TOO TIGHT — p95 |basis| {p95abs:.1f}bp[/red]\n")
+
+
 @cli.group("sports")
 def sports_group() -> None:
     """Live sports data: scores, game state, ESPN win probability."""
