@@ -9,14 +9,6 @@
 //! in the file with a `// pmstrat: pub(crate)` marker line — nothing here is
 //! hand-maintained.
 
-mod alert_test;
-mod dynamic_market_maker;
-mod hanta_maker;
-mod market_maker;
-mod momentum_fade;
-mod order_test;
-mod spread_watcher;
-mod sure_bets;
 pub(crate) mod updown;
 pub(crate) mod updown_model;
 pub(crate) mod updown_oracle;
@@ -26,22 +18,12 @@ pub(crate) mod updown_state;
 use std::collections::HashMap;
 use crate::strategy::Strategy;
 
-pub use alert_test::AlertTest;
-pub use dynamic_market_maker::DynamicMarketMaker;
-pub use hanta_maker::HantaMaker;
-pub use market_maker::MarketMaker;
-pub use momentum_fade::MomentumFade;
-pub use order_test::OrderTest;
-pub use spread_watcher::SpreadWatcher;
-pub use sure_bets::SureBets;
 pub use updown::Updown;
 
 /// Information about a strategy in the registry.
 pub struct StrategyInfo {
     /// Factory function to create a new instance of the strategy.
     pub factory: fn() -> Box<dyn Strategy>,
-    /// Whether this strategy requires market discovery (empty tokens list).
-    pub requires_market_discovery: bool,
 }
 
 /// Returns the strategy registry - a map of strategy names to their info.
@@ -51,49 +33,8 @@ pub struct StrategyInfo {
 pub fn registry() -> HashMap<&'static str, StrategyInfo> {
     let mut m = HashMap::new();
 
-    m.insert("alert_test", StrategyInfo {
-        factory: || Box::new(alert_test::AlertTest::new()),
-        requires_market_discovery: false,
-    });
-
-    m.insert("dynamic_market_maker", StrategyInfo {
-        factory: || Box::new(dynamic_market_maker::DynamicMarketMaker::new()),
-        requires_market_discovery: true,
-    });
-
-    m.insert("hanta_maker", StrategyInfo {
-        factory: || Box::new(hanta_maker::HantaMaker::new()),
-        requires_market_discovery: false,
-    });
-
-    m.insert("market_maker", StrategyInfo {
-        factory: || Box::new(market_maker::MarketMaker::new()),
-        requires_market_discovery: false,
-    });
-
-    m.insert("momentum_fade", StrategyInfo {
-        factory: || Box::new(momentum_fade::MomentumFade::new()),
-        requires_market_discovery: false,
-    });
-
-    m.insert("order_test", StrategyInfo {
-        factory: || Box::new(order_test::OrderTest::new()),
-        requires_market_discovery: false,
-    });
-
-    m.insert("spread_watcher", StrategyInfo {
-        factory: || Box::new(spread_watcher::SpreadWatcher::new()),
-        requires_market_discovery: false,
-    });
-
-    m.insert("sure_bets", StrategyInfo {
-        factory: || Box::new(sure_bets::SureBets::new()),
-        requires_market_discovery: true,
-    });
-
     m.insert("updown", StrategyInfo {
         factory: || Box::new(updown::Updown::new()),
-        requires_market_discovery: false,
     });
 
     m

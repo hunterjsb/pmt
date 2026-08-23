@@ -1,6 +1,5 @@
 use clap::{Parser, Subcommand};
-use pmengine::{Config, Engine, GammaClient};
-use rust_decimal_macros::dec;
+use pmengine::{Config, Engine};
 use std::path::PathBuf;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -27,7 +26,7 @@ struct Cli {
 enum Commands {
     /// Run one or more strategies
     Run {
-        /// Strategy names to run (e.g., sure_bets market_maker)
+        /// Strategy names to run (e.g., updown)
         #[arg(required = true)]
         strategies: Vec<String>,
 
@@ -43,9 +42,6 @@ enum Commands {
         #[arg(long, default_value = "false")]
         skip_warmup: bool,
     },
-
-    /// Test Gamma API only (no CLOB auth needed, prints discovered markets and exits)
-    TestGamma,
 
     /// List available strategies
     List,
@@ -180,9 +176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle commands
     match cli.command {
-        Some(Commands::TestGamma) => {
-            run_test_gamma().await
-        }
         Some(Commands::List) => {
             run_list()
         }
@@ -220,50 +213,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Commands:");
             eprintln!("  run <strategies...>  Run one or more strategies");
             eprintln!("  list                 List available strategies");
-            eprintln!("  test-gamma           Test Gamma API (no auth needed)");
             eprintln!("  replay               Offline replay of the updown decision core");
             eprintln!();
             eprintln!("Examples:");
-            eprintln!("  pmengine run sure_bets --dry-run");
-            eprintln!("  pmengine run sure_bets market_maker --max-ticks 10");
+            eprintln!("  pmengine run updown --dry-run");
+            eprintln!("  pmengine run updown --max-ticks 10");
             eprintln!("  pmengine list");
             eprintln!("  pmengine replay --mode evals --slug btc-updown-15m");
             eprintln!("  pmengine replay --fixtures fixtures");
             Ok(())
-        }
-    }
-}
-
-async fn run_test_gamma() -> Result<(), Box<dyn std::error::Error>> {
-    info!("Running Gamma API test mode...");
-    let gamma = GammaClient::new();
-
-    // Fetch sure bet candidates: expiring within 2 hours, 95%+ certainty
-    match gamma.fetch_sure_bet_candidates(2.0, dec!(0.95)).await {
-        Ok(markets) => {
-            info!("Found {} sure bet candidates", markets.len());
-            for market in &markets {
-                if let Some(hours) = market.hours_until_expiry() {
-                    if let Some(idx) = market.highest_certainty_index() {
-                        let price = market.outcome_prices.get(idx).copied().unwrap_or_default();
-                        let outcome = market.outcomes.get(idx).cloned().unwrap_or_default();
-                        info!(
-                            "  {} | {} @ {:.2}¢ | {:.1}h left | slug: {}",
-                            market.question,
-                            outcome,
-                            price * dec!(100),
-                            hours,
-                            market.slug
-                        );
-                    }
-                }
-            }
-            info!("Gamma API test completed successfully");
-            Ok(())
-        }
-        Err(e) => {
-            tracing::error!("Gamma API test failed: {}", e);
-            Err(e.to_string().into())
         }
     }
 }
@@ -279,13 +237,7 @@ fn run_list() -> Result<(), Box<dyn std::error::Error>> {
     names.sort();
 
     for name in names {
-        let info = reg.get(name).unwrap();
-        let discovery = if info.requires_market_discovery {
-            " [market-discovery]"
-        } else {
-            ""
-        };
-        println!("  {}{}", name, discovery);
+        println!("  {}", name);
     }
 
     println!();

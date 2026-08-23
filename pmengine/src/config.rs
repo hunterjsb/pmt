@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn slow_tick_warning_silent_for_strategies_that_want_a_slow_tick() {
         // A strategy declaring 5s is not throttled by a 1s loop.
-        assert!(slow_tick_warning("market_maker", 5000, 1000).is_none());
-        assert!(slow_tick_warning("market_maker", 1000, 1000).is_none());
+        assert!(slow_tick_warning("slow_quoter", 5000, 1000).is_none());
+        assert!(slow_tick_warning("slow_quoter", 1000, 1000).is_none());
     }
 }

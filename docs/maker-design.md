@@ -245,10 +245,11 @@ defaults to 1000ms but is overridable per strategy (**[pmengine:strategy.rs:219-
 updown overrides it down to 50ms for taker-clip latency
 (**[pmengine:strategies/updown.rs:1250-1252]**). A maker requoting both sides every tick at
 50ms with a cancel-then-replace burst (2-4 order events per requote) would exhaust
-Standard-tier placement tokens in under two seconds across even a single arm. The existing
-(currently unregistered/dead) example market makers already made the right call here —
-`market_maker.rs`/`dynamic_market_maker.rs` both declare `tick_interval_ms() -> 5000`
-(**[pmengine:strategies/market_maker.rs:47-49]**) — and **[hansi]**'s
+Standard-tier placement tokens in under two seconds across even a single arm. The example
+market makers that used to ship here made the right call on this — `market_maker.rs` and
+`dynamic_market_maker.rs` both declared `tick_interval_ms() -> 5000` — though both were
+deleted in the 2026-08 cleanup, never having traded (see git history at `6158130`) — and
+**[hansi]**'s
 `REFRESH_INTERVAL` config defaults similarly (1-5s range, README config table). Recommend
 starting maker mode at **3-5s per arm**, well inside Standard-tier headroom even across all
 six fleet arms simultaneously quoting.

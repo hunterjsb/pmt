@@ -108,6 +108,12 @@ pub enum Signal {
 ///
 /// This provides information about the market that a token belongs to,
 /// including the question, outcome name, and expiration time.
+///
+/// Part of the pmstrat DSL surface (`ctx.markets` / `ctx.market(token)`).
+/// The engine's `StrategyContext.markets` is currently always empty: the
+/// blanket gamma-discovery refresh that filled it was removed along with
+/// the only two strategies that read it. A scanner-driven strategy
+/// (`market_filter()`) works off `order_books`.
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
     /// The market question (e.g., "Will X happen?")
