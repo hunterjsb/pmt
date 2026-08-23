@@ -131,6 +131,24 @@ def floor_label(floor: float) -> str:
     return f"windows since {stamp}"
 
 
+def _stamp(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m-%d %H:%MZ")
+
+
+def era_span_label(start: float, end: float) -> str:
+    """`05:00Z→10:39Z` — an era's boundaries, short enough for a panel title.
+
+    `open` on the left edge and `now` on the right are the two honest ends:
+    the first era has no left boundary by design (nothing may fall outside
+    the registry) and the last one has not ended.
+    """
+    lo = "open" if start <= 0 else datetime.fromtimestamp(
+        start, tz=timezone.utc).strftime("%H:%MZ")
+    hi = "now" if end == float("inf") else datetime.fromtimestamp(
+        end, tz=timezone.utc).strftime("%H:%MZ")
+    return f"{lo}→{hi}"
+
+
 def _span_label(span_h: float | None) -> str:
     """A duration in the unit it actually has: "over 0.1d" hides that a
     %/day figure is extrapolated from three hours."""
@@ -173,6 +191,38 @@ def _record_line(sb: dict, eff: dict, bal: dict | None) -> str:
     return "     ".join(parts)
 
 
+def era_line(era: dict | None, scoped: bool = False) -> str:
+    """`era stream     12W-1L (92.3%)     P&L +34.56` — the same identity, one
+    policy regime wide.
+
+    Its own row rather than a tail on _record_line: that line is already 91
+    columns and nothing on this report may wrap. It is written to read as the
+    second half of a pair — same segments, same separator — with the reminder
+    that the row above it, not this one, is the ledger of record.
+
+    `scoped` says the whole report is already inside this era (`--era`), in
+    which case the row above is NOT all-time and the tail must not claim it
+    is — the same two numbers on both rows is the honest confirmation that
+    the scoping took.
+    """
+    if not era:
+        return ""
+    sb = era["sb"]
+    wins, losses = sb.get("wins", 0), sb.get("losses", 0)
+    n = wins + losses
+    wr = _pct(wins / n, 1) if n else "[dim]—[/dim]"
+    net = _zeroed(sb.get("net", 0.0))
+    # Both tails are length-budgeted against the longest era name: this row
+    # must clear 100 columns inside the panel's border and padding.
+    tail = "scoped view — drop --era for all-time" if scoped else "all-time above is the ledger"
+    return "     ".join([
+        f"[dim]era[/dim] [bold]{era['name']}[/bold]",
+        f"[bold]{wins}W-{losses}L[/bold] [dim]({wr})[/dim]",
+        f"[dim]P&L[/dim] [bold {_pnl_color(net)}]{net:+,.2f}[/]",
+        f"[dim]{tail}[/dim]",
+    ])
+
+
 def _gap_line(eff: dict) -> str:
     """The break-even GAP: the count win rate minus the win rate THIS payoff
     shape needs to stay flat. Positive is the whole game; a 92% win rate
@@ -210,16 +260,20 @@ def _fleet_line(fleet: dict | None) -> str:
 
 
 def header_panel(sb: dict, eff: dict, bal: dict | None, status: dict | None,
-                 floor: float, fleet: dict | None = None) -> Panel:
-    """Identity, the break-even gap, live exposure, and the fleet ration.
+                 floor: float, fleet: dict | None = None,
+                 era_now: dict | None = None, scope_label: str | None = None) -> Panel:
+    """Identity, the current era, the break-even gap, live exposure, the ration.
 
     The exposure line comes from watch's own build_risk_header, so the two
     reports can never disagree about what is at risk.
     """
     from watch_ui import _rtds_line, build_risk_header
 
-    lines = [_record_line(sb, eff, bal), _gap_line(eff),
-             build_risk_header(status or {}, sb, rtds=False)]
+    lines = [_record_line(sb, eff, bal)]
+    era = era_line(era_now, scoped=scope_label is not None)
+    if era:
+        lines.append(era)
+    lines += [_gap_line(eff), build_risk_header(status or {}, sb, rtds=False)]
     fleet_line = _fleet_line(fleet)
     if fleet_line:
         lines.append(fleet_line)
@@ -236,7 +290,8 @@ def header_panel(sb: dict, eff: dict, bal: dict | None, status: dict | None,
     # 200-column terminal, which is what keeps the report reading as a card
     # rather than a banner. Rich still clamps it on a narrow terminal.
     return Panel(Text.from_markup("\n".join(lines)), expand=False,
-                 title=f"[bold]updown fleet[/bold] [dim]· {floor_label(floor)}[/dim]",
+                 title=f"[bold]updown fleet[/bold] "
+                       f"[dim]· {scope_label or floor_label(floor)}[/dim]",
                  title_align="left", border_style=_HEADER_BORDER, padding=(0, 1))
 
 
@@ -297,6 +352,69 @@ def symbol_table(series: dict, flags: dict | None = None,
                   _money(s["pnl"]), _money(s.get("med")), f"${s['usd']:,.0f}",
                   _pct(rate), _bar(rate, _rate_style(rate, breakeven)))
     return t
+
+
+def era_table(era_rows: list[dict], marked: str | None = None) -> Table:
+    """The record cut at the policy boundaries that actually moved it.
+
+    This earns default placement because it answers the question the all-time
+    line cannot: the headline sums windows fired under brakes that no longer
+    exist, off a book that was a 2s REST poller, at sizes since scaled — and
+    the operator's standing question is whether the CURRENT policy is paying.
+
+    Every era in polymarket.eras is a row, including ones with nothing in
+    them. An era rendering `0-0` is information; an era omitted for being
+    empty is how a bad regime gets quietly forgotten. `--era` scopes the rest
+    of the report and never this table.
+
+    GAP is that era's own win rate minus the break-even rate ITS OWN payoff
+    shape needed — a bar computed over all time would grade a regime against
+    a payoff structure it never traded.
+    """
+    t = Table(box=None, pad_edge=False, padding=(0, 1))
+    t.add_column("era", justify="left", width=10, no_wrap=True)
+    t.add_column("from", justify="left", width=12, no_wrap=True)
+    t.add_column("span", justify="right", width=7, no_wrap=True)
+    t.add_column("W-L", justify="right", width=7, no_wrap=True)
+    t.add_column("net", justify="right", width=10, no_wrap=True)
+    t.add_column("win %", justify="right", width=6, no_wrap=True)
+    t.add_column("need", justify="right", width=6, no_wrap=True)
+    t.add_column("GAP", justify="right", width=8, no_wrap=True)
+    t.add_column("", justify="left", width=3, no_wrap=True)
+    for r in era_rows:
+        sb = r["sb"]
+        wins, losses = sb.get("wins", 0), sb.get("losses", 0)
+        decided = wins + losses
+        rate = wins / decided if decided else None
+        be = r.get("breakeven")
+        gap = None if (rate is None or be is None) else (rate - be) * 100
+        name = r["name"]
+        t.add_row(
+            f"[bold cyan]{name}[/]" if name == marked else name,
+            "[dim]open[/dim]" if r["start"] <= 0 else _stamp(r["start"]),
+            "[dim]—[/dim]" if r.get("span_h") is None else _span_label(r["span_h"]),
+            f"{wins}-{losses}",
+            _money(sb.get("net", 0.0)) if decided else "[dim]—[/dim]",
+            f"[{_rate_style(rate, be)}]{_pct(rate)}[/]",
+            _pct(be),
+            "[dim]—[/dim]" if gap is None else f"[{_pnl_color(gap)}]{gap:+.1f}pp[/]",
+            "[cyan]◀[/cyan]" if name == marked else "")
+    return t
+
+
+def era_footnote(era_rows: list[dict], marked: str | None = None) -> list[str]:
+    """Say the rules out loud, on the report, every time it prints."""
+    lines = [
+        "[dim]boundaries are DEPLOY moments (commit / recorded deploy), cited per era in "
+        "polymarket/eras.py.[/dim]",
+        f"[dim]all {len(era_rows)} eras listed — none may be hidden; all-time above stays "
+        "the ledger of record.[/dim]",
+    ]
+    if marked:
+        why = next((r["why"] for r in era_rows if r["name"] == marked), "")
+        if why:
+            lines.append(f"[cyan]◀ {marked}[/cyan] [dim]— {why}[/dim]")
+    return lines
 
 
 def effectiveness_table(eff: dict) -> Table:
@@ -490,17 +608,38 @@ def gates_footer(report: dict) -> list[str]:
 
 def render_stats(sb: dict, eff: dict, bal: dict | None, status: dict | None,
                  floor: float, *, blocks: dict | None = None,
-                 full: bool = False, gates: dict | None = None) -> Group:
+                 full: bool = False, gates: dict | None = None,
+                 era_rows: list[dict] | None = None, era_now: dict | None = None,
+                 scope_label: str | None = None, eras_omitted: bool = False) -> Group:
     """The single renderable `pmt crypto stats` prints.
 
     `blocks` carries the tape folds (polymarket.updown_stats): arm flags,
     the maker experiment, the order path, the fleet ration. Sections with no
     data drop out entirely rather than printing an empty box — an experiment
     block with nothing in it is a claim the report has no business making.
+
+    The by-era table is the ONE exception to that rule: it prints every era
+    the registry knows, empty ones included, because the whole point of it is
+    that no regime can go missing. It drops out only when `--since` floored
+    the wallet walk itself, and then it says so rather than showing a partial
+    set of eras — half an era table is worse than none.
     """
     status = status or {}
     blocks = blocks or {}
-    parts: list = [header_panel(sb, eff, bal, status, floor, blocks.get("fleet")), ""]
+    marked = (era_now or {}).get("name")
+    parts: list = [header_panel(sb, eff, bal, status, floor, blocks.get("fleet"),
+                                era_now=era_now, scope_label=scope_label), ""]
+
+    if era_rows:
+        parts += [section("by era", "policy regimes, pinned to deploy moments"),
+                  era_table(era_rows, marked)]
+        parts += era_footnote(era_rows, marked) + [""]
+    elif eras_omitted:
+        parts += [section("by era", "omitted"),
+                  "[dim]--since floors the wallet walk, so every older era would read "
+                  "short.[/dim]",
+                  "[dim]Drop --since for the full table, or --era <name> to scope the "
+                  "report and keep it.[/dim]", ""]
 
     series = sb.get("series") or {}
     flags = blocks.get("flags") or {}

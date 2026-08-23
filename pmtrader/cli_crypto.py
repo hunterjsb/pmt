@@ -26,7 +26,7 @@ import stats_render
 from engine import post as _engine_post
 
 from cli_common import console, _api, _pnl_color
-from polymarket import effectiveness, tape, updown_slugs, updown_stats, wallet
+from polymarket import effectiveness, eras, tape, updown_slugs, updown_stats, wallet
 from watch_ui import (
     _SB_EMPTY, _brake_rich, _cbreak_stdin, _controls_panel,
     _restore_stdin, _rtds_line, _safety_rich, _tape_render, _tape_slug, _wait_key,
@@ -388,7 +388,9 @@ def _impute_win_pnl(buy_usd: float, sell_usd: float, buy_shares: float) -> float
 
 
 def _tape_scoreboard(floor: float, sliding_floor: float | None = None,
-                      keep_activity: bool = False) -> dict:
+                      keep_activity: bool = False, ceiling: float | None = None,
+                      walk_floor: float | None = None,
+                      tape_records: list[dict] | None = None) -> dict:
     """Fetch the wallet's activity and grade it — the synchronous one-shot
     form used by `pmt crypto stats` and by anything that wants a fresh full
     walk. The watch dashboard instead keeps a wallet.ActivityLedger warm and
@@ -396,23 +398,44 @@ def _tape_scoreboard(floor: float, sliding_floor: float | None = None,
     the SAME aggregation below, so the two never drift.
 
     `keep_activity` hands the raw rows back under "activity". The wallet walk
-    is the slowest thing this report does, and the maker attribution and the
-    --gates ledger both need the same rows — paginating twice for one report
-    would be paying the price twice for one answer.
+    is the slowest thing this report does, and the maker attribution, the
+    --gates ledger and the by-era table all need the same rows — paginating
+    twice for one report would be paying the price twice for one answer.
+
+    `walk_floor` separates how far BACK we paginate from what we grade, and
+    exists for exactly one caller: `--era` grades one era but still owes the
+    operator a complete era table, which needs the whole ledger. Defaults to
+    `floor`, so every other caller pages back exactly as far as it grades.
     """
     # Ground truth: every updown trade + redemption on the proxy wallet.
     # funder_address() RAISES on an unset addr, like every sibling command —
     # never fall through to a clean-looking "0W-0L" (docs/LESSONS.md#L26).
     addr = wallet.funder_address()
-    rows = wallet.fetch_wallet_activity(addr, floor)
-    sb = score_activity(rows, floor, sliding_floor=sliding_floor)
+    rows = wallet.fetch_wallet_activity(addr, floor if walk_floor is None else walk_floor)
+    sb = score_activity(rows, floor, sliding_floor=sliding_floor, ceiling=ceiling,
+                        tape_records=tape_records)
     if keep_activity:
         sb["activity"] = rows
     return sb
 
 
+def _fire_roll_records() -> list[dict]:
+    """The updown tape's fire+roll slice, read once and materialized.
+
+    Hand this to every score_activity() call in one report. The by-era table
+    grades N eras off the same tape; re-reading a 15MB jsonl per era would
+    pay for one answer N times over, the same way re-walking the wallet
+    would. Callers that grade once can leave it None and let score_activity
+    read the tape itself.
+    """
+    return list(tape.iter_records(tape.UPDOWN_TAPE,
+                                  evs={tape.EV_FIRE, tape.EV_ROLL}))
+
+
 def score_activity(rows: list[dict], floor: float,
-                   sliding_floor: float | None = None) -> dict:
+                   sliding_floor: float | None = None,
+                   ceiling: float | None = None,
+                   tape_records: list[dict] | None = None) -> dict:
     """W-L / realized P&L graded by the WALLET (data-api activity), not the
     model's own final read — a model that's confidently wrong (XRP basis,
     2026-08-23) would otherwise grade its own loss as a win. The tape only
@@ -428,6 +451,15 @@ def score_activity(rows: list[dict], floor: float,
     range while its buys fell outside, printing phantom profit (caught live
     2026-08-23: +$78 shown vs -$17 true).
 
+    `ceiling` closes that selection on the right (start < ceiling), making it
+    half-open [floor, ceiling). That is what the by-era table grades through:
+    adjacent eras share a boundary, and half-open is what stops a window that
+    starts exactly on one from being counted in both.
+
+    `tape_records`, if given, is a pre-read fire+roll slice (_fire_roll_records)
+    used instead of re-reading the tape file — the sharing discipline the era
+    loop needs. None means read it here, which is what every other caller does.
+
     `sliding_floor`, if given, additionally derives a "sliding" aggregate
     (recent-window W-L/P&L, keyed "sliding" in the result) from windows with
     start >= sliding_floor — computed in the SAME pass over the SAME rows
@@ -440,10 +472,14 @@ def score_activity(rows: list[dict], floor: float,
     from polymarket import outcomes
 
     now = _t.time()
+
+    def _in_range(start: float) -> bool:
+        return start >= floor and (ceiling is None or start < ceiling)
+
     win_by_slug: dict[str, dict] = {}
     for a in rows:
         slug = a.get("slug") or ""
-        if not updown_slugs.is_updown(slug) or updown_slugs.window_start(slug) < floor:
+        if not updown_slugs.is_updown(slug) or not _in_range(updown_slugs.window_start(slug)):
             continue
         w = win_by_slug.setdefault(slug, {"buy": 0.0, "sell": 0.0, "redeem": 0.0,
                                           "redeem_seen": False, "won": None,
@@ -467,11 +503,16 @@ def score_activity(rows: list[dict], floor: float,
 
     fires: dict[str, list] = {}
     rolls = rolls_sliding = 0
-    for r in tape.iter_records(tape.UPDOWN_TAPE, evs={tape.EV_FIRE, tape.EV_ROLL}):
-        if r.get("ev") == tape.EV_FIRE:
-            if updown_slugs.window_start(r.get("slug", "")) >= floor:
+    records = (tape.iter_records(tape.UPDOWN_TAPE, evs={tape.EV_FIRE, tape.EV_ROLL})
+               if tape_records is None else tape_records)
+    for r in records:
+        ev = r.get("ev")
+        if ev == tape.EV_FIRE:
+            if _in_range(updown_slugs.window_start(r.get("slug", ""))):
                 fires.setdefault(r["slug"], []).append(r)
-        elif r.get("t", 0) >= floor:
+        # A roll has no window of its own, so it is ranged on its own record
+        # time — the one place in this function that is not a window start.
+        elif ev == tape.EV_ROLL and _in_range(r.get("t", 0)):
             rolls += 1
             if sliding_floor is not None and r.get("t", 0) >= sliding_floor:
                 rolls_sliding += 1
@@ -591,7 +632,55 @@ def effectiveness_summary(sb: dict, bal: dict | None) -> dict:
                                   bankroll=bankroll or None, now=time.time())
 
 
-def _stats_blocks(sb: dict, status: dict, floor: float) -> dict:
+def era_scoreboards(rows: list[dict], tape_records: list[dict] | None = None,
+                     registry: tuple | None = None) -> list[dict]:
+    """One graded scoreboard per policy era (polymarket.eras), off ONE walk.
+
+    Grading is score_activity's, called once per era over the era's own
+    half-open [start, next start) window range — the same selection the
+    --since path uses. Nothing here re-derives a W, an L or a dollar, so an
+    era row and a floored report can never disagree about what a window was
+    worth.
+
+    The expensive halves are fetched ONCE by the caller and shared: `rows` is
+    the already-paginated wallet activity and `tape_records` the already-read
+    fire+roll slice. N eras therefore cost N CPU passes over memory, not N
+    wallet walks and not N tape reads.
+
+    Every era in the registry gets a row, including ones the fleet never
+    traded — an era that renders as 0-0 is information, and an era that
+    silently vanishes is how a bad regime gets forgotten.
+    """
+    registry = eras.ERAS if registry is None else registry
+    if tape_records is None:
+        tape_records = _fire_roll_records()
+    now = time.time()
+    out = []
+    for e in registry:
+        lo, hi = eras.bounds(e, registry)
+        sb = score_activity(rows, lo, ceiling=hi, tape_records=tape_records)
+        out.append({
+            "name": e.name, "why": e.why, "start": lo, "end": hi, "sb": sb,
+            # Stamped here, not in the renderer: the running era's span ends
+            # at the clock, and stats_render owns pixels, never a clock.
+            "span_h": None if lo <= 0 else ((now if hi == float("inf") else hi) - lo) / 3600.0,
+            # The bar this era's OWN payoff shape had to clear — a break-even
+            # need computed over all time would grade a regime against a
+            # payoff structure it never traded.
+            "breakeven": effectiveness.breakeven_win_rate(sb.get("eff_windows") or []),
+        })
+    return out
+
+
+def era_row(era_rows: list[dict], name: str) -> dict | None:
+    for r in era_rows:
+        if r["name"] == name:
+            return r
+    return None
+
+
+def _stats_blocks(sb: dict, status: dict, floor: float,
+                   ceiling: float | None = None) -> dict:
     """The tape-derived half of the report: arm flags, the resting-bid
     experiment, the order path, the fleet ration.
 
@@ -600,11 +689,17 @@ def _stats_blocks(sb: dict, status: dict, floor: float) -> dict:
     every 10s off its warm ledger and has no use for any of this, so putting
     it there would charge the dashboard for a one-shot report's blocks.
     """
-    evals = list(tape.iter_records(tape.UPDOWN_TAPE, floor=floor,
-                                    evs={tape.EV_EVAL, tape.EV_FIRE}))
+    def _under(rs):
+        # These blocks fold TAPE records, which carry a record time and no
+        # window of their own — so an era scope closes them on `t`, not on a
+        # window start the way the scoreboard does.
+        return [r for r in rs if ceiling is None or r.get("t", 0) < ceiling]
+
+    evals = _under(tape.iter_records(tape.UPDOWN_TAPE, floor=floor,
+                                      evs={tape.EV_EVAL, tape.EV_FIRE}))
     fires = [r for r in evals if r.get("ev") == tape.EV_FIRE]
     evals = [r for r in evals if r.get("ev") == tape.EV_EVAL]
-    orders = list(tape.iter_records(tape.ORDER_TAPE, floor=floor))
+    orders = _under(tape.iter_records(tape.ORDER_TAPE, floor=floor))
     return {
         "flags": updown_stats.arm_flags(status.get("arms")),
         "maker": updown_stats.maker_summary(evals, orders,
@@ -629,12 +724,37 @@ def _stats_blocks(sb: dict, status: dict, floor: float) -> dict:
                    "cost and saved, per reason. Resolves (and REFRESHES on "
                    "disk) the outcomes corpus, so it is markedly slower than "
                    "the default report")
+@click.option("--era", "era_name", type=str, default=None,
+              help="Scope the whole report to one policy era (see the by-era "
+                   "table for the names). The era table itself stays complete "
+                   "— scoping the view never hides an era")
 @click.option("--json", "as_json", is_flag=True)
-def crypto_stats(since: float | None, full: bool, gates: bool, as_json: bool) -> None:
+def crypto_stats(since: float | None, full: bool, gates: bool,
+                 era_name: str | None, as_json: bool) -> None:
     """Fleet scoreboard: record + streak, per-symbol P&L, effectiveness, live experiments."""
-    floor = _parse_since(since) if since else 0.0
+    era = None
+    if era_name is not None:
+        era = eras.by_name(era_name)
+        if era is None:
+            raise click.UsageError(
+                f"unknown era {era_name!r} — known eras: {', '.join(eras.names())}")
+    if era is not None and since is not None:
+        raise click.UsageError("--era and --since both pick a range; use one")
+
+    floor, ceiling = (_parse_since(since) if since else 0.0), None
+    scope_label = None
+    if era is not None:
+        floor, ceiling = eras.bounds(era)
+        scope_label = f"era {era.name} · {stats_render.era_span_label(floor, ceiling)}"
+    # The era table needs the FULL ledger even when the report is scoped, so
+    # --era pages back to the start while grading only its own era. --since is
+    # the operator narrowing the walk itself, and gets no era table at all.
+    show_eras = since is None
     try:
-        sb = _tape_scoreboard(floor, keep_activity=True)
+        tape_records = _fire_roll_records()
+        sb = _tape_scoreboard(floor, keep_activity=True, ceiling=ceiling,
+                              walk_floor=0.0 if show_eras else None,
+                              tape_records=tape_records)
     except Exception as e:
         console.print(f"[red]data-api unreachable: {e}[/red]")
         sys.exit(1)
@@ -652,8 +772,16 @@ def crypto_stats(since: float | None, full: bool, gates: bool, as_json: bool) ->
         pass
 
     eff_s = effectiveness_summary(sb, bal)
-    blocks = _stats_blocks(sb, status, floor)
+    blocks = _stats_blocks(sb, status, floor, ceiling=ceiling)
+    # Same rows, same tape: the era table is the third consumer of the one
+    # walk, not a second walk of its own.
+    era_rows = (era_scoreboards(sb.get("activity") or [], tape_records=tape_records)
+                if show_eras else None)
     gates_report = _gates_report(sb.pop("activity", []), floor) if gates else None
+
+    # The chip beside all-time names the era the report is LOOKING THROUGH:
+    # the scoped one under --era, otherwise the era the clock is in.
+    era_now = era_row(era_rows or [], (era or eras.current()).name) if era_rows else None
 
     if as_json:
         click.echo(json.dumps({
@@ -665,12 +793,20 @@ def crypto_stats(since: float | None, full: bool, gates: bool, as_json: bool) ->
             "windows": sb["windows"], "effectiveness": eff_s,
             "maker": blocks["maker"], "chase": blocks["chase"],
             "fleet": blocks["fleet"], "gates": gates_report,
+            "era": era.name if era else None,
+            "eras": [{"name": r["name"], "why": r["why"], "start": r["start"],
+                      "end": None if r["end"] == float("inf") else r["end"],
+                      "wins": r["sb"]["wins"], "losses": r["sb"]["losses"],
+                      "net_est": r["sb"]["net"], "breakeven_win_rate": r["breakeven"]}
+                     for r in (era_rows or [])],
         }, indent=2))
         return
 
     console.print(stats_render.render_stats(sb, eff_s, bal, status, floor,
                                              blocks=blocks, full=full,
-                                             gates=gates_report))
+                                             gates=gates_report, era_rows=era_rows,
+                                             era_now=era_now, scope_label=scope_label,
+                                             eras_omitted=not show_eras))
 
 
 # ---------- watch: the render/fetch split ----------

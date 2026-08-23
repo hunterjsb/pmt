@@ -591,3 +591,132 @@ def test_render_stats_never_wraps_a_default_report_at_a_hundred_columns():
                                   {"arms": _arms()}, 1787452500,
                                   blocks=_blocks()), width=100)
     assert all(len(ln) <= 100 for ln in out.splitlines())
+
+
+# ---------- by era ----------
+
+def _era(name, start, end, wins, losses, net, breakeven=None, span_h=3.0) -> dict:
+    return {"name": name, "why": f"why {name}", "start": start, "end": end,
+            "span_h": span_h, "breakeven": breakeven,
+            "sb": {"wins": wins, "losses": losses, "net": net, "rolls": 0,
+                   "series": {}, "cal": {}, "estimated": 0}}
+
+
+def _eras() -> list[dict]:
+    return [
+        _era("pre-brake", 0.0, 1787451100.0, 49, 8, -447.87, 0.876, span_h=None),
+        _era("brakes", 1787451100.0, 1787461200.0, 60, 4, -91.04, 0.946, span_h=2.8),
+        _era("quiet", 1787461200.0, 1787481547.0, 0, 0, 0.0, None, span_h=5.7),
+        _era("stream", 1787481547.0, float("inf"), 73, 0, 336.91, None, span_h=5.7),
+    ]
+
+
+def test_era_table_shows_every_era_including_ones_that_traded_nothing():
+    out = _render(sr.era_table(_eras()), width=100)
+    for name in ("pre-brake", "brakes", "quiet", "stream"):
+        assert name in out
+    assert "0-0" in out  # the empty era renders, it does not vanish
+
+
+def test_era_table_prints_the_gap_against_each_eras_own_breakeven_bar():
+    out = _render(sr.era_table(_eras()), width=100)
+    assert "-1.6pp" in out   # 86.0% actual against an 87.6% bar
+    assert "-0.8pp" in out   # 93.8% against 94.6%
+
+
+def test_era_table_dashes_an_undefined_breakeven_rather_than_zeroing_it():
+    # An era with no losses cannot size its payoff shape; a 0% bar would read
+    # as "clears everything", which is the opposite of "not yet known".
+    out = _render(sr.era_table([_era("stream", 100.0, float("inf"), 73, 0, 336.91)]),
+                  width=100)
+    assert "—" in out and "0.0pp" not in out
+
+
+def test_era_table_labels_the_open_left_era_as_open():
+    out = _render(sr.era_table(_eras()), width=100)
+    assert "open" in out
+
+
+def test_era_table_marks_only_the_era_the_report_is_looking_through():
+    out = _render(sr.era_table(_eras(), marked="brakes"), width=100)
+    assert out.count("◀") == 1
+
+
+def test_era_table_fits_a_hundred_columns():
+    out = _render(sr.era_table(_eras(), marked="stream"), width=100)
+    assert all(len(ln) <= 100 for ln in out.splitlines())
+
+
+def test_era_footnote_states_the_rules_and_counts_the_eras():
+    lines = sr.era_footnote(_eras(), marked="stream")
+    out = _plain(lines, width=100)
+    assert "DEPLOY moments" in out and "eras.py" in out
+    assert "all 4 eras listed" in out and "none may be hidden" in out
+    assert "ledger of record" in out
+    assert "why stream" in out            # the marked era says what it was
+    assert all(len(ln) <= 100 for ln in out.splitlines())
+
+
+def test_era_line_pairs_with_the_identity_row():
+    out = _plain([sr.era_line(_era("stream", 100.0, float("inf"), 73, 0, 336.91))],
+                 width=100)
+    assert "era stream" in out and "73W-0L" in out and "+336.91" in out
+    assert "all-time above is the ledger" in out
+
+
+def test_era_line_says_scoped_when_the_whole_report_is_one_era():
+    # Under --era the row above is NOT all-time, so the tail must not say it is.
+    out = _plain([sr.era_line(_era("theta", 100.0, 200.0, 44, 1, 115.59), scoped=True)],
+                 width=100)
+    assert "scoped view" in out and "all-time above" not in out
+
+
+def test_era_line_is_absent_when_there_is_no_era_to_name():
+    assert sr.era_line(None) == ""
+
+
+def test_era_span_label_marks_both_open_ends():
+    assert sr.era_span_label(0.0, 1787451100.0).startswith("open→")
+    assert sr.era_span_label(1787451100.0, float("inf")).endswith("→now")
+    assert sr.era_span_label(1787451100.0, 1787461200.0) == "02:11Z→05:00Z"
+
+
+def test_render_stats_puts_the_era_table_in_the_default_view():
+    # It earns default placement: it answers the operator's standing question,
+    # which the all-time line structurally cannot.
+    out = _render(sr.render_stats(_sb(), _eff(), {"total": 1649.14}, {}, 0,
+                                  blocks=_blocks(), era_rows=_eras(),
+                                  era_now=_eras()[-1]), width=100)
+    assert "by era" in out
+    assert out.index("updown fleet") < out.index("by era") < out.index("by symbol")
+    assert "era stream" in out          # the identity chip beside all-time
+    assert all(len(ln) <= 100 for ln in out.splitlines())
+
+
+def test_render_stats_era_scope_relabels_the_header_and_keeps_every_era():
+    out = _render(sr.render_stats(_sb(), _eff(), None, {}, 1787461200,
+                                  blocks=_blocks(), era_rows=_eras(),
+                                  era_now=_eras()[1],
+                                  scope_label="era brakes · 02:11Z→05:00Z"), width=100)
+    assert "era brakes · 02:11Z→05:00Z" in out
+    assert "windows since" not in out
+    for name in ("pre-brake", "brakes", "quiet", "stream"):
+        assert name in out          # scoping the view hides no era
+    assert "scoped view" in out
+
+
+def test_render_stats_says_why_the_era_table_is_missing_under_since():
+    out = _render(sr.render_stats(_sb(), _eff(), None, {}, 1787452500,
+                                  blocks=_blocks(), era_rows=None,
+                                  eras_omitted=True), width=100)
+    # Half an era table is worse than none — say so rather than show a short one.
+    assert "by era" in out and "omitted" in out
+    assert "--since floors the wallet walk" in out
+    assert all(len(ln) <= 100 for ln in out.splitlines())
+
+
+def test_render_stats_without_era_rows_is_the_report_as_it_was():
+    out = _render(sr.render_stats(_sb(), _eff(), None, {}, 0, blocks=_blocks()),
+                  width=100)
+    assert "by era" not in out
+    assert "by symbol" in out and "effectiveness" in out
