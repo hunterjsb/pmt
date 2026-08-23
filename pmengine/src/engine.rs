@@ -1589,29 +1589,7 @@ impl Engine {
                                 let _ = reply.send(report);
                             }
                             EngineCommand::ListStrategies(reply) => {
-                                let now_instant = std::time::Instant::now();
-                                let now_utc = chrono::Utc::now();
-                                let infos: Vec<StrategyInfo> = self
-                                    .strategy_runtime
-                                    .summaries()
-                                    .into_iter()
-                                    .map(|s| StrategyInfo {
-                                        id: s.id,
-                                        tick_interval_ms: s.tick_interval_ms,
-                                        subscribed_tokens: s.subscriptions,
-                                        paused: s.paused,
-                                        last_tick_at: s.last_tick_at.map(|t| {
-                                            // Instant → wall-clock by aligning the
-                                            // monotonic delta against the observed
-                                            // wall-clock at the same moment.
-                                            let elapsed = now_instant.saturating_duration_since(t);
-                                            now_utc
-                                                - chrono::Duration::from_std(elapsed)
-                                                    .unwrap_or_else(|_| chrono::Duration::zero())
-                                        }),
-                                    })
-                                    .collect();
-                                let _ = reply.send(infos);
+                                let _ = reply.send(self.strategy_infos());
                             }
                             EngineCommand::ListOrders(reply) => {
                                 let orders: Vec<OrderInfo> = self
@@ -1636,65 +1614,7 @@ impl Engine {
                                 let _ = reply.send(self.alert_queue.list());
                             }
                             EngineCommand::ApproveAlert { id, reply } => {
-                                self.alert_queue.prune_expired();
-                                let res = match self.alert_queue.take(&id) {
-                                    None => Err(format!("alert {} not found", id)),
-                                    Some((_, sig)) => {
-                                        // Run the suggested signal through the
-                                        // normal risk + order pipeline, exactly
-                                        // as if the strategy had emitted it
-                                        // directly. Any rejection bubbles up
-                                        // to the HTTP response.
-                                        match self.risk_manager.check_signal(&sig, &self.positions) {
-                                            RiskCheckResult::Approved(ref s)
-                                            | RiskCheckResult::Reduced(ref s, _) => {
-                                                let (token_id, price, size) = match s {
-                                                    Signal::Buy { token_id, price, size, .. } => (token_id.clone(), *price, *size),
-                                                    Signal::Sell { token_id, price, size, .. } => (token_id.clone(), *price, *size),
-                                                    _ => {
-                                                        let _ = reply.send(Err("suggested is not Buy/Sell".to_string()));
-                                                        continue;
-                                                    }
-                                                };
-                                                let notional = price * size;
-                                                let reservation_id = match self
-                                                    .risk_manager
-                                                    .reserve_exposure(&token_id, notional, &self.positions)
-                                                {
-                                                    Some(id) => id,
-                                                    None => {
-                                                        let _ = reply.send(Err(
-                                                            "exposure reservation rejected".to_string(),
-                                                        ));
-                                                        continue;
-                                                    }
-                                                };
-                                                match self.order_manager.execute(s.clone()).await {
-                                                    Ok(Some(order_id)) => {
-                                                        self.risk_manager.confirm_reservation(
-                                                            &reservation_id,
-                                                            &order_id,
-                                                        );
-                                                        Ok(order_id)
-                                                    }
-                                                    Ok(None) => {
-                                                        self.risk_manager
-                                                            .release_reservation(&reservation_id);
-                                                        Ok("dry-run".to_string())
-                                                    }
-                                                    Err(e) => {
-                                                        self.risk_manager
-                                                            .release_reservation(&reservation_id);
-                                                        Err(format!("execute failed: {}", e))
-                                                    }
-                                                }
-                                            }
-                                            RiskCheckResult::Rejected(reason) => {
-                                                Err(format!("risk rejected: {}", reason))
-                                            }
-                                        }
-                                    }
-                                };
+                                let res = self.approve_alert(&id).await;
                                 let _ = reply.send(res);
                             }
                             EngineCommand::RejectAlert { id, reply } => {
@@ -1757,60 +1677,10 @@ impl Engine {
                                 let _ = reply.send(());
                             }
                             EngineCommand::ListAllOrders(reply) => {
-                                let mut combined: Vec<crate::control::UnifiedOrderInfo> = self
-                                    .order_manager
-                                    .active_orders_snapshot()
-                                    .into_iter()
-                                    .map(|o| crate::control::UnifiedOrderInfo {
-                                        id: o.id,
-                                        token_id: o.token_id,
-                                        side: if o.is_buy { "buy" } else { "sell" }.to_string(),
-                                        price: o.price,
-                                        size: o.size,
-                                        filled: o.filled_size,
-                                        status: format!("{:?}", o.status),
-                                        created_at: o.created_at,
-                                        source: "engine".to_string(),
-                                    })
-                                    .collect();
-                                for ext in self.external_orders.values() {
-                                    combined.push(crate::control::UnifiedOrderInfo {
-                                        id: ext.id.clone(),
-                                        token_id: ext.token_id.clone(),
-                                        side: ext.side.clone(),
-                                        price: ext.price,
-                                        size: ext.size,
-                                        filled: Decimal::ZERO,
-                                        status: "external".to_string(),
-                                        created_at: ext.created_at,
-                                        source: ext.source.clone(),
-                                    });
-                                }
-                                let _ = reply.send(combined);
+                                let _ = reply.send(self.all_orders());
                             }
                             EngineCommand::CancelOrderById { order_id, reply } => {
-                                let res = match self.client.cancel_order(&order_id).await {
-                                    Ok(_) => {
-                                        // If it was tracked externally, clean up; if it was
-                                        // engine-placed, release the risk reservation. Both
-                                        // calls are no-ops if the id isn't present.
-                                        self.external_orders.remove(&order_id);
-                                        self.risk_manager.release_order(&order_id);
-                                        tracing::info!(
-                                            order_id = %order_id,
-                                            "CancelOrderById succeeded"
-                                        );
-                                        Ok(())
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            order_id = %order_id,
-                                            "CancelOrderById failed"
-                                        );
-                                        Err(format!("cancel failed: {}", e))
-                                    }
-                                };
+                                let res = self.cancel_order_by_id(&order_id).await;
                                 let _ = reply.send(res);
                             }
                             EngineCommand::ScheduleCancel { order_id, at, reply } => {
@@ -1823,59 +1693,7 @@ impl Engine {
                                 let _ = reply.send(());
                             }
                             EngineCommand::PlaceOrder { token_id, side, price, size, reply } => {
-                                let sdk_side = match side.as_str() {
-                                    "buy" => crate::client::Side::Buy,
-                                    "sell" => crate::client::Side::Sell,
-                                    _ => {
-                                        let _ = reply.send(Err(format!("invalid side '{}'", side)));
-                                        continue;
-                                    }
-                                };
-                                // Round price to the market's tick. Cached lookup
-                                // means this is free after first touch, eliminating
-                                // the CLI's separate tick_size REST call.
-                                let rounded_price = match self.client.tick_decimals_for(&token_id).await {
-                                    Ok(decimals) => price.round_dp(decimals),
-                                    Err(e) => {
-                                        let _ = reply.send(Err(format!("tick lookup failed: {}", e)));
-                                        continue;
-                                    }
-                                };
-                                let res = match self.client.place_limit_order(
-                                    &token_id, sdk_side, rounded_price, size,
-                                ).await {
-                                    Ok(order_id) => {
-                                        self.external_orders.insert(
-                                            order_id.clone(),
-                                            crate::control::ExternalOrder {
-                                                id: order_id.clone(),
-                                                token_id: token_id.clone(),
-                                                side: side.clone(),
-                                                price: rounded_price,
-                                                size,
-                                                source: "cli-via-engine".to_string(),
-                                                created_at: chrono::Utc::now(),
-                                            },
-                                        );
-                                        tracing::info!(
-                                            order_id = %order_id,
-                                            token_id = %token_id,
-                                            side = %side,
-                                            price = %rounded_price,
-                                            size = %size,
-                                            "PlaceOrder (CLI via engine) succeeded"
-                                        );
-                                        Ok(order_id)
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            token_id = %token_id,
-                                            "PlaceOrder (CLI via engine) failed"
-                                        );
-                                        Err(format!("place failed: {}", e))
-                                    }
-                                };
+                                let res = self.place_order_for_cli(&token_id, &side, price, size).await;
                                 let _ = reply.send(res);
                             }
                             EngineCommand::PauseStrategy { id, reply } => {
@@ -1949,6 +1767,159 @@ impl Engine {
         tracing::debug!("Background pollers stopped");
 
         Ok(())
+    }
+
+    // --- control-plane command handlers ---
+    //
+    // The long EngineCommand arms live here rather than inline in run()'s
+    // select!, which keeps that loop readable as a dispatch table. Each takes
+    // &mut self and returns what the arm sends down its oneshot; none of them
+    // touch the reply channel.
+
+    /// `pmt engine strategies`. `last_tick_at` is an Instant, so it becomes a
+    /// wall-clock time by aligning the monotonic delta against `now_utc` read
+    /// at the same moment.
+    fn strategy_infos(&self) -> Vec<StrategyInfo> {
+        let now_instant = std::time::Instant::now();
+        let now_utc = chrono::Utc::now();
+        self.strategy_runtime.summaries().into_iter().map(|s| StrategyInfo {
+            id: s.id,
+            tick_interval_ms: s.tick_interval_ms,
+            subscribed_tokens: s.subscriptions,
+            paused: s.paused,
+            last_tick_at: s.last_tick_at.map(|t| {
+                let elapsed = now_instant.saturating_duration_since(t);
+                now_utc - chrono::Duration::from_std(elapsed)
+                    .unwrap_or_else(|_| chrono::Duration::zero())
+            }),
+        }).collect()
+    }
+
+    /// Engine-placed and externally-registered orders in one list, so
+    /// `pmt orders` sees everything resting under this account.
+    fn all_orders(&self) -> Vec<crate::control::UnifiedOrderInfo> {
+        let mut combined: Vec<crate::control::UnifiedOrderInfo> = self
+            .order_manager
+            .active_orders_snapshot()
+            .into_iter()
+            .map(|o| crate::control::UnifiedOrderInfo {
+                id: o.id,
+                token_id: o.token_id,
+                side: if o.is_buy { "buy" } else { "sell" }.to_string(),
+                price: o.price,
+                size: o.size,
+                filled: o.filled_size,
+                status: format!("{:?}", o.status),
+                created_at: o.created_at,
+                source: "engine".to_string(),
+            })
+            .collect();
+        combined.extend(self.external_orders.values().map(|ext| crate::control::UnifiedOrderInfo {
+            id: ext.id.clone(),
+            token_id: ext.token_id.clone(),
+            side: ext.side.clone(),
+            price: ext.price,
+            size: ext.size,
+            filled: Decimal::ZERO,
+            status: "external".to_string(),
+            created_at: ext.created_at,
+            source: ext.source.clone(),
+        }));
+        combined
+    }
+
+    /// Cancel any order by id, engine-placed or external. Both cleanup calls
+    /// are no-ops when the id isn't present on that side.
+    async fn cancel_order_by_id(&mut self, order_id: &str) -> Result<(), String> {
+        match self.client.cancel_order(order_id).await {
+            Ok(_) => {
+                self.external_orders.remove(order_id);
+                self.risk_manager.release_order(order_id);
+                tracing::info!(order_id = %order_id, "CancelOrderById succeeded");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, order_id = %order_id, "CancelOrderById failed");
+                Err(format!("cancel failed: {}", e))
+            }
+        }
+    }
+
+    /// Run an approved alert's suggested signal through the normal risk +
+    /// order pipeline, exactly as if the strategy had emitted it directly.
+    /// Every refusal reason bubbles up to the HTTP response.
+    async fn approve_alert(&mut self, id: &str) -> Result<String, String> {
+        self.alert_queue.prune_expired();
+        let (_, sig) = self.alert_queue.take(id)
+            .ok_or_else(|| format!("alert {} not found", id))?;
+        let signal = match self.risk_manager.check_signal(&sig, &self.positions) {
+            RiskCheckResult::Approved(s) | RiskCheckResult::Reduced(s, _) => s,
+            RiskCheckResult::Rejected(reason) => return Err(format!("risk rejected: {}", reason)),
+        };
+        let (token_id, price, size) = match &signal {
+            Signal::Buy { token_id, price, size, .. }
+            | Signal::Sell { token_id, price, size, .. } => (token_id.clone(), *price, *size),
+            _ => return Err("suggested is not Buy/Sell".to_string()),
+        };
+        let reservation_id = self
+            .risk_manager
+            .reserve_exposure(&token_id, price * size, &self.positions)
+            .ok_or_else(|| "exposure reservation rejected".to_string())?;
+        match self.order_manager.execute(signal).await {
+            Ok(Some(order_id)) => {
+                self.risk_manager.confirm_reservation(&reservation_id, &order_id);
+                Ok(order_id)
+            }
+            Ok(None) => {
+                self.risk_manager.release_reservation(&reservation_id);
+                Ok("dry-run".to_string())
+            }
+            Err(e) => {
+                self.risk_manager.release_reservation(&reservation_id);
+                Err(format!("execute failed: {}", e))
+            }
+        }
+    }
+
+    /// `pmt buy/sell` routed through the engine so the account-wide rate limit
+    /// and the tick-size cache are shared with the strategies. The cached tick
+    /// lookup is free after first touch, which is what lets the CLI drop its
+    /// own tick_size REST call.
+    async fn place_order_for_cli(
+        &mut self, token_id: &str, side: &str, price: Decimal, size: Decimal,
+    ) -> Result<String, String> {
+        let sdk_side = match side {
+            "buy" => crate::client::Side::Buy,
+            "sell" => crate::client::Side::Sell,
+            _ => return Err(format!("invalid side '{}'", side)),
+        };
+        let rounded_price = match self.client.tick_decimals_for(token_id).await {
+            Ok(decimals) => price.round_dp(decimals),
+            Err(e) => return Err(format!("tick lookup failed: {}", e)),
+        };
+        match self.client.place_limit_order(token_id, sdk_side, rounded_price, size).await {
+            Ok(order_id) => {
+                self.external_orders.insert(order_id.clone(), crate::control::ExternalOrder {
+                    id: order_id.clone(),
+                    token_id: token_id.to_string(),
+                    side: side.to_string(),
+                    price: rounded_price,
+                    size,
+                    source: "cli-via-engine".to_string(),
+                    created_at: chrono::Utc::now(),
+                });
+                tracing::info!(
+                    order_id = %order_id, token_id = %token_id, side = %side,
+                    price = %rounded_price, size = %size,
+                    "PlaceOrder (CLI via engine) succeeded"
+                );
+                Ok(order_id)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, token_id = %token_id, "PlaceOrder (CLI via engine) failed");
+                Err(format!("place failed: {}", e))
+            }
+        }
     }
 
     /// Graceful shutdown: cancel all orders and cleanup.
