@@ -52,21 +52,37 @@ def resolve_moneyline(league: str, ref: str, slug: str | None = None) -> dict:
 
     home = next(t for t in game["teams"] if t["home"])
     away = next(t for t in game["teams"] if not t["home"])
-    if not slug:
+    if slug:
+        candidates = [slug]
+    else:
         et_date = (
             datetime.fromisoformat(game["start"].replace("Z", "+00:00"))
             .astimezone(ZoneInfo("America/New_York"))
             .strftime("%Y-%m-%d")
         )
-        slug = f"{league.lower()}-{away['abbrev'].lower()}-{home['abbrev'].lower()}-{et_date}"
+        # ESPN and Polymarket disagree on a few abbrevs (ESPN CHW = slug
+        # cws, ESPN AZ = slug ari) — try alias combos before giving up.
+        aliases = {"chw": "cws", "az": "ari"}
+        aw, hm = away["abbrev"].lower(), home["abbrev"].lower()
+        candidates = list(dict.fromkeys(
+            f"{league.lower()}-{a}-{h}-{et_date}"
+            for a in dict.fromkeys([aw, aliases.get(aw, aw)])
+            for h in dict.fromkeys([hm, aliases.get(hm, hm)])
+        ))
 
-    r = requests.get(
-        f"{hosts.GAMMA}/events", params={"slug": slug}, headers=hosts.UA, timeout=15
-    )
-    r.raise_for_status()
-    events = r.json() or []
+    events = []
+    for slug in candidates:
+        r = requests.get(
+            f"{hosts.GAMMA}/events", params={"slug": slug}, headers=hosts.UA, timeout=15
+        )
+        r.raise_for_status()
+        events = r.json() or []
+        if events:
+            break
     if not events:
-        raise ValueError(f"no Polymarket event for slug '{slug}' (override with --slug)")
+        raise ValueError(
+            f"no Polymarket event for slug(s) {', '.join(candidates)} (override with --slug)"
+        )
     ml = next(
         (m for m in events[0]["markets"] if m.get("sportsMarketType") == "moneyline"),
         None,
