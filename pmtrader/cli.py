@@ -2699,6 +2699,121 @@ def crypto_outcomes(since: float, out_path: str | None) -> None:
     console.print(f"[dim]{out_file}  ({len(merged)} total rows)[/dim]")
 
 
+def _shadow_parse_since(v: float | None) -> float:
+    """HOURS_AGO_OR_EPOCH: small values are hours-ago, big ones (a real Unix
+    timestamp is always > 1e6 in hours-ago terms) are a raw epoch already."""
+    import time as _t
+
+    if v is None:
+        return 0.0
+    if v > 1_000_000:
+        return v
+    return _t.time() - v * 3600
+
+
+@crypto_group.command("shadow")
+@click.option("--since", type=float, default=None,
+              help="Hours-ago, or a raw epoch if the value is large (default: all tape)")
+@click.option("--json", "as_json", is_flag=True, help="Raw report JSON")
+def crypto_shadow(since: float | None, as_json: bool) -> None:
+    """Shadow P&L ledger: what our own gates cost/saved us, per refusal reason.
+
+    Every refused side on the decision tape — basis-guard gates, the
+    safety/latched/distrust/avg_down brakes, and unbraked sides that just
+    missed min_fair/min_edge — plus every unfilled remainder of a real fire,
+    becomes a hindsight-priced counterfactual clip: net shadow P&L = missed
+    wins MINUS avoided losses, so a gate that dodges one big loss can still
+    net-positive even after refusing several winners — always reported both
+    ways, never just the missed-wins half.
+
+    Reuses polymarket.outcomes' wallet-first / Chainlink-fallback resolver
+    (and refreshes the ~/.pmt/corpus/outcomes.jsonl corpus in-process, same
+    as `pmt crypto outcomes`) — a window's winner is never guessed, so an
+    unresolved window's episodes surface as an honest coverage gap instead
+    of a silent zero.
+    """
+    import os
+    import time as _t
+
+    from polymarket import chainlink as ck
+    from polymarket import outcomes, shadow
+
+    addr = os.environ.get("PM_FUNDER_ADDRESS", "")
+    if not addr:
+        raise click.UsageError("PM_FUNDER_ADDRESS not set")
+
+    since_epoch = _shadow_parse_since(since)
+    now = _t.time()
+
+    try:
+        with open(_TAPE_PATH) as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        lines = []
+
+    slugs = outcomes.extract_updown_slugs(lines)
+    windows = outcomes.window_universe(slugs, since_epoch, now)
+
+    floor = windows[0]["start"] if windows else since_epoch
+    try:
+        activity = _fetch_wallet_activity(addr, floor)
+    except Exception as e:
+        console.print(f"[red]data-api unreachable: {e}[/red]")
+        sys.exit(1)
+
+    wallet = outcomes.wallet_outcomes(activity)
+    symbols = {w["symbol"] for w in windows}
+    rounds_by_symbol = {sym: ck.load_corpus(sym) for sym in symbols}
+    rows, _dropped = outcomes.build_outcomes(windows, wallet, rounds_by_symbol)
+
+    existing = outcomes.load_outcomes()
+    merged, _added, _upgraded = outcomes.merge_outcomes(existing, rows)
+    outcomes.write_outcomes(merged)
+    winners = {slug: row["winner"] for slug, row in merged.items()}
+
+    report = shadow.build_report(lines, winners, activity, since=since_epoch)
+
+    if as_json:
+        console.print_json(json.dumps(report))
+        return
+
+    categories, totals, coverage = report["categories"], report["totals"], report["coverage"]
+
+    if totals["episodes"] == 0:
+        console.print("[dim]No refusals on the tape in range.[/dim]")
+        return
+
+    console.print(f"[bold]shadow P&L[/bold] — {totals['episodes']} episodes across "
+                  f"{coverage['windows']} windows")
+
+    t = Table(title="by refusal reason (hindsight-priced)")
+    cols = [("category", "left"), ("episodes", "right"), ("priced", "right"),
+            ("hit rate", "right"), ("missed wins", "right"), ("avoided losses", "right"),
+            ("net", "right"), ("verdict", "left")]
+    for name, justify in cols:
+        t.add_column(name, justify=justify)
+    for cat in shadow.CATEGORY_ORDER:
+        s = categories.get(cat)
+        if not s or s["episodes"] == 0:
+            continue
+        hr = f"{s['hit_rate'] * 100:.0f}%" if s["hit_rate"] is not None else "—"
+        net = s["net"]
+        net_style = "red" if net > 0 else "green"
+        t.add_row(cat, str(s["episodes"]), str(s["priced"]), hr,
+                  f"{s['missed_wins']:,.2f}", f"{s['avoided_losses']:,.2f}",
+                  f"[{net_style}]{net:+,.2f}[/{net_style}]", shadow.verdict(s))
+    console.print(t)
+
+    grand_net = totals["net"]
+    grand_style = "red" if grand_net > 0 else "green"
+    console.print(f"[bold]grand total[/bold]  missed wins {totals['missed_wins']:,.2f} · "
+                  f"avoided losses {totals['avoided_losses']:,.2f} · "
+                  f"net [{grand_style}]{grand_net:+,.2f}[/{grand_style}]")
+    console.print(f"[dim]coverage: {coverage['windows']} windows touched · "
+                  f"{coverage['unpriced_episodes']} unpriced episodes (no recorded ask) · "
+                  f"{coverage['skipped_unresolved']} skipped (window not yet resolved)[/dim]")
+
+
 @cli.group("sports")
 def sports_group() -> None:
     """Live sports data: scores, game state, ESPN win probability."""
