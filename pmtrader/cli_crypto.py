@@ -24,7 +24,7 @@ from rich.table import Table
 
 from engine import post as _engine_post
 
-from cli_common import console, _api
+from cli_common import console, _api, _pnl_color
 from polymarket import tape, updown_slugs, wallet
 
 
@@ -146,7 +146,7 @@ def _resolve_basis_guard(explicit: float | None, symbol: str) -> tuple[float, st
                    "cents above the decision ask, funded only by surplus edge "
                    "over --min-edge (marketable limits fill at the book, so "
                    "it costs nothing unless the book moved). 0 disables; the "
-                   "2026-08-23 audit measured 32%% of taker notional unfilled")
+                   "2026-08-23 audit measured 32% of taker notional unfilled")
 @click.option("--p-cap", type=float, default=1.0, show_default=True,
               help="R6 tail honesty: cap the model's fair unless flip-proof — "
                    "Gaussian p_up 0.99+ is fiction in the tails (>3-sigma "
@@ -763,7 +763,7 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
     else:
         floor_label = f"windows since {datetime.fromtimestamp(floor, tz=timezone.utc).strftime('%m-%d %H:%MZ')}"
     console.print(f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L "
-                  f"[{'green' if net >= 0 else 'red'}]{net:+,.2f}[/] · "
+                  f"[{_pnl_color(net)}]{net:+,.2f}[/] · "
                   f"{rolls} rolls · capital {cap} · [dim]{floor_label}[/dim]{est}")
 
     t = Table(title="By series (wallet-graded)")
@@ -1200,14 +1200,14 @@ def crypto_watch(since: float | None) -> None:
         wr = f"{wins / n * 100:.0f}%" if n else "—"
         bal = snap["bal"]
         cap = f"${bal['total']:,.2f}" if bal else "…"
-        color = "green" if net >= 0 else "red"
+        color = _pnl_color(net)
         stale = " · [yellow dim]stats stale[/]" if snap["sb_stale"] else ""
         est = (f" · [dim]{sliding.get('estimated', 0)} ~estimated[/dim]"
                if sliding.get("estimated") else "")
         note = render_err or snap["err"]
         err = f" · [red dim]{note}[/]" if note else ""
         all_net = sb.get("net", 0.0)
-        all_color = "green" if all_net >= 0 else "red"
+        all_color = _pnl_color(all_net)
         all_time = (f" · [dim]all-time {sb.get('wins', 0)}W-{sb.get('losses', 0)}L "
                     f"[{all_color}]{all_net:+,.2f}[/{all_color}][/dim]")
         if snap["sb_fetched_at"] is None:
@@ -1453,7 +1453,7 @@ def crypto_window(slug: str) -> None:
                   f"–{_t.strftime(fmt, _t.localtime(end))} ({dur})")
     console.print(
         f"  bought ${buy:,.2f} · sold ${sell:,.2f} · redeemed ${redeem:,.2f} · "
-        f"P&L [{'green' if net >= 0 else 'red'}]{net:+,.2f}[/] · outcome {outcome_label}"
+        f"P&L [{_pnl_color(net)}]{net:+,.2f}[/] · outcome {outcome_label}"
     )
     if not events:
         console.print("[dim]No activity or tape for this window.[/dim]")

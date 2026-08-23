@@ -105,7 +105,7 @@ pmt pnl                              # Realized (1d/7d/30d/all) & unrealized (ma
 pmt rewards --days 7                 # REWARD + YIELD distributions
 pmt book URL yes                     # Depth chart with mid price and spread
 pmt search pandemic                  # Query active markets by keyword
-pmt scan cliff                       # Scan order books for liquidity cliffs
+pmt scan REF                         # Pre-trade due-diligence scan on an event
 ```
 
 See [pmtrader/README.md](pmtrader/README.md) for the full CLI reference.

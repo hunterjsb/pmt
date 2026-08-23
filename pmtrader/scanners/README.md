@@ -2,6 +2,11 @@
 
 This directory contains trading strategies and scanners for Polymarket.
 
+> **[deprecated — candidate for removal, speak up if you use this]**
+> Both scanners here are reachable only through `pmt scan cliff` / `pmt scan
+> expiring`, both of which are flagged for removal. The code still works; it
+> just hasn't been touched since 2026-05-26 and finds nothing we act on.
+
 ## Available Strategies
 
 ### 1. Volume Cliff Scanner (`scanner.py`)
@@ -19,13 +24,13 @@ Finds order book inefficiencies where thin ask levels are followed by significan
 **Usage:**
 ```bash
 # Single scan for volume cliffs
-uv run python scan.py cliff --once
+pmt scan cliff --once
 
 # Continuous scanning every 30 seconds
-uv run python scan.py cliff --interval 30
+pmt scan cliff --interval 30
 
 # Custom parameters
-uv run python scan.py cliff --min 85 --max 99 --volume-jump 2000 --price-gap 2.0
+pmt scan cliff --min 85 --max 99 --volume-jump 2000 --price-gap 2.0
 ```
 
 **Parameters:**
@@ -54,13 +59,13 @@ Finds high-certainty outcomes (98%+) on markets expiring soon (default: 2 hours 
 **Usage:**
 ```bash
 # Find 98%+ outcomes expiring within 2 hours
-uv run python scan.py expiring --once
+pmt scan expiring --once
 
 # Continuous scanning with custom criteria
-uv run python scan.py expiring --min-price 95 --max-hours 24 --interval 60
+pmt scan expiring --min-price 95 --max-hours 24 --interval 60
 
 # Verbose mode to see scanning details
-uv run python scan.py expiring --once --verbose
+pmt scan expiring --once --verbose
 ```
 
 **Parameters:**
