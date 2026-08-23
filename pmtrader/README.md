@@ -33,6 +33,7 @@ pmt buy URL no --size 200
 pmt buy URL no --amount $50 --ttl 30m
 
 # Two-leg buy-then-sell (token-only, for niche maker-taker plays)
+# [deprecated — candidate for removal, speak up if you use this] — see `pmt sweep --flip`
 pmt flip --token 14658... --buy-price 0.09 --sell-price 0.10 --size 850
 
 # Buy-side sweep: take every displayed ask ≤ --to with one GTC limit resting there
@@ -85,9 +86,20 @@ When the engine is up, `pmt buy/sell/cancel` route through it so writes share th
 ### Scanners
 
 ```bash
-pmt scan cliff    --once             # ask-ladder gaps + thick wall
-pmt scan expiring --once             # high-certainty markets expiring soon
+pmt scan REF                         # pre-trade due diligence on an event
+pmt fit  REF                         # touch buckets vs realized vol  [deprecated]
+pmt scan cliff    --once             # ask-ladder gaps + thick wall   [deprecated]
+pmt scan expiring --once             # high-certainty expiring        [deprecated]
 ```
+
+`[deprecated — candidate for removal, speak up if you use this]` — flagged in
+`--help` too. Nothing is broken; these just look like one-offs whose moment passed.
+
+### Sports
+
+`pmt sports board|game|watch LEAGUE ...` — ESPN scores, win prob, and a live
+game-vs-moneyline dashboard. Also `[deprecated — candidate for removal, speak
+up if you use this]`; nothing outside `cli.py` references it.
 
 ## Python SDK
 

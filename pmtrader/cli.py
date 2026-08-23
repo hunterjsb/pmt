@@ -22,12 +22,15 @@ Pricing:
 
 Other commands:
     pmt sweep  REF [OUTCOME] --to P [--max-cost $X] [--flip P]
-    pmt flip   TOKEN --buy-price BP --sell-price SP --size N
     pmt cancel ORDER_ID
     pmt orders | positions | pnl | rewards | balance
     pmt market | search | book
     pmt engine status | strategies | orders | trades | alerts | approve | reject
-    pmt scan REF | cliff | expiring
+    pmt scan REF
+
+Flagged for removal (still working — see `--help` for the case against each):
+    pmt flip   TOKEN --buy-price BP --sell-price SP --size N
+    pmt scan cliff | expiring
     pmt fit REF
     pmt sports board LEAGUE | game LEAGUE REF | watch LEAGUE REF
 """
@@ -54,7 +57,23 @@ from engine import (
     schedule_cancel as _schedule_ttl_cancel_if_live,
 )
 
-from cli_common import console, _api
+from cli_common import console, _api, _pnl_color
+
+DEPRECATED = "[deprecated — candidate for removal, speak up if you use this]"
+
+
+def _deprecated(reason: str):
+    """Stamp the removal-candidate banner (plus why) onto a command's --help.
+
+    These commands still work — nothing here is broken. They're flagged as
+    one-offs whose moment looks past, so the operator sees the flag in
+    `--help` and can veto before anything actually gets deleted.
+    """
+    def deco(f):
+        f.__doc__ = f"{DEPRECATED}\n\n{reason}\n\n{f.__doc__ or ''}"
+        return f
+
+    return deco
 
 # Theme keyword regexes for `pmt positions`.
 DEFAULT_THEMES = {
@@ -68,10 +87,6 @@ DEFAULT_THEMES = {
     "bank-fail": r"\bfail by\b",
     "trump": r"\bTrump\b|\bDJT\b",
 }
-
-
-def _pnl_color(pnl: float) -> str:
-    return "green" if pnl >= 0 else "red"
 
 
 # ============================================================
@@ -97,14 +112,6 @@ cli.add_command(crypto_group)
 
 # ---------- ref / book / amount helpers ----------
 
-def _slug_from_url(url_or_slug: str) -> str:
-    """Strip a polymarket.com URL down to the event slug; pass slugs through."""
-    s = url_or_slug.strip()
-    if "polymarket.com/event/" in s:
-        s = s.split("/event/", 1)[1]
-    return s.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
-
-
 def _parse_amount(raw: str) -> float:
     """Parse '$200', '200', '$1,000' → float."""
     return float(raw.lstrip("$").replace(",", "").strip())
@@ -121,7 +128,11 @@ def _resolve_ref(
     if ref.isdigit():
         return ref, None, None, None
 
-    slug = _slug_from_url(ref)
+    # URL→slug lives once, in polymarket.scanner — a second copy here is how
+    # the two drift apart on the next URL shape polymarket invents.
+    from polymarket.scanner import parse_event_ref
+
+    slug = parse_event_ref(ref)
     ev = api.get_market(slug)
     markets = [m for m in (ev.get("markets") or [])
                if not m.get("closed") and not m.get("archived")]
@@ -435,13 +446,18 @@ def _resolve_token(value: str) -> str:
     return value
 
 
-@cli.command()
+@cli.command(short_help="DEPRECATED — two-leg trade: taker BUY, then maker SELL.")
 @click.option("--token", required=True)
 @click.option("--buy-price", required=True, type=float)
 @click.option("--sell-price", required=True, type=float)
 @click.option("--size", required=True, type=int)
 @click.option("--tick", default=None)
 @click.option("--dry-run", is_flag=True)
+@_deprecated(
+    "Superseded by `pmt sweep REF --to P --flip P`, which takes a URL/slug "
+    "instead of a raw token id and can cap the buy leg with --max-cost. The "
+    "PolymarketAPI.flip() method behind this command has no other caller."
+)
 def flip(
     token: str, buy_price: float, sell_price: float, size: int, tick: str | None, dry_run: bool
 ) -> None:
@@ -885,10 +901,16 @@ def search(query: str, keyword: str | None) -> None:
 # ============================================================
 
 
-@cli.command("fit")
+@cli.command("fit", short_help="DEPRECATED — compare an event's touch buckets against realized vol.")
 @click.argument("ref")
 @click.option("--lookback", default=90, show_default=True, help="Vol lookback in daily candles.")
 @click.option("--json", "as_json", is_flag=True, help="Emit the fit as JSON")
+@_deprecated(
+    "Built 2026-08-22 for one touch-bucket event and not referenced since — "
+    "no runbook, README, or analysis script calls it. The polymarket.fit "
+    "module itself stays either way: analysis/r6_tail_flip_study.py imports "
+    "fetch_klines from it."
+)
 def fit_cmd(ref: str, lookback: int, as_json: bool) -> None:
     """Compare an event's touch buckets against the realized distribution.
 
@@ -1093,14 +1115,19 @@ def scan_diligence(ref: str, match: str | None, as_json: bool) -> None:
     console.print(f"\n[bold]VERDICT[/bold]  {data['verdict']}")
 
 
-@scan.command("cliff")
-@click.option("--min", "min_pct", default=85.0, type=float, help="Min outcome price %% (default 85)")
-@click.option("--max", "max_pct", default=99.0, type=float, help="Max outcome price %% (default 99)")
+@scan.command("cliff", short_help="DEPRECATED — find ask-ladder gaps followed by a thick volume wall.")
+@click.option("--min", "min_pct", default=85.0, type=float, help="Min outcome price % (default 85)")
+@click.option("--max", "max_pct", default=99.0, type=float, help="Max outcome price % (default 99)")
 @click.option("--volume-jump", default=2000.0, type=float, help="Min $ jump to call it a cliff (default 2000)")
 @click.option("--price-gap", default=2.0, type=float, help="Min price gap in cents (default 2.0)")
 @click.option("--interval", default=30, type=int, help="Seconds between scans in continuous mode")
 @click.option("--once", is_flag=True, help="Run a single scan and exit")
 @click.option("--limit", default=None, type=int, help="Max scans in continuous mode")
+@_deprecated(
+    "Ported in from the old standalone scan.py in May and untouched since; "
+    "pmtrader/scanners/ is the only code left behind it and last changed "
+    "2026-05-26. A live --once run finds 0 opportunities. Still works."
+)
 def scan_cliff(min_pct, max_pct, volume_jump, price_gap, interval, once, limit):
     """Find ask-ladder gaps followed by a thick volume wall."""
     from scanners.scanner import create_opportunities_table, scan_continuous, scan_once
@@ -1119,12 +1146,18 @@ def scan_cliff(min_pct, max_pct, volume_jump, price_gap, interval, once, limit):
                         interval=interval, max_iterations=limit)
 
 
-@scan.command("expiring")
-@click.option("--min-price", default=98.0, type=float, help="Min outcome price %% (default 98)")
+@scan.command("expiring", short_help="DEPRECATED — find high-certainty markets resolving soon.")
+@click.option("--min-price", default=98.0, type=float, help="Min outcome price % (default 98)")
 @click.option("--max-hours", default=2.0, type=float, help="Max hours until expiry (default 2)")
 @click.option("--interval", default=60, type=int, help="Seconds between scans in continuous mode")
 @click.option("--once", is_flag=True, help="Run a single scan and exit")
 @click.option("--verbose", "-v", is_flag=True, help="Show scanned-market counts")
+@_deprecated(
+    "Same May-era scanners/ code as `scan cliff`. A live --once run returns "
+    "41 hits and every one of them is an up/down window already at 99¢ with "
+    "minutes left — the exact markets the updown fleet prices properly. "
+    "Still works; it just no longer finds anything we'd act on."
+)
 def scan_expiring(min_price, max_hours, interval, once, verbose):
     """Find high-certainty markets resolving in the next few hours."""
     from scanners.expiring import calculate_max_return, find_expiring_opportunities
@@ -1570,7 +1603,13 @@ def engine_reject(alert_id: str) -> None:
 # ============================================================
 
 
-@cli.group("sports")
+@cli.group("sports", short_help="DEPRECATED — live sports data: scores, game state, ESPN win prob.")
+@_deprecated(
+    "The whole group — board, game, watch — was built on 2026-08-22 and has "
+    "no reference outside this file: not CLAUDE.md, not either README, not "
+    "ROADMAP, not one analysis script. All three still work against ESPN. "
+    "polymarket/espn.py + gamewatch.py go with it if it goes."
+)
 def sports_group() -> None:
     """Live sports data: scores, game state, ESPN win probability."""
 
