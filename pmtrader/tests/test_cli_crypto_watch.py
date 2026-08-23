@@ -92,6 +92,63 @@ def test_a_graded_trade_always_reaches_the_watch_trades_table(monkeypatch):
     assert watch_ui.trades_title(sb) == "trades · last 1 decided · 1 riding"
 
 
+def test_a_riding_position_stays_on_the_panel_through_a_roll_until_it_grades(monkeypatch):
+    """The operator's ask: "don't leave the position too early when switching
+    markets/quiescing so we can see how each position resolves".
+
+    Three frames off the ONE acquisition path: the arm fills window A, then
+    rolls to window B (nothing filled there yet), then A's redeem row posts.
+    A must be on the trades panel in all three — riding through the roll, then
+    decided — because the wallet, not the arm, is what retires a position.
+    """
+    import watch_ui
+    from rich.console import Console
+
+    # A closed two minutes ago (inside the 300s no-redeem grace, so still
+    # genuinely undecided); B is the window the arm rolled into and is live.
+    now = int(time.time())
+    a_start, b_start = now - 420, now - 120
+    a, b = f"btc-updown-5m-{a_start}", f"btc-updown-5m-{b_start}"
+    filled_a = {"type": "TRADE", "side": "BUY", "usdcSize": 19.44, "size": 20.0,
+                "slug": a, "timestamp": a_start + 180}
+    redeem_a = {"type": "REDEEM", "usdcSize": 20.0, "outcome": "up",
+                "slug": a, "timestamp": a_start + 320}
+    fires = [{"ev": "fire", "slug": a, "side": "up", "fair": 1.0, "t": 0}]
+    rows = [filled_a]
+
+    monkeypatch.setattr(cs.wallet, "funder_address", lambda: "0xabc")
+    monkeypatch.setattr(cs.wallet, "fetch_wallet_activity", lambda addr, floor: list(rows))
+    monkeypatch.setattr(cs.tape, "iter_records", lambda *a_, **k: iter(fires))
+    monkeypatch.setattr(cs, "_gamma_resolution_cached", lambda slug: None)
+
+    def panel_text():
+        state = cw.WatchState()
+        cw.WatchFetcher(state, sliding_floor=0.0).fetch_sb()
+        sb = state.read()["sb"]
+        c = Console(record=True, width=100)
+        c.print(watch_ui.build_trades_table(sb, time.time(), limit=cw.TRADES_MAX_ROWS))
+        return sb, c.export_text()
+
+    # 1. filled, window A still open
+    sb, out = panel_text()
+    assert "btc 5m" in out and "riding" in out
+    assert [w["slug"] for w in sb["riding_windows"]] == [a]
+
+    # 2. the arm has rolled to B and armed it — A is nobody's current window
+    #    any more, and used to vanish from every per-arm view at this point.
+    fires.append({"ev": "fire", "slug": b, "side": "up", "fair": 1.0, "t": 0})
+    sb, out = panel_text()
+    assert [w["slug"] for w in sb["riding_windows"]] == [a], "the rolled-off position was dropped"
+    assert "riding" in out
+
+    # 3. the wallet grades it — and only now does it stop riding
+    rows.append(redeem_a)
+    sb, out = panel_text()
+    assert sb["riding_windows"] == []
+    assert [w["slug"] for w in sb["windows"]] == [a]
+    assert "btc 5m" in out and "riding" not in out
+
+
 def test_trades_panel_never_starves_the_tape_and_never_paints_a_clipped_box():
     """The panel is sized to the rows it will actually paint. Rich clips a
     Layout slot that overflows, and a table cut off below its last row (no
@@ -103,19 +160,34 @@ def test_trades_panel_never_starves_the_tape_and_never_paints_a_clipped_box():
     # Cramped screen: the tape keeps its floor, one trade row still survives.
     assert cw.trades_rows_shown(30, 12, 16) == 1
     for h in range(20, 60):
-        n = cw.trades_rows_shown(h, 12, 16)
-        assert 1 <= n <= cw.TRADES_MAX_ROWS
-        # 4 head + 3 strip + arms + panel: what's left is the tape's.
-        assert h - 4 - 3 - 12 - (n + cw.TRADES_CHROME) >= cw.MIN_TAPE_ROWS or n == 1
+        for head_h in (cw.HEAD_MIN_H, cw.HEAD_MIN_H + 2):
+            n = cw.trades_rows_shown(h, 12, 16, head_h)
+            assert 1 <= n <= cw.TRADES_MAX_ROWS
+            # head + strip + arms + panel: what's left is the tape's.
+            left = h - head_h - cw.STRIP_H - 12 - (n + cw.TRADES_CHROME)
+            assert left >= cw.MIN_TAPE_ROWS or n == 1
 
 
-def _fetcher(monkeypatch, *, sb=None, status=None, bal=None, sb_boom=None):
+def test_a_taller_header_costs_the_tape_rows_not_the_trades_floor():
+    # The header grows a row for the settlement feed and one for a render
+    # error; the trades panel keeps its floor of one row either way.
+    roomy = cw.trades_rows_shown(50, 12, 16, cw.HEAD_MIN_H)
+    taller = cw.trades_rows_shown(50, 12, 16, cw.HEAD_MIN_H + 2)
+    assert roomy == taller == cw.TRADES_MAX_ROWS  # a roomy screen absorbs it
+    assert cw.trades_rows_shown(31, 12, 16, cw.HEAD_MIN_H + 2) == 1
+
+
+def _fetcher(monkeypatch, *, sb=None, status=None, bal=None, sb_boom=None,
+             odds=None):
     """A WatchFetcher with every network seam replaced. The scoreboard seam
     is _tape_scoreboard — the SAME function `pmt crypto stats` runs, which
     is the whole point: one acquisition path, one truth."""
     state = cw.WatchState()
     f = cw.WatchFetcher(state, sliding_floor=0.0)
     monkeypatch.setattr(wallet, "funder_address", lambda: "0xabc")
+    monkeypatch.setattr(cw.positions, "fetch_positions",
+                        _raiser(odds) if isinstance(odds, BaseException)
+                        else (lambda addr, *a, **k: odds or []))
     def _fake_scoreboard(floor, sliding_floor=None):
         if sb_boom and sb_boom[0] is not None:
             raise sb_boom[0]
@@ -231,11 +303,11 @@ def test_fetcher_balance_failure_keeps_last_capital(monkeypatch):
 def test_fetcher_tick_honors_per_source_cadences(monkeypatch):
     state, f = _fetcher(monkeypatch, bal={"total": 1.0})
     ran: list[str] = []
-    for name in ("status", "sb", "bal"):
+    for name in ("status", "sb", "bal", "odds"):
         monkeypatch.setattr(f, f"fetch_{name}", lambda n=name: ran.append(n))
 
     f.tick(1000.0)
-    assert sorted(ran) == ["bal", "sb", "status"]   # first tick primes everything
+    assert sorted(ran) == ["bal", "odds", "sb", "status"]  # first tick primes everything
     ran.clear()
 
     f.tick(1001.0)                                   # nothing is due yet
@@ -246,8 +318,47 @@ def test_fetcher_tick_honors_per_source_cadences(monkeypatch):
     f.tick(1010.0)
     assert sorted(ran) == ["sb", "status"]            # scoreboard: 10s
     ran.clear()
+    f.tick(1030.0)
+    assert sorted(ran) == ["odds", "sb", "status"]    # position marks: 30s
+    ran.clear()
     f.tick(1060.0)
-    assert sorted(ran) == ["bal", "sb", "status"]     # balance: 60s
+    assert sorted(ran) == ["bal", "odds", "sb", "status"]  # balance: 60s
+
+
+# ---------- current odds: a display feed, on the slow lane ----------
+
+_POSITION = {"slug": "bnb-updown-5m-1787510100", "outcome": "Up", "curPrice": 0.99}
+
+
+def test_fetcher_publishes_current_marks_keyed_by_window_and_side(monkeypatch):
+    state, f = _fetcher(monkeypatch, odds=[_POSITION])
+    f.fetch_odds()
+    assert state.read()["odds"] == {("bnb-updown-5m-1787510100", "up"): 0.99}
+
+
+def test_current_marks_go_blank_on_failure_rather_than_going_stale(monkeypatch):
+    # A mark is a live quote. A 10-minute-old one beside a live entry price
+    # reads as "the position hasn't moved", which is worse than saying nothing.
+    state, f = _fetcher(monkeypatch, odds=[_POSITION])
+    f.tick(0.0)
+    assert state.read()["odds"]
+    monkeypatch.setattr(cw.positions, "fetch_positions",
+                        _raiser(ConnectionError("data-api down")))
+    f.tick(10_000.0)                                  # must not raise
+    assert state.read()["odds"] == {}
+
+
+def test_the_marks_fetch_never_calls_the_engine(monkeypatch):
+    # The control plane is not a price feed: this whole column is served off
+    # the public data-api and the funder address, nothing else.
+    state, f = _fetcher(monkeypatch, odds=[_POSITION])
+    monkeypatch.setattr(cw, "_engine_post", _raiser(AssertionError("engine touched")))
+    f.fetch_odds()
+    assert state.read()["odds"]
+
+
+def test_the_marks_cadence_is_slow_enough_to_never_be_a_hot_loop():
+    assert cw.ODDS_EVERY_S >= 30.0
 
 
 def test_fetcher_loop_exits_on_stop_flag(monkeypatch):

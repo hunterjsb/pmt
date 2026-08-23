@@ -1260,8 +1260,9 @@ def header_note(snap: dict, render_err: str | None = None):
 
     # Labelled and indented to the grid's own value column, so it reads as one
     # more row of the same box.
-    return Text.from_markup(f"[dim]{'note':<{_HEAD_LABEL_W}}[/dim]  [red dim]{note}[/]",
-                            no_wrap=True, overflow="ellipsis")
+    t = Text.from_markup(f"[dim]{'note':<{_HEAD_LABEL_W}}[/dim]  [red dim]{note}[/]")
+    t.no_wrap, t.overflow = True, "ellipsis"
+    return t
 
 
 def header_height(snap: dict, render_err: str | None = None) -> int:

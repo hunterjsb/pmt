@@ -426,11 +426,11 @@ def test_a_fresh_fill_chips_the_strip_before_its_redeem_posts():
 # had rolled, the fire had scrolled off the tape, and the only per-trade view
 # carried decided windows only.
 
-def _trades_text(sb, now=1787510500.0, width=90, limit=None):
+def _trades_text(sb, now=1787510500.0, width=100, limit=None, odds=None):
     from rich.console import Console
 
     c = Console(record=True, width=width)
-    c.print(cc.build_trades_table(sb, now, limit=limit))
+    c.print(cc.build_trades_table(sb, now, limit=limit, odds=odds))
     return c.export_text()
 
 
@@ -534,6 +534,51 @@ def test_trades_table_empty_scoreboard_says_so():
     assert "no trades" in _trades_text({"windows": [], "riding_windows": []})
     assert "no trades" in _trades_text(None)
     assert "…" not in _trades_text(None)
+
+
+def test_a_riding_row_says_what_we_paid_and_what_it_is_worth_now():
+    """The operator's ask, verbatim: "show more about the position, like what
+    we got it for and current odds". One row: age, arm, side, entry, now,
+    size, verdict."""
+    sb = {"windows": [], "riding_windows": [
+        {"slug": "bnb-updown-5m-1787510100", "won": None, "pnl": None, "est": False,
+         "end_ts": 1787510400, "notional": 19.44, "shares": 20.0,
+         "entry_px": 0.972, "side": "up"}]}
+    out = _trades_text(sb, odds={("bnb-updown-5m-1787510100", "up"): 0.99})
+    row = next(ln for ln in out.splitlines() if "bnb 5m" in ln)
+    cells = [c.strip() for c in row.strip("│").split("│")]
+    assert cells == ["1m", "bnb 5m", "up", "0.97", "0.99", "$19.44", "riding"]
+
+
+def test_the_now_column_is_blank_when_the_marks_feed_has_nothing():
+    # No fetch yet, a failed one, or a window the wallet no longer holds: the
+    # column says "—" and every other column is unaffected.
+    sb = {"windows": [], "riding_windows": [_riding("bnb-updown-5m-1787510100",
+                                                     1787510400)]}
+    for odds in (None, {}, {("eth-updown-5m-1", "up"): 0.5}):
+        out = _trades_text(sb, odds=odds)
+        row = next(ln for ln in out.splitlines() if "bnb 5m" in ln)
+        cells = [c.strip() for c in row.strip("│").split("│")]
+        assert cells[3] == "0.97" and cells[4] == "—", (odds, cells)
+
+
+def test_the_now_column_colors_by_which_side_is_winning():
+    # A binary settles to 0 or 1: above the coin flip the side we hold is
+    # ahead, below it we are behind, and that is the whole read.
+    ahead = {"slug": "bnb-updown-5m-1", "side": "up"}
+    assert cc._odds_cell(ahead, {("bnb-updown-5m-1", "up"): 0.99}) == "[green]0.99[/green]"
+    assert cc._odds_cell(ahead, {("bnb-updown-5m-1", "up"): 0.04}) == "[red]0.04[/red]"
+    assert cc._odds_cell(ahead, {}) == "[dim]—[/dim]"
+
+
+def test_position_odds_needs_the_side_to_match_not_just_the_window():
+    # Holding `up` at 0.99 and `down` at 0.01 are the same window and opposite
+    # facts — a slug-only lookup would print the wrong one half the time.
+    w = {"slug": "bnb-updown-5m-1", "side": "down"}
+    odds = {("bnb-updown-5m-1", "up"): 0.99, ("bnb-updown-5m-1", "down"): 0.01}
+    assert cc.position_odds(odds, w) == 0.01
+    assert cc.position_odds(odds, {"slug": "bnb-updown-5m-1"}) is None  # side unknown
+    assert cc.position_odds(None, w) is None
 
 
 def test_trades_table_marks_an_estimated_pnl_and_never_shows_negative_zero():
@@ -1048,6 +1093,115 @@ def _frame_text(width: int = 160) -> str:
     c.print(Panel(Text.from_markup(cc.build_windows_strip(sb["windows"])),
                   title="recent windows", border_style="dim"))
     return c.export_text()
+
+
+# ---------- the top box: one aligned label/value grid ----------
+#
+# "better alignment in the top box" — the two dot-joined prose lines this
+# replaced put the same figure in a different column every tick, and on a
+# narrow terminal ellipsised the digits off the ones that mattered.
+
+_HDR_SB = {"wins": 247, "losses": 19, "net": -280.62, "rolls": 973, "estimated": 2,
+           "riding_n": 7, "riding_usd": 509.23, "windows": [], "riding_windows": [],
+           "sliding": {"wins": 9, "losses": 2, "net": 61.5, "rolls": 3,
+                        "estimated": 1}}
+
+
+def _hdr_snap(**kw):
+    status = {"arms": {"btc-updown-5m-9999999999": {
+        "filled_usdc": 200.0, "roll": True, "feed": "rtds", "resting_usdc": 45.0,
+        "eval": {"state": "armed", "banked_decided": False, "committed": 200.0}}},
+        "rtds": dict(_LIVE_RTDS)}
+    snap = {"status": status, "bal": {"total": 2139.20}, "sb": dict(_HDR_SB),
+            "sb_stale": False, "sb_fetched_at": 1700000000.0, "err": None, "odds": {}}
+    snap.update(kw)
+    return snap
+
+
+def _hdr_lines(snap, render_err=None, width=120):
+    """The panel's content rows with the border and panel padding stripped, so
+    column 0 is the grid's own column 0."""
+    from rich.console import Console
+
+    c = Console(record=True, width=width)
+    c.print(cc.build_header_panel(snap, "since 08-23 04:00Z", render_err))
+    out = [ln.rstrip() for ln in c.export_text().splitlines()]
+    return [ln[1:-1].rstrip()[1:] for ln in out
+            if ln.startswith("│") and ln.endswith("│")]
+
+
+def test_top_box_starts_every_value_field_at_the_same_column():
+    lines = _hdr_lines(_hdr_snap())
+    cols = set()
+    for ln in lines:
+        tail = ln[cc._HEAD_LABEL_W:]
+        if tail.strip():
+            cols.add(cc._HEAD_LABEL_W + len(tail) - len(tail.lstrip()))
+    assert len(cols) == 1, f"ragged value column: {sorted(cols)}"
+
+
+def test_top_box_labels_every_row_and_drops_the_ones_with_nothing_to_say():
+    assert [ln[:cc._HEAD_LABEL_W].strip() for ln in _hdr_lines(_hdr_snap())] == [
+        "recent", "all-time", "exposure", "resting", "feed"]
+    # Binance-only, no maker bid, nothing broken: three rows, not five padded
+    # with zeros.
+    bare = _hdr_snap(status={"arms": {"btc-updown-5m-1": {
+        "filled_usdc": 10.0, "feed": "binance", "eval": {}}}})
+    assert [ln[:cc._HEAD_LABEL_W].strip() for ln in _hdr_lines(bare)] == [
+        "recent", "all-time", "exposure"]
+
+
+def test_top_box_puts_the_recent_record_directly_above_the_all_time_one():
+    # Same column shape on both rows is what lets the two be compared by eye,
+    # which is the reason they are stacked at all.
+    recent, all_time = _hdr_lines(_hdr_snap())[:2]
+    assert recent.index("9W-2L") == all_time.index("247W-19L")
+
+
+def test_top_box_never_truncates_a_number_however_big_it_gets():
+    fat = dict(_HDR_SB, wins=1247, losses=193, net=-12436.76,
+               riding_n=12, riding_usd=1234.56)
+    fat["sliding"] = dict(_HDR_SB["sliding"], wins=109, losses=22, net=-1234.56)
+    arms = {"btc-updown-5m-9999999999": {"filled_usdc": 12345.67, "resting_usdc": 1234.56,
+                                          "feed": "rtds", "eval": {}}}
+    snap = _hdr_snap(sb=fat, bal={"total": 123456.78},
+                     status={"arms": arms, "rtds": dict(_LIVE_RTDS)})
+    for width in (160, 120, 100):
+        lines = _hdr_lines(snap, width=width)
+        assert "…" not in "".join(lines), (width, lines)
+        assert len(lines) == cc.header_height(snap) - 2, (width, lines)
+        for fact in ("1247W-193L", "-12,436.76", "$123,456.78",
+                     "committed $12,345.67", "riding 12 windows $1,234.56"):
+            assert any(fact in ln for ln in lines), (width, fact)
+
+
+def test_top_box_height_matches_what_it_actually_paints():
+    for snap, err in ((_hdr_snap(), None),
+                      (_hdr_snap(err="ConnectionError: data-api down"), None),
+                      (_hdr_snap(), "TypeError: " + "x" * 90)):
+        assert len(_hdr_lines(snap, err)) == cc.header_height(snap, err) - 2
+
+
+def test_a_failure_note_stays_one_line_however_long_it_is():
+    # It is prose the width of the panel, not a value in a 20-column money
+    # field: folded into a cell it would cost five rows and say less.
+    lines = _hdr_lines(_hdr_snap(), render_err="RuntimeError: " + "y" * 200)
+    assert lines[-1].startswith("note")
+    assert len([ln for ln in lines if ln.startswith("note")]) == 1
+
+
+def test_the_scoreboard_age_and_clock_ride_the_border_not_a_row():
+    from rich.console import Console
+
+    snap = _hdr_snap(sb_fetched_at=None)
+    c = Console(record=True, width=120)
+    c.print(cc.build_header_panel(snap, "since 08-23 04:00Z", None))
+    out = c.export_text()
+    # "—", never a confident "0s ago", before the first wallet walk lands.
+    assert "stats —" in out
+    assert "since 08-23 04:00Z" in out
+    assert not any(ln[1:].lstrip().startswith("stats")
+                   for ln in out.splitlines() if ln.startswith("│"))
 
 
 def test_composed_frame_shows_the_capital_figure_exactly_once():
