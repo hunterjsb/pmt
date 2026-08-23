@@ -93,17 +93,16 @@ def _has_rtds_arm(arms: dict | None) -> bool:
                for a in (arms or {}).values())
 
 
-def _rtds_rich(h: dict | None) -> str:
-    """One line for the shared RTDS settlement-stream supervisor, or "" when
-    nothing has ever armed on it.
+def rtds_cells(h: dict | None) -> list[str]:
+    """The stream-health segments, as cells: `[head, "3.0/s", "age 0s", ...]`.
 
-    Worth its own line rather than a per-arm field: it is ONE socket behind
-    every stream-fed arm, so when it drops they all gate at once and the
-    per-arm reasons all say the same thing. Red the moment it is not
-    connected — a dark stream is a fleet-wide event.
+    The head carries its own color (green connected / red down); the rest are
+    raw so a caller can dim them, or lay them out in a grid, without having to
+    re-derive a single number. `_rtds_rich` joins these into the one-line form
+    both watch rows use — one computation, two presentations.
     """
     if not h or not (h.get("started") or h.get("events")):
-        return ""
+        return []
     age = h.get("last_event_age_s")
     if h.get("connected"):
         head = "[green]rtds[/green]"
@@ -116,7 +115,32 @@ def _rtds_rich(h: dict | None) -> str:
         bits.append(f"{h['reconnects']} reconnects")
     if h.get("err") and not h.get("connected"):
         bits.append(str(h["err"])[:48])
+    return [head] + bits
+
+
+def _rtds_rich(h: dict | None) -> str:
+    """One line for the shared RTDS settlement-stream supervisor, or "" when
+    nothing has ever armed on it.
+
+    Worth its own line rather than a per-arm field: it is ONE socket behind
+    every stream-fed arm, so when it drops they all gate at once and the
+    per-arm reasons all say the same thing. Red the moment it is not
+    connected — a dark stream is a fleet-wide event.
+    """
+    cells = rtds_cells(h)
+    if not cells:
+        return ""
+    head, bits = cells[0], cells[1:]
     return f"{head} [dim]{' · '.join(bits)}[/dim]"
+
+
+def rtds_line_cells(status: dict | None) -> list[str]:
+    """rtds_cells, gated the way _rtds_line is — empty unless an arm is on the
+    stream right now."""
+    status = status or {}
+    if not _has_rtds_arm(status.get("arms")):
+        return []
+    return rtds_cells(status.get("rtds"))
 
 
 def _rtds_line(status: dict | None) -> str:
@@ -644,19 +668,17 @@ def _risk_exposure(arms: dict | None) -> tuple[float, float, float]:
     return committed, undecided, resting
 
 
-def build_risk_header(status: dict | None, sb: dict | None,
-                       rtds: bool = True) -> str:
-    """`committed $Y ($Z un-decided) · ◇resting $R · riding N windows $W` —
-    the one-line exposure summary between the scoreboard and the arms table.
+def risk_cells(status: dict | None, sb: dict | None,
+                rtds: bool = True) -> list[str]:
+    """The exposure summary's segments, as cells:
+    `["committed $Y", "$Z un-decided", ("◇resting $R"), "riding N windows $W"]`.
 
-    Deliberately carries no capital figure: that is the top panel's, and two
-    money-shaped lines stacked back to back read as one line printed twice.
+    Committed and un-decided are separate cells here and one clause in
+    `build_risk_header` — the numbers and the un-decided threshold color are
+    computed once, in this function, so a grid layout and the one-line layout
+    can never disagree about what is at risk.
+
     Reads only already-cached data (status/sb) — never fetches.
-
-    `rtds=False` drops the stream-health tail. The dashboard has a full-width
-    row for this line; `pmt crypto stats` prints it inside a panel that has
-    to hold 100 columns, and the two clauses answer different questions
-    anyway — stats gives the stream its own line.
     """
     committed, undecided, resting = _risk_exposure((status or {}).get("arms"))
     riding_n = (sb or {}).get("riding_n", 0)
@@ -666,18 +688,37 @@ def build_risk_header(status: dict | None, sb: dict | None,
     undecided_s = f"${undecided:,.2f} un-decided"
     if color:
         undecided_s = f"[{color}]{undecided_s}[/{color}]"
-    bits = [f"committed ${committed:,.2f} ({undecided_s})"]
+    cells = [f"committed ${committed:,.2f}", undecided_s]
     # Only when a bid is actually on the book — a "◇resting $0.00" every tick
     # on a taker-only fleet is noise.
     if resting > 0.005:
-        bits.append(f"[cyan]◇resting ${resting:,.2f}[/cyan]")
-    bits.append(f"riding {riding_n} windows ${riding_usd:,.2f}")
+        cells.append(f"[cyan]◇resting ${resting:,.2f}[/cyan]")
+    cells.append(f"riding {riding_n} windows ${riding_usd:,.2f}")
     # One socket feeds every stream-fed arm, so its state belongs on the
     # fleet's risk line, not buried per-arm.
     health = _rtds_line(status) if rtds else ""
     if health:
-        bits.append(health)
-    return " · ".join(bits)
+        cells.append(health)
+    return cells
+
+
+def build_risk_header(status: dict | None, sb: dict | None,
+                       rtds: bool = True) -> str:
+    """`committed $Y ($Z un-decided) · ◇resting $R · riding N windows $W` —
+    the one-line exposure summary between the scoreboard and the arms table.
+
+    Deliberately carries no capital figure: that is the top panel's, and two
+    money-shaped lines stacked back to back read as one line printed twice.
+
+    `rtds=False` drops the stream-health tail. The dashboard has a full-width
+    row for this line; `pmt crypto stats` prints it inside a panel that has
+    to hold 100 columns, and the two clauses answer different questions
+    anyway — stats gives the stream its own line.
+    """
+    cells = risk_cells(status, sb, rtds)
+    # committed and its un-decided share are one clause on a single line and
+    # two cells in a grid — same numbers, laid out for the space available.
+    return " · ".join([f"{cells[0]} ({cells[1]})"] + cells[2:])
 
 
 def _window_chip(w: dict) -> str:

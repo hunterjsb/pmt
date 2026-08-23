@@ -10,8 +10,10 @@ report can be redesigned without touching a single number.
 
 The default report reads top-down in the order an operator actually asks:
 
-    identity   who are we — record, streak, P&L, capital, break-even gap,
-               what is exposed right now
+    identity   who are we — a label/value GRID: record+streak, the current
+               era's record beside it, P&L+capital, the break-even bar, live
+               exposure, the fleet ration, the feed
+    by era     the same record cut at the deploy moments that moved it
     by symbol  where it came from, on which feed, and what a TYPICAL window
                of that series pays
     effectiveness   is any of that good once corrected for size and time
@@ -38,7 +40,6 @@ from rich.console import Group
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
-from rich.text import Text
 
 from cli_common import _pnl_color
 
@@ -172,58 +173,72 @@ def _streak_text(eff: dict) -> str:
     return f"[dim]streak[/dim] [{style}]{cur}[/{style}] [dim](best {best})[/dim]"
 
 
-def _record_line(sb: dict, eff: dict, bal: dict | None) -> str:
-    """The identity line: who this book is, in one row."""
+# The identity box is a LABEL/VALUE GRID, not stacked prose. Every row names
+# itself in the label column and every value field starts at the same column,
+# so the record, the era, the money, the bar, the exposure and the ration read
+# down as a column of comparable figures instead of six ragged sentences —
+# and the record row can no longer wrap "streak 101 (best 101)" across a line
+# break the way a dot-joined line did once the numbers grew a digit.
+#
+# Widths are fixed so the shape is stable between runs and between eras.
+# Budget: 13 + 18 + 21 + 36 = 88, plus Rich's inter-column padding, plus the
+# panel's border and padding — under 100 columns, which is the report's law.
+# The label column holds the longest label the box can emit, `era pre-brake`.
+_HDR_LABEL_W = 13
+_HDR_V1_W = 18
+_HDR_V2_W = 21
+_HDR_V3_W = 36
+
+
+def _record_cells(sb: dict, eff: dict) -> tuple:
+    """`record | 147W-13L (91.9%) | streak 7 (best 41) | 335 rolls`."""
     wins, losses = sb.get("wins", 0), sb.get("losses", 0)
     n = wins + losses
     # One decimal, not zero: rounded to "92%" the headline rate reads as if it
     # were level with a 92.5% break-even bar it is in fact under.
     wr = _pct(wins / n, 1) if n else "[dim]—[/dim]"
-    cap = f"[bold]${bal['total']:,.2f}[/bold]" if bal else "[dim]?[/dim]"
+    return ("record", f"[bold]{wins}W-{losses}L[/bold] [dim]({wr})[/dim]",
+            _streak_text(eff), f"[dim]{sb.get('rolls', 0)} rolls[/dim]")
+
+
+def _money_cells(sb: dict, bal: dict | None) -> tuple:
+    """`P&L | -436.76 | capital $1,649.14 |`.
+
+    Split off the record row rather than trailing it: two money figures and a
+    W-L on one line is what pushed the old identity line past 100 columns.
+    """
+    cap = f"[dim]capital[/dim] [bold]${bal['total']:,.2f}[/bold]" if bal \
+        else "[dim]capital ?[/dim]"
     net = _zeroed(sb.get("net", 0.0))
-    parts = [f"[bold]{wins}W-{losses}L[/bold] [dim]({wr})[/dim]",
-             f"[dim]P&L[/dim] [bold {_pnl_color(net)}]{net:+,.2f}[/]",
-             f"[dim]capital[/dim] {cap}"]
-    streak = _streak_text(eff)
-    if streak:
-        parts.append(streak)
-    parts.append(f"[dim]{sb.get('rolls', 0)} rolls[/dim]")
-    return "     ".join(parts)
+    return ("P&L", f"[bold {_pnl_color(net)}]{net:+,.2f}[/]", cap, "")
 
 
-def era_line(era: dict | None, scoped: bool = False) -> str:
-    """`era stream     12W-1L (92.3%)     P&L +34.56` — the same identity, one
-    policy regime wide.
+def era_cells(era: dict | None, scoped: bool = False) -> tuple | None:
+    """`era stream | 12W-1L (92.3%) | P&L +34.56 | vs all-time above`.
 
-    Its own row rather than a tail on _record_line: that line is already 91
-    columns and nothing on this report may wrap. It is written to read as the
-    second half of a pair — same segments, same separator — with the reminder
-    that the row above it, not this one, is the ledger of record.
+    Deliberately the same column shape as the record row directly above it, so
+    the era's W-L sits under all-time's W-L and the two are read by eye rather
+    than by arithmetic. That comparison IS the point of the row.
 
-    `scoped` says the whole report is already inside this era (`--era`), in
-    which case the row above is NOT all-time and the tail must not claim it
-    is — the same two numbers on both rows is the honest confirmation that
-    the scoping took.
+    `scoped` says the whole report is already inside this era (`--era`), so the
+    row above is NOT all-time and the note must not claim it is — the same two
+    numbers on both rows is then the honest confirmation that scoping took.
     """
     if not era:
-        return ""
+        return None
     sb = era["sb"]
     wins, losses = sb.get("wins", 0), sb.get("losses", 0)
     n = wins + losses
     wr = _pct(wins / n, 1) if n else "[dim]—[/dim]"
     net = _zeroed(sb.get("net", 0.0))
-    # Both tails are length-budgeted against the longest era name: this row
-    # must clear 100 columns inside the panel's border and padding.
-    tail = "scoped view — drop --era for all-time" if scoped else "all-time above is the ledger"
-    return "     ".join([
-        f"[dim]era[/dim] [bold]{era['name']}[/bold]",
-        f"[bold]{wins}W-{losses}L[/bold] [dim]({wr})[/dim]",
-        f"[dim]P&L[/dim] [bold {_pnl_color(net)}]{net:+,.2f}[/]",
-        f"[dim]{tail}[/dim]",
-    ])
+    note = "scoped: drop --era for all-time" if scoped else "vs all-time above"
+    return (f"era {era['name']}",
+            f"[bold]{wins}W-{losses}L[/bold] [dim]({wr})[/dim]",
+            f"[dim]P&L[/dim] [bold {_pnl_color(net)}]{net:+,.2f}[/]",
+            f"[dim]{note}[/dim]")
 
 
-def _gap_line(eff: dict) -> str:
+def _gap_cells(eff: dict) -> tuple:
     """The break-even GAP: the count win rate minus the win rate THIS payoff
     shape needs to stay flat. Positive is the whole game; a 92% win rate
     against a 92.5% bar is a losing book, and that fact deserves to be the
@@ -231,65 +246,122 @@ def _gap_line(eff: dict) -> str:
     """
     wr, be = eff.get("win_rate"), eff.get("breakeven_win_rate")
     if be is None or wr is None:
-        return "[dim]break-even — not enough decided windows to size the bar yet[/dim]"
+        # Empty value cells rather than a fabricated 0.0%: the bar is not zero,
+        # it is unknown, and the row says which.
+        return ("break-even", "", "",
+                "[dim]not enough decided windows to size the bar[/dim]")
     gap = (wr - be) * 100
     if gap >= 0:
         verdict, style = "clear of break-even", "green"
     else:
         verdict, style = "SHORT of break-even", "red"
-    return (f"[dim]break-even[/dim]  need [bold]{be * 100:.1f}%[/bold]"
-            f"  [dim]·[/dim]  actual [bold]{wr * 100:.1f}%[/bold]"
-            f"  [dim]·[/dim]  [bold {style}]GAP {gap:+.1f}pp[/]  [{style}]{verdict}[/]")
+    return ("break-even", f"[dim]need[/dim] [bold]{be * 100:.1f}%[/bold]",
+            f"[dim]actual[/dim] [bold]{wr * 100:.1f}%[/bold]",
+            f"[bold {style}]GAP {gap:+.1f}pp[/]  [{style}]{verdict}[/]")
 
 
-def _fleet_line(fleet: dict | None) -> str:
+def _fleet_cells(fleet: dict | None) -> tuple | None:
     """The R7 ration and how close the fleet came to it. Absent entirely
     when no cap is set — an uncapped fleet has no headroom to report."""
     if not fleet or not fleet.get("cap"):
-        return ""
+        return None
     peak, cap = fleet.get("peak_undecided"), fleet["cap"]
     if peak is None:
-        return f"[dim]fleet cap[/dim] ${cap:,.0f}  [dim](no capped ticks in range)[/dim]"
+        return ("fleet cap", f"[dim]${cap:,.0f}[/dim]", "",
+                "[dim]no capped ticks in range[/dim]")
     style = "yellow" if peak >= cap * 0.9 else "dim"
-    bits = (f"[dim]fleet cap[/dim] ${cap:,.0f}  [dim]·[/dim]  "
-            f"[dim]peak un-decided[/dim] [{style}]${peak:,.0f}[/{style}] "
-            f"[dim]over {fleet['ticks']:,} ticks[/dim]")
+    tail = f"[dim]over {fleet['ticks']:,} ticks[/dim]"
     if fleet.get("blocked_usd", 0.0) > 0.5:
-        bits += f"  [dim]·[/dim]  [dim]refused[/dim] ${fleet['blocked_usd']:,.0f}"
-    return bits
+        tail += f"[dim] · refused ${fleet['blocked_usd']:,.0f}[/dim]"
+    return ("fleet cap", f"[dim]${cap:,.0f}[/dim]",
+            f"[dim]peak un-decided[/dim] [{style}]${peak:,.0f}[/{style}]", tail)
+
+
+def _exposure_rows(status: dict | None, sb: dict) -> list[tuple]:
+    """The live exposure, laid into the grid from watch's own risk cells.
+
+    The numbers and the un-decided threshold color come from
+    watch_ui.risk_cells, the same function build_risk_header joins — so this
+    report and the dashboard can never disagree about what is at risk, only
+    about how many columns they had to say it in. A resting maker bid earns
+    its own row because it only exists on the days a bid is on the book.
+    """
+    from watch_ui import risk_cells
+
+    cells = risk_cells(status or {}, sb, rtds=False)
+    resting = next((c for c in cells if "resting" in c), None)
+    riding = next(c for c in cells if c.startswith("riding"))
+    rows = [("exposure", cells[0], cells[1], f"[dim]{riding}[/dim]")]
+    if resting:
+        rows.append(("resting", resting, "[dim]maker bid on the book[/dim]", ""))
+    return rows
+
+
+def _feed_row(status: dict | None) -> tuple | None:
+    """The shared settlement socket's health, on its own row: one socket's
+    state and the fleet's dollars answer different questions."""
+    from watch_ui import rtds_line_cells
+
+    cells = rtds_line_cells(status or {})
+    if not cells:
+        return None
+    head, bits = cells[0], cells[1:]
+    v1 = f"{head} [dim]{bits[0]}[/dim]" if bits else head
+    return ("feed", v1, f"[dim]{bits[1]}[/dim]" if len(bits) > 1 else "",
+            f"[dim]{' · '.join(bits[2:])}[/dim]" if len(bits) > 2 else "")
+
+
+def header_grid(sb: dict, eff: dict, bal: dict | None, status: dict | None,
+                fleet: dict | None = None, era_now: dict | None = None,
+                scoped: bool = False) -> Table:
+    """The identity box's rows, as one aligned grid.
+
+    Row order is the order an operator reads: who we are, who we are RIGHT
+    NOW, the money, the bar the money has to clear, what is at risk, the
+    ration, the feed. A row with nothing to say is dropped, never padded with
+    a zero.
+    """
+    rows: list[tuple] = [_record_cells(sb, eff)]
+    era = era_cells(era_now, scoped=scoped)
+    if era:
+        rows.append(era)
+    rows += [_money_cells(sb, bal), _gap_cells(eff)]
+    rows += _exposure_rows(status, sb)
+    fleet_row = _fleet_cells(fleet)
+    if fleet_row:
+        rows.append(fleet_row)
+    feed = _feed_row(status)
+    if feed:
+        rows.append(feed)
+    est = sb.get("estimated") or 0
+    if est:
+        rows.append(("estimated", f"[dim]{est} windows[/dim]", "",
+                     "[dim]gamma unreachable, or a redeem still pending[/dim]"))
+
+    t = Table(box=None, pad_edge=False, padding=(0, 1), show_header=False)
+    t.add_column("label", justify="left", width=_HDR_LABEL_W, no_wrap=True,
+                 overflow="ellipsis", style="dim")
+    # max_width, not width, on the value columns: the grid still aligns (a
+    # table renders one width per column for every row) but a sparse box hugs
+    # its content instead of padding out to a fixed 88 on a narrow terminal.
+    for w in (_HDR_V1_W, _HDR_V2_W, _HDR_V3_W):
+        t.add_column(justify="left", max_width=w, no_wrap=True, overflow="ellipsis")
+    for row in rows:
+        t.add_row(*row)
+    return t
 
 
 def header_panel(sb: dict, eff: dict, bal: dict | None, status: dict | None,
                  floor: float, fleet: dict | None = None,
                  era_now: dict | None = None, scope_label: str | None = None) -> Panel:
-    """Identity, the current era, the break-even gap, live exposure, the ration.
-
-    The exposure line comes from watch's own build_risk_header, so the two
-    reports can never disagree about what is at risk.
-    """
-    from watch_ui import _rtds_line, build_risk_header
-
-    lines = [_record_line(sb, eff, bal)]
-    era = era_line(era_now, scoped=scope_label is not None)
-    if era:
-        lines.append(era)
-    lines += [_gap_line(eff), build_risk_header(status or {}, sb, rtds=False)]
-    fleet_line = _fleet_line(fleet)
-    if fleet_line:
-        lines.append(fleet_line)
-    # Own line, not the risk line's tail: one socket's health and the fleet's
-    # dollars answer different questions, and together they overrun 100 cols.
-    stream = _rtds_line(status or {})
-    if stream:
-        lines.append(stream)
-    est = sb.get("estimated") or 0
-    if est:
-        lines.append(f"[dim]{est} ~estimated "
-                     f"(gamma unreachable or pending redeem)[/dim]")
+    """Identity, the current era, the break-even gap, live exposure, the ration
+    — one label/value grid, every value field on the same column."""
+    grid = header_grid(sb, eff, bal, status, fleet, era_now,
+                       scoped=scope_label is not None)
     # expand=False: the panel hugs its own content instead of stretching to a
     # 200-column terminal, which is what keeps the report reading as a card
     # rather than a banner. Rich still clamps it on a narrow terminal.
-    return Panel(Text.from_markup("\n".join(lines)), expand=False,
+    return Panel(grid, expand=False,
                  title=f"[bold]updown fleet[/bold] "
                        f"[dim]· {scope_label or floor_label(floor)}[/dim]",
                  title_align="left", border_style=_HEADER_BORDER, padding=(0, 1))
