@@ -95,6 +95,33 @@ fn every_fixture_carries_everything_its_replay_reads() {
         }
         let start = fx.params["start"].as_f64().expect("params.start") as i64;
         let end = fx.params["end"].as_f64().expect("params.end") as i64;
+
+        // Which slice has to be whole follows the arm's feed, exactly as it
+        // does in the loader and live: a stream-fed window never read a
+        // kline, and a Binance window has no rtds slice to be short of.
+        if fx.params["feed"].as_str() == Some("rtds") {
+            assert!(fx.klines.is_empty(), "{}: a stream-fed window read no klines", name);
+            assert!(!fx.rtds.is_empty(), "{}: full mode on rtds needs its stream slice", name);
+            let t = |r: &serde_json::Value| r["t_recv"].as_f64().unwrap_or(0.0);
+            let first = fx.rtds.iter().map(t).fold(f64::INFINITY, f64::min);
+            let last = fx.rtds.iter().map(t).fold(f64::NEG_INFINITY, f64::max);
+            // The settlement reference prints AT `start`, and the last
+            // in-window mark AT the close — both have to be inside.
+            assert!(
+                first <= start as f64,
+                "{}: rtds slice starts {:.0}s after the window's reference print",
+                name,
+                first - start as f64
+            );
+            assert!(
+                last >= end as f64,
+                "{}: rtds slice ends {:.0}s before the close",
+                name,
+                end as f64 - last
+            );
+            continue;
+        }
+
         let have: std::collections::HashSet<i64> = fx.klines.iter().map(|k| k.t).collect();
         let (lo, hi) = (
             (start - KLINE_LOOKBACK_S).div_euclid(60) * 60,

@@ -1210,16 +1210,17 @@ impl ArmState {
                                         side, ask, fair, net, size, slug = %p.slug,
                                         "updown FLIP clip — TWAP beyond reach, book still trading the print"
                                     );
-                                    tape_out.push(serde_json::json!({
-                                        "t": now, "ev": EV_FIRE, "slug": p.slug, "side": side,
-                                        "ask": ask, "fair": fair, "net": net, "size": size,
-                                        "committed": committed, "mode": "flip", "rho": m.rho,
-                                    }));
-                                    self.last_clip.insert(token.clone(), now);
-                                    self.inflight.insert(token.clone(), (size * ask, now));
                                     let limit = pay_up_limit(
                                         ask, net, p.min_edge, p.pay_up_max, p.max_price,
                                     );
+                                    tape_out.push(serde_json::json!({
+                                        "t": now, "ev": EV_FIRE, "slug": p.slug, "side": side,
+                                        "ask": ask, "limit": limit, "fair": fair, "net": net,
+                                        "size": size, "committed": committed, "mode": "flip",
+                                        "rho": m.rho,
+                                    }));
+                                    self.last_clip.insert(token.clone(), now);
+                                    self.inflight.insert(token.clone(), (size * ask, now));
                                     cancel_once(&mut actions, &token);
                                     actions.push(Action::Buy {
                                         token: token.clone(),
@@ -1262,13 +1263,17 @@ impl ArmState {
                 }
                 // The numbers ride ALONGSIDE the prose, never instead of it:
                 // `reason` reads exactly as it always has for old consumers,
-                // while margin/banked/cushion/guard arrive as fields so
-                // nobody has to regex a sentence apart. Non-basis gates
-                // (stale feed) write them as null.
+                // while every number the sentence turns on arrives as a
+                // field so nobody has to regex a sentence apart. Each gate
+                // class fills the fields it has and nulls the rest — a
+                // basis gate carries margin/banked/cushion/guard, a stale
+                // feed carries the age it refused on, a missing reference
+                // print carries neither.
                 self.last_eval = Some(serde_json::json!({
                     "state": "gated", "reason": gate.reason, "t": now,
                     "margin_bp": gate.margin_bp, "banked_bp": gate.banked_bp,
                     "cushion_bp": gate.cushion_bp, "guard_bp": gate.guard_bp,
+                    "spot_age_s": gate.spot_age_s,
                 }));
                 if now - self.last_tape_at >= 5.0 {
                     self.last_tape_at = now;
@@ -1279,6 +1284,7 @@ impl ArmState {
                         "t": now, "ev": EV_GATED, "slug": p.slug, "reason": gate.reason,
                         "margin_bp": gate.margin_bp, "banked_bp": gate.banked_bp,
                         "cushion_bp": gate.cushion_bp, "guard_bp": gate.guard_bp,
+                        "spot_age_s": gate.spot_age_s,
                         "up_ask": view.up.ask.map(|(px, _)| px),
                         "dn_ask": view.dn.ask.map(|(px, _)| px),
                     }));
@@ -1447,9 +1453,17 @@ impl ArmState {
                 slug = %p.slug,
                 "updown clip firing"
             );
+            // The marketable limit, recorded beside the ask it chased from.
+            // Without it a recorded window can never prove a pay-up: `ask`
+            // alone leaves the price actually submitted unrecoverable, which
+            // is why every fixture froze `pay_up_max` at 0 and the payup-era
+            // fixtures are era markers rather than chase evidence
+            // (fixtures/README.md, gap 2). With pay_up_max at its default 0
+            // this equals `ask` — the field earns its keep the day it doesn't.
+            let limit = pay_up_limit(ask, net, edge_req, p.pay_up_max, p.max_price);
             tape_out.push(serde_json::json!({
                 "t": now, "ev": EV_FIRE, "slug": p.slug, "side": side,
-                "ask": ask, "fair": fair, "net": net, "size": size,
+                "ask": ask, "limit": limit, "fair": fair, "net": net, "size": size,
                 "committed": committed, "elapsed_frac": elapsed_frac,
                 "mode": if unlocked { "safe" } else { "spec" }, "rho": m.rho,
             }));
@@ -1463,7 +1477,6 @@ impl ArmState {
             self.last_clip.insert(token.clone(), now);
             self.last_clip_ask.insert(token.clone(), ask);
             self.inflight.insert(token.clone(), (size * ask, now));
-            let limit = pay_up_limit(ask, net, edge_req, p.pay_up_max, p.max_price);
             cancel_once(&mut actions, token);
             actions.push(Action::Buy {
                 token: token.clone(),
@@ -2205,6 +2218,7 @@ mod tests {
             banked_bp: Some(1.0),
             cushion_bp: Some(9.0),
             guard_bp: Some(6.0),
+            spot_age_s: None,
         };
         let out = arm.decide(&view_with_up_ask(0.94, 500.0), Err(gate), 1400.0);
         assert!(out.actions.is_empty(), "a gate never trades");
@@ -2224,11 +2238,34 @@ mod tests {
     #[test]
     fn decide_gated_record_nulls_the_numbers_for_a_non_basis_gate() {
         let mut arm = armed(params("s"));
-        let out = arm.decide(&ArmView::default(), Err(GateReason::plain("feed stale")), 1400.0);
+        let out = arm.decide(
+            &ArmView::default(),
+            Err(GateReason::plain("range-start reference not printed yet")),
+            1400.0,
+        );
         let rec = out.tape.iter().find(|r| r["ev"] == EV_GATED).expect("gated tape record");
-        assert_eq!(rec["reason"], "feed stale");
-        assert!(rec["margin_bp"].is_null(), "no margin behind a stale feed");
+        assert_eq!(rec["reason"], "range-start reference not printed yet");
+        assert!(rec["margin_bp"].is_null(), "no margin behind a missing print");
         assert!(rec["guard_bp"].is_null());
+        assert!(rec["spot_age_s"].is_null(), "and no age either — this gate has no number");
+    }
+
+    #[test]
+    fn decide_gated_record_carries_the_stale_feeds_age_as_a_field() {
+        // The last gate class whose number lived only in prose — and on the
+        // rtds feed, only inside a NESTED error string. A staleness study
+        // now reads a float instead of regexing "rtds sample lag 12.3s".
+        let mut arm = armed(params("s"));
+        let gate = GateReason::stale("feed stale: rtds sample lag 12.3s", 12.3);
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Err(gate), 1400.0);
+        let rec = out.tape.iter().find(|r| r["ev"] == EV_GATED).expect("gated tape record");
+        assert_eq!(rec["reason"], "feed stale: rtds sample lag 12.3s", "prose unchanged");
+        assert_eq!(rec["spot_age_s"], 12.3, "and the number beside it");
+        assert!(rec["margin_bp"].is_null(), "a stale feed still has no margin");
+        assert_eq!(rec["up_ask"], 0.94, "asks recorded while gated, as before");
+        // Both registers, same as the basis gate: the durable tape and the
+        // status payload `pmt crypto trigger` renders.
+        assert_eq!(arm.last_eval.as_ref().unwrap()["spot_age_s"], 12.3);
     }
 
     #[test]
@@ -2325,6 +2362,41 @@ mod tests {
         let Action::Buy { price, size, .. } = b[0] else { unreachable!() };
         assert!(*price > 0.90 + 1e-9, "limit chases above the ask");
         assert_eq!(*size, 27.0, "sizing still on the decision ask (25/0.90)");
+    }
+
+    #[test]
+    fn a_fire_record_carries_the_limit_actually_submitted() {
+        // Without this field a recorded window can never prove a pay-up:
+        // `ask` says what the book showed, and the price we crossed at was
+        // unrecoverable from any tape (fixtures/README.md gap 2, which is
+        // why every fixture froze pay_up_max at 0). The record has to name
+        // the SAME number the Buy action carries, or it is a second story.
+        let mut p = params("s");
+        p.pay_up_max = 0.02;
+        let mut arm = armed(p);
+        let out = arm.decide(&view_with_up_ask(0.90, 500.0), Ok(locked_up_model()), 1400.0);
+        let rec = out.tape.iter().find(|r| r["ev"] == EV_FIRE).expect("fire record");
+        let Action::Buy { price, .. } = buys(&out)[0] else { unreachable!() };
+        assert_eq!(rec["ask"], 0.90, "the book's ask, unchanged");
+        assert_eq!(
+            rec["limit"].as_f64().unwrap(),
+            *price,
+            "and the limit the order actually went out at"
+        );
+        assert!(rec["limit"].as_f64().unwrap() > 0.90, "a chase is now visible on the tape");
+    }
+
+    #[test]
+    fn a_fire_record_with_no_pay_up_budget_limits_at_the_ask() {
+        // The default arm: pay_up_max 0, so limit == ask. The field is
+        // still written, because "equal to the ask" is a fact worth
+        // recording — the alternative is a reader guessing which era a
+        // window came from.
+        let mut arm = armed(params("s"));
+        let out = arm.decide(&view_with_up_ask(0.90, 500.0), Ok(locked_up_model()), 1400.0);
+        let rec = out.tape.iter().find(|r| r["ev"] == EV_FIRE).expect("fire record");
+        assert_eq!(rec["limit"], 0.90);
+        assert_eq!(rec["limit"], rec["ask"]);
     }
 
     #[test]

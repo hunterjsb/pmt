@@ -1103,6 +1103,51 @@ def _corpus_jsonl(name: str) -> list[dict]:
     return out
 
 
+def _rtds_corpus_rows() -> list[dict]:
+    """Every recorder row under ~/.pmt/corpus/rtds. Read whole because a
+    window's lookback can cross a daily rotation."""
+    from pathlib import Path
+
+    d = Path.home() / ".pmt" / "corpus" / "rtds"
+    files = sorted(d.glob("rtds-*.jsonl")) if d.is_dir() else []
+    if not files:
+        raise click.UsageError(
+            f"{d}: no rtds-*.jsonl recorder files — a stream-fed window's market "
+            f"data exists nowhere else, the feed serves no history"
+        )
+    out: list[dict] = []
+    for path in files:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    return out
+
+
+def _rtds_gap(coverage: tuple[float, float] | None, symbol: str,
+              start: int, end: int) -> str | None:
+    """Why this window cannot be frozen full-mode off the corpus, or None.
+
+    Mirrors replay/rtds.rs's own refusal: the slice has to reach the
+    settlement reference printed at `start` and run through the close.
+    """
+    if coverage is None:
+        return (f"the RTDS corpus carries no {symbol} samples — full mode rebuilds "
+                f"the model from the settlement stream this window traded on")
+    first, last = coverage
+    if first > start or last < end:
+        return (f"the RTDS corpus covers {first:.0f}..{last:.0f} but this window needs "
+                f"{start}..{end} (its settlement reference through the close) — short by "
+                f"{max(first - start, 0):.0f}s at the start and {max(end - last, 0):.0f}s "
+                f"at the end")
+    return None
+
+
 @crypto_group.command("fixture")
 @click.argument("slug")
 @click.option("--out", "out_dir", default=None,
@@ -1182,31 +1227,53 @@ def crypto_fixture(slug: str, out_dir: str | None, mode: str, teaches: str | Non
         raise click.UsageError(str(e))
 
     symbol = fx.SYMBOL.get(slug.split("-")[0], "")
-    klines, missing = fx.kline_slice(_corpus_jsonl(f"klines-1m-{symbol}.jsonl"), start, end)
-    if mode == "auto":
-        mode = "full" if book_recs and not missing else "evals"
-    if mode == "full":
-        if not book_recs:
-            raise click.UsageError(
-                f"{slug}: no book records — this window predates the book recorder "
-                f"(02:45:20Z on 2026-08-23) and can only be frozen as --mode evals"
-            )
-        if missing:
-            raise click.UsageError(
-                f"{slug}: kline cache is missing {len(missing)} minute(s) — full mode "
-                f"rebuilds the model from them and a fixture may never fetch"
-            )
-    else:
-        klines = []
 
-    # As-armed params: what the tape proves, plus the arm store's policy for
-    # the rest, with every field's source recorded.
+    # The arm store decides which market data this window even HAS: a
+    # stream-fed arm never read a kline, and a Binance arm has no place in
+    # the recorder corpus. Resolved before the mode decision for that reason.
     arms_path = Path.home() / ".pmt" / "engine" / "arms-state.json"
     try:
         live = {a["symbol"]: a for a in json.loads(arms_path.read_text())["arms"]}
     except (OSError, ValueError, KeyError) as e:
         raise click.UsageError(f"{arms_path}: {e}")
     live_arm = live.get(symbol) or next(iter(live.values()))
+    feed = (prior.get("params", {}).get("feed")
+            or live_arm.get("feed") or "binance")
+
+    klines: list[dict] = []
+    rtds_recs: list[dict] = []
+    missing: list[int] = []
+    if feed == "rtds":
+        rtds_symbol = fx.rtds_symbol(symbol)
+        if not rtds_symbol:
+            raise click.UsageError(f"{slug}: the RTDS stream does not carry {symbol}")
+        rtds_recs, coverage = fx.rtds_slice(
+            _rtds_corpus_rows(), rtds_symbol, start, end)
+        rtds_gap = _rtds_gap(coverage, rtds_symbol, start, end)
+    else:
+        klines, missing = fx.kline_slice(
+            _corpus_jsonl(f"klines-1m-{symbol}.jsonl"), start, end)
+        rtds_gap = None
+
+    if mode == "auto":
+        ready = not rtds_gap if feed == "rtds" else not missing
+        mode = "full" if book_recs and ready else "evals"
+    if mode == "full":
+        if not book_recs:
+            raise click.UsageError(
+                f"{slug}: no book records — this window predates the book recorder "
+                f"(02:45:20Z on 2026-08-23) and can only be frozen as --mode evals"
+            )
+        if feed == "rtds":
+            if rtds_gap:
+                raise click.UsageError(f"{slug}: {rtds_gap}")
+        elif missing:
+            raise click.UsageError(
+                f"{slug}: kline cache is missing {len(missing)} minute(s) — full mode "
+                f"rebuilds the model from them and a fixture may never fetch"
+            )
+    else:
+        klines, rtds_recs = [], []
     series = updown_slugs.series_key(parsed["symbol"], parsed["dur_s"])
     series_roll = _series_first_roll(series)
     overrides = dict(_parse_override(o) for o in param_overrides)
@@ -1225,6 +1292,15 @@ def crypto_fixture(slug: str, out_dir: str | None, mode: str, teaches: str | Non
         "klines": ({"source": f"~/.pmt/corpus/klines-1m-{symbol}.jsonl",
                     "records": len(klines), "sha256": fx.sha256_records(klines)}
                    if klines else None),
+        # The stream serves no history, so unlike klines this slice can
+        # never be re-cut from anywhere. `lookback_s` says how far back the
+        # hub was warmed, because rho and the slow sigma depend on it.
+        "rtds": ({"source": "~/.pmt/corpus/rtds/rtds-*.jsonl",
+                  "symbol": fx.rtds_symbol(symbol),
+                  "records": len(rtds_recs),
+                  "lookback_s": fx.RTDS_LOOKBACK_S,
+                  "sha256": fx.sha256_records(rtds_recs)}
+                 if rtds_recs else None),
         "outcome": {"source": "~/.pmt/corpus/outcomes.jsonl + activity.jsonl",
                     "graded": "wallet"},
         # Which structured fields this slice's tape generation carries. An
@@ -1242,7 +1318,7 @@ def crypto_fixture(slug: str, out_dir: str | None, mode: str, teaches: str | Non
         lessons_ref or prior.get("lessons_ref"),
         list(eras) or prior.get("era") or [],
         list(invariants) or prior.get("invariants") or [],
-        provenance, prior.get("expect"),
+        provenance, prior.get("expect"), rtds_recs,
     )
 
     rendered = fx.render_fixture(fixture)
@@ -1339,12 +1415,20 @@ def _tape_schema(recs: list[dict]) -> dict:
     the generation present in ITS slice."""
     evals = [r for r in recs if r.get("ev") == tape.EV_EVAL]
     gated = [r for r in recs if r.get("ev") == tape.EV_GATED]
+    fires = [r for r in recs if r.get("ev") == tape.EV_FIRE]
     has = lambda rows, k: bool(rows) and all(k in r for r in rows)
     return {
         "eval_margin_fields": has(evals, "margin_bp"),
         "eval_guard_bp": has(evals, "guard_bp"),
         "gated_structured": has(gated, "margin_bp"),
-        "fire_limit": any("limit" in r for r in recs if r.get("ev") == tape.EV_FIRE),
+        # The last unstructured gate number: the staleness gate's spot age,
+        # which lived in prose (or, on rtds, inside a nested error string)
+        # until it became a field.
+        "gated_spot_age": has(gated, "spot_age_s"),
+        # The marketable limit actually submitted. False = this slice cannot
+        # prove a pay-up chase and its pay_up_max is 0 by necessity, not by
+        # measurement (fixtures/README.md gap 2).
+        "fire_limit": has(fires, "limit"),
     }
 
 
