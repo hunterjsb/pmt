@@ -9,6 +9,13 @@
 - **pmengine** (Rust) - HFT trading engine
 - **pmstrat** (Python) - Strategy DSL and transpiler
 
+This repo is PUBLIC. The live strategies (updown\*) and the characterization
+fixtures live in PRIVATE **pm-trade/pmt-strategies**, mounted as a git
+submodule at `pmengine/src/strategies/private/` — see "Private strategies"
+below. A clone without the submodule still builds and tests green as the
+**public flavor** (in-tree `example` strategy only, no `replay` subcommand);
+with it inited you get the **private flavor** the live engine runs.
+
 ## Build & Test
 
 Use `uv` for Python (not pip). Use `uv run` to execute, `uv sync` to install.
@@ -22,6 +29,58 @@ Use `uv` for Python (not pip). Use `uv run` to execute, `uv sync` to install.
 (cd pmproxy && cargo test)
 (cd pmengine && cargo build --features ec2 && cargo test)
 ```
+
+**The merge bar for anything strategy-adjacent is the PRIVATE gate** (submodule
+inited; `PMENGINE_EXPECT_PRIVATE=1` makes a silently-public build FAIL in
+tests/flavor.rs instead of passing on zero tests):
+
+```bash
+cd pmengine
+PMENGINE_EXPECT_PRIVATE=1 cargo test --features ec2
+cargo clippy --features ec2 --all-targets
+cargo build --release --features ec2
+```
+
+## Private strategies (pm-trade/pmt-strategies submodule)
+
+- Mount: `pmengine/src/strategies/private/` (updown\*.rs + `fixtures/`).
+  `.gitmodules` has `update = none`, so plain and `--recurse-submodules`
+  clones skip it; the one-time init is
+  `git submodule update --init --checkout pmengine/src/strategies/private`.
+  build.rs probes `private/updown.rs` (the FILE — an uninited submodule
+  leaves an empty dir) and sets `cfg(private_strategies)`; the generated
+  `strategies/mod.rs` gates every private item on it, so ONE committed
+  mod.rs compiles in both flavors and module names stay
+  `crate::strategies::updown` etc.
+- **Worktrees**: `git worktree add` NEVER populates submodules. First thing
+  in any pmengine worktree: run the init command above (per-worktree gitdirs
+  are independent and safe). Without it every gate runs the PUBLIC flavor
+  and a private-breaking change sails through — hence the EXPECT guard in
+  the merge-bar gate.
+- **Agents never stage `pmengine/src/strategies/private`** — no `git add -A`
+  gitlink bumps. The operator reviews any gitlink diff explicitly. To change
+  private code use `scripts/strategies-push.sh "msg"`: it commits + pushes
+  pmt-strategies FIRST (push-order invariant: the submodule commit must be
+  on GitHub before any pmt commit records its gitlink, or fresh clones/CI
+  404), then stages the gitlink for the operator. Never rewrite pushed
+  pmt-strategies history.
+- `pmstrat transpile --all` refuses when the submodule is declared but not
+  inited (it would drop updown from mod.rs); `--public` knowingly emits the
+  public form for local iteration — NEVER commit its output, and make sure
+  pmstrat is current (a stale install predating the split emits ungated
+  decls that break public clones).
+- CI: public pmt CI never touches the submodule and holds zero secrets —
+  **never add `submodules: true` to any workflow in this repo**, and never
+  add submodule checkout to publish-pmengine.yml (public release artifacts
+  stay public-flavor). The private net is pmt-strategies' own CI: it checks
+  out public pmt at `PMT_REF` (default master; point it at a branch for
+  coordinated changes), mounts itself, runs the full private gate + fixture
+  replay on push + nightly cron.
+- **Restart checklist**: before any operator `pmt engine restart`/rebuild,
+  `scripts/preflight-private.sh` must pass in the live checkout (submodule
+  inited + gitlinked sha reachable on the private remote). A rebuild from a
+  submodule-less checkout starts an engine where `run updown` fails — arms
+  never load and the roll chain is dead.
 
 ## Architecture
 
@@ -83,7 +142,7 @@ Tag-triggered workflows (`publish-pmproxy.yml`, `publish-pmengine.yml`, `publish
 - Manual momentum override: `--min-elapsed 0 --min-fair 0 --min-edge 0.005 --side X`.
 - **Market-data source**: `pmt crypto arm ... --feed rtds` runs an arm off the Chainlink TWAP stream these markets *settle* on instead of the Binance proxy — reference, spot and TWAP marks all come off one series, so the cross-venue basis the guard was sized for disappears (twap markets only; close_open needs a venue's candle open, and is refused). One shared socket for the whole fleet, lazily opened by the first rtds arm; `pmt crypto trigger` / `watch` show its health and mark rtds arms `≈`. Default stays `binance` and nothing uses rtds until an arm asks for it. A dropped stream gates every rtds arm within `MAX_SPOT_AGE_S` (5s), same as a dead Binance feed.
 - Durable eval/fire tape: `~/.pmt/engine/updown-tape.jsonl` — cross-session calibration data. Session scratchpads are tmpfs and die on the nightly poweroff; never leave data you want there.
-- **Characterization fixtures** (`pmengine/fixtures/`, see its README): real wallet-graded windows frozen into the repo — tape slice, book slice, the arm's own market data, as-armed params, the wallet's verdict — so `pmengine replay --fixtures fixtures` and `cargo test` regression-test the decision core offline, with no `~/.pmt`. Freeze a new one with `pmt crypto fixture <slug> --teaches '...'` (wallet-graded windows only; a chainlink/book label is refused). A fixture that starts failing is a FINDING: the engine changed behaviour on a real trade. Regenerating an expectation is `--regen`, one fixture at a time, justified in the commit message — never a way to get CI green.
+- **Characterization fixtures** (`pmengine/src/strategies/private/fixtures/` — inside the pmt-strategies submodule since the private split, because a fixture embeds the arm's as-armed params; see its README): real wallet-graded windows frozen into the private repo — tape slice, book slice, the arm's own market data, as-armed params, the wallet's verdict — so `pmengine replay --fixtures src/strategies/private/fixtures` and `cargo test` (private flavor) regression-test the decision core offline, with no `~/.pmt`. Freeze a new one with `pmt crypto fixture <slug> --teaches '...'` (wallet-graded windows only; a chainlink/book label is refused). A fixture that starts failing is a FINDING: the engine changed behaviour on a real trade. Regenerating an expectation is `--regen`, one fixture at a time, justified in the commit message — never a way to get CI green.
 - **Replaying a stream-fed arm**: `replay --mode full` follows the arm's `feed` param the same way `start_feeds` does. A `binance` arm reconstructs from cached 1m klines; a `feed=rtds` arm replays the RTDS recorder corpus (`--rtds-corpus`, default `~/.pmt/corpus/rtds`) back through `updown_rtds`'s own router into a real hub, so spot/per_min/closes/rho are shaped by the live code and cannot drift from it. Klines are never a stand-in: replay and the fixture loader both refuse a stream-fed window that has no corpus behind it rather than quietly answering off the wrong venue. Caveat worth knowing: the recorder is a SECOND subscriber to the stream, so its dropped samples are not the engine's — a window can replay as permanently gated on a missing reference print that the live arm did receive.
 - Order-path tape: `~/.pmt/engine/order-latency-tape.jsonl` (Phase 7) — one line per decision, `stage` ∈ `ack` / `suppressed` / `fill`. Splits decision→ack into `sign_done_ms` / `send_ms` / `ack_ms` (cumulative offsets from build start) so the latency report names the stage instead of bounding it, and records the fires the delta matcher suppressed, which the engine log could only count by their absence. Joins to `updown-tape.jsonl` on `t` + `token`.
 - **Policy eras** (`pmtrader/polymarket/eras.py`): the all-time record sums windows fired under policies that no longer exist, so `pmt crypto stats` cuts it at the deploy moments that actually moved it — pre-brake / brakes / theta / ws+scale / stream, each boundary an epoch cited to a commit, ROADMAP line or fixture `era` tag in a comment beside it. The "by era" table is in the DEFAULT view and lists every era, empty ones included; `--era <name>` scopes the rest of the report (per-symbol, effectiveness) to one era and still prints the whole table. All-time stays the headline ledger — an era is context, never a replacement. `--since` suppresses the table rather than showing a short one (it floors the wallet walk). Names deliberately match the fixture era vocabulary; boundaries are append-only and need a repo-citable moment.
