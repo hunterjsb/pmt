@@ -22,6 +22,10 @@ pub(crate) mod updown_oracle;
 // and `pmstrat transpile --all` won't emit this line on its own. Hand-added;
 // re-add by hand if this file is ever regenerated.
 pub(crate) mod updown_model;
+// Helper module for updown (durable arm state + restart recovery), not a
+// strategy — same `pub(crate)`-only rule as the two above. Hand-added;
+// re-add by hand if this file is ever regenerated.
+pub(crate) mod updown_state;
 
 use std::collections::HashMap;
 use crate::strategy::Strategy;

@@ -29,10 +29,11 @@ use crate::strategies::updown_model::{
 #[cfg(test)]
 use crate::strategies::updown_model::MAX_SPOT_AGE_S;
 use crate::strategies::updown_oracle;
+use crate::strategies::updown_state::{plan_recovery, ArmStore, ArmsState, RollRecord};
 use crate::strategy::{Signal, Strategy, StrategyContext, Urgency};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -53,7 +54,11 @@ const EARLY_MIN_FAIR: f64 = 0.55;
 
 // pub(crate), never plain pub, on purpose: the registry generator registers
 // the first `pub struct` in the file, which must be Updown.
-#[derive(Debug, Clone, Deserialize)]
+//
+// Serialize as well as Deserialize: these params ARE the durable arm state
+// (updown_state.rs) — everything a restart needs to rebuild a live arm,
+// runtime-fetched token ids included, is already in here.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct ArmParams {
     pub slug: String,
     /// "twap" or "close_open" — parsed from the market description upstream.
@@ -253,6 +258,10 @@ pub(crate) struct ArmState {
     trade_hwm: std::collections::HashMap<String, i64>,
 }
 
+/// Safety write cadence for the arm store. Every mutation writes too — this
+/// only bounds the damage from a mutation path nobody remembered to hook.
+const PERSIST_INTERVAL_S: f64 = 30.0;
+
 pub struct Updown {
     id: String,
     /// slug -> arm. Every armed window is hunted concurrently.
@@ -264,6 +273,11 @@ pub struct Updown {
     /// on a slow clock; a task whose window expires hops to the next one,
     /// so the chain survives gamma outages.
     rolls: Vec<RollTask>,
+    /// Durable arm state. Without it a crash mid-window is terminal: the
+    /// position rides to resolution with no exit rule, the roll chain dies,
+    /// and past `end` nothing can recreate the arm.
+    store: ArmStore,
+    last_persist_at: f64,
 }
 
 struct RollTask {
@@ -274,9 +288,33 @@ struct RollTask {
     next_try_at: f64,
 }
 
+impl RollTask {
+    fn record(&self) -> RollRecord {
+        RollRecord {
+            params: self.params.clone(),
+            next_slug: self.next_slug.clone(),
+            next_start: self.next_start,
+            next_end: self.next_end,
+        }
+    }
+
+    /// Restored tasks are due immediately — the retry clock is runtime-only.
+    fn from_record(r: RollRecord, now: f64) -> Self {
+        Self {
+            params: r.params,
+            next_slug: r.next_slug,
+            next_start: r.next_start,
+            next_end: r.next_end,
+            next_try_at: now,
+        }
+    }
+}
+
 /// btc-updown-5m-1787442000 + its bounds -> the following window.
 /// Recurring series are contiguous: next start = this end.
-fn next_window(slug: &str, start: f64, end: f64) -> Option<(String, f64, f64)> {
+/// pub(crate): recovery re-derives a downed arm's successor with it, so the
+/// gap-hopping rule has exactly one implementation.
+pub(crate) fn next_window(slug: &str, start: f64, end: f64) -> Option<(String, f64, f64)> {
     let dur = end - start;
     if dur <= 0.0 {
         return None;
@@ -1005,21 +1043,95 @@ fn to_signal(a: Action) -> Signal {
 
 impl Updown {
     pub fn new() -> Self {
+        let mut s = Self::with_store(ArmStore::live());
+        s.recover(unix_now());
+        s
+    }
+
+    /// Bare construction against an explicit store, no recovery pass. The
+    /// seam the persistence tests drive.
+    pub(crate) fn with_store(store: ArmStore) -> Self {
         Self {
             id: "updown".to_string(),
             arms: std::collections::BTreeMap::new(),
             pending_cleanup: Vec::new(),
             rolls: Vec::new(),
+            store,
+            last_persist_at: 0.0,
         }
+    }
+
+    /// Rebuild from the durable store, then rewrite it clean.
+    ///
+    /// Still-open windows re-arm from their persisted params alone — token
+    /// ids were fetched at arm time and live in there, so this needs no
+    /// gamma call. Spend is NOT persisted and doesn't need to be: `decide`
+    /// floors `committed` at the position tracker's shares x entry, and
+    /// re-armed tokens are back in `subscriptions()` before the engine's
+    /// startup position seed runs, so the budget comes back with the arm.
+    pub(crate) fn recover(&mut self, now: f64) {
+        let Some(state) = self.store.load() else { return };
+        let plan = plan_recovery(&state, now);
+        for p in plan.rearm {
+            tracing::info!(
+                slug = %p.slug, size = p.size_usdc, rem_s = p.end - now,
+                "updown recovery — window still open, re-arming from durable state"
+            );
+            self.install_arm(p);
+        }
+        for r in plan.rolls {
+            tracing::info!(
+                slug = %r.next_slug, from = %r.params.slug,
+                "updown recovery — resuming roll chain (hops forward if this window also passed)"
+            );
+            self.rolls.push(RollTask::from_record(r, now));
+        }
+        for p in &plan.ended {
+            tracing::info!(
+                slug = %p.slug, end = p.end, roll = p.roll,
+                "updown recovery — window closed while the engine was down, dropping the arm"
+            );
+        }
+        self.persist(now);
+    }
+
+    /// Build, start feeds, and register an arm, replacing any existing one
+    /// for the slug. The single path an arm enters the fleet by — command,
+    /// roll, or recovery.
+    fn install_arm(&mut self, p: ArmParams) {
+        let slug = p.slug.clone();
+        if let Some(mut old) = self.arms.remove(&slug) {
+            old.stop_feed();
+        }
+        let mut arm = ArmState::with_params(p);
+        // Unit tests get the arm without the sockets: `cfg!` (not `#[cfg]`)
+        // so the feed path still compiles and lints under `cargo test`.
+        if cfg!(not(test)) {
+            arm.start_feeds();
+        }
+        self.arms.insert(slug, arm);
+    }
+
+    /// Snapshot arms + roll chain to the store. A full snapshot, never an
+    /// incremental edit: a disarm that left a resurrectable entry behind
+    /// would re-buy a market the operator retired, so "gone from the map"
+    /// has to mean "gone from disk" with no bookkeeping in between.
+    fn persist(&mut self, now: f64) {
+        self.last_persist_at = now;
+        let arms: Vec<ArmParams> = self.arms.values().map(|a| a.p.clone()).collect();
+        let rolls: Vec<RollRecord> = self.rolls.iter().map(|t| t.record()).collect();
+        self.store.save(&ArmsState::new(arms, rolls, now));
     }
 
     /// Arm any due successor windows. Gamma hiccups retry every 10s; a
     /// task whose target window has already ended hops forward instead
-    /// of dying, so an unattended fleet self-heals.
-    fn process_rolls(&mut self, now: f64) {
+    /// of dying, so an unattended fleet self-heals. Returns true when the
+    /// roll set changed and the store owes a write.
+    fn process_rolls(&mut self, now: f64) -> bool {
         if self.rolls.is_empty() {
-            return;
+            return false;
         }
+        let mut changed = false;
         let mut keep = Vec::new();
         for mut task in std::mem::take(&mut self.rolls) {
             if now < task.next_try_at {
@@ -1027,6 +1139,7 @@ impl Updown {
                 continue;
             }
             if now >= task.next_end {
+                changed = true;
                 if let Some((ns, s, e)) =
                     next_window(&task.next_slug, task.next_start, task.next_end)
                 {
@@ -1049,13 +1162,8 @@ impl Updown {
                     tape(serde_json::json!({
                         "t": now, "ev": EV_ROLL, "slug": p.slug, "size": p.size_usdc,
                     }));
-                    if let Some(mut old) = self.arms.remove(&p.slug) {
-                        old.stop_feed();
-                    }
-                    let slug = p.slug.clone();
-                    let mut arm = ArmState::with_params(p);
-                    arm.start_feeds();
-                    self.arms.insert(slug, arm);
+                    self.install_arm(p);
+                    changed = true;
                 }
                 Err(e) => {
                     tracing::warn!(slug = %task.next_slug, err = %e, "updown roll retry");
@@ -1065,6 +1173,7 @@ impl Updown {
             }
         }
         self.rolls = keep;
+        changed
     }
 }
 
@@ -1105,6 +1214,7 @@ impl Strategy for Updown {
                 finished.push(slug.clone());
             }
         }
+        let retired = !finished.is_empty();
         for slug in finished {
             if let Some(mut arm) = self.arms.remove(&slug) {
                 arm.stop_feed();
@@ -1122,7 +1232,13 @@ impl Strategy for Updown {
                 }
             }
         }
-        self.process_rolls(now);
+        let rolled = self.process_rolls(now);
+        // Write on every mutation, so a window the engine actually saw close
+        // is off disk immediately — an entry still on disk past its end is
+        // exactly what the unmanaged-position check reads as "we were down".
+        if retired || rolled || now - self.last_persist_at >= PERSIST_INTERVAL_S {
+            self.persist(now);
+        }
 
         if signals.is_empty() {
             vec![Signal::Hold]
@@ -1169,12 +1285,8 @@ impl Strategy for Updown {
                 }
                 let slug = p.slug.clone();
                 // Re-arming a slug replaces its arm (fresh budget + feeds).
-                if let Some(mut old) = self.arms.remove(&slug) {
-                    old.stop_feed();
-                }
-                let mut arm = ArmState::with_params(p);
-                arm.start_feeds();
-                self.arms.insert(slug.clone(), arm);
+                self.install_arm(p);
+                self.persist(unix_now());
                 Ok(serde_json::json!({"armed": slug, "arms": self.arms.len()}))
             }
             Some("disarm") => {
@@ -1198,6 +1310,10 @@ impl Strategy for Updown {
                         self.pending_cleanup.extend(arm.tokens());
                     }
                 }
+                // Before the reply, not on the next tick: a disarm that
+                // survived on disk would re-arm itself on the next restart
+                // and buy a market the operator deliberately retired.
+                self.persist(unix_now());
                 Ok(serde_json::json!({
                     "disarmed": slugs, "arms": self.arms.len(),
                     "rolls_cancelled": rolls_before - self.rolls.len(),
@@ -1807,6 +1923,150 @@ mod tests {
         }]);
         assert_eq!(parse_gamma_tokens(&rev).unwrap(), ("222".into(), "111".into()));
         assert!(parse_gamma_tokens(&serde_json::json!([])).is_err());
+    }
+
+    // --- arm-state survivorship (updown_state.rs): the strategy-level half.
+    // The store, the recovery plan, and the unmanaged-position matching are
+    // unit-tested there; these drive the whole loop through `Updown`.
+
+    fn tmp_store(name: &str) -> (ArmStore, std::path::PathBuf) {
+        let dir = std::env::temp_dir()
+            .join(format!("pmengine-updown-{}-{}", name, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("arms-state.json");
+        let _ = std::fs::remove_file(&path);
+        (ArmStore::at(path.clone()), path)
+    }
+
+    /// A live-shaped arm command on a window opening `offset_s` from now.
+    /// Negative offsets build a window that already closed.
+    fn arm_cmd(offset_s: f64, roll: bool) -> (String, serde_json::Value) {
+        let start = (unix_now() + offset_s) as i64;
+        let slug = format!("btc-updown-5m-{}", start);
+        let cmd = serde_json::json!({
+            "action": "arm", "slug": slug, "kind": "twap", "symbol": "BTCUSDT",
+            "token_up": format!("{}-u", slug), "token_down": format!("{}-d", slug),
+            "start": start as f64, "end": (start + 300) as f64,
+            "sigma_bp_per_min": 3.0, "fee_rate": 0.07, "size_usdc": 250.0,
+            "roll": roll,
+        });
+        (slug, cmd)
+    }
+
+    #[test]
+    fn arm_persists_and_a_fresh_strategy_recovers_it() {
+        let (store, path) = tmp_store("roundtrip");
+        let mut s = Updown::with_store(store);
+        let (slug, cmd) = arm_cmd(-30.0, true);
+        s.on_command(&cmd).unwrap();
+        assert!(path.exists(), "arming writes durable state");
+
+        // The crash: everything in memory is gone, the file is not.
+        let mut fresh = Updown::with_store(ArmStore::at(path));
+        fresh.recover(unix_now());
+        assert_eq!(fresh.arms.len(), 1);
+        let arm = fresh.arms.get(&slug).expect("the open window came back");
+        assert_eq!(arm.p.token_up, format!("{}-u", slug), "token ids survive — no gamma call");
+        assert_eq!(arm.p.size_usdc, 250.0);
+        assert!(arm.p.roll);
+        assert_eq!(fresh.subscriptions().len(), 2, "recovered tokens are re-subscribed");
+    }
+
+    #[test]
+    fn disarm_deletes_the_persisted_arm() {
+        // The money bug this guards: a disarmed market that resurrects on
+        // the next restart and starts buying again.
+        let (store, path) = tmp_store("disarm");
+        let mut s = Updown::with_store(store);
+        let (slug, cmd) = arm_cmd(-30.0, true);
+        s.on_command(&cmd).unwrap();
+        s.on_command(&serde_json::json!({"action": "disarm", "slug": slug}))
+            .unwrap();
+        assert!(!path.exists(), "the last arm out clears the file");
+
+        let mut fresh = Updown::with_store(ArmStore::at(path));
+        fresh.recover(unix_now());
+        assert!(fresh.arms.is_empty(), "a disarm must never resurrect");
+        assert!(fresh.rolls.is_empty(), "nor its roll chain");
+    }
+
+    #[test]
+    fn disarming_one_arm_leaves_the_others_recoverable() {
+        let (store, path) = tmp_store("disarm-one");
+        let mut s = Updown::with_store(store);
+        let (kept, keep_cmd) = arm_cmd(-30.0, true);
+        let (dropped, drop_cmd) = arm_cmd(-90.0, true);
+        s.on_command(&keep_cmd).unwrap();
+        s.on_command(&drop_cmd).unwrap();
+        s.on_command(&serde_json::json!({"action": "disarm", "slug": dropped}))
+            .unwrap();
+
+        let mut fresh = Updown::with_store(ArmStore::at(path));
+        fresh.recover(unix_now());
+        assert_eq!(fresh.arms.len(), 1);
+        assert!(fresh.arms.contains_key(&kept));
+    }
+
+    #[test]
+    fn recovery_hops_a_closed_roll_window_and_drops_a_stale_one() {
+        let (store, path) = tmp_store("hop");
+        let mut s = Updown::with_store(store);
+        // Both windows closed while we were down: one rolls, one doesn't.
+        let (rolling, roll_cmd) = arm_cmd(-600.0, true);
+        let (_stale, stale_cmd) = arm_cmd(-900.0, false);
+        // on_command refuses a dead window, so seed the file the way a
+        // mid-window crash would have left it.
+        let rolling_p: ArmParams = serde_json::from_value(roll_cmd).unwrap();
+        let stale_p: ArmParams = serde_json::from_value(stale_cmd).unwrap();
+        s.arms.insert(rolling.clone(), ArmState::with_params(rolling_p.clone()));
+        s.arms.insert(stale_p.slug.clone(), ArmState::with_params(stale_p));
+        s.persist(unix_now());
+
+        let mut fresh = Updown::with_store(ArmStore::at(path.clone()));
+        fresh.recover(unix_now());
+        assert!(fresh.arms.is_empty(), "no dead window is ever re-armed");
+        assert_eq!(fresh.rolls.len(), 1, "only the rolling arm leaves a successor");
+        assert_eq!(
+            fresh.rolls[0].next_slug,
+            format!("btc-updown-5m-{}", rolling_p.end as i64),
+            "the chain resumes at the immediate successor; process_rolls walks it forward"
+        );
+        // The rewrite dropped both stale entries and kept the live roll task.
+        let back = ArmStore::at(path).load().expect("state rewritten, not deleted");
+        assert!(back.arms.is_empty());
+        assert_eq!(back.rolls.len(), 1);
+    }
+
+    #[test]
+    fn recovery_is_inert_without_a_file() {
+        let (store, path) = tmp_store("inert");
+        assert!(!path.exists());
+        let mut s = Updown::with_store(store);
+        s.recover(unix_now());
+        assert!(s.arms.is_empty());
+        assert!(s.rolls.is_empty());
+        assert!(!path.exists(), "an empty strategy writes nothing");
+    }
+
+    #[test]
+    fn scheduled_rolls_persist_across_a_restart() {
+        let (store, path) = tmp_store("rollpersist");
+        let mut s = Updown::with_store(store);
+        let (_slug, cmd) = arm_cmd(-30.0, true);
+        let p: ArmParams = serde_json::from_value(cmd).unwrap();
+        s.rolls.push(RollTask {
+            params: p.clone(),
+            next_slug: format!("btc-updown-5m-{}", p.end as i64),
+            next_start: p.end,
+            next_end: p.end + 300.0,
+            next_try_at: 0.0,
+        });
+        s.persist(unix_now());
+
+        let mut fresh = Updown::with_store(ArmStore::at(path));
+        fresh.recover(unix_now());
+        assert_eq!(fresh.rolls.len(), 1, "a pending roll survives the restart");
+        assert_eq!(fresh.rolls[0].next_slug, format!("btc-updown-5m-{}", p.end as i64));
     }
 
     #[test]
