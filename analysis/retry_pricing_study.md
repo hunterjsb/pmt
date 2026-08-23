@@ -362,3 +362,13 @@ worse re-decide is +10c, twice the 5c now live.
   orders, no network).
 - `analysis/retry_pricing_report.txt` — full output, all tiers, worked example,
   matcher sweep.
+
+## Addendum (operator, same day): the pay-up A/B this study demanded
+
+`--pay-up 0.02 vs 0.05`, frozen corpus, same driver as aggression_sweep:
+282 windows, Δnet **+$71.81**, CI95 [−$91.98, +$363.88]. Point-positive,
+not CI-clearing. Kept at 0.05 for a live A/B night on these grounds:
+pay_up_max is chase width funded only by surplus edge (min_edge floor
+unchanged — not a brake or guard), and this study's own §chase population
+measured 94.1% won. The loop grades tonight's realized fills; a negative
+wallet read reverts it.
