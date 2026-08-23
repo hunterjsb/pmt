@@ -9,7 +9,9 @@ mod momentum_fade;
 mod order_test;
 mod spread_watcher;
 mod sure_bets;
-mod updown;
+// pub(crate): the replay harness (src/replay.rs) drives updown's decision
+// core directly. If regeneration ever reverts this, the build breaks loudly.
+pub(crate) mod updown;
 
 use std::collections::HashMap;
 use crate::strategy::Strategy;

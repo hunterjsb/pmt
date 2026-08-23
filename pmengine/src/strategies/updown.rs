@@ -60,10 +60,10 @@ const BOOK_DISTRUST_NET: f64 = 0.15;
 /// market repricing against the thesis, not a discount to chase.
 const AVG_DOWN_TOL: f64 = 0.02;
 
-// Private on purpose: the registry generator registers the first `pub
-// struct` in the file, which must be Updown.
+// pub(crate), never plain pub, on purpose: the registry generator registers
+// the first `pub struct` in the file, which must be Updown.
 #[derive(Debug, Clone, Deserialize)]
-struct ArmParams {
+pub(crate) struct ArmParams {
     pub slug: String,
     /// "twap" or "close_open" — parsed from the market description upstream.
     pub kind: String,
@@ -157,63 +157,125 @@ fn d_manip_push() -> f64 { 25.0 }
 /// Flip-proof buys stay live until this close to resolution.
 const FLIP_BUY_CUTOFF_S: f64 = 8.0;
 
-/// Shared state an arm's Binance feed threads keep warm.
+/// Shared state an arm's Binance feed threads keep warm. In replay the
+/// corpus loader builds one of these per recorded sample instead.
 #[derive(Default)]
-struct FeedState {
-    spot: f64,
-    spot_ts: f64,
+pub(crate) struct FeedState {
+    pub(crate) spot: f64,
+    pub(crate) spot_ts: f64,
     /// minute epoch -> (open+close)/2, proxying the Chainlink 60s TWAP.
-    per_min: std::collections::BTreeMap<i64, f64>,
+    pub(crate) per_min: std::collections::BTreeMap<i64, f64>,
     /// Exact 1h candle open once the close_open window starts.
-    candle_open: Option<f64>,
+    pub(crate) candle_open: Option<f64>,
     /// Recent 1m closes, oldest first — feeds fast vol + regime autocorr.
-    closes: Vec<f64>,
+    pub(crate) closes: Vec<f64>,
     /// Lag-1 autocorrelation of trailing 1m returns. Negative = the tape
     /// fades its own moves; momentum "locks" are mirages there.
-    rho: f64,
-    last_err: Option<String>,
+    pub(crate) rho: f64,
+    pub(crate) last_err: Option<String>,
 }
 
 /// One model read: everything the clip engine needs to pick a mode.
-#[derive(Debug)]
-struct ModelEval {
-    p_up: f64,
-    sig_bp: f64,
+#[derive(Debug, Clone)]
+pub(crate) struct ModelEval {
+    pub(crate) p_up: f64,
+    pub(crate) sig_bp: f64,
     /// twap only: the banked contribution alone decides the window even if
     /// the remaining path fully reverts, with basis + vol cushion. The one
     /// entry condition immune to mean reversion.
-    banked_decided: bool,
+    pub(crate) banked_decided: bool,
     /// Stronger: the banked margin survives even an adversarial spot push
     /// (manip_push_bp) sustained for the whole remaining window. When true,
     /// the book's late panic/push prices are free money — nobody can flip
     /// this TWAP anymore.
-    flip_proof: bool,
-    rho: f64,
+    pub(crate) flip_proof: bool,
+    pub(crate) rho: f64,
     /// R9 safety-gate inputs, recorded on every tick (not yet gating):
     /// projected full-window margin, the locked banked contribution, and the
     /// 1σ-scale residual of the unlocked piece. safety = |banked|/cushion.
-    margin_bp: f64,
-    banked_margin_bp: f64,
-    cushion_bp: f64,
+    pub(crate) margin_bp: f64,
+    pub(crate) banked_margin_bp: f64,
+    pub(crate) cushion_bp: f64,
+}
+
+/// Top-of-book for one token: (price, size) per side, None when the level
+/// is missing.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TopOfBook {
+    pub(crate) bid: Option<(f64, f64)>,
+    pub(crate) ask: Option<(f64, f64)>,
+}
+
+/// Everything outside the arm that one decision pass reads. Built from the
+/// live StrategyContext on real ticks and from the recorded corpus in
+/// replay — the seam that makes the firing policy a pure function.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ArmView {
+    pub(crate) up: TopOfBook,
+    pub(crate) dn: TopOfBook,
+    /// Shares held per side (position tracker), feeding exits.
+    pub(crate) held_up: f64,
+    pub(crate) held_dn: f64,
+    /// Authoritative committed-notional floor: shares held x entry price.
+    pub(crate) position_floor: f64,
+}
+
+/// One intended order/lifecycle step. The live adapter converts these to
+/// engine Signals; the replay executor applies them to simulated fills.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Action {
+    Subscribe(String),
+    Unsubscribe(String),
+    Cancel(String),
+    Buy { token: String, price: f64, size: f64 },
+    Sell { token: String, price: f64, size: f64 },
+}
+
+/// Result of one pure decision pass: orders as data, durable-tape records
+/// as data, and whether the arm just retired.
+#[derive(Debug, Default)]
+pub(crate) struct DecideOut {
+    pub(crate) actions: Vec<Action>,
+    pub(crate) tape: Vec<serde_json::Value>,
+    pub(crate) finished: bool,
+}
+
+/// Replay-only policy knobs. Live arms always run the defaults — the brake
+/// constants are the law in production and are NOT reachable from the arm
+/// command. The A/B harness needs the pre-brake policy expressible to
+/// reproduce recorded nights; that is this struct's only reason to exist.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Tunables {
+    pub(crate) distrust_net: f64,
+    pub(crate) avg_down_tol: f64,
+}
+
+impl Default for Tunables {
+    fn default() -> Self {
+        Self { distrust_net: BOOK_DISTRUST_NET, avg_down_tol: AVG_DOWN_TOL }
+    }
 }
 
 /// Everything one hunted window owns: params, feeds, budget, clip clocks.
-struct ArmState {
-    p: ArmParams,
+pub(crate) struct ArmState {
+    pub(crate) p: ArmParams,
     feed: Arc<Mutex<FeedState>>,
     feed_stop: Arc<AtomicBool>,
     feed_handles: Vec<std::thread::JoinHandle<()>>,
-    subscribed: bool,
+    pub(crate) subscribed: bool,
     cleaned: bool,
-    filled_usdc: f64,
+    pub(crate) filled_usdc: f64,
+    /// Replay-only overrides; always Default (= the live constants) on
+    /// arms created through the command path.
+    pub(crate) tunables: Tunables,
     /// token -> (notional, emitted_at) for the one order allowed in flight.
-    inflight: std::collections::HashMap<String, (f64, f64)>,
+    pub(crate) inflight: std::collections::HashMap<String, (f64, f64)>,
     /// token -> last clip time, enforcing the per-side clip cadence.
     last_clip: std::collections::HashMap<String, f64>,
     /// token -> ask price of the last clip, feeding the no-averaging-down
     /// brake. New windows use new token ids so this resets per window.
     last_clip_ask: std::collections::HashMap<String, f64>,
-    last_eval: Option<serde_json::Value>,
+    pub(crate) last_eval: Option<serde_json::Value>,
     /// Throttle for eval/gated lines in the durable tape.
     last_tape_at: f64,
     /// Throttle for the book/spot recorder — its own cadence, see
@@ -335,8 +397,8 @@ fn book_tape(record: serde_json::Value) {
 }
 
 impl ArmState {
-    /// Build without feeds (tests use this directly).
-    fn with_params(p: ArmParams) -> Self {
+    /// Build without feeds (tests and the replay driver use this directly).
+    pub(crate) fn with_params(p: ArmParams) -> Self {
         Self {
             p,
             feed: Arc::new(Mutex::new(FeedState::default())),
@@ -345,6 +407,7 @@ impl ArmState {
             subscribed: false,
             cleaned: false,
             filled_usdc: 0.0,
+            tunables: Tunables::default(),
             inflight: std::collections::HashMap::new(),
             last_clip: std::collections::HashMap::new(),
             last_clip_ask: std::collections::HashMap::new(),
@@ -468,8 +531,16 @@ impl ArmState {
 
     /// Model fair P(UP) plus regime/decidedness context. Errors = gated.
     fn fair_p_up(&self, now: f64) -> Result<ModelEval, String> {
-        let p = &self.p;
         let f = self.feed.lock().unwrap();
+        eval_model(&self.p, &f, now)
+    }
+}
+
+/// The pricing model as a pure function of (params, feed snapshot, t) —
+/// the live tick locks the feed and delegates; replay hands in a feed
+/// state reconstructed from the corpus. Errors = gated.
+pub(crate) fn eval_model(p: &ArmParams, f: &FeedState, now: f64) -> Result<ModelEval, String> {
+    {
         if now - f.spot_ts > MAX_SPOT_AGE_S {
             return Err(match &f.last_err {
                 Some(e) => format!("feed stale: {}", e),
@@ -554,31 +625,32 @@ impl ArmState {
             })
         }
     }
+}
 
+impl ArmState {
     /// Math-forced evacuation: dump a held side whose fair has collapsed,
     /// into a bid that still resembles fair. Runs every armed tick AND
     /// through quiesce (exits are most needed late; only new buys stop).
-    fn exit_signals(&mut self, ctx: &StrategyContext, p_up: f64, now: f64) -> Vec<Signal> {
+    fn exit_actions(
+        &mut self,
+        view: &ArmView,
+        p_up: f64,
+        now: f64,
+        tape_out: &mut Vec<serde_json::Value>,
+    ) -> Vec<Action> {
         let p = self.p.clone();
-        let mut signals = Vec::new();
-        for (side, token, fair) in
-            [("up", &p.token_up, p_up), ("down", &p.token_down, 1.0 - p_up)]
-        {
+        let mut actions = Vec::new();
+        for (side, token, fair, held, top) in [
+            ("up", &p.token_up, p_up, view.held_up, &view.up),
+            ("down", &p.token_down, 1.0 - p_up, view.held_dn, &view.dn),
+        ] {
             if fair >= EXIT_FAIR || self.inflight.contains_key(token) {
                 continue;
             }
-            let held = ctx
-                .positions
-                .get(token)
-                .map(|pos| pos.size.to_f64().unwrap_or(0.0))
-                .unwrap_or(0.0);
             if held < 5.0 {
                 continue;
             }
-            let Some((bid, bid_size)) = ctx.order_books.get(token).and_then(|b| {
-                b.best_bid()
-                    .map(|l| (l.price.to_f64().unwrap_or(0.0), l.size.to_f64().unwrap_or(0.0)))
-            }) else {
+            let Some((bid, bid_size)) = top.bid else {
                 continue;
             };
             if bid < fair - EXIT_MAX_DISCOUNT {
@@ -592,20 +664,15 @@ impl ArmState {
                 side, fair, bid, size, slug = %p.slug,
                 "updown EXIT — side fair collapsed, evacuating at the bid"
             );
-            tape(serde_json::json!({
+            tape_out.push(serde_json::json!({
                 "t": now, "ev": "exit", "slug": p.slug, "side": side,
                 "fair": fair, "bid": bid, "size": size,
             }));
             self.inflight.insert(token.clone(), (0.0, now));
-            signals.push(Signal::Cancel { token_id: token.clone() });
-            signals.push(Signal::Sell {
-                token_id: token.clone(),
-                price: Decimal::from_f64(bid).unwrap_or(Decimal::ONE),
-                size: Decimal::from_f64(size).unwrap_or(Decimal::ZERO),
-                urgency: Urgency::High,
-            });
+            actions.push(Action::Cancel(token.clone()));
+            actions.push(Action::Sell { token: token.clone(), price: bid, size });
         }
-        signals
+        actions
     }
 
     /// Book+spot snapshot for the replay corpus — book history isn't
@@ -643,16 +710,26 @@ impl ArmState {
         }));
     }
 
-    /// One decision pass for this arm. Returns (signals, finished).
-    fn tick(&mut self, ctx: &StrategyContext, now: f64) -> (Vec<Signal>, bool) {
+    /// One pure decision pass — the entire firing policy with I/O stripped:
+    /// market state arrives as `view` + `model`, orders leave as Actions,
+    /// durable-tape records leave as data. Live ticks and the replay
+    /// harness run this exact path — the simulator judges the code that
+    /// trades, not a copy of it.
+    pub(crate) fn decide(
+        &mut self,
+        view: &ArmView,
+        model: Result<ModelEval, String>,
+        now: f64,
+    ) -> DecideOut {
         let p = self.p.clone();
-        let mut signals = Vec::new();
+        let mut actions = Vec::new();
+        let mut tape_out = Vec::new();
 
         if !self.subscribed {
             self.subscribed = true;
-            signals.push(Signal::Subscribe { token_id: p.token_up.clone() });
-            signals.push(Signal::Subscribe { token_id: p.token_down.clone() });
-            return (signals, false);
+            actions.push(Action::Subscribe(p.token_up.clone()));
+            actions.push(Action::Subscribe(p.token_down.clone()));
+            return DecideOut { actions, tape: tape_out, finished: false };
         }
 
         // Window over: pull everything, drop the market, retire the arm.
@@ -660,16 +737,14 @@ impl ArmState {
             if !self.cleaned {
                 self.cleaned = true;
                 tracing::info!(slug = %p.slug, filled_usdc = self.filled_usdc, "updown window closed — cleaning up");
-                tape(serde_json::json!({"t": now, "ev": "cleanup", "slug": p.slug}));
-                signals.push(Signal::Cancel { token_id: p.token_up.clone() });
-                signals.push(Signal::Cancel { token_id: p.token_down.clone() });
-                signals.push(Signal::Unsubscribe { token_id: p.token_up.clone() });
-                signals.push(Signal::Unsubscribe { token_id: p.token_down.clone() });
+                tape_out.push(serde_json::json!({"t": now, "ev": "cleanup", "slug": p.slug}));
+                actions.push(Action::Cancel(p.token_up.clone()));
+                actions.push(Action::Cancel(p.token_down.clone()));
+                actions.push(Action::Unsubscribe(p.token_up.clone()));
+                actions.push(Action::Unsubscribe(p.token_down.clone()));
             }
-            return (signals, true);
+            return DecideOut { actions, tape: tape_out, finished: true };
         }
-
-        self.record_book(ctx, now);
 
         // Quiesce: standing orders pulled, no new buys — with one carve-out.
         // When the TWAP is flip-proof (banked beyond even an adversarial
@@ -677,37 +752,33 @@ impl ArmState {
         // clips stay live until FLIP_BUY_CUTOFF_S. Exits always stay live
         // until the final seconds.
         if now >= p.end - p.quiesce_secs {
-            let model = self.fair_p_up(now).ok();
+            let model = model.ok();
             let flip_live = model.as_ref().map(|m| m.flip_proof).unwrap_or(false)
                 && now < p.end - FLIP_BUY_CUTOFF_S;
             if !flip_live {
-                signals.push(Signal::Cancel { token_id: p.token_up.clone() });
-                signals.push(Signal::Cancel { token_id: p.token_down.clone() });
+                actions.push(Action::Cancel(p.token_up.clone()));
+                actions.push(Action::Cancel(p.token_down.clone()));
             }
             if let Some(m) = model {
                 if now < p.end - 5.0 {
-                    let exits = self.exit_signals(ctx, m.p_up, now);
-                    signals.extend(exits);
+                    let exits = self.exit_actions(view, m.p_up, now, &mut tape_out);
+                    actions.extend(exits);
                 }
                 if flip_live {
                     self.inflight.retain(|_, (_, at)| now - *at < INFLIGHT_TTL_S);
                     let inflight_usdc: f64 = self.inflight.values().map(|(n, _)| n).sum();
-                    let committed = self.filled_usdc.max(position_floor(ctx, &p));
+                    let committed = self.filled_usdc.max(view.position_floor);
                     let room = p.size_usdc - committed - inflight_usdc;
-                    let (side, token, fair) = if m.p_up > 0.5 {
-                        ("up", p.token_up.clone(), m.p_up)
+                    let (side, token, fair, top) = if m.p_up > 0.5 {
+                        ("up", p.token_up.clone(), m.p_up, view.up)
                     } else {
-                        ("down", p.token_down.clone(), 1.0 - m.p_up)
+                        ("down", p.token_down.clone(), 1.0 - m.p_up, view.dn)
                     };
                     let allowed = p.side_filter.as_ref().map(|s| s == side).unwrap_or(true);
                     let cooled = now - self.last_clip.get(&token).copied().unwrap_or(0.0)
                         >= p.clip_cooldown_s;
                     if allowed && cooled && room > 5.0 && !self.inflight.contains_key(&token) {
-                        if let Some((ask, ask_size)) = ctx.order_books.get(&token).and_then(|b| {
-                            b.best_ask().map(|l| {
-                                (l.price.to_f64().unwrap_or(1.0), l.size.to_f64().unwrap_or(0.0))
-                            })
-                        }) {
+                        if let Some((ask, ask_size)) = top.ask {
                             let fee = p.fee_rate * ask.min(1.0 - ask);
                             let net = fair - ask - fee;
                             if net >= p.min_edge && ask <= p.max_price {
@@ -718,19 +789,18 @@ impl ArmState {
                                         side, ask, fair, net, size, slug = %p.slug,
                                         "updown FLIP clip — TWAP beyond reach, book still trading the print"
                                     );
-                                    tape(serde_json::json!({
+                                    tape_out.push(serde_json::json!({
                                         "t": now, "ev": "fire", "slug": p.slug, "side": side,
                                         "ask": ask, "fair": fair, "net": net, "size": size,
                                         "committed": committed, "mode": "flip", "rho": m.rho,
                                     }));
                                     self.last_clip.insert(token.clone(), now);
                                     self.inflight.insert(token.clone(), (size * ask, now));
-                                    signals.push(Signal::Cancel { token_id: token.clone() });
-                                    signals.push(Signal::Buy {
-                                        token_id: token.clone(),
-                                        price: Decimal::from_f64(ask).unwrap_or(Decimal::ONE),
-                                        size: Decimal::from_f64(size).unwrap_or(Decimal::ZERO),
-                                        urgency: Urgency::High,
+                                    actions.push(Action::Cancel(token.clone()));
+                                    actions.push(Action::Buy {
+                                        token: token.clone(),
+                                        price: ask,
+                                        size,
                                     });
                                 }
                             }
@@ -741,7 +811,7 @@ impl ArmState {
             self.last_eval = Some(serde_json::json!({
                 "state": if flip_live { "flip" } else { "quiesce" }, "t": now,
             }));
-            return (signals, false);
+            return DecideOut { actions, tape: tape_out, finished: false };
         }
 
         let elapsed_frac = (now - p.start) / (p.end - p.start).max(1.0);
@@ -752,21 +822,21 @@ impl ArmState {
                                   elapsed_frac * 100.0, p.min_elapsed_frac * 100.0),
                 "t": now,
             }));
-            return (signals, false);
+            return DecideOut { actions, tape: tape_out, finished: false };
         }
 
-        let m = match self.fair_p_up(now) {
+        let m = match model {
             Ok(v) => v,
             Err(gate) => {
                 self.last_eval =
                     Some(serde_json::json!({"state": "gated", "reason": gate, "t": now}));
                 if now - self.last_tape_at >= 5.0 {
                     self.last_tape_at = now;
-                    tape(serde_json::json!({
+                    tape_out.push(serde_json::json!({
                         "t": now, "ev": "gated", "slug": p.slug, "reason": gate,
                     }));
                 }
-                return (signals, false);
+                return DecideOut { actions, tape: tape_out, finished: false };
             }
         };
         let (p_up, sig_bp) = (m.p_up, m.sig_bp);
@@ -777,11 +847,11 @@ impl ArmState {
         // shares held x entry price. Take the max of every signal we have.
         self.inflight.retain(|_, (_, at)| now - *at < INFLIGHT_TTL_S);
         let inflight_usdc: f64 = self.inflight.values().map(|(n, _)| n).sum();
-        let committed = self.filled_usdc.max(position_floor(ctx, &p));
+        let committed = self.filled_usdc.max(view.position_floor);
         let budget = p.size_usdc - committed - inflight_usdc;
 
-        let exits = self.exit_signals(ctx, p_up, now);
-        signals.extend(exits);
+        let exits = self.exit_actions(view, p_up, now, &mut tape_out);
+        actions.extend(exits);
 
         // Exposure envelope: small speculative clips until the window is
         // either late or banked-decided; then the full budget eases into
@@ -797,28 +867,28 @@ impl ArmState {
         let chop_blocked = !unlocked && m.rho < p.rho_block;
 
         let mut evals = Vec::new();
-        for (side, token, fair) in
-            [("up", &p.token_up, p_up), ("down", &p.token_down, 1.0 - p_up)]
-        {
+        for (side, token, fair, top) in [
+            ("up", &p.token_up, p_up, view.up),
+            ("down", &p.token_down, 1.0 - p_up, view.dn),
+        ] {
             if let Some(only) = &p.side_filter {
                 if only != side {
                     continue;
                 }
             }
-            let book = match ctx.order_books.get(token) {
-                Some(b) => b,
-                None => continue,
-            };
-            let (ask, ask_size) = match book.best_ask() {
-                Some(l) => (l.price.to_f64().unwrap_or(1.0), l.size.to_f64().unwrap_or(0.0)),
-                None => continue,
+            let Some((ask, ask_size)) = top.ask else {
+                continue;
             };
             let fee = p.fee_rate * ask.min(1.0 - ask);
             let net = fair - ask - fee;
-            let brake = if distrust_blocks(net, m.banked_decided) {
+            let brake = if distrust_blocks(net, self.tunables.distrust_net, m.banked_decided) {
                 Some("distrust")
-            } else if avg_down_blocks(ask, self.last_clip_ask.get(token).copied(), m.banked_decided)
-            {
+            } else if avg_down_blocks(
+                ask,
+                self.last_clip_ask.get(token).copied(),
+                self.tunables.avg_down_tol,
+                m.banked_decided,
+            ) {
                 Some("avg_down")
             } else {
                 None
@@ -851,7 +921,7 @@ impl ArmState {
                 slug = %p.slug,
                 "updown clip firing"
             );
-            tape(serde_json::json!({
+            tape_out.push(serde_json::json!({
                 "t": now, "ev": "fire", "slug": p.slug, "side": side,
                 "ask": ask, "fair": fair, "net": net, "size": size,
                 "committed": committed, "elapsed_frac": elapsed_frac,
@@ -861,13 +931,8 @@ impl ArmState {
             self.last_clip.insert(token.clone(), now);
             self.last_clip_ask.insert(token.clone(), ask);
             self.inflight.insert(token.clone(), (size * ask, now));
-            signals.push(Signal::Cancel { token_id: token.clone() });
-            signals.push(Signal::Buy {
-                token_id: token.clone(),
-                price: Decimal::from_f64(ask).unwrap_or(Decimal::ONE),
-                size: Decimal::from_f64(size).unwrap_or(Decimal::ZERO),
-                urgency: Urgency::High,
-            });
+            actions.push(Action::Cancel(token.clone()));
+            actions.push(Action::Buy { token: token.clone(), price: ask, size });
         }
 
         self.last_eval = Some(serde_json::json!({
@@ -881,7 +946,7 @@ impl ArmState {
         }));
         if now - self.last_tape_at >= 5.0 {
             self.last_tape_at = now;
-            tape(serde_json::json!({
+            tape_out.push(serde_json::json!({
                 "t": now, "ev": "eval", "slug": p.slug, "p_up": p_up,
                 "sig_bp": sig_bp, "rho": m.rho, "banked_decided": m.banked_decided,
                 "margin_bp": m.margin_bp, "banked_bp": m.banked_margin_bp,
@@ -890,7 +955,73 @@ impl ArmState {
             }));
         }
 
-        (signals, false)
+        DecideOut { actions, tape: tape_out, finished: false }
+    }
+
+    /// Live-tick adapter around `decide`: snapshot the StrategyContext into
+    /// an ArmView, run the pure pass, then do the I/O it prescribed — tape
+    /// records to disk here, orders upstream as Signals.
+    fn tick(&mut self, ctx: &StrategyContext, now: f64) -> (Vec<Signal>, bool) {
+        if self.subscribed && now < self.p.end {
+            self.record_book(ctx, now);
+        }
+        let view = arm_view(ctx, &self.p);
+        let model = self.fair_p_up(now);
+        let out = self.decide(&view, model, now);
+        for rec in out.tape {
+            tape(rec);
+        }
+        (out.actions.into_iter().map(to_signal).collect(), out.finished)
+    }
+}
+
+/// Snapshot the live StrategyContext into the pure view `decide` consumes.
+fn arm_view(ctx: &StrategyContext, p: &ArmParams) -> ArmView {
+    let top = |token: &str| -> TopOfBook {
+        let book = ctx.order_books.get(token);
+        TopOfBook {
+            bid: book.and_then(|b| b.best_bid()).map(|l| {
+                (l.price.to_f64().unwrap_or(0.0), l.size.to_f64().unwrap_or(0.0))
+            }),
+            ask: book.and_then(|b| b.best_ask()).map(|l| {
+                (l.price.to_f64().unwrap_or(1.0), l.size.to_f64().unwrap_or(0.0))
+            }),
+        }
+    };
+    let held = |token: &str| -> f64 {
+        ctx.positions
+            .get(token)
+            .map(|pos| pos.size.to_f64().unwrap_or(0.0))
+            .unwrap_or(0.0)
+    };
+    ArmView {
+        up: top(&p.token_up),
+        dn: top(&p.token_down),
+        held_up: held(&p.token_up),
+        held_dn: held(&p.token_down),
+        position_floor: position_floor(ctx, p),
+    }
+}
+
+/// Action -> engine Signal. The Decimal conversion lives here so the pure
+/// core stays in f64 like the model math. All clip orders are High urgency.
+fn to_signal(a: Action) -> Signal {
+    match a {
+        Action::Subscribe(t) => Signal::Subscribe { token_id: t },
+        Action::Unsubscribe(t) => Signal::Unsubscribe { token_id: t },
+        Action::Cancel(t) => Signal::Cancel { token_id: t },
+        Action::Buy { token, price, size } => Signal::Buy {
+            token_id: token,
+            price: Decimal::from_f64(price).unwrap_or(Decimal::ONE),
+            size: Decimal::from_f64(size).unwrap_or(Decimal::ZERO),
+            urgency: Urgency::High,
+        },
+        Action::Sell { token, price, size } => Signal::Sell {
+            token_id: token,
+            price: Decimal::from_f64(price).unwrap_or(Decimal::ONE),
+            size: Decimal::from_f64(size).unwrap_or(Decimal::ZERO),
+            urgency: Urgency::High,
+        },
     }
 }
 
@@ -1230,18 +1361,21 @@ fn position_floor(ctx: &StrategyContext, p: &ArmParams) -> f64 {
 }
 
 /// Book-distrust brake predicate: a book handing over more than
-/// BOOK_DISTRUST_NET net is pricing in something the model missed, unless
-/// the TWAP math itself has already decided the window.
-fn distrust_blocks(net: f64, banked_decided: bool) -> bool {
-    net > BOOK_DISTRUST_NET && !banked_decided
+/// `threshold` net (BOOK_DISTRUST_NET live) is pricing in something the
+/// model missed, unless the TWAP math itself has already decided the
+/// window. The threshold is a parameter only so replay can express the
+/// pre-brake policy — live arms always pass the constant.
+fn distrust_blocks(net: f64, threshold: f64, banked_decided: bool) -> bool {
+    net > threshold && !banked_decided
 }
 
-/// No-averaging-down brake predicate: the ask dropping more than
-/// AVG_DOWN_TOL below our last clip on this token means the market is
-/// repricing against the thesis, unless the TWAP math has already decided.
-fn avg_down_blocks(ask: f64, last_clip_ask: Option<f64>, banked_decided: bool) -> bool {
+/// No-averaging-down brake predicate: the ask dropping more than `tol`
+/// (AVG_DOWN_TOL live) below our last clip on this token means the market
+/// is repricing against the thesis, unless the TWAP math has already
+/// decided.
+fn avg_down_blocks(ask: f64, last_clip_ask: Option<f64>, tol: f64, banked_decided: bool) -> bool {
     match last_clip_ask {
-        Some(prev) => ask < prev - AVG_DOWN_TOL && !banked_decided,
+        Some(prev) => ask < prev - tol && !banked_decided,
         None => false,
     }
 }
@@ -1366,19 +1500,122 @@ mod tests {
 
     #[test]
     fn distrust_brake_blocks_outsized_net_unless_banked() {
-        assert!(distrust_blocks(0.16, false));
-        assert!(!distrust_blocks(0.16, true), "banked-decided is exempt");
-        assert!(!distrust_blocks(0.15, false), "at the threshold, not over it");
-        assert!(!distrust_blocks(0.05, false));
+        let t = BOOK_DISTRUST_NET;
+        assert!(distrust_blocks(0.16, t, false));
+        assert!(!distrust_blocks(0.16, t, true), "banked-decided is exempt");
+        assert!(!distrust_blocks(0.15, t, false), "at the threshold, not over it");
+        assert!(!distrust_blocks(0.05, t, false));
     }
 
     #[test]
     fn avg_down_brake_blocks_cheapening_ask_unless_banked() {
-        assert!(avg_down_blocks(0.50, Some(0.53), false), "3c cheaper clears tolerance");
-        assert!(!avg_down_blocks(0.50, Some(0.53), true), "banked-decided is exempt");
-        assert!(!avg_down_blocks(0.52, Some(0.53), false), "within tolerance");
-        assert!(!avg_down_blocks(0.55, Some(0.53), false), "richer ask, not cheaper");
-        assert!(!avg_down_blocks(0.50, None, false), "no prior clip on this token");
+        let t = AVG_DOWN_TOL;
+        assert!(avg_down_blocks(0.50, Some(0.53), t, false), "3c cheaper clears tolerance");
+        assert!(!avg_down_blocks(0.50, Some(0.53), t, true), "banked-decided is exempt");
+        assert!(!avg_down_blocks(0.52, Some(0.53), t, false), "within tolerance");
+        assert!(!avg_down_blocks(0.55, Some(0.53), t, false), "richer ask, not cheaper");
+        assert!(!avg_down_blocks(0.50, None, t, false), "no prior clip on this token");
+    }
+
+    // --- decide()-level tests: the pure core makes the full firing policy
+    // testable without a StrategyContext, which is half the point of the
+    // extraction (the other half is replay running this exact path).
+
+    fn armed(p: ArmParams) -> ArmState {
+        let mut a = ArmState::with_params(p);
+        a.subscribed = true;
+        a
+    }
+
+    fn locked_up_model() -> ModelEval {
+        ModelEval {
+            p_up: 1.0, sig_bp: 3.0, banked_decided: true, flip_proof: false,
+            rho: 0.0, margin_bp: 20.0, banked_margin_bp: 15.0, cushion_bp: 5.0,
+        }
+    }
+
+    fn view_with_up_ask(ask: f64, size: f64) -> ArmView {
+        ArmView {
+            up: TopOfBook { bid: None, ask: Some((ask, size)) },
+            ..ArmView::default()
+        }
+    }
+
+    fn buys(out: &DecideOut) -> Vec<&Action> {
+        out.actions
+            .iter()
+            .filter(|a| matches!(a, Action::Buy { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn decide_fires_a_clip_when_all_gates_hold() {
+        let mut arm = armed(params("s"));
+        // rem=100s <= late_rem 120 -> unlocked; before quiesce (end-20).
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.0);
+        let b = buys(&out);
+        assert_eq!(b.len(), 1);
+        let Action::Buy { token, price, size } = b[0] else { unreachable!() };
+        assert_eq!(token, "s-u");
+        assert_eq!(*price, 0.94);
+        assert_eq!(*size, 26.0, "clip_usdc 25 / 0.94 floored");
+        assert!(out.tape.iter().any(|r| r["ev"] == "fire" && r["mode"] == "safe"));
+        assert!(arm.inflight.contains_key("s-u"), "one order in flight");
+    }
+
+    #[test]
+    fn decide_inflight_and_cooldown_block_the_next_clip() {
+        let mut arm = armed(params("s"));
+        arm.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.0);
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.1);
+        assert!(buys(&out).is_empty());
+    }
+
+    #[test]
+    fn decide_distrust_brake_blocks_undecided_moonshot() {
+        let mut arm = armed(params("s"));
+        let m = ModelEval { p_up: 0.99, banked_decided: false, ..locked_up_model() };
+        // net ~0.45 into an undecided model: the -$370 signature.
+        let out = arm.decide(&view_with_up_ask(0.50, 500.0), Ok(m), 1400.0);
+        assert!(buys(&out).is_empty(), "distrust brake must hold");
+        let eval = arm.last_eval.as_ref().unwrap();
+        assert_eq!(eval["sides"][0]["brake"], "distrust");
+    }
+
+    #[test]
+    fn decide_replay_tunables_express_the_pre_brake_policy() {
+        // The A/B harness reproduces recorded pre-brake nights by lifting
+        // the constants — live arms can never reach this path.
+        let mut arm = armed(params("s"));
+        arm.tunables.distrust_net = f64::INFINITY;
+        let m = ModelEval { p_up: 0.99, banked_decided: false, ..locked_up_model() };
+        let out = arm.decide(&view_with_up_ask(0.50, 500.0), Ok(m), 1400.0);
+        assert_eq!(buys(&out).len(), 1, "old policy fires where the brake now holds");
+    }
+
+    #[test]
+    fn decide_clock_gate_holds_before_min_elapsed() {
+        let mut p = params("s");
+        p.min_elapsed_frac = 0.5;
+        let mut arm = armed(p);
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 960.0);
+        assert!(out.actions.is_empty());
+        assert_eq!(arm.last_eval.as_ref().unwrap()["state"], "gated");
+    }
+
+    #[test]
+    fn decide_quiesce_pulls_orders_without_flip_proof() {
+        let mut arm = armed(params("s"));
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1490.0);
+        assert!(buys(&out).is_empty(), "no new buys through quiesce unless flip-proof");
+        assert_eq!(
+            out.actions
+                .iter()
+                .filter(|a| matches!(a, Action::Cancel(_)))
+                .count(),
+            2
+        );
+        assert_eq!(arm.last_eval.as_ref().unwrap()["state"], "quiesce");
     }
 
     #[test]
