@@ -224,3 +224,7 @@ infra/
 
 # feed A/B scratch (params + replay reports)
 .ab/
+
+# gate-shadow scratch (frozen tapes, shadow HOME, cached wallet walk)
+.work/
+.shadowhome/
