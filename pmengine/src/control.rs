@@ -1,8 +1,8 @@
 //! Local HTTP control plane for the running engine.
 //!
-//! Exposes read-only introspection (status, strategies, orders, alerts) and,
-//! in later phases, action endpoints (approve/reject alerts, cancel orders,
-//! pause strategies). All traffic is local: the server binds to a loopback
+//! Exposes read-only introspection (status, strategies, orders, alerts) and
+//! action endpoints (approve/reject alerts, cancel orders, pause/resume/stop
+//! strategies, per-strategy commands). All traffic is local: the server binds to a loopback
 //! address by default. Remote access, if ever wanted, should route through
 //! pmproxy behind its IAM-authed Function URL.
 //!

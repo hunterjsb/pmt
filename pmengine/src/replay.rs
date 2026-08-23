@@ -32,18 +32,14 @@
 
 use crate::strategies::updown::{Action, ArmParams, ArmState, ArmView, DecideOut, TopOfBook};
 use crate::strategies::updown_model::{
-    eval_model, lag1_autocorr, FeedState, ModelEval, Tunables, EV_EVAL, EV_FIRE, EV_GATED,
+    eval_model, lag1_autocorr, shape_klines, FeedState, GateReason, Kline, ModelEval, Tunables,
+    BINANCE_DATA, EV_EVAL, EV_FIRE, EV_GATED, KLINE_LOOKBACK_S,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-
-const BINANCE_DATA: &str = "https://data-api.binance.vision";
-/// Matches poll_binance's live reach-back so the regime autocorr has real
-/// history instead of pinning at 0.
-const KLINE_LOOKBACK_S: i64 = 2700;
 
 pub struct ReplayOpts {
     pub mode: String,
@@ -458,8 +454,7 @@ fn replay_evals_window(
             EV_GATED => {
                 // decide()'s Err branch never reads `view` — a default is
                 // fine, we're only here to keep gate bookkeeping faithful.
-                let reason = rec["reason"].as_str().unwrap_or("gated").to_string();
-                let out = arm.decide(&ArmView::default(), Err(reason), now);
+                let out = arm.decide(&ArmView::default(), Err(gate_from_record(rec)), now);
                 apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate);
             }
             _ => {} // fire/roll/cleanup — real fires come from the shared tally
@@ -471,6 +466,23 @@ fn replay_evals_window(
     });
     let pnl = outcome.as_deref().map(|w| settle_pnl(&sim, p, w));
     build_report(&p.slug, "evals", &sim, real, outcome, pnl)
+}
+
+/// Rebuild a `GateReason` from a recorded `gated` tape line.
+///
+/// Structured fields when the line has them; `None` when it doesn't —
+/// every line written before those fields shipped, which is most of the
+/// existing corpus. Never parses the prose: an old line simply replays as
+/// a numberless gate, which is exactly what decide() does with it anyway.
+fn gate_from_record(rec: &Value) -> GateReason {
+    let num = |k: &str| rec.get(k).and_then(|v| v.as_f64());
+    GateReason {
+        reason: rec["reason"].as_str().unwrap_or("gated").to_string(),
+        margin_bp: num("margin_bp"),
+        banked_bp: num("banked_bp"),
+        cushion_bp: num("cushion_bp"),
+        guard_bp: num("guard_bp"),
+    }
 }
 
 fn run_evals(opts: &ReplayOpts) -> Result<(), String> {
@@ -505,34 +517,27 @@ fn run_evals(opts: &ReplayOpts) -> Result<(), String> {
 
 // --- full mode -------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
-struct KlineRow {
-    t: i64,
-    o: f64,
-    c: f64,
-}
-
 fn kline_cache_path(symbol: &str) -> Result<PathBuf, String> {
     let dir = home_dir().join(".pmt/corpus");
     std::fs::create_dir_all(&dir).map_err(|e| format!("corpus dir: {}", e))?;
     Ok(dir.join(format!("klines-1m-{}.jsonl", symbol)))
 }
 
-fn load_kline_cache(path: &Path) -> BTreeMap<i64, KlineRow> {
+fn load_kline_cache(path: &Path) -> BTreeMap<i64, Kline> {
     let mut rows = BTreeMap::new();
     let Ok(f) = std::fs::File::open(path) else { return rows };
     for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
         if let Ok(v) = serde_json::from_str::<Value>(&line) {
             if let (Some(t), Some(o), Some(c)) = (v["t"].as_i64(), v["o"].as_f64(), v["c"].as_f64())
             {
-                rows.insert(t, KlineRow { t, o, c });
+                rows.insert(t, Kline { t, o, c });
             }
         }
     }
     rows
 }
 
-fn append_kline_rows(path: &Path, rows: &[KlineRow]) -> Result<(), String> {
+fn append_kline_rows(path: &Path, rows: &[Kline]) -> Result<(), String> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -546,7 +551,7 @@ fn append_kline_rows(path: &Path, rows: &[KlineRow]) -> Result<(), String> {
     Ok(())
 }
 
-fn cache_covers(rows: &BTreeMap<i64, KlineRow>, lo: i64, hi: i64) -> bool {
+fn cache_covers(rows: &BTreeMap<i64, Kline>, lo: i64, hi: i64) -> bool {
     let mut m = lo;
     while m < hi {
         if !rows.contains_key(&m) {
@@ -561,7 +566,7 @@ fn fetch_klines(
     client: &reqwest::blocking::Client,
     symbol: &str,
     start_epoch_s: i64,
-) -> Result<Vec<KlineRow>, String> {
+) -> Result<Vec<Kline>, String> {
     let start_ms = (start_epoch_s * 1000).to_string();
     let v: Value = client
         .get(format!("{}/api/v3/klines", BINANCE_DATA))
@@ -571,23 +576,16 @@ fn fetch_klines(
         .map_err(|e| format!("klines fetch: {}", e))?
         .json()
         .map_err(|e| format!("klines json: {}", e))?;
-    let mut out = Vec::new();
-    for k in v.as_array().unwrap_or(&Vec::new()) {
-        let t = k[0].as_i64().unwrap_or(0) / 1000;
-        let o: f64 = k[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-        let c: f64 = k[4].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-        if o > 0.0 && c > 0.0 {
-            out.push(KlineRow { t, o, c });
-        }
-    }
-    Ok(out)
+    // Same shaper the live feed poller runs — replay must reconstruct the
+    // feed from the identical parse, not a lookalike.
+    Ok(shape_klines(&v))
 }
 
 /// Cached 1m klines for `symbol` covering [start-2700, end). Fetches and
 /// appends only the missing range. The sole network call in this module,
 /// and only ever reached from `--mode full` — never from tests, never
 /// from evals mode.
-fn klines_for_window(symbol: &str, start: i64, end: i64) -> Result<BTreeMap<i64, KlineRow>, String> {
+fn klines_for_window(symbol: &str, start: i64, end: i64) -> Result<BTreeMap<i64, Kline>, String> {
     let path = kline_cache_path(symbol)?;
     let mut rows = load_kline_cache(&path);
     let lo = start - KLINE_LOOKBACK_S;
@@ -599,7 +597,7 @@ fn klines_for_window(symbol: &str, start: i64, end: i64) -> Result<BTreeMap<i64,
             .build()
             .map_err(|e| format!("client: {}", e))?;
         let fetched = fetch_klines(&client, symbol, lo)?;
-        let new_rows: Vec<KlineRow> = fetched.into_iter().filter(|r| !rows.contains_key(&r.t)).collect();
+        let new_rows: Vec<Kline> = fetched.into_iter().filter(|r| !rows.contains_key(&r.t)).collect();
         append_kline_rows(&path, &new_rows)?;
         for r in &new_rows {
             rows.insert(r.t, *r);
@@ -615,7 +613,7 @@ fn klines_for_window(symbol: &str, start: i64, end: i64) -> Result<BTreeMap<i64,
 /// close isn't known yet — mirrors poll_binance's live (o+c)/2 for closed
 /// bars and the model's own forming-bar approximation.
 fn feed_state_at(
-    rows: &BTreeMap<i64, KlineRow>,
+    rows: &BTreeMap<i64, Kline>,
     start: i64,
     spot: f64,
     spot_ts: f64,
@@ -626,7 +624,7 @@ fn feed_state_at(
     let mut closes = Vec::new();
     for (&t, r) in rows.range(start - KLINE_LOOKBACK_S..=m0) {
         if (t + 60) as f64 <= now {
-            per_min.insert(t, (r.o + r.c) / 2.0);
+            per_min.insert(t, r.mid());
             closes.push(r.c);
         } else if t == m0 {
             per_min.insert(t, (r.o + spot) / 2.0);
@@ -641,11 +639,11 @@ fn feed_state_at(
 /// look-ahead concern here, the outcome already happened. Same math the
 /// model banks on: avg of the window's final per-minute values vs the
 /// range-start reference.
-fn settle_winner(rows: &BTreeMap<i64, KlineRow>, start: i64, end: i64) -> Option<String> {
-    let ref_px = rows.get(&(start - 60)).map(|r| (r.o + r.c) / 2.0)?;
+fn settle_winner(rows: &BTreeMap<i64, Kline>, start: i64, end: i64) -> Option<String> {
+    let ref_px = rows.get(&(start - 60)).map(|r| r.mid())?;
     let (mut sum, mut n) = (0.0, 0usize);
-    for (_, r) in rows.range(start..end) {
-        sum += (r.o + r.c) / 2.0;
+    for r in rows.range(start..end).map(|(_, r)| r) {
+        sum += r.mid();
         n += 1;
     }
     if n == 0 {
@@ -779,6 +777,21 @@ mod tests {
     }
 
     #[test]
+    fn gate_from_record_prefers_fields_and_tolerates_old_lines() {
+        let modern = serde_json::json!({
+            "ev": "gated", "reason": "basis guard: projected margin -4.9bp inside 6.0bp noise band",
+            "margin_bp": -4.9, "banked_bp": 1.0, "cushion_bp": 9.0, "guard_bp": 6.0,
+        });
+        let g = gate_from_record(&modern);
+        assert_eq!(g.margin_bp, Some(-4.9));
+        assert_eq!(g.guard_bp, Some(6.0));
+        // Pre-structured line: reason survives, numbers are simply absent —
+        // no regex, no guessing.
+        let old = serde_json::json!({"ev": "gated", "reason": "feed stale"});
+        assert_eq!(gate_from_record(&old), GateReason::plain("feed stale"));
+    }
+
+    #[test]
     fn evals_tunables_override_reproduces_pre_brake_policy() {
         // Same signature as updown.rs's replay-tunables test: an
         // undecided moonshot the live brake blocks, the old (infinite
@@ -792,7 +805,8 @@ mod tests {
                 {"side": "down", "fair": 0.01, "ask": 0.92, "net": -0.98},
             ],
         });
-        let blocked = replay_evals_window(&p, None, &[rec.clone()], None, &RealTally::default());
+        let blocked =
+            replay_evals_window(&p, None, std::slice::from_ref(&rec), None, &RealTally::default());
         assert_eq!(blocked["sim"]["fires"], 0, "distrust brake holds under default tunables");
 
         let old_policy = Tunables { distrust_net: f64::INFINITY, avg_down_tol: f64::INFINITY };
@@ -806,8 +820,8 @@ mod tests {
         // closed, 660 is still forming. The forming bucket must use
         // (open+spot)/2, never its true close, even though the cache has it.
         let mut rows = BTreeMap::new();
-        rows.insert(600, KlineRow { t: 600, o: 100.0, c: 100.5 });
-        rows.insert(660, KlineRow { t: 660, o: 100.5, c: 101.0 }); // future — true close must not leak
+        rows.insert(600, Kline { t: 600, o: 100.0, c: 100.5 });
+        rows.insert(660, Kline { t: 660, o: 100.5, c: 101.0 }); // future — true close must not leak
         let now = 680.0;
         let spot = 100.6;
         let feed = feed_state_at(&rows, 600, spot, now, now);
@@ -825,8 +839,8 @@ mod tests {
     #[test]
     fn lookahead_cutoff_never_sees_a_minute_that_has_not_started() {
         let mut rows = BTreeMap::new();
-        rows.insert(600, KlineRow { t: 600, o: 100.0, c: 100.5 });
-        rows.insert(660, KlineRow { t: 660, o: 100.5, c: 101.0 }); // hasn't started at now=650
+        rows.insert(600, Kline { t: 600, o: 100.0, c: 100.5 });
+        rows.insert(660, Kline { t: 660, o: 100.5, c: 101.0 }); // hasn't started at now=650
         let now = 650.0; // still inside minute 600
         let feed = feed_state_at(&rows, 600, 100.3, now, now);
         assert!(!feed.per_min.contains_key(&660), "minute 660 hasn't opened yet at t=650");
@@ -836,14 +850,14 @@ mod tests {
     #[test]
     fn settle_winner_picks_the_higher_side() {
         let mut rows = BTreeMap::new();
-        rows.insert(540, KlineRow { t: 540, o: 100.0, c: 100.0 }); // ref (start-60)
-        rows.insert(600, KlineRow { t: 600, o: 100.0, c: 101.0 });
-        rows.insert(660, KlineRow { t: 660, o: 101.0, c: 102.0 });
+        rows.insert(540, Kline { t: 540, o: 100.0, c: 100.0 }); // ref (start-60)
+        rows.insert(600, Kline { t: 600, o: 100.0, c: 101.0 });
+        rows.insert(660, Kline { t: 660, o: 101.0, c: 102.0 });
         assert_eq!(settle_winner(&rows, 600, 720).as_deref(), Some("up"));
 
         let mut down_rows = BTreeMap::new();
-        down_rows.insert(540, KlineRow { t: 540, o: 100.0, c: 100.0 });
-        down_rows.insert(600, KlineRow { t: 600, o: 100.0, c: 99.0 });
+        down_rows.insert(540, Kline { t: 540, o: 100.0, c: 100.0 });
+        down_rows.insert(600, Kline { t: 600, o: 100.0, c: 99.0 });
         assert_eq!(settle_winner(&down_rows, 600, 660).as_deref(), Some("down"));
 
         assert_eq!(settle_winner(&BTreeMap::new(), 600, 660), None, "no ref, no verdict");
@@ -858,13 +872,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let rows = vec![
-            KlineRow { t: 600, o: 100.0, c: 100.5 },
-            KlineRow { t: 660, o: 100.5, c: 101.0 },
+            Kline { t: 600, o: 100.0, c: 100.5 },
+            Kline { t: 660, o: 100.5, c: 101.0 },
         ];
         append_kline_rows(&path, &rows).unwrap();
         // Re-appending the same t=600 row (simulating an overlapping
         // fetch range) must not duplicate it once loaded into a map.
-        append_kline_rows(&path, &[KlineRow { t: 600, o: 100.0, c: 100.5 }]).unwrap();
+        append_kline_rows(&path, &[Kline { t: 600, o: 100.0, c: 100.5 }]).unwrap();
 
         let loaded = load_kline_cache(&path);
         assert_eq!(loaded.len(), 2, "dedupes by t on load despite the duplicate line");

@@ -50,6 +50,29 @@ def test_basis_guard_side_none_when_unparseable():
     assert basis_guard_side("basis guard: something changed") is None
 
 
+def test_basis_guard_side_prefers_the_structured_margin():
+    # Reworded past the regex; the engine's margin_bp field still decides.
+    assert basis_guard_side("basis guard: nope", -5.6) == "down"
+    assert basis_guard_side("basis guard: nope", 4.5) == "up"
+    assert basis_guard_side("basis guard: nope", 0.0) == "up"
+
+
+def test_basis_guard_side_structured_margin_does_not_rescue_a_non_guard_reason():
+    # A stale-feed gate is not a side signal no matter what rides with it.
+    assert basis_guard_side("feed stale", -5.6) is None
+
+
+def test_iter_ticks_reads_the_structured_margin_off_a_gated_line():
+    line = json.dumps({
+        "t": 100.0, "ev": "gated", "slug": "btc-updown-15m-100",
+        "reason": "basis guard: reworded past the regex",
+        "margin_bp": -5.6, "guard_bp": 6.0, "up_ask": 0.55, "dn_ask": 0.47,
+    })
+    ticks = list(iter_ticks([line]))
+    assert [t["side"] for t in ticks] == ["down"]
+    assert ticks[0]["ask"] == 0.47
+
+
 # ---------- fee / shadow value ----------
 
 def test_fee_symmetric_around_50c():

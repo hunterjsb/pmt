@@ -19,13 +19,13 @@ import time
 import requests
 
 from . import hosts
+from .constants import BASIS_NOISE_BP, taker_fee  # re-exported: this module's original home
 from .fit import BINANCE_DATA, fetch_klines, realized_sigma, _norm_cdf
 from .scanner import fetch_event
 
 REQUEST_TIMEOUT = 10
 
-# Chainlink-TWAP vs Binance-proxy disagreement band (bp on the final margin).
-BASIS_NOISE_BP = 3.0
+__all__ = ["BASIS_NOISE_BP", "eval_updown", "parse_semantics", "slug_of", "spot_price", "taker_fee"]
 
 _PAIR_RE = re.compile(r"([A-Z0-9]{2,10})/(?:USDT?|USD)")
 _TITLE_SYMBOLS = {"bitcoin": "BTCUSDT", "btc": "BTCUSDT", "ethereum": "ETHUSDT",
@@ -108,11 +108,6 @@ def parse_semantics(event: dict) -> dict:
         "fee_rate": fee_rate,
         "closed": bool(m.get("closed")),
     }
-
-
-def taker_fee(price: float, fee_rate: float) -> float:
-    """crypto_fees_v2, exponent 1: per-share fee on the cheaper side of the pair."""
-    return fee_rate * min(price, 1.0 - price)
 
 
 def _sigma_1m(symbol: str, now: float, lookback_min: int = 120) -> float:

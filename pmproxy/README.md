@@ -8,7 +8,7 @@ HTTP + WebSocket reverse proxy for Polymarket APIs. Deployed close to Polymarket
 Python client → pmproxy → Polymarket APIs
 ```
 
-The proxy forwards Polymarket auth headers unchanged — the upstream signing is handled client-side. Optional Cognito JWT validation adds a multi-tenant gate in front.
+The proxy forwards Polymarket auth headers unchanged — the upstream signing is handled client-side. **The deployed Lambda authenticates with SigV4/IAM** (`AuthType=AWS_IAM` on the Function URL, `PMPROXY_AUTH_ENABLED=false`); the in-process Cognito JWT gate below is a dormant option for a multi-tenant deployment, not the live path.
 
 ## Routes
 
@@ -60,10 +60,12 @@ pmproxy [OPTIONS]
 
 ## Environment
 
-Optional multi-tenant authentication:
+Optional multi-tenant Cognito gate — **off in the live deployment**, which
+relies on the Function URL's IAM auth instead. Leave `PMPROXY_AUTH_ENABLED`
+unset unless you are running a multi-tenant proxy of your own:
 
 ```
-PMPROXY_AUTH_ENABLED=true              # default: false
+PMPROXY_AUTH_ENABLED=true              # default: false — live Lambda leaves it false
 PMPROXY_COGNITO_REGION=us-east-1       # AWS region
 PMPROXY_COGNITO_POOL_ID=us-east-1_xxx  # User Pool ID
 PMPROXY_COGNITO_APP_CLIENT_ID=xxx      # optional: validate audience claim
@@ -96,7 +98,7 @@ src/
 ├── main.rs      EC2 server binary (tokio)
 ├── lambda.rs    Lambda handler binary
 ├── ws.rs        WebSocket bridge (ec2 only)
-├── auth.rs      Cognito JWKS fetch + JWT validation
+├── auth.rs      Cognito JWKS fetch + JWT validation (dormant; off in the live Lambda)
 ├── ratelimit.rs governor-based per-tenant rate limiting
 ├── config.rs    ProxyConfig from env
 └── error.rs     AuthError + axum IntoResponse

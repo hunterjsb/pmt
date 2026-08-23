@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from polymarket import crypto as crypto_mod
 from polymarket.crypto import parse_semantics, slug_of, taker_fee
 
 
@@ -56,3 +57,25 @@ def test_taker_fee_cheaper_side():
     assert taker_fee(0.91, 0.07) == pytest.approx(0.07 * 0.09)
     assert taker_fee(0.09, 0.07) == pytest.approx(0.07 * 0.09)
     assert taker_fee(0.5, 0.0) == 0.0
+
+
+# ---------- one source for the shared constants ----------
+
+def test_taker_fee_is_the_shared_constants_implementation():
+    from polymarket import constants
+
+    assert crypto_mod.taker_fee is constants.taker_fee
+    assert crypto_mod.BASIS_NOISE_BP is constants.BASIS_NOISE_BP
+
+
+def test_shadow_prices_fees_at_the_shared_rate():
+    from polymarket import constants, shadow
+
+    assert shadow.FEE_RATE is constants.FEE_RATE
+    assert shadow.fee(0.91) == pytest.approx(constants.taker_fee(0.91))
+
+
+def test_taker_fee_defaults_to_the_live_rate():
+    from polymarket.constants import FEE_RATE, taker_fee
+
+    assert taker_fee(0.91) == pytest.approx(FEE_RATE * 0.09)

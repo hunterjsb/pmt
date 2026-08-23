@@ -45,6 +45,27 @@ def test_gated_reason_compact_handles_missing_reason():
     assert cc._gated_reason_compact("") == "gated"
 
 
+def test_gated_reason_compact_prefers_structured_fields_over_the_regex():
+    # A reworded reason the regex cannot touch — the fields still render it.
+    e = {"reason": "guard says no", "margin_bp": -4.9, "guard_bp": 6.0}
+    assert cc._gated_reason_compact(e["reason"], e) == "margin -4.9 vs 6.0bp"
+
+
+def test_gated_reason_compact_falls_back_to_regex_on_a_pre_structured_eval():
+    # Engine built before the fields shipped: reason only, nulls (or no keys).
+    reason = ("basis guard: projected margin -4.9bp inside 6.0bp noise band "
+              "[banked -3.2bp cushion 9.3bp]")
+    e = {"reason": reason, "margin_bp": None, "guard_bp": None}
+    assert cc._gated_reason_compact(reason, e) == "margin -4.9 vs 6.0bp"
+    assert cc._gated_reason_compact(reason, {"reason": reason}) == "margin -4.9 vs 6.0bp"
+
+
+def test_gated_reason_compact_structured_survives_a_non_basis_gate():
+    # feed stale: nulls everywhere, reason still shown verbatim.
+    e = {"reason": "feed stale", "margin_bp": None, "guard_bp": None}
+    assert cc._gated_reason_compact("feed stale", e) == "feed stale"
+
+
 # ---------- evidence column color thresholds ----------
 
 def test_evidence_style_banked_decided_is_always_green():
@@ -628,3 +649,31 @@ def test_render_path_is_never_blocked_by_a_slow_fetch(monkeypatch):
     finally:
         stop.set()
         th.join(timeout=cc.WORKER_JOIN_S + 2)
+# ---------- `crypto arm` basis-guard default ----------
+
+def test_arm_basis_guard_defaults_to_the_measured_per_symbol_value():
+    # A bare arm on an alt must NOT hand the engine the flat 3bp band —
+    # that under-guards eth/sol by 2-3x, which is the shape of the
+    # 2026-08-23 losses.
+    assert cc._resolve_basis_guard(None, "BTCUSDT") == (6.0, None)
+    assert cc._resolve_basis_guard(None, "ETHUSDT") == (8.0, None)
+    assert cc._resolve_basis_guard(None, "SOLUSDT") == (10.0, None)
+
+
+def test_arm_basis_guard_explicit_always_wins():
+    for symbol in ("ETHUSDT", "XRPUSDT", "NOTAPAIR"):
+        assert cc._resolve_basis_guard(2.5, symbol) == (2.5, None)
+
+
+def test_arm_basis_guard_unmeasured_symbol_falls_back_loudly():
+    from polymarket.constants import BASIS_NOISE_BP
+
+    guard, warning = cc._resolve_basis_guard(None, "XRPUSDT")
+    assert guard == BASIS_NOISE_BP
+    assert warning and "XRPUSDT" in warning and "--basis-guard" in warning
+
+
+def test_arm_basis_guard_unknown_symbol_falls_back_loudly():
+    guard, warning = cc._resolve_basis_guard(None, "PEPEUSDT")
+    assert guard == 3.0
+    assert warning is not None

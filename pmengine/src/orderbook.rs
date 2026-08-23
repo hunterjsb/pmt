@@ -60,9 +60,9 @@ impl OrderBook {
     /// the actual top of book.
     pub fn update_from_ws(&mut self, update: &BookUpdate) {
         let mut bids: Vec<Level> = update.bids.iter().map(Level::from).collect();
-        bids.sort_by(|a, b| b.price.cmp(&a.price)); // descending: best bid first
+        bids.sort_by_key(|l| std::cmp::Reverse(l.price)); // descending: best bid first
         let mut asks: Vec<Level> = update.asks.iter().map(Level::from).collect();
-        asks.sort_by(|a, b| a.price.cmp(&b.price)); // ascending: best ask first
+        asks.sort_by_key(|l| l.price); // ascending: best ask first
         self.bids = bids;
         self.asks = asks;
         self.timestamp = update.timestamp;
@@ -411,9 +411,10 @@ impl MarketDataHub {
 
     /// Replace a token's book wholesale, e.g. from a REST poll snapshot.
     ///
-    /// Unlike `process_book_update` (which applies an incremental WS diff),
-    /// this overwrites bids/asks/timestamp/hash with the provided snapshot
-    /// and broadcasts a `BookUpdate` event so subscribers see the change.
+    /// Overwrites bids/asks/timestamp/hash with the provided snapshot and
+    /// broadcasts a `BookUpdate` event so subscribers see the change. Same
+    /// wholesale replacement `process_book_update` does for a WS message —
+    /// neither path applies an incremental diff.
     pub async fn set_book(&self, book: OrderBook) {
         let token_id = book.token_id.clone();
         let arc = Arc::new(book);

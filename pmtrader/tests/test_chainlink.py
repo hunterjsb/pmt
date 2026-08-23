@@ -202,3 +202,27 @@ def test_signed_bias_keeps_sign_unlike_aligned_stats():
     rows = [{"basis_bp": v} for v in [-10.0, -10.0]]
     assert signed_bias(rows) == pytest.approx(-10.0)
     assert signed_bias([]) == 0.0
+
+
+# ---------- measured per-arm basis guards ----------
+
+def test_guard_bp_for_resolves_a_binance_pair_to_its_measured_guard():
+    assert chainlink.guard_bp_for("BTCUSDT") == 6.0
+    assert chainlink.guard_bp_for("ETHUSDT") == 8.0
+    assert chainlink.guard_bp_for("SOLUSDT") == 10.0
+    assert chainlink.guard_bp_for("ethusdt") == 8.0  # case-insensitive
+
+
+def test_guard_bp_for_is_none_without_a_measured_corpus():
+    # Symbol we know but haven't measured, and a symbol that isn't ours.
+    assert chainlink.guard_bp_for("XRPUSDT") is None
+    assert chainlink.guard_bp_for("BNBUSDT") is None
+    assert chainlink.guard_bp_for("PEPEUSDT") is None
+
+
+def test_guard_bp_map_and_binance_symbols_stay_in_sync():
+    # Every guarded symbol must be resolvable from its Binance pair — the
+    # arm default reads this map through guard_bp_for and nothing else.
+    for sym, guard in chainlink.GUARD_BP.items():
+        assert sym in chainlink.BINANCE_SYMBOL, sym
+        assert chainlink.guard_bp_for(chainlink.BINANCE_SYMBOL[sym]) == guard

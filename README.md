@@ -9,7 +9,7 @@ Polymarket trading toolchain designed for agentic workflows, discretionary execu
 
 ```
 pmtrader/   Python SDK + pmt CLI (Agentic trading cockpit, portfolio & PnL, order routing)
-pmproxy/    Rust reverse proxy (AWS Lambda in eu-west-1 w/ Function URL + Cognito/SigV4)
+pmproxy/    Rust reverse proxy (AWS Lambda in eu-west-1 w/ SigV4-authed Function URL)
 pmengine/   Rust execution & risk daemon (HTTP control plane, trade buffer, human-in-the-loop alerts)
 pmstrat/    Python strategy DSL + transpiler to Rust for high-throughput execution
 ```
@@ -51,7 +51,7 @@ flowchart TD
     CLI -.->|"pmt engine status/approve/reject"| CP
 
     subgraph PROXY["pmproxy (AWS Lambda eu-west-1)"]
-        AUTH["Cognito JWT / SigV4 Auth"]
+        AUTH["SigV4 / IAM Auth"]
         RATELIMIT["Tenant Rate Limiting"]
         ROUTE["Upstream Router"]
     end
@@ -134,7 +134,7 @@ cd pmengine && cargo build --release --features ec2
 Rust reverse proxy deployed as an AWS Lambda with a Function URL in `eu-west-1` (near Polymarket infrastructure).
 
 - **Geoblock Bypass**: Bridges requests to `clob.polymarket.com`, `gamma-api.polymarket.com`, and Polygon RPC.
-- **Security & Multi-Tenancy**: Cognito JWT auth validation and SigV4 client signing.
+- **Security & Multi-Tenancy**: SigV4 client signing against an `AWS_IAM` Function URL, plus per-tenant rate limiting. (A Cognito JWT gate exists in `auth.rs` but is disabled in the live deployment.)
 - **Automated CI/CD**: Managed via Pulumi (`infra/pulumi/`) and auto-deployed via GitHub Actions OIDC on version bumps.
 
 See [pmproxy/README.md](pmproxy/README.md).

@@ -1,6 +1,6 @@
 # pmtrader
 
-Polymarket trading CLI + Python SDK. Routes through `pmproxy` (Cognito-authed Lambda in eu-west-1) to bypass the US geoblock, and through a locally-running `pmengine` for order writes when it's up.
+Polymarket trading CLI + Python SDK. Routes through `pmproxy` (SigV4/IAM-authed Lambda in eu-west-1) to bypass the US geoblock, and through a locally-running `pmengine` for order writes when it's up.
 
 ## `pmt` CLI
 
@@ -126,15 +126,24 @@ get_order_book_depth(token_id)       # full ladder, not aggregated
 ```
 pmtrader/
 ├── cli.py              # pmt CLI (click)
+├── cli_crypto.py       # `pmt crypto ...` — up/down pricing, trigger, tape tooling
+├── cli_common.py       # the one Rich console + lazy API loader shared by both
 ├── engine.py           # pmengine control-plane client
+├── scanners/           # market scanners (expiring, order-book)
 └── polymarket/
     ├── __init__.py     # public exports
     ├── hosts.py        # single source of truth for API URLs + PMPROXY_URL
+    ├── sigv4.py        # SigV4 signing for the AWS_IAM Function URL
     ├── api.py          # PolymarketAPI — authenticated v2 client
-    ├── clob_v2.py      # v2 ClobClient factory + Cognito monkey-patch
+    ├── clob_v2.py      # v2 ClobClient factory + SigV4 monkey-patch
     ├── clob.py         # unauth read helpers (depth, sampling)
     ├── gamma.py        # Gamma API
-    ├── cognito.py      # Cognito JWT auth
+    ├── constants.py    # FEE_RATE / BASIS_NOISE_BP / taker_fee (one source)
+    ├── crypto.py       # up/down semantics + one-shot pricing
+    ├── chainlink.py    # Chainlink oracle rounds + measured per-arm GUARD_BP
+    ├── tape.py         # decision-tape paths, event names, record iteration
+    ├── shadow.py       # shadow P&L ledger (pure)
+    ├── outcomes.py     # resolved-window corpus
     ├── pnl.py          # activity-ledger replay
     └── models.py       # plain dataclasses
 ```
@@ -146,12 +155,10 @@ PM_PRIVATE_KEY=0x...
 PM_FUNDER_ADDRESS=0x...
 PM_SIGNATURE_TYPE=1                  # 1 = Polymarket Proxy wallet
 
-# pmproxy — required for placing orders from a geoblocked region
+# pmproxy — required for placing orders from a geoblocked region.
+# Auth is SigV4 against the AWS_IAM Function URL: signed with your local
+# AWS credentials, so no proxy secrets belong in .env.
 PMPROXY_URL=https://<...>.lambda-url.eu-west-1.on.aws
-PMPROXY_USERNAME=...
-PMPROXY_PASSWORD=...
-PMPROXY_COGNITO_CLIENT_ID=...
-PMPROXY_COGNITO_REGION=eu-west-1
 ```
 
 ## Tests

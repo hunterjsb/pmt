@@ -3,8 +3,8 @@
 Every consumer (the fleet scoreboard, `pmt crypto shadow`, the `watch`
 dashboard, `pmt crypto tape`) used to open the tape file and run its own
 json.loads loop with "fire"/"eval"/"gated"/... literals sprinkled through
-cli.py and polymarket/shadow.py. One place for the paths, the event-name
-constants, and (for full-file scans) the parsing loop itself.
+cli_crypto.py and polymarket/shadow.py. One place for the paths, the
+event-name constants, and (for full-file scans) the parsing loop itself.
 
 iter_records skips corrupt lines instead of raising — a line can be
 truncated mid-write by a concurrently-crashing engine, and a bad record
@@ -16,9 +16,15 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Iterator
+from pathlib import Path
 
-UPDOWN_TAPE = "/var/home/hunter/.pmt/engine/updown-tape.jsonl"
-BOOK_TAPE = "/var/home/hunter/.pmt/engine/book-tape.jsonl"
+# Where the engine appends (updown_model.rs::append_jsonl writes under
+# $HOME/.pmt/engine). Derived, not hardcoded — same shape as
+# outcomes.OUTCOMES_PATH. str, not Path: every consumer passes these
+# straight to open() and some log them.
+ENGINE_DIR = Path.home() / ".pmt" / "engine"
+UPDOWN_TAPE = str(ENGINE_DIR / "updown-tape.jsonl")
+BOOK_TAPE = str(ENGINE_DIR / "book-tape.jsonl")
 
 EV_FIRE = "fire"
 EV_EXIT = "exit"

@@ -4,7 +4,11 @@
 - `Gamma`         — read-only Gamma client (events, markets)
 - `get_order_book_depth` — full-depth book fetch (no auth)
 - `hosts`         — single source of truth for API hosts + proxy override
-- `pnl`           — activity-ledger replay (realized + unrealized PnL)
+- `Market`/`Token`/`OrderBook`/`OrderBookLevel` — response models
+- `FlipResult`/`locked_buy_cash`/`lookup_market_name`/`sampling_markets`
+
+Submodules not re-exported here (import them directly): `pnl`, `crypto`,
+`chainlink`, `constants`, `shadow`, `tape`, `outcomes`, `updown_slugs`.
 """
 
 from . import hosts

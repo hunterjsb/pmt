@@ -203,6 +203,13 @@ book-distrust brake and unlocked the full budget — while the honest edge was �
 engine's own margin reading barely moved all hour (BNB −59.0 → −59.2bp); the thing that actually
 decides the window moved 40 points.
 
+For the record, that window resolved **Down on all six symbols**, and both rules agreed on all six
+(engine-rule −60 to −109bp, terminal-rule −84 to −136bp). The mis-specification is not a loss every
+time — it is a *false confidence* every time, which converts into a loss on the ~10% of windows where
+the two rules part company. An engine buying BNB DOWN at 0.610 at 07:19Z would have won this one; it
+would have been buying a 0.601 coin flip at full size with the distrust brake disabled, and calling
+it certain.
+
 **The same thing on 15,000+ historical prints.** For 24 expired 4h windows, every BUY print was
 re-evaluated at its own timestamp: was the engine's gate open (θ=1.0 + basis guard), and if so, what
 was that side actually worth under the correct model?

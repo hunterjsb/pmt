@@ -56,7 +56,7 @@ from engine import (
 
 from cli_common import console, _api
 
-# Theme keyword regexes for `pmt positions` — same set portfolio.py used.
+# Theme keyword regexes for `pmt positions`.
 DEFAULT_THEMES = {
     "hantavirus": r"\bhantavirus\b",
     "pandemic": r"\bpandemic\b",

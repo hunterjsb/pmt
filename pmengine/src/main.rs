@@ -188,11 +188,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("  run <strategies...>  Run one or more strategies");
             eprintln!("  list                 List available strategies");
             eprintln!("  test-gamma           Test Gamma API (no auth needed)");
+            eprintln!("  replay               Offline replay of the updown decision core");
             eprintln!();
             eprintln!("Examples:");
             eprintln!("  pmengine run sure_bets --dry-run");
             eprintln!("  pmengine run sure_bets market_maker --max-ticks 10");
             eprintln!("  pmengine list");
+            eprintln!("  pmengine replay --mode evals --slug btc-updown-15m");
             Ok(())
         }
     }

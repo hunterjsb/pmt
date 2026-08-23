@@ -13,21 +13,23 @@ If `/health` doesn't return 200 within 2s, treat as a P1 incident.
 
 ## Common problems
 
-### `/clob/*` or `/gamma/*` returning 401
+### `/clob/*` or `/gamma/*` returning 401/403
 
-The Lambda thinks your JWT is bad. Most likely causes:
+The live Lambda authenticates with SigV4 against an `AuthType=AWS_IAM`
+Function URL (`PMPROXY_AUTH_ENABLED=false` — the Cognito JWT gate is off).
+Most likely causes:
 
-1. Your Cognito access token expired (1 hr TTL). Re-auth:
-   ```bash
-   from polymarket.cognito import CognitoAuth
-   CognitoAuth().get_token()   # forces a fresh fetch
-   ```
-2. The JWKS cache in the Lambda needs a rotation cycle. Cold-start the
-   Lambda — bump `pmproxy/Cargo.toml` patch version, push, let
-   deploy-pmproxy.yml fire, or `workflow_dispatch` the deploy.
-3. Cognito Pool ID / region mis-configured in the Lambda env. Compare
-   `PMPROXY_COGNITO_POOL_ID` / `PMPROXY_COGNITO_REGION` against
+1. Local AWS credentials expired or absent — `aws sts get-caller-identity`.
+   pmtrader signs via `polymarket/sigv4.py`, pmengine via `src/sigv4.rs`.
+2. Signing region mismatch: both default to `eu-west-1`, overridable with
+   `PMPROXY_AWS_REGION`. A signature for the wrong region reads as 403.
+3. The caller's IAM principal lacks `lambda:InvokeFunctionUrl` on the
+   function — check the Function URL's resource policy against
    `infra/pulumi/`.
+
+(The Cognito troubleshooting that used to live here applied to a JWT gate
+that is no longer the auth path; the `polymarket.cognito` helper it named
+has been deleted.)
 
 ### All routes returning 5xx
 
