@@ -41,11 +41,21 @@ def parse(slug: str) -> tuple[str, int, int, int, str] | None:
     return w["symbol"], w["dur_s"], w["start"], w["end"], series_key(w["symbol"], w["dur_s"])
 
 
+def dur_label(dur_s: int) -> str:
+    """'15m' / '4h' — a window duration in the unit its own slug names it in.
+
+    THE one duration formatter. series_key got the `h` branch when 4h windows
+    started trading; every sibling that kept its own `// 60` prints the same
+    window as '240m', a label no market, no arm and no operator uses.
+    """
+    if dur_s >= 3600 and dur_s % 3600 == 0:
+        return f"{dur_s // 3600}h"
+    return f"{dur_s // 60}m"
+
+
 def series_key(symbol: str, dur_s: int) -> str:
     """'btc 15m' from ('btc', 900); hour formats keep their own unit ('btc 4h')."""
-    if dur_s >= 3600 and dur_s % 3600 == 0:
-        return f"{symbol} {dur_s // 3600}h"
-    return f"{symbol} {dur_s // 60}m"
+    return f"{symbol} {dur_label(dur_s)}"
 
 
 def window_start(slug: str) -> float:
@@ -77,4 +87,4 @@ def display(slug: str) -> str:
     if w is None:
         return slug
     start_label = _t.strftime("%H:%M", _t.localtime(w["start"]))
-    return f"{w['symbol']} {w['dur_s'] // 60}m {start_label}"
+    return f"{series_key(w['symbol'], w['dur_s'])} {start_label}"

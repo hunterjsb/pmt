@@ -18,6 +18,7 @@ The two hard rules the dashboard is built on:
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import time
@@ -611,18 +612,36 @@ class _RollClosePair(_CollapseRule):
             # Half the pair (a --no-roll arm closing, or a roll with no close
             # recorded) still renders as its own event, never as a merged line
             # implying a fact the tape didn't carry.
-            return _render_record(rolled or closed, "")
-        w = updown_slugs.parse_updown_slug(closed.get("slug") or "")
-        shut = time.strftime("%H:%M", time.localtime(w["start"])) if w else "?"
+            return _render_record(rolled or closed, "", run.n, run.t0)
+        # ×2 like every other collapsed line: this one absorbed two records,
+        # and the panel's count is what says so. Without it a merged pair reads
+        # as one record and the tape stops adding up.
         return click.style(
-            f"{_tape_head(rolled)} {_tape_tag('ROLL')}"
-            f"{shut} closed → next window armed (${rolled.get('size', 0):g})",
+            f"{_tape_head(rolled, run.n, run.t0)} {_tape_tag('ROLL')}"
+            f"{self._shut(closed)} closed → next window armed"
+            f" (${rolled.get('size', 0):g})",
             fg="cyan")
+
+    @staticmethod
+    def _shut(closed: dict) -> str:
+        w = updown_slugs.parse_updown_slug(closed.get("slug") or "")
+        return time.strftime("%H:%M", time.localtime(w["start"])) if w else "?"
 
 
 def _best_side(sides: list[dict]) -> dict | None:
-    """The side the eval line prints — same pick as _render_record's."""
-    return max(sides, key=lambda s: s["net"], default=None)
+    """The side the eval line prints — same pick as _render_record's.
+
+    Only PRICED sides are candidates. A side the engine is quoting into rather
+    than taking from carries `ask: null` and no `net` at all, and reaching for
+    `s["net"]` on one raised straight through the collapser's crash belt — the
+    record was routed nowhere, rendered as nothing, and took every open run
+    with it. 2.2% of live evals carry such a side, all of them the maker-rest
+    shape the newest arms emit. A side with no book is not the best side; it
+    is not a side this line can print.
+    """
+    priced = [s for s in sides
+              if s.get("net") is not None and s.get("ask") is not None]
+    return max(priced, key=lambda s: s["net"], default=None)
 
 
 class TapeCollapser:
@@ -667,30 +686,35 @@ class TapeCollapser:
         if not isinstance(r, dict):
             return
         try:
-            run = self._route(r, raw)
+            run = self._route(r, raw, lines)
         except Exception:
             run = None  # a malformed record must never take the dashboard down
         if run is not None:
             try:
                 out = run.rule.render(run)
             except Exception:
-                return
-            slot = self._own_slot(run, lines)
-            if slot is None:
-                lines.append(out)
+                # This run can no longer render itself. Fall through to the raw
+                # path below rather than return: a belt that swallows a record
+                # is the failure the panel exists to prevent, and _runs.clear()
+                # down there retires the broken run.
+                run = None
             else:
-                lines[slot] = out
-            run.out = out
-            return
+                slot = self._own_slot(run, lines)
+                if slot is None:
+                    lines.append(out)
+                else:
+                    lines[slot] = out
+                run.out = out
+                return
         self._runs.clear()
         try:
             rendered = _render_record(r, raw)
         except Exception:
-            return
+            rendered = raw.rstrip()  # unrenderable, but never unseen
         if rendered:
             lines.append(rendered)
 
-    def _route(self, r: dict, raw: str) -> _Run | None:
+    def _route(self, r: dict, raw: str, lines) -> _Run | None:
         rule = next((ru for ru in self._RULES if ru.matches(r)), None)
         if rule is None:
             return None
@@ -700,7 +724,13 @@ class TapeCollapser:
         run = self._runs.get(lane)
         if (run is None or run.sig != sig
                 or not _within(run.anchor, met, rule.tolerances)
-                or not rule.continues(run, r)):
+                or not rule.continues(run, r)
+                # Its line has scrolled past _OWN_LOOKBACK and can no longer be
+                # updated. Continuing the run would append a SECOND line
+                # restating a count for records the first one already carries —
+                # the panel would then add up to more than the tape. Start
+                # fresh: the records above stay counted above.
+                or self._own_slot(run, lines) is None):
             run = self._runs[lane] = _Run(rule, arm, sig, met)
         run.n += 1
         run.t1 = r.get("t", 0.0)
@@ -888,10 +918,9 @@ _WINDOWS_COLUMNS = (
     # both sides' safety read AND a brake on one of them —
     # "armed safe  saf +0.90/-0.30  down:distrust" is 42. A gate reason
     # ("gated  margin -4.9 vs 6.0bp", 27) fits well inside that.
-    # This and `read` are the two widest cells, so a console narrower than the
-    # table's natural ~149 squeezes THEM first — which is the right place for
-    # it to land: they are diagnostic prose, and every money column is sized to
-    # its longest value and must never lose a digit.
+    # This and `read` are the two widest cells and the two the narrowing lands
+    # on — see windows_columns: they are diagnostic prose, and every money
+    # column is sized to its longest value and must never lose a digit.
     ("state", "left", 42),
     ("read", "right", 25),     # "+12.3/9.3bp p↑0.87 ρ+0.40" is 25
     ("position", "right", 15),  # "down 0.97→0.99" is 15
@@ -901,6 +930,65 @@ _WINDOWS_COLUMNS = (
     # may not have.
     ("P&L", "right", 10),
 )
+
+# The two diagnostic prose columns. Narrowing is spent on THESE, in full,
+# before any other column loses a character.
+_WINDOWS_PROSE = ("state", "read")
+# 12 = "gated  marg…" — below this the cell states a category and no evidence,
+# at which point the column is worth less than the width it costs.
+_PROSE_MIN_W = 12
+# The order whole columns are dropped in once both prose columns are at their
+# floor. `arm` (identity + lifecycle glyph), `$` and `P&L` (money) are not in
+# it and never go: an unreadable row is better than a wrong one, and a blank
+# money cell is a wrong one.
+_WINDOWS_SHED_ORDER = ("read", "state", "position", "t")
+
+
+def _table_width(cols) -> int:
+    """Console columns Rich needs for a box table of these: every column's
+    width plus its one space of padding either side, plus the box's own
+    vertical rules (one between each pair, one at each end)."""
+    return sum(w + 2 for _, _, w in cols) + len(cols) + 1
+
+
+def windows_columns(width: int | None = None) -> tuple[tuple[str, str, int], ...]:
+    """_WINDOWS_COLUMNS narrowed to what a console `width` wide can hold.
+
+    Rich's own squeeze reduces every `no_wrap` column PROPORTIONALLY, which is
+    not what this table's comment above claims and not what it needs: at 130
+    columns the P&L cell sheds a digit off "+1,234.50", at 70 it renders
+    completely blank with no ellipsis to say so, and at 100 the 14-wide `arm`
+    cell is cut to eight, so `btc 5m` and `btc 15m` render byte-identically —
+    two different windows, one row. (The `t` column, the other half of that
+    disambiguation, is squeezed to nothing at the same width.)
+
+    So the decision is made HERE, where what each column MEANS is known. The
+    two prose columns absorb the whole narrowing down to _PROSE_MIN_W; past
+    that whole columns are dropped in _WINDOWS_SHED_ORDER, and identity and
+    money keep their natural width the whole way down. `None` (the default) is
+    "no constraint" — the natural 149.
+    """
+    if width is None:
+        return _WINDOWS_COLUMNS
+    cols = [list(c) for c in _WINDOWS_COLUMNS]
+    floor = {name: (_PROSE_MIN_W if name in _WINDOWS_PROSE else w)
+             for name, _, w in _WINDOWS_COLUMNS}
+
+    def floor_width(cs) -> int:
+        return _table_width([(n, j, floor[n]) for n, j, _ in cs])
+
+    for name in _WINDOWS_SHED_ORDER:
+        if floor_width(cols) <= width:
+            break
+        cols = [c for c in cols if c[0] != name]
+    # Hand the slack back to the prose columns, in table order, up to natural.
+    slack = width - floor_width(cols)
+    for c in cols:
+        if c[0] in _WINDOWS_PROSE:
+            grow = max(0, min(c[2] - _PROSE_MIN_W, slack))
+            c[2] = _PROSE_MIN_W + grow
+            slack -= grow
+    return tuple(tuple(c) for c in cols)
 
 _STAGE_LEGEND = "○ armed · ⊘ gated · ◆ riding · ✓ won · ✗ lost"
 
@@ -1218,7 +1306,8 @@ def tape_title(remote: bool = False) -> str:
 def build_windows_table(sb: dict | None, now: float,
                         arms: dict | None = None,
                         limit: int | None = None,
-                        odds: dict | None = None) -> Table:
+                        odds: dict | None = None,
+                        width: int | None = None) -> Table:
     """The dashboard's ONE table — every window the fleet is in or has been
     in, newest first, each cell reading whichever of its two meanings the
     row's stage calls for. See the design note above.
@@ -1240,28 +1329,34 @@ def build_windows_table(sb: dict | None, now: float,
     the live head and each live row's posture, and nothing else. `odds` is the
     optional current-mark map (polymarket.positions); absent, empty or stale
     it degrades to `—` on the right of the `position` cell and nothing else.
+
+    `width` is the console width the table has to live in; the column set is
+    chosen for it (see windows_columns) rather than left to Rich's proportional
+    squeeze, which blanks money cells. None means the natural 149.
     """
     # Natural widths, not expand=True: the columns are sized to their longest
     # value, and stretching them across a 200-column terminal puts a metre of
     # whitespace between a window's size and its P&L.
     t = Table(expand=False, pad_edge=False)
-    for col, justify, width in _WINDOWS_COLUMNS:
-        t.add_column(col, justify=justify, width=width, no_wrap=True, overflow="ellipsis")
+    cols = windows_columns(width)
+    for col, justify, w_ in cols:
+        t.add_column(col, justify=justify, width=w_, no_wrap=True, overflow="ellipsis")
     rows = window_rows(sb, arms, limit)
+    cells = {
+        "arm": _arm_cell, "t": lambda w: _t_cell(w, now),
+        "state": lambda w: _state_cell(w, now), "read": _read_cell,
+        "position": lambda w: _position_cell(w, odds),
+        "$": _money_cell, "P&L": _window_pnl_cell,
+    }
     for w in rows:
-        t.add_row(
-            _arm_cell(w),
-            _t_cell(w, now),
-            _state_cell(w, now),
-            _read_cell(w),
-            _position_cell(w, odds),
-            _money_cell(w),
-            _window_pnl_cell(w),
-        )
+        t.add_row(*(cells[name](w) for name, _, _ in cols))
     if not rows:
-        # In the state cell, the widest one: a placeholder that ellipsizes is
-        # worse than a short honest one, and this is the only column with room.
-        t.add_row("—", "—", "[dim]no windows[/dim]", "—", "—", "—", "—")
+        # In the state cell where there is one, the widest column: a
+        # placeholder that ellipsizes is worse than a short honest one.
+        empty = {"state": "[dim]no windows[/dim]", "arm": "[dim]no windows[/dim]"}
+        names = [name for name, _, _ in cols]
+        first = "state" if "state" in names else "arm"
+        t.add_row(*(empty[first] if name == first else "—" for name in names))
     return t
 
 
@@ -1475,12 +1570,37 @@ def header_note(snap: dict, render_err: str | None = None):
     return t
 
 
-def header_height(snap: dict, render_err: str | None = None) -> int:
-    """Terminal rows the header panel will occupy — its rows, the failure line
-    if there is one, plus the border. The watch layout sizes its head slot from
-    this, the same way it sizes the arms slot from the arm count."""
-    return (len(header_rows(snap))
-            + (1 if header_note(snap, render_err) is not None else 0) + 2)
+# The grid at its natural size, in a panel: four fixed columns, a space of
+# padding either side of each, the panel's own padding and its border.
+_HEAD_NATURAL_W = (_HEAD_LABEL_W + _HEAD_V1_W + _HEAD_V2_W + _HEAD_V3_W
+                   + 4 * 2 + 2 + 2)
+
+
+def header_height(snap: dict, render_err: str | None = None,
+                  width: int | None = None) -> int:
+    """Terminal rows the header panel will occupy, MEASURED by rendering it.
+
+    It used to be `len(header_rows) + note + border`, which assumes one grid
+    line per row. Two rows break that assumption at EVERY width: `engine_row`
+    and `feed_row` carry prose in columns sized for money (22 and 26 characters
+    in the 20- and 22-wide `overflow="fold"` columns), so they always paint two
+    grid lines, and a feed row explaining a dropped websocket paints three. The
+    watch layout sized its head slot to the undercount and Rich cropped the
+    bottom off the panel — taking the border and the `stats Ns ago · stale`
+    freshness subtitle with it, exactly when the engine is unreachable and the
+    operator most needs to know how stale the numbers on screen are.
+
+    Measured rather than re-derived because the fold is Rich's arithmetic, not
+    ours: word breaks make a cell's line count more than its length over the
+    column width. `width` is the console it will paint into (the grid is fixed
+    width, so anything at or above its natural size folds identically).
+    """
+    from rich.console import Console
+
+    console = Console(width=max(width or _HEAD_NATURAL_W, 20),
+                      file=io.StringIO(), force_terminal=False, no_color=True)
+    return len(console.render_lines(build_header_panel(snap, "", render_err),
+                                    pad=False))
 
 
 def _header_subtitle(snap: dict) -> str:

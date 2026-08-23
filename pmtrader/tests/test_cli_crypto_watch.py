@@ -883,3 +883,172 @@ def test_a_desktop_waking_from_an_idle_spell_never_claims_remote(monkeypatch, tm
     feed.drain(collapser, lines)                   # ...gets there first
     assert len(lines) == 1
     assert feed.remote is False, "the local file served this; the title must not move"
+
+
+# ---------- conservation: the panel adds up to the tape ----------
+#
+# THE law this section exists for, and the one the tape panel silently broke:
+#
+#     every record the panel is fed is either RENDERED as its own line, or
+#     counted inside a rendered run's ×N. Nothing is unaccounted.
+#
+# A collapse SUMMARISES — the counter says what it absorbed. A drop LOSES. The
+# two are indistinguishable on screen, which is why they have to be told apart
+# by a test. Measured on the live 25MB `updown-tape.jsonl` before the fix, a
+# 5,000-record slice put 1,014 records on the panel and threw 3,965 away:
+# 100% of ROLLs, 90% of window closes, and four of the seven armed symbols
+# never appeared at all. The cause was `TapeFeed.accept` gating on `t` alone
+# while the engine writes ONE `t` per fleet tick shared by every arm's record.
+#
+# The fixture below is that shape — one `t` per tick, every arm speaking on it
+# — so the suite carries the bug's own conditions rather than a tidy tape that
+# never had them.
+
+import json as _json           # noqa: E402
+import random as _random       # noqa: E402
+import re as _re               # noqa: E402
+
+import click as _click         # noqa: E402
+
+_FLEET = ("btc-updown-5m", "eth-updown-5m", "sol-updown-5m", "xrp-updown-5m",
+          "btc-updown-15m", "eth-updown-15m", "sol-updown-15m")
+_TICK_S = 5.0                  # the engine's eval throttle
+_AGG_AT = 9                    # _tape_head: "HH:MM:SS " then the fixed ×N cell
+
+
+def _fleet_tape(n: int = 5000, t0: float = 1787500000.0, seed: int = 7) -> list[str]:
+    """`n` raw tape lines shaped like the live fleet's.
+
+    One `t` per tick, shared by every armed arm — and doubled at a window
+    boundary, where each arm emits its close AND its roll on that same `t`
+    (the live tape's max multiplicity is 14, which is exactly this).
+    """
+    rnd = _random.Random(seed)
+    out: list[dict] = []
+    start = {s: t0 for s in _FLEET}
+    t = t0
+    while len(out) < n:
+        for base in _FLEET:
+            dur = 300 if base.endswith("5m") else 900
+            slug = f"{base}-{int(start[base])}"
+            if t >= start[base] + dur:
+                out.append({"t": t, "ev": "cleanup", "slug": slug})
+                start[base] = t
+                out.append({"t": t, "ev": "roll", "size": 100.0,
+                            "slug": f"{base}-{int(t)}"})
+                continue
+            draw = rnd.random()
+            if draw < 0.01:
+                out.append({"t": t, "ev": "fire", "slug": slug, "side": "up",
+                            "size": 20.0, "ask": 0.88, "fair": 0.9412,
+                            "net": 0.0612, "rho": 0.31, "committed": 17.6})
+            elif draw < 0.7:
+                out.append({"t": t, "ev": "gated", "slug": slug,
+                            "margin_bp": round(rnd.uniform(-9, 1), 2),
+                            "guard_bp": 6.0, "up_ask": 0.52, "dn_ask": 0.49,
+                            "reason": "basis guard: projected margin inside"})
+            else:
+                p = round(rnd.uniform(0.3, 0.7), 4)
+                out.append({"t": t, "ev": "eval", "slug": slug, "p_up": p,
+                            "rho": round(rnd.uniform(-0.4, 0.4), 2),
+                            "committed": round(rnd.uniform(0, 200), 2),
+                            "sides": [
+                                {"side": "up", "ask": 0.52, "safety": 0.4,
+                                 "net": round(rnd.uniform(-0.05, 0.05), 4)},
+                                # The maker-quoting side: no ask, and so no net
+                                # at all. 2.2% of live evals carry one.
+                                {"side": "down", "ask": None, "safety": -0.4,
+                                 "maker_px": 0.985, "maker_size": 10.0}
+                                if draw > 0.95 else
+                                {"side": "down", "ask": 0.49, "safety": -0.4,
+                                 "net": round(rnd.uniform(-0.05, 0.05), 4)}]})
+        t += _TICK_S
+    return [_json.dumps(r) for r in out[:n]]
+
+
+def _absorbed(lines) -> int:
+    """How many records the panel's own lines SAY they stand for: one each,
+    plus whatever a collapsed line's ×N counter claims it swallowed. Read out
+    of the fixed aggregation cell, which is where every line type puts it."""
+    total = 0
+    for ln in lines:
+        cell = _click.unstyle(ln)[_AGG_AT:_AGG_AT + watch_ui._TAPE_AGG_WIDTH]
+        m = _re.search(r"×(\d+)", cell)
+        total += int(m.group(1)) if m else 1
+    return total
+
+
+def _replay(raws):
+    """Drive the real TapeFeed + TapeCollapser over raw lines, exactly as the
+    render loop does. An unbounded list, not the panel's deque: conservation is
+    a fact about the collapser, and a maxlen would scroll the evidence off."""
+    feed = cw.TapeFeed(path="/nonexistent/no-local-tape.jsonl")
+    collapser, lines = watch_ui.TapeCollapser(), []
+    accepted = sum(1 for raw in raws if feed.accept(raw, collapser, lines))
+    return accepted, lines
+
+
+def test_every_record_is_rendered_or_counted_in_a_rendered_run():
+    """THE conservation law. 5,000 records in; rendered + absorbed = 5,000."""
+    raws = _fleet_tape(5000)
+    accepted, lines = _replay(raws)
+
+    assert accepted == 5000, f"the cursor dropped {5000 - accepted} records"
+    assert _absorbed(lines) == 5000, (
+        f"{len(lines)} lines account for {_absorbed(lines)} of 5000 records")
+    assert len(lines) < 5000, "nothing collapsed at all — the rule stopped working"
+
+
+def test_the_fleet_shares_one_t_per_tick_which_is_what_broke_the_cursor():
+    """The fixture's own premise, pinned: if this ever stops holding, the
+    conservation test above is passing on a tape the engine does not write."""
+    ts = [_json.loads(r)["t"] for r in _fleet_tape(5000)]
+    from collections import Counter
+    mult = Counter(ts)
+    assert max(mult.values()) >= 14
+    assert sum(1 for a, b in zip(ts, ts[1:]) if a == b) > len(ts) * 0.7
+
+
+def test_every_fire_reaches_the_panel():
+    """A fire is a real trade and a singular event. Two live ones were
+    suppressed by the cursor; a fire that leaves no line is a trade the
+    operator never saw."""
+    raws = _fleet_tape(5000)
+    fires = sum(1 for r in raws if _json.loads(r)["ev"] == "fire")
+    _, lines = _replay(raws)
+    rendered = sum(1 for ln in lines if "FIRE UP" in _click.unstyle(ln))
+    assert fires > 0 and rendered == fires
+
+
+def test_every_roll_reaches_the_panel_as_the_consolidated_line():
+    """100% of ROLLs were dropped: the roll and its close share the close's
+    `t` with every other arm on the fleet. Each roll gets exactly one line,
+    and it is the merged close→armed one."""
+    raws = _fleet_tape(5000)
+    rolls = sum(1 for r in raws if _json.loads(r)["ev"] == "roll")
+    _, lines = _replay(raws)
+    roll_lines = [ln for ln in lines if "ROLL" in _click.unstyle(ln)]
+    assert rolls > 0 and len(roll_lines) == rolls
+    assert all("closed → next window armed" in _click.unstyle(ln)
+               for ln in roll_lines[:-1])  # the last may be a half pair at the cut
+
+
+def test_no_armed_symbol_is_starved_off_the_panel():
+    """Four of seven armed symbols never appeared at all: the cursor kept the
+    lexically-first slug of each tick and threw the rest of the fleet away, so
+    a quiet panel read as a quiet fleet."""
+    raws = _fleet_tape(5000)
+    _, lines = _replay(raws)
+    plain = [_click.unstyle(ln) for ln in lines]
+    for base in _FLEET:
+        sym, _, dur = base.split("-")
+        assert any(f"{sym} {dur} " in ln for ln in plain), f"{sym} {dur} is missing"
+
+
+def test_a_collapsed_line_never_claims_more_records_than_it_absorbed():
+    """The other half of conservation: a run whose line scrolled out of reach
+    used to append a SECOND line restating the whole count, so the panel added
+    up to 8% MORE records than the tape carried."""
+    raws = _fleet_tape(2000)
+    _, lines = _replay(raws)
+    assert _absorbed(lines) == 2000

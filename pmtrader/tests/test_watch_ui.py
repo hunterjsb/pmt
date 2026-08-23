@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import time
 from collections import deque
+from unittest import mock
 
 import click
 import pytest
@@ -1176,8 +1177,12 @@ def test_a_window_close_and_its_roll_render_as_one_line():
     # both windows are still named: the one that shut and the one now armed
     assert cc._tape_slug(_BTC_NEXT) in line
     assert time.strftime("%H:%M", time.localtime(1700000000)) in line
-    # and it keeps the fixed geometry every other tape line has
-    assert line[_agg_col():_agg_col() + cc._TAPE_AGG_WIDTH].strip() == ""
+    # and it keeps the fixed geometry every other tape line has — including
+    # the count, which is what says this ONE line absorbed TWO records. A
+    # merged pair that reported ×1 was the tape's last hole: the panel stopped
+    # adding up to the file it is reading.
+    assert click.unstyle(line)[_agg_col():_agg_col() + cc._TAPE_AGG_WIDTH] \
+        .strip().endswith("×2")
 
 
 def test_the_pair_merges_per_arm_when_the_whole_fleet_rolls_at_once():
@@ -1255,17 +1260,53 @@ def test_a_torn_line_is_dropped_without_ending_a_run():
     assert len(lines) == 1 and "×2" in click.unstyle(lines[0])
 
 
-def test_a_malformed_record_is_dropped_rather_than_taking_the_dashboard_down():
-    # sides without "net" is the shape that raises inside the best-side pick —
-    # in the classifier AND in the renderer. Both are belted: the record is
-    # dropped, the deque is untouched, and nothing propagates.
+def test_a_side_with_no_book_is_not_the_best_side_and_never_costs_a_record():
+    """A side the engine is QUOTING into carries `ask: null` and no `net` at
+    all — 2.2% of live evals, all of them the maker-rest shape. Reaching for
+    `s["net"]` on one raised straight through the collapser's crash belts, so
+    the record was routed nowhere, rendered as nothing, and took every open
+    run with it. It is a side with no book, not a malformed record."""
     c = cc.TapeCollapser()
     lines = deque()
+    quoting = [{"side": "up", "ask": 0.97, "net": 0.01, "safety": 0.4},
+               {"side": "down", "ask": None, "maker_px": 0.985,
+                "maker_rest": 0.985, "maker_size": 10.0, "safety": -0.4}]
     c.add(json.dumps(_eval(0)), lines)
-    c.add(json.dumps(_eval(1, sides=[{"side": "up"}])), lines)
+    c.add(json.dumps(_eval(1, sides=quoting)), lines)
     c.add(json.dumps(_eval(2)), lines)
-    assert len(lines) == 2  # the run, then a fresh line after the break
-    assert "×" not in click.unstyle(lines[-1])
+    # Three records in, three counted: the middle one used to be swallowed AND
+    # to clear the run, so the panel showed two lines standing for two records.
+    assert len(lines) == 1, lines
+    assert "×3" in click.unstyle(lines[0]), lines[0]
+    assert "up @ 0.97" in click.unstyle(lines[0])
+
+    # ...and when EVERY side is unpriced there is simply no book to print.
+    only_quoting = deque()
+    cc.TapeCollapser().add(
+        json.dumps(_eval(0, sides=[quoting[1]])), only_quoting)
+    assert len(only_quoting) == 1
+    assert "no book" in click.unstyle(only_quoting[0])
+
+
+def test_a_record_the_renderer_chokes_on_is_shown_raw_never_swallowed():
+    # The belts stay — a bad record must not take the dashboard down — but
+    # "belted" may not mean "gone": the panel exists to show what the tape
+    # said, so an unrenderable record falls back to its own raw line.
+    c = cc.TapeCollapser()
+    lines = deque()
+    original = cc._render_record
+
+    def boom(r, raw, n=1, t0=None):
+        if r.get("t") == _T0 + 1:
+            raise ValueError("no")
+        return original(r, raw, n, t0)
+
+    c.add(json.dumps(_eval(0)), lines)
+    with mock.patch.object(cc, "_render_record", boom):
+        c.add(json.dumps(_eval(1)), lines)
+    c.add(json.dumps(_eval(2)), lines)
+    assert len(lines) == 3, lines
+    assert json.loads(lines[1])["t"] == _T0 + 1   # the raw record itself
 
 
 # --- deque ownership ---
@@ -1296,16 +1337,20 @@ def test_ownership_is_identity_not_equal_text():
     assert "×2" in click.unstyle(lines[0])
 
 
-def test_a_run_whose_line_has_scrolled_out_of_reach_appends_instead():
+def test_a_run_whose_line_has_scrolled_out_of_reach_starts_a_fresh_one():
     # Past the lookback the run's line is off where the operator is looking;
-    # editing it there would be an invisible update.
+    # editing it there would be an invisible update. The new line must open a
+    # FRESH count, not restate a total: the record on the line above is already
+    # counted up there, and a ×2 down here would have the panel claiming more
+    # records than the tape carries.
     c = cc.TapeCollapser()
     lines = deque(maxlen=200)
     c.add(json.dumps(_eval(0)), lines)
     for i in range(cc._OWN_LOOKBACK + 1):
         lines.append(f"other {i}")
     c.add(json.dumps(_eval(1)), lines)
-    assert "×2" in click.unstyle(lines[-1])
+    assert "×" not in click.unstyle(lines[-1])
+    assert "p↑" in click.unstyle(lines[-1])
     assert lines[0].endswith("in") or "p↑" in click.unstyle(lines[0])
 
 
@@ -1549,3 +1594,172 @@ def test_the_refresh_legend_still_names_every_cadence():
     for secs in (cw.ENGINE_EVERY_S, cw.SB_EVERY_S, cw.ODDS_EVERY_S,
                  cw.BAL_EVERY_S, cw.TAPE_EVERY_S):
         assert f"{secs:g}s" in line, f"{secs}s cadence is not in the help modal"
+
+
+# ---------- the squeeze: what a narrow console may and may not cost ----------
+#
+# Rich squeezes every `no_wrap` column PROPORTIONALLY when the console is
+# narrower than the table. Applied to a table whose columns are money, identity
+# and prose alike, that produced three failures the dashboard may not have:
+# money cells shedding digits from 130 columns and rendering BLANK (no
+# ellipsis, nothing) at 70; the 14-wide `arm` cell cut to eight at 100, so two
+# different windows of one symbol rendered byte-identically; and the whole
+# lifecycle glyph gone at 50. windows_columns makes the width decision here
+# instead, where the columns' meanings are known.
+
+_SQ_WIDTHS = (200, 149, 140, 130, 120, 110, 100, 90, 80, 70, 60, 50)
+
+
+def _sq_rows(width):
+    """The windows table's body rows at `width`, plain text."""
+    from rich.console import Console
+
+    now = 1700000000.0
+    sb = {"windows": [{"slug": "eth-updown-5m-1699999700", "won": False,
+                       "pnl": -12436.76, "notional": 9500.0, "entry_px": 0.97,
+                       "side": "up", "shares": 20, "entry_ts": now - 600,
+                       "end_ts": now - 300, "est": False}],
+          "riding_windows": []}
+    arms = {slug: {"roll": True, "eval": {
+        "state": "armed", "mode": "safe", "p_up": 0.55, "rho": 0.1,
+        "committed": 100.0, "banked_bp": 5.0, "cushion_bp": 9.3,
+        "sides": [{"side": "up", "safety": 0.9, "net": 0.01, "ask": 0.5}]}}
+        for slug in ("btc-updown-5m-9999999999", "btc-updown-15m-9999999999")}
+    c = Console(record=True, width=width, no_color=True)
+    c.print(cc.build_windows_table(sb, now, arms=arms, width=width))
+    return [ln for ln in c.export_text().splitlines() if ln.startswith("│")]
+
+
+def test_a_money_column_never_loses_a_digit_however_narrow_the_console():
+    """The table's own stated invariant, and the one it was breaking: "every
+    money column is sized to its longest value and must never lose a digit"."""
+    for width in _SQ_WIDTHS:
+        rows = _sq_rows(width)
+        assert any("-12,436.76" in ln for ln in rows), (width, rows)
+        assert any("$9,500.00" in ln for ln in rows), (width, rows)
+
+
+def test_a_money_cell_is_never_blank_and_never_ellipsised():
+    """At 70 columns the P&L cell rendered EMPTY — not truncated, not "…",
+    blank — which reads as "no P&L" rather than "no room"."""
+    for width in _SQ_WIDTHS:
+        pnl = [ln for ln in _sq_rows(width) if "-12,436" in ln or "9,500" in ln]
+        assert pnl, width
+        assert "…" not in pnl[0].split("$")[-1], (width, pnl[0])
+
+
+def test_two_windows_of_one_symbol_never_render_as_the_same_row():
+    """`_arm_label` drops the window clock because "the `t` column counts down
+    to that same window's end" — but `t` is the first column Rich's squeeze
+    zeroed, so both disambiguators failed together and `btc 5m` and `btc 15m`
+    became one row."""
+    for width in _SQ_WIDTHS:
+        rows = _sq_rows(width)
+        assert len(set(rows)) == len(rows), (width, rows)
+        assert any("btc 15m" in ln for ln in rows), (width, rows)
+        assert any("btc 5m" in ln for ln in rows), (width, rows)
+
+
+def test_the_lifecycle_glyph_survives_to_the_narrowest_dashboard():
+    """The failure 70b9b31 says it fixed, at a different threshold: at 50
+    columns the whole `arm` column was squeezed to width 1 and rendered
+    blank."""
+    for width in _SQ_WIDTHS:
+        rows = _sq_rows(width)
+        assert any("✗ eth 5m" in ln for ln in rows), (width, rows)
+        assert any("○ btc" in ln for ln in rows), (width, rows)
+
+
+def test_the_narrowing_is_spent_on_the_prose_columns_first():
+    """Which columns pay is the whole design: the two diagnostic prose columns
+    absorb it, and are dropped outright before identity or money loses a
+    character."""
+    assert cc.windows_columns(None) == cc._WINDOWS_COLUMNS
+    keep = {"arm", "$", "P&L"}
+    for width in _SQ_WIDTHS:
+        names = [n for n, _, _ in cc.windows_columns(width)]
+        assert keep <= set(names), (width, names)
+        widths = {n: w for n, _, w in cc.windows_columns(width)}
+        for name, _, natural in cc._WINDOWS_COLUMNS:
+            if name in widths and name not in cc._WINDOWS_PROSE:
+                assert widths[name] == natural, (width, name)
+        assert cc._table_width(cc.windows_columns(width)) <= width, width
+
+
+def test_the_column_set_only_ever_shrinks_as_the_console_does():
+    """No width may bring a column back that a wider one had dropped —
+    the panel must not gain detail as the terminal loses room."""
+    prev = None
+    for width in range(240, 49, -1):
+        names = {n for n, _, _ in cc.windows_columns(width)}
+        if prev is not None:
+            assert names <= prev, width
+        prev = names
+
+
+# ---------- the header's height is what it paints ----------
+
+def _hdr_actual(snap, err, width):
+    from rich.console import Console
+
+    c = Console(record=True, width=width, no_color=True)
+    c.print(cc.build_header_panel(snap, "since 08-23 04:00Z", err))
+    return len([ln for ln in c.export_text().splitlines() if ln.strip()])
+
+
+_CLIP_SNAP = {"sb": cc._SB_EMPTY, "bal": None, "sb_fetched_at": None,
+              "sb_stale": True, "err": None}
+_ENGINE_DOWN = dict(_CLIP_SNAP, status={})
+_FEED_DOWN = dict(_CLIP_SNAP, status={
+    "arms": {"btc-updown-5m-1": {"feed": "rtds"}},
+    "rtds": {"started": True, "connected": False, "events": 5, "events_per_s": 3.0,
+             "last_event_age_s": 12.0, "consumers": 1, "reconnects": 4,
+             "err": "websocket closed 1006 abnormal closure, retrying"}})
+
+
+@pytest.mark.parametrize("snap", [_ENGINE_DOWN, _FEED_DOWN])
+@pytest.mark.parametrize("width", [200, 120, 100, 90])
+def test_the_header_slot_is_sized_to_what_the_panel_actually_paints(snap, width):
+    """`engine_row` and `feed_row` carry PROSE in columns sized for money — 22
+    and 26 characters in the 20- and 22-wide fold columns — so they paint two
+    and three grid lines while a per-row count said one. The layout sized the
+    head slot to the undercount and Rich cropped the panel's bottom off,
+    taking the border and the `stats Ns ago · stale` freshness line with it,
+    exactly when the engine is unreachable and staleness matters most.
+    """
+    assert cc.header_height(snap, None, width) == _hdr_actual(snap, None, width)
+
+
+@pytest.mark.parametrize("snap", [_ENGINE_DOWN, _FEED_DOWN])
+def test_the_clipped_header_keeps_its_freshness_line(snap):
+    """What the crop actually cost: the subtitle that says how old the numbers
+    are. It is the last line of the panel, so it goes first."""
+    from rich.console import Console
+
+    c = Console(record=True, width=120, no_color=True)
+    c.print(cc.build_header_panel(snap, "since 08-23 04:00Z", None))
+    painted = [ln for ln in c.export_text().splitlines() if ln.strip()]
+    assert "stale" in painted[-1]
+    assert len(painted) <= cc.header_height(snap, None, 120)
+
+
+# ---------- durations are labelled in their own unit ----------
+
+def test_a_four_hour_window_is_never_labelled_240m():
+    """`series_key` got the `h` branch when 4h windows started trading; its
+    sibling formatters kept their own `// 60` and printed the same window as
+    `240m`, a label no market, no arm and no operator uses."""
+    from polymarket import updown_slugs
+
+    assert updown_slugs.series_key("btc", 14400) == "btc 4h"
+    assert updown_slugs.dur_label(14400) == "4h"
+    assert updown_slugs.dur_label(900) == "15m"
+    assert updown_slugs.dur_label(300) == "5m"
+    # 90m is not "1h" — only whole hours get the h form, or the label lies.
+    assert updown_slugs.dur_label(5400) == "90m"
+
+    shown = updown_slugs.display("btc-updown-4h-1787443200")
+    assert shown.startswith("btc 4h ") and "240m" not in shown
+    # ...and the watch tape's own label, which renders through it
+    assert "240m" not in cc._tape_slug("btc-updown-4h-1787443200")
+    assert cc._arm_label("btc-updown-4h-1787443200") == "btc 4h"
