@@ -1851,7 +1851,7 @@ def _tape_scoreboard(floor: float) -> dict:
         rows = requests.get(
             "https://data-api.polymarket.com/activity",
             params={"user": addr, "limit": 500, "offset": offset},
-            headers=hosts.UA, timeout=15,
+            headers=hosts.UA, timeout=8,
         ).json() or []
         for a in rows:
             slug = a.get("slug") or ""
@@ -2024,7 +2024,14 @@ def crypto_watch(since: float | None) -> None:
     except FileNotFoundError:
         pass
 
-    sb = _tape_scoreboard(floor)
+    # The dashboard must outlive every upstream hiccup: stale numbers with a
+    # marker, never a traceback to the terminal.
+    sb_stale = False
+    try:
+        sb = _tape_scoreboard(floor)
+    except Exception:
+        sb = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "series": {}, "cal": {}}
+        sb_stale = True
     status: dict = {}
     bal: dict = {}
 
@@ -2034,9 +2041,10 @@ def crypto_watch(since: float | None) -> None:
         wr = f"{wins / n * 100:.0f}%" if n else "—"
         cap = f"${bal['total']:,.2f}" if bal else "…"
         color = "green" if net >= 0 else "red"
+        stale = " · [yellow dim]stats stale[/]" if sb_stale else ""
         return Panel(
             f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L [{color}]{net:+,.2f}[/] · "
-            f"{sb['rolls']} rolls · capital {cap} · [dim]{_t.strftime('%H:%M:%S')}[/dim]",
+            f"{sb['rolls']} rolls · capital {cap}{stale} · [dim]{_t.strftime('%H:%M:%S')}[/dim]",
             title="updown fleet", border_style="cyan")
 
     def arms_table() -> Table:
@@ -2088,8 +2096,12 @@ def crypto_watch(since: float | None) -> None:
                                               {"action": "status"})
                     except Exception:
                         status = {}
-                if tick % 10 == 0:
-                    sb = _tape_scoreboard(floor)
+                if tick % 30 == 0 and tick > 0:
+                    try:
+                        sb = _tape_scoreboard(floor)
+                        sb_stale = False
+                    except Exception:
+                        sb_stale = True
                 # Balance is a slow call — after first paint, then per minute.
                 if tick % 60 == 1:
                     try:
