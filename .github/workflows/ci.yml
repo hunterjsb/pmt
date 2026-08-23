@@ -105,6 +105,43 @@ jobs:
         working-directory: ${{ matrix.crate }}
         run: cargo test
 
+  characterization:
+    # Frozen real, wallet-graded windows (pmengine/fixtures) replayed through
+    # the updown decision core. A failure here is a FINDING, not a chore: the
+    # engine changed behaviour on a trade that actually happened. Triage it —
+    # regenerating an expectation is a deliberate act that belongs in the PR
+    # body, never a way to get CI green. See pmengine/fixtures/README.md.
+    #
+    # Its own job rather than a step inside build-rust so it is visible by
+    # name and cannot be dropped by a change to the test filter.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pmengine
+
+      - name: Build
+        working-directory: pmengine
+        run: cargo build --features ec2
+
+      - name: Replay the committed fixtures
+        working-directory: pmengine
+        # HOME is redirected at an empty directory: the suite must pass on a
+        # machine that has never run the engine, and a fixture that quietly
+        # read ~/.pmt would sail through here otherwise. The binary is invoked
+        # directly (not `cargo run`) because cargo itself wants a real HOME.
+        run: |
+          mkdir -p "$RUNNER_TEMP/no-home"
+          HOME="$RUNNER_TEMP/no-home" ./target/debug/pmengine \
+            --log-level warn replay --fixtures fixtures
+
   cargo-audit:
     # RUSTSEC advisory check on Cargo.lock for both Rust crates. Fails CI on
     # any vulnerability so we notice + refresh deps promptly. The binstall

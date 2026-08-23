@@ -41,6 +41,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
+pub mod fixtures;
+
 pub struct ReplayOpts {
     pub mode: String,
     pub tape: Option<PathBuf>,
@@ -98,6 +100,15 @@ struct ParamsFileEntry {
     tunables: Option<TunablesOverride>,
 }
 
+/// One `--params` array entry as a value — the shape a fixture embeds so
+/// that "as-armed params" mean the same thing in both entry points.
+pub(crate) fn params_from_value(v: &Value) -> Result<(ArmParams, Option<Tunables>), String> {
+    let e: ParamsFileEntry =
+        serde_json::from_value(v.clone()).map_err(|e| format!("parse params: {}", e))?;
+    let tun = e.tunables.map(Tunables::from);
+    Ok((e.p, tun))
+}
+
 fn load_params_map(path: Option<&Path>) -> Result<HashMap<String, (ArmParams, Option<Tunables>)>, String> {
     let Some(path) = path else { return Ok(HashMap::new()) };
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
@@ -152,7 +163,7 @@ fn load_outcomes(path: Option<&Path>) -> Result<HashMap<String, String>, String>
 
 // --- tape loading / grouping -------------------------------------------
 
-fn load_jsonl(path: &Path) -> Result<Vec<Value>, String> {
+pub(crate) fn load_jsonl(path: &Path) -> Result<Vec<Value>, String> {
     let f = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
     let mut out = Vec::new();
     for line in std::io::BufReader::new(f).lines() {
@@ -200,10 +211,26 @@ fn group_by_slug(records: &[Value], query: &str) -> Vec<(String, Vec<Value>)> {
 /// Missing/unreadable tape degrades to empty rather than failing the run:
 /// the comparison is a bonus, not a requirement for replay to work.
 #[derive(Default, Clone)]
-struct RealTally {
-    fires: usize,
-    notional: f64,
-    first_fire_t: Option<f64>,
+pub(crate) struct RealTally {
+    pub(crate) fires: usize,
+    pub(crate) notional: f64,
+    pub(crate) first_fire_t: Option<f64>,
+}
+
+/// One window's live fire tally, counted off records already in hand — the
+/// fixture form of `load_real_tally`, which reads a whole tape file.
+pub(crate) fn real_tally_from(records: &[Value]) -> RealTally {
+    let mut tally = RealTally::default();
+    for rec in records {
+        if rec.get("ev").and_then(|v| v.as_str()) != Some(EV_FIRE) {
+            continue;
+        }
+        let t = rec["t"].as_f64().unwrap_or(0.0);
+        tally.fires += 1;
+        tally.notional += rec["ask"].as_f64().unwrap_or(0.0) * rec["size"].as_f64().unwrap_or(0.0);
+        tally.first_fire_t = Some(tally.first_fire_t.map_or(t, |a: f64| a.min(t)));
+    }
+    tally
 }
 
 fn load_real_tally(path: &Path) -> HashMap<String, RealTally> {
@@ -438,12 +465,28 @@ fn replay_evals_window(
     outcome_override: Option<String>,
     real: &RealTally,
 ) -> Value {
+    replay_evals_window_traced(p, tun, recs, outcome_override, real).0
+}
+
+/// `replay_evals_window` plus the decision tape decide() emitted along the
+/// way — the SAME records the live engine appends to updown-tape.jsonl.
+/// Characterization fixtures assert against those records rather than
+/// re-deriving fire side/mode from the fill sim, so a fixture pins the
+/// engine's own account of what it did.
+pub(crate) fn replay_evals_window_traced(
+    p: &ArmParams,
+    tun: Option<Tunables>,
+    recs: &[Value],
+    outcome_override: Option<String>,
+    real: &RealTally,
+) -> (Value, Vec<Value>) {
     let mut arm = ArmState::with_params(p.clone());
     arm.subscribed = true;
     if let Some(t) = tun {
         arm.tunables = t;
     }
     let mut sim = FillSim::default();
+    let mut trace: Vec<Value> = Vec::new();
     let mut last_p_up: Option<f64> = None;
 
     for rec in recs {
@@ -455,12 +498,14 @@ fn replay_evals_window(
                 let model = model_from_eval_record(rec, p_up, p);
                 let view = view_from_sides(&rec["sides"], &sim);
                 let out = arm.decide(&view, Ok(model), now);
+                trace.extend(out.tape.iter().cloned());
                 apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate);
             }
             EV_GATED => {
                 // decide()'s Err branch never reads `view` — a default is
                 // fine, we're only here to keep gate bookkeeping faithful.
                 let out = arm.decide(&ArmView::default(), Err(gate_from_record(rec)), now);
+                trace.extend(out.tape.iter().cloned());
                 apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate);
             }
             _ => {} // fire/roll/cleanup — real fires come from the shared tally
@@ -471,7 +516,7 @@ fn replay_evals_window(
         last_p_up.map(|p_up| if p_up >= 0.5 { "up".to_string() } else { "down".to_string() })
     });
     let pnl = outcome.as_deref().map(|w| settle_pnl(&sim, p, w));
-    build_report(&p.slug, "evals", &sim, real, outcome, pnl)
+    (build_report(&p.slug, "evals", &sim, real, outcome, pnl), trace)
 }
 
 /// Rebuild the model read that a recorded `eval` line captured. One
@@ -733,18 +778,36 @@ fn replay_full_window(
     real: &RealTally,
 ) -> Result<Value, String> {
     let rows = klines_for_window(&p.symbol, p.start as i64, p.end as i64)?;
+    Ok(replay_full_window_with(&rows, p, tun, recs, outcome_override, real).0)
+}
+
+/// Full-mode replay over klines the caller already holds — the offline seam.
+///
+/// `klines_for_window` is this module's ONLY network path; a fixture run
+/// never reaches it, because the fixture carries its own kline slice and
+/// hands it in here. That is a structural guarantee, not an env var CI
+/// might forget to set (issue #5, Phase 3).
+pub(crate) fn replay_full_window_with(
+    rows: &BTreeMap<i64, Kline>,
+    p: &ArmParams,
+    tun: Option<Tunables>,
+    recs: &[Value],
+    outcome_override: Option<String>,
+    real: &RealTally,
+) -> (Value, Vec<Value>) {
     let mut arm = ArmState::with_params(p.clone());
     arm.subscribed = true;
     if let Some(t) = tun {
         arm.tunables = t;
     }
     let mut sim = FillSim::default();
+    let mut trace: Vec<Value> = Vec::new();
 
     for rec in recs {
         let now = rec["t"].as_f64().unwrap_or(0.0);
         let spot = rec["spot"].as_f64().unwrap_or(0.0);
         let spot_age = rec["spot_age_s"].as_f64().unwrap_or(0.0);
-        let feed = feed_state_at(&rows, p.start as i64, spot, now - spot_age, now);
+        let feed = feed_state_at(rows, p.start as i64, spot, now - spot_age, now);
         // Static guard only — replay has no recorded oracle-sample corpus
         // (yet; oracle-tape.jsonl starts accumulating once the dynamic
         // guard runs live), so pass the operator's param unchanged: replay
@@ -753,12 +816,13 @@ fn replay_full_window(
         let model = eval_model(p, &feed, now, p.basis_guard_bp);
         let view = view_from_book_record(rec, &sim, p);
         let out = arm.decide(&view, model, now);
+        trace.extend(out.tape.iter().cloned());
         apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate);
     }
 
-    let outcome = outcome_override.or_else(|| settle_winner(&rows, p.start as i64, p.end as i64));
+    let outcome = outcome_override.or_else(|| settle_winner(rows, p.start as i64, p.end as i64));
     let pnl = outcome.as_deref().map(|w| settle_pnl(&sim, p, w));
-    Ok(build_report(&p.slug, "full", &sim, real, outcome, pnl))
+    (build_report(&p.slug, "full", &sim, real, outcome, pnl), trace)
 }
 
 fn run_full(opts: &ReplayOpts) -> Result<(), String> {
