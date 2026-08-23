@@ -156,11 +156,15 @@ R3 → R5/R6/R1 → R7/R8/R9.
 
 ## Operating rules while the roadmap runs
 
-Posture: keep the braked directional fleet live at current (or modestly reduced) size,
-instrument everything, force the harness to reproduce reality, then promote only what
-survives R4 and the calibration gate.
+Posture: keep the braked directional fleet live at current size, instrument everything,
+force the harness to reproduce reality, then promote only what survives R4 and the
+calibration gate. Operator-approved bump 2026-08-23 (post-brakes/σ-floor/R9-instrumentation):
+btc5m 400/50, btc15m 350/25, eth5m+15m 350/50, sol5m unchanged 150/25 — weighted toward the
+wallet's proven edge (btc5m 30-1), clips deliberately NOT raised (clip size is the brake
+system's risk-rate lever), SOL flat until R1's aligned basis verdict.
 
-- No size increases anywhere without an R2 calibration pass.
+- No further size increases without an R2 calibration pass (the 2026-08-23 bump above is
+  the operator's call and the new baseline).
 - Never loosen the three brakes (15¢ distrust, 2¢ no-averaging-down, final-120s unlock)
   or the basis guards without a replay A/B win — they encode the paid-for lessons.
 - 5m arms stay at current size (experimental class) until R4 settles; XRP stays off until R1.
