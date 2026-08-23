@@ -7,10 +7,15 @@ import pytest
 
 from polymarket import chainlink
 from polymarket.chainlink import (
+    aligned_stats,
     basis_stats,
     join_basis,
     join_round_id,
+    per_minute_basis,
+    settlement_basis,
+    signed_bias,
     split_round_id,
+    twap_over_window,
 )
 
 
@@ -133,3 +138,67 @@ def test_basis_stats_handles_negative_basis_via_abs():
     assert s["mean"] == pytest.approx(0.4)
     # max_abs looks at magnitude regardless of sign
     assert s["max_abs"] == pytest.approx(10.0)
+
+
+# ---------- aligned basis: TWAP-vs-TWAP (R1) ----------
+
+def _rounds(prices_by_t: dict[int, float]) -> list[dict]:
+    return [{"round_id": i, "price": p, "updated_at": t}
+            for i, (t, p) in enumerate(sorted(prices_by_t.items()))]
+
+
+def test_twap_over_window_holds_step_value():
+    rounds = _rounds({0: 100.0, 30: 200.0})
+    ts = [r["updated_at"] for r in rounds]
+    # half the window at 100, half at 200 -> average 150
+    assert twap_over_window(rounds, ts, 0, 60) == pytest.approx(150.0)
+
+
+def test_twap_over_window_none_without_carry_in():
+    rounds = _rounds({100: 100.0})
+    ts = [r["updated_at"] for r in rounds]
+    assert twap_over_window(rounds, ts, 0, 60) is None  # no round at/before start=0
+
+
+def test_twap_over_window_none_when_stale_entering():
+    rounds = _rounds({0: 100.0})
+    ts = [r["updated_at"] for r in rounds]
+    # start=1000 is >ALIGNED_STALE_S past the only round
+    assert twap_over_window(rounds, ts, 1000, 1060) is None
+
+
+def test_per_minute_basis_matches_marks():
+    rounds = _rounds({0: 100.0, 60: 102.0})
+    marks = {60: 101.0}  # minute [60,120) needs a round before 60 -> carries 102.0
+    out = per_minute_basis(rounds, marks)
+    assert len(out) == 1
+    assert out[0]["t"] == 60
+    assert out[0]["basis_bp"] == pytest.approx((102.0 / 101.0 - 1) * 1e4)
+
+
+def test_settlement_basis_uses_ck_window_and_prior_minute_mark():
+    # 305 just past the 300s boundary so last_end covers it; doesn't affect the [270,300) TWAP itself
+    rounds = _rounds({0: 100.0, 270: 110.0, 305: 115.0})
+    marks = {240: 105.0}  # mark(end - 60) for end=300
+    out = settlement_basis(rounds, marks, period_s=300, ck_window_s=30)
+    assert len(out) == 1
+    assert out[0]["t"] == 300
+    assert out[0]["basis_bp"] == pytest.approx((110.0 / 105.0 - 1) * 1e4)
+
+
+def test_aligned_stats_shape_and_percentiles():
+    rows = [{"basis_bp": v} for v in [-5.0, 1.0, 2.0, 3.0, 4.0]]
+    s = aligned_stats(rows)
+    assert s["n"] == 5
+    assert s["p50"] == pytest.approx(3.0)  # median of sorted abs values [1,2,3,4,5]
+    assert s["max"] == pytest.approx(5.0)
+
+
+def test_aligned_stats_empty_is_none():
+    assert aligned_stats([]) is None
+
+
+def test_signed_bias_keeps_sign_unlike_aligned_stats():
+    rows = [{"basis_bp": v} for v in [-10.0, -10.0]]
+    assert signed_bias(rows) == pytest.approx(-10.0)
+    assert signed_bias([]) == 0.0
