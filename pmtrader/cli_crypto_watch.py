@@ -27,9 +27,9 @@ from cli_crypto_stats import _tape_scoreboard
 from engine import post as _engine_post
 from polymarket import positions, tape, wallet
 from watch_ui import (
-    _SB_EMPTY, _cbreak_stdin, _controls_panel, _restore_stdin, _wait_key,
-    build_arms_table, build_header_panel, build_trades_table,
-    build_windows_strip, header_height, trade_rows, trades_title,
+    _SB_EMPTY, _cbreak_stdin, _restore_stdin, _wait_key, build_arms_table,
+    build_header_panel, build_help_modal, build_windows_table, header_height,
+    window_rows, windows_title,
 )
 
 
@@ -46,7 +46,7 @@ from watch_ui import (
 # Why it is split at all: docs/LESSONS.md#L28.
 
 
-# Fetch cadences — keep in sync with the line in _controls_panel().
+# Fetch cadences — keep in sync with watch_ui._REFRESH_LINE.
 ENGINE_EVERY_S = 2.0
 SB_EVERY_S = 10.0
 ODDS_EVERY_S = 30.0       # per-position marks: a display feed, not a control input
@@ -59,22 +59,22 @@ WORKER_JOIN_S = 0.25
 KEY_POLL_S = 0.05         # 20Hz key polling — the perceived-latency budget
 RENDER_EVERY_S = 1.0      # repaint cadence when no key changed anything
 
-# Trades panel geometry. TRADES_MAX_ROWS is a VIEW cap, and the panel title
-# names it ("last N decided · M riding") — a cap the operator can't see reads
-# as a dropped trade, which is the confusion this panel exists to end.
-# 8, not 6: a five-arm fleet rolls five windows at once, and at 6 a single
-# roll cycle filled the panel and pushed the previous cycle off before the
-# operator could see how any of it resolved.
-TRADES_MAX_ROWS = 8
-TRADES_CHROME = 6         # panel border (2) + table border/header/rule (4)
-MIN_TAPE_ROWS = 6         # the tape never gets squeezed below this for a trade row
-STRIP_H = 3               # the recent-windows / controls slot
+# Windows panel geometry. WINDOWS_MAX_ROWS is a VIEW cap, and the panel title
+# names it ("N of M") — a cap the operator can't see reads as a dropped
+# window, which is the confusion this panel exists to end.
+# 11, not 8: the panel absorbed the recent-windows strip's three rows, and it
+# now also carries the fleet's LIVE windows at the top, so a five-arm fleet
+# spends five rows before the decided tail starts. At 8 the tail a roll cycle
+# left behind was pushed off before the operator saw how any of it resolved.
+WINDOWS_MAX_ROWS = 11
+WINDOWS_CHROME = 6        # panel border (2) + table border/header/rule (4)
+MIN_TAPE_ROWS = 6         # the tape never gets squeezed below this for a window row
 HEAD_MIN_H = 5            # header border + the four rows it always paints
 
 
-def trades_rows_shown(console_h: int, arms_h: int, n_rows: int,
-                      head_h: int = HEAD_MIN_H) -> int:
-    """Trade rows this screen can hold: what there is, capped, and never so
+def windows_rows_shown(console_h: int, arms_h: int, n_rows: int,
+                       head_h: int = HEAD_MIN_H) -> int:
+    """Window rows this screen can hold: what there is, capped, and never so
     many that the tape stops being readable.
 
     The panel is BUILT to this number rather than clipped to it — a table cut
@@ -84,10 +84,32 @@ def trades_rows_shown(console_h: int, arms_h: int, n_rows: int,
 
     `head_h` is the header panel's live height (watch_ui.header_height): it
     grows a row for the settlement feed and for a render error, and the tape
-    is what pays for that, never the trades panel's floor of one row.
+    is what pays for that, never the windows panel's floor of one row.
     """
-    room = console_h - head_h - STRIP_H - arms_h - MIN_TAPE_ROWS - TRADES_CHROME
-    return max(1, min(TRADES_MAX_ROWS, n_rows, room))
+    room = console_h - head_h - arms_h - MIN_TAPE_ROWS - WINDOWS_CHROME
+    return max(1, min(WINDOWS_MAX_ROWS, n_rows, room))
+
+
+def handle_key(key: str | None, show_help: bool) -> tuple[bool, bool, bool]:
+    """One keypress -> `(quit, show_help, dirty)`.
+
+    THE key contract. watch_ui.WATCH_KEYS lists exactly what this reacts to and
+    a test drives it both ways, so a key with no panel line (or a panel line
+    with no key behind it) fails rather than ships.
+
+    `q` closes the modal before it quits: a foreground panel that the quit key
+    punched straight through would cost the operator their dashboard on a
+    stray press. Ctrl-C is a signal, not a key, and still leaves from anywhere.
+    """
+    if key == "h":
+        return False, not show_help, True
+    if key == "\x1b":
+        # Dirty only if it actually closed something — an idle esc must not
+        # force a repaint the loop's 1Hz cadence didn't ask for.
+        return False, False, show_help
+    if key == "q":
+        return (False, False, True) if show_help else (True, show_help, False)
+    return False, show_help, False
 
 
 class WatchState:
@@ -224,10 +246,10 @@ class WatchFetcher:
               help="Sliding-window floor for the header's recent P&L: "
                    "hours-ago if small, raw unix epoch if large (default: "
                    "last 6h — a live dashboard cares about the recent pulse). "
-                   "All-time P&L, and the riding/recent-windows figures, "
+                   "All-time P&L, and the riding/windows-table figures, "
                    "always walk the full wallet history regardless of this.")
 def crypto_watch(since: float | None) -> None:
-    """Full-screen live dashboard: risk header + arms + trades + streaming tape."""
+    """Full-screen live dashboard: risk header + arms + windows + streaming tape."""
     import time as _t
     from collections import deque
     from datetime import datetime, timezone
@@ -271,18 +293,20 @@ def crypto_watch(since: float | None) -> None:
     def arms_table() -> Table:
         return build_arms_table(snap["status"].get("arms"), _t.time())
 
-    def strip_panel() -> Panel:
-        sb = snap["sb"]
-        return Panel(Text.from_markup(build_windows_strip(sb.get("windows"),
-                                                          sb.get("riding_windows"))),
-                     title="recent windows", subtitle="[dim]h = controls[/dim]",
-                     border_style="dim")
+    def windows_panel(rows: int) -> Panel:
+        sb, arms = snap["sb"], snap["status"].get("arms")
+        return Panel(build_windows_table(sb, _t.time(), arms=arms, limit=rows,
+                                         odds=snap.get("odds")),
+                     title=windows_title(sb, arms, rows),
+                     # The strip carried the "h" hint; it lives on the panel
+                     # that gained the strip's glyphs.
+                     subtitle="[dim]h · controls[/dim]", border_style="dim")
 
-    def trades_panel(rows: int) -> Panel:
-        sb = snap["sb"]
-        return Panel(build_trades_table(sb, _t.time(), limit=rows,
-                                        odds=snap.get("odds")),
-                     title=trades_title(sb, rows), border_style="dim")
+    def _modal(width: int):
+        """The controls panel centred over the whole screen — a modal reads as
+        one because it is the only thing on it, not because Rich composites."""
+        from rich.align import Align
+        return Align.center(build_help_modal(width), vertical="middle")
 
     def tape_panel(height: int) -> Panel:
         shown = list(lines)[-max(height - 2, 1):]
@@ -297,12 +321,11 @@ def crypto_watch(since: float | None) -> None:
     layout.split_column(
         Layout(name="head", size=HEAD_MIN_H),
         Layout(name="arms", size=10),
-        Layout(name="trades", size=TRADES_MAX_ROWS + TRADES_CHROME),
-        Layout(name="strip", size=STRIP_H),
+        Layout(name="windows", size=WINDOWS_MAX_ROWS + WINDOWS_CHROME),
         Layout(name="tape", ratio=1),
     )
 
-    show_controls = False
+    show_help = False
     next_render = 0.0
     saved_term = _cbreak_stdin()
     worker.start()
@@ -313,12 +336,9 @@ def crypto_watch(since: float | None) -> None:
                 # 'q'/'h' are seen within ~50ms no matter what the worker is
                 # doing. Nothing below this line touches the network.
                 key = _wait_key(KEY_POLL_S)
-                if key == "q":
+                quit_now, show_help, dirty = handle_key(key, show_help)
+                if quit_now:
                     break
-                dirty = False
-                if key == "h":
-                    show_controls = not show_controls
-                    dirty = True  # a toggle repaints now, not on the next second
                 now = time.time()
                 if not dirty and now < next_render:
                     continue
@@ -345,18 +365,16 @@ def crypto_watch(since: float | None) -> None:
                     # for a render error; size the slot to what it will paint
                     # or Rich clips the row that says what broke.
                     layout["head"].size = header_height(snap, render_err)
-                    n_trades = trades_rows_shown(live.console.size.height,
-                                                  layout["arms"].size,
-                                                  len(trade_rows(snap["sb"])),
-                                                  layout["head"].size)
-                    layout["trades"].size = n_trades + TRADES_CHROME
+                    n_win = windows_rows_shown(
+                        live.console.size.height, layout["arms"].size,
+                        len(window_rows(snap["sb"], snap["status"].get("arms"))),
+                        layout["head"].size)
+                    layout["windows"].size = n_win + WINDOWS_CHROME
                     layout["head"].update(header())
                     layout["arms"].update(arms_table())
-                    layout["trades"].update(trades_panel(n_trades))
-                    layout["strip"].update(
-                        _controls_panel() if show_controls else strip_panel())
-                    h = (live.console.size.height - layout["head"].size - STRIP_H
-                         - layout["arms"].size - layout["trades"].size)
+                    layout["windows"].update(windows_panel(n_win))
+                    h = (live.console.size.height - layout["head"].size
+                         - layout["arms"].size - layout["windows"].size)
                     layout["tape"].update(tape_panel(h))
                     render_err = None
                 except KeyboardInterrupt:
@@ -368,6 +386,11 @@ def crypto_watch(since: float | None) -> None:
                         layout["head"].update(header())
                     except Exception:
                         pass
+                # The modal is FOREGROUND: it takes the screen while open. The
+                # dashboard behind it is still rebuilt every frame above (and
+                # the fetch worker never pauses), so dismissing restores the
+                # live frame, not the one that was up when 'h' was pressed.
+                live.update(_modal(live.console.size.width) if show_help else layout)
                 live.refresh()
     except KeyboardInterrupt:
         pass
