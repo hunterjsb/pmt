@@ -330,8 +330,8 @@ def test_flag_column_fits_every_marker_at_once():
     assert flags.strip() == "⟳≈◇", row
     assert "…" not in flags, row
     # ...and the header still names what the column now holds.
-    header = next(ln for ln in out if "window" in ln)
-    assert "flags" in header and "roll" not in header
+    header = next(ln for ln in out if "T-" in ln and "flags" in ln)
+    assert "arm" in header and "roll" not in header
 
 
 def test_committed_column_fits_a_resting_bid_beside_a_four_figure_fill():
