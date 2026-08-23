@@ -2,14 +2,15 @@
 parsing, evidence/countdown color thresholds, the tape log's fixed-width
 alignment, the risk header's committed/undecided math, the merged windows
 table (lifecycle glyphs, live/riding/decided merge, retention), the controls
-modal, the arms table's column geometry, and the terminal-mode helpers.
+modal, and the column geometry every panel holds to.
 
 Every dashboard render function must tolerate a missing/partial eval (an
 engine restart mid-watch leaves last_eval None or half-built) — several tests
 below exist specifically to pin that behavior down.
 
-The fetch/grade side of the same dashboard is tested in
-test_cli_crypto_watch.py and test_cli_crypto_stats.py.
+The fetch/grade side of the same dashboard, and the terminal-mode helpers its
+input loop owns, are tested in test_cli_crypto_watch.py and
+test_cli_crypto_stats.py.
 """
 
 from __future__ import annotations
@@ -1478,63 +1479,6 @@ def test_composed_frame_puts_each_fact_in_its_own_place():
     # phrase is the unambiguous fingerprint
     assert "un-decided" not in rest, "exposure renders exactly once, in the panel"
 
-class _FakeStdin:
-    def __init__(self, isatty=True, chars=""):
-        self._isatty = isatty
-        self._chars = chars
-
-    def isatty(self):
-        return self._isatty
-
-    def read(self, n):
-        ch, self._chars = self._chars[:n], self._chars[n:]
-        return ch
-
-    def fileno(self):
-        return 0
-
-
-def test_cbreak_stdin_noop_when_not_a_tty(monkeypatch):
-    monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=False))
-    assert cc._cbreak_stdin() is None
-    cc._restore_stdin(None)  # must not raise
-
-
-def test_poll_key_none_when_not_a_tty(monkeypatch):
-    monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=False))
-    assert cc._poll_key() is None
-
-
-def test_poll_key_reads_q_when_ready(monkeypatch):
-    monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=True, chars="q"))
-    monkeypatch.setattr(cc.select, "select", lambda r, w, x, t: ([0], [], []))
-    monkeypatch.setattr(cc.os, "read", lambda fd, n: b"q")
-    assert cc._poll_key() == "q"
-
-
-def test_poll_key_returns_other_keys_lowercased(monkeypatch):
-    monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=True, chars="x"))
-    monkeypatch.setattr(cc.select, "select", lambda r, w, x, t: ([0], [], []))
-    monkeypatch.setattr(cc.os, "read", lambda fd, n: b"H")
-    assert cc._poll_key() == "h"
-
-
-def test_poll_key_none_when_nothing_ready(monkeypatch):
-    monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=True, chars=""))
-    monkeypatch.setattr(cc.select, "select", lambda r, w, x, t: ([], [], []))
-    assert cc._poll_key() is None
-
-
-def test_quit_requested_swallows_select_errors(monkeypatch):
-    monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=True))
-
-    def boom(*a, **k):
-        raise OSError("bad fd")
-
-    monkeypatch.setattr(cc.select, "select", boom)
-    assert cc._poll_key() is None  # never raises, dashboard must survive
-
-
 # ---------- the controls modal ----------
 
 def _modal_text(width=160):
@@ -1573,30 +1517,6 @@ def test_the_modal_fits_a_narrow_terminal():
     for width in (60, 78, 200):
         for ln in _modal_text(width).splitlines():
             assert len(ln) <= min(width, cc._HELP_MODAL_W), (width, ln)
-
-
-def test_poll_key_passes_timeout_through_to_select(monkeypatch):
-    seen = {}
-
-    def fake_select(r, w, x, t):
-        seen["timeout"] = t
-        return ([], [], [])
-
-    monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=True))
-    monkeypatch.setattr(cc.select, "select", fake_select)
-    assert cc._poll_key() is None
-    assert seen["timeout"] == 0.0          # default stays non-blocking
-    assert cc._poll_key(0.05) is None
-    assert seen["timeout"] == 0.05         # the watch loop's 20Hz pacing
-
-
-def test_wait_key_without_a_tty_paces_instead_of_spinning(monkeypatch):
-    slept = []
-    monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=False))
-    monkeypatch.setattr(cc.time, "sleep", lambda s: slept.append(s))
-    assert cc._wait_key(0.05) is None
-    assert slept == [0.05]  # no tty to select on -> the sleep is the pacing
-
 
 
 def test_committed_never_renders_negative_zero():

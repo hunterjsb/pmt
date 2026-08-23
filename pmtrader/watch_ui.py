@@ -14,21 +14,13 @@ The two hard rules the dashboard is built on:
     _TAPE_TAG_WIDTH, _TAPE_AGG_WIDTH), so the layout never jitters as
     state/reason text changes tick to tick, and every panel puts a given
     kind of figure at the same offset every frame.
-
-Also holds the tty-mode helpers, since cbreak/key-polling exists only to serve
-this dashboard's input loop.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
-import select
-import sys
-import termios
 import time
-import tty
 
 import click
 from rich.table import Table
@@ -299,9 +291,8 @@ def _tape_agg(n: int, t_end: float = 0.0) -> str:
     Span and count share ONE fixed cell, right after the line's own clock, so
     "when + how many" is a single glance and both read at the same offset on
     every line type. The clock to its left is the run's FIRST record, so the
-    pair brackets exactly what the line covers; the span used to trail the
-    body, where it landed at a different column on every line and only
-    repeated the clock it already had.
+    pair brackets exactly what the line covers. It may not trail the body: a
+    variable-width body puts it at a different column on every line.
 
     Plain text, never styled: it is concatenated into lines that are styled
     as a whole, and a nested reset would drop the rest of the line's color.
@@ -421,9 +412,8 @@ def _render_record(r: dict, raw: str, n: int = 1, t0: float | None = None) -> st
 # ONE grouping rule for evals and gates alike: a lane per arm, a signature that
 # is the line's own discrete state, anchored tolerances the width of the
 # numbers as displayed, and a lifetime that ends on the arm's next contrary
-# record. Gates used to collapse fleet-wide on a lane of their own, which read
-# as a different mechanism on the same screen — and lost the collapse entirely
-# whenever another arm's eval landed between two of them.
+# record. A fleet-wide gate lane would read as a second mechanism on the same
+# screen, and would break every time another arm spoke between two gates.
 
 _NUM_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
 
@@ -883,10 +873,10 @@ _WINDOWS_COLUMNS = (
     # the glyph — the right order of importance.
     ("arm", "left", 14),
     ("t", "right", 6),         # T- past "59:59" on a not-yet-open window
-    # Sized for the arms table's own worst case, which is a normal state and
-    # not a corner: an armed arm with both sides' safety read AND a brake on
-    # one of them — "armed safe  saf +0.90/-0.30  down:distrust" is 42. The
-    # gate reason ("gated  margin -4.9 vs 6.0bp", 27) fits well inside that.
+    # Sized for the widest NORMAL live state, not a corner: an armed arm with
+    # both sides' safety read AND a brake on one of them —
+    # "armed safe  saf +0.90/-0.30  down:distrust" is 42. A gate reason
+    # ("gated  margin -4.9 vs 6.0bp", 27) fits well inside that.
     # This and `read` are the two widest cells, so a console narrower than the
     # table's natural ~149 squeezes THEM first — which is the right place for
     # it to land: they are diagnostic prose, and every money column is sized to
@@ -895,9 +885,9 @@ _WINDOWS_COLUMNS = (
     ("read", "right", 25),     # "+12.3/9.3bp p↑0.87 ρ+0.40" is 25
     ("position", "right", 15),  # "down 0.97→0.99" is 15
     ("$", "right", 15),        # "$1,234.56 ◇$450" is 15
-    # 10, not 9: "-12,436.76" is a P&L this fleet has actually printed, and at
-    # 9 the cell ellipsised a digit off it — the one failure a money column may
-    # not have.
+    # 10, not 9: a five-figure loss ("-12,436.76") is a P&L this fleet can
+    # print, and at 9 the cell sheds a digit — the one failure a money column
+    # may not have.
     ("P&L", "right", 10),
 )
 
@@ -930,8 +920,8 @@ def _stage(w: dict) -> str:
 
 
 def _stage_cell(w: dict) -> str:
-    """The one-glyph lifecycle column. Dim for an ~estimated verdict, same
-    lower-confidence convention the P&L cell and the old chips used."""
+    """The one-glyph lifecycle column. Dim for an ~estimated verdict, the same
+    lower-confidence convention the P&L cell uses."""
     glyph, style = _STAGE_GLYPH.get(_stage(w), ("⊘", "dim"))
     return f"[{'dim' if w.get('est') else style}]{glyph}[/]"
 
@@ -962,8 +952,7 @@ def _window_pnl_cell(w: dict) -> str:
     "N ~estimated".
 
     Deliberately NOT the armed/gated word: the `state` cell two columns left
-    already says it, in colour and with its reason, and the same word twice in
-    one row is the duplication the fold exists to end.
+    already says it, in colour and with its reason.
     """
     stage = _stage(w)
     if stage == "riding":
@@ -976,9 +965,9 @@ def _window_pnl_cell(w: dict) -> str:
 
 def _t_cell(w: dict, now: float) -> str:
     """One column, one axis: how far this window is from its own end — the T-
-    countdown while it is still open (the arms table's column, verbatim), the
-    age since it closed after that. A live arm and a decided trade are asking
-    the same question from opposite sides of the same instant."""
+    countdown while it is still open, the age since it closed after that. A
+    live arm and a decided trade ask the same question from opposite sides of
+    the same instant."""
     end_ts = float(w.get("end_ts") or 0.0)
     if not end_ts:
         return "[dim]—[/dim]"
@@ -988,7 +977,7 @@ def _t_cell(w: dict, now: float) -> str:
 
 
 def _live_state_text(e: dict) -> str:
-    """The arms table's `state` cell: the compact gate reason for a gated arm,
+    """A live window's `state` cell: the compact gate reason for a gated arm,
     the regime label plus safety/brake badges for an armed one. Every branch
     tolerates a missing or half-built eval — an engine restart mid-watch leaves
     last_eval None or partial, and the row must keep painting."""
@@ -1011,9 +1000,9 @@ def _state_cell(w: dict, now: float) -> str:
     """What this row is about right now: the ENGINE's posture while the window
     is live, the position's exposure once the arm has left it behind.
 
-    The stage-repurposing that let the arms table fold in — an armed window has
-    no exposure to report and a rolled-away one has no engine reading it, so
-    one column carries whichever of the two exists.
+    One column repurposed by stage: an armed window has no exposure to report
+    and a rolled-away one has no engine reading it, so the column carries
+    whichever of the two exists.
     """
     if w.get("live"):
         return _live_state_text(w.get("eval") or {})
@@ -1029,8 +1018,8 @@ def _state_cell(w: dict, now: float) -> str:
 
 def _read_cell(w: dict) -> str:
     """The model's case while the window is live — banked-vs-cushion evidence,
-    p↑ and ρ, the three arms-table columns that only mean anything before a
-    verdict — and what we actually took once it is settled."""
+    p↑ and ρ, the three figures that only mean anything before a verdict —
+    and what we actually took once it is settled."""
     if w.get("live"):
         e = w.get("eval") or {}
         bits = []
@@ -1218,11 +1207,9 @@ def build_windows_table(sb: dict | None, now: float,
         ✓  eth 5m      10m   held 2m45s                    10sh in 14:31              down 0.95→1.00 $95.00   +12.30
 
     Renders EVERY row it is handed (the caller caps via `limit`), so a window
-    the scoreboard knows about is always on screen somewhere — the guarantee
-    the chip strip could not make, because it only ever carried decided
-    windows. A riding row has to survive the arm rolling AWAY from that
-    window: the position stays ours until the wallet grades it, and this is
-    where the operator watches it land.
+    the scoreboard knows about is always on screen somewhere. A riding row
+    must survive the arm rolling AWAY from that window: the position stays
+    ours until the wallet grades it.
 
     Every cell tolerates a missing or half-built eval — an engine restart
     mid-watch leaves last_eval None or partial, and the row must keep painting
@@ -1230,9 +1217,8 @@ def build_windows_table(sb: dict | None, now: float,
 
     `arms` is the engine's already-fetched /status arms mapping: it supplies
     the live head and each live row's posture, and nothing else. `odds` is the
-    optional current-mark map (polymarket.positions), fetched on the watch
-    worker's slow cadence; absent, empty or stale it degrades to `—` on the
-    right of the `position` cell and changes nothing else.
+    optional current-mark map (polymarket.positions); absent, empty or stale
+    it degrades to `—` on the right of the `position` cell and nothing else.
     """
     # Natural widths, not expand=True: the columns are sized to their longest
     # value, and stretching them across a 200-column terminal puts a metre of
@@ -1295,8 +1281,8 @@ def _arm_cell(w: dict) -> str:
 
 
 def engine_row(status: dict | None) -> tuple | None:
-    """The arms table's red "engine unreachable or no arms" placeholder, kept
-    alive as a header row after the fold, or None while something is armed.
+    """The red "engine unreachable or no arms" placeholder as a header row, or
+    None while something is armed.
 
     It has to live somewhere: with no arms there are no live rows for the
     windows table to hang it on, the decided tail below keeps painting exactly
@@ -1308,65 +1294,6 @@ def engine_row(status: dict | None) -> tuple | None:
         return None
     return ("engine", "[red]unreachable or no arms[/red]",
             "[dim]nothing is armed right now[/dim]", "")
-
-
-def _cbreak_stdin() -> tuple[int, list] | None:
-    """Put stdin in cbreak (no line buffering, no echo) so a single 'q'
-    keypress is visible without Enter — SIGINT stays enabled (cbreak, unlike
-    raw mode, leaves ISIG alone), so Ctrl-C still works. None when stdin
-    isn't a real tty (piped input, a test harness) — termios would just raise.
-    """
-    if not sys.stdin.isatty():
-        return None
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    tty.setcbreak(fd)
-    return fd, old
-
-
-def _restore_stdin(saved: tuple[int, list] | None) -> None:
-    """Undo _cbreak_stdin — must run even on an exception, or the shell is
-    left echo-less after the dashboard exits."""
-    if saved is None:
-        return
-    fd, old = saved
-    try:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    except Exception:
-        pass
-
-
-def _poll_key(timeout: float = 0.0) -> str | None:
-    """The waiting keypress (lowercased) or None. `timeout` is the select
-    wait in seconds; 0 (the default) polls without blocking at all.
-
-    os.read on the raw fd, NEVER sys.stdin.read — see docs/LESSONS.md#L30.
-    """
-    if not sys.stdin.isatty():
-        return None
-    try:
-        fd = sys.stdin.fileno()
-        ready, _, _ = select.select([fd], [], [], timeout)
-        if not ready:
-            return None
-        ch = os.read(fd, 1)
-        return ch.decode(errors="ignore").lower() or None
-    except Exception:
-        return None
-
-
-def _wait_key(timeout: float) -> str | None:
-    """Wait up to `timeout` for one keypress — the watch loop's ONLY pacing.
-
-    The loop sleeps inside select(), so a keypress wakes it within
-    microseconds instead of sitting in the tty buffer behind a sleep(1) and
-    whatever network work followed it. With no tty (piped input, a test
-    harness) there's nothing to select on, so it just paces the loop.
-    """
-    if not sys.stdin.isatty():
-        time.sleep(timeout)
-        return None
-    return _poll_key(timeout)
 
 
 _SB_EMPTY_SLIDING = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "estimated": 0}
@@ -1402,10 +1329,10 @@ def build_help_modal(width: int | None = None):
     refresh cadences.
 
     A FOREGROUND panel, not a strip — it takes the screen while it is open,
-    which is what let the legends grow past the single line the old three-row
-    controls slot could hold. The `--since` explanation is back on screen here
-    for the same reason: it changes what the header's `recent` row means, and
-    `--help` is not reachable without leaving the dashboard.
+    which is what gives the legends more than the single line an inline
+    controls strip could hold. `--since` is explained here for the same
+    reason: it changes what the header's `recent` row means, and `--help` is
+    not reachable without leaving the dashboard.
 
     Nothing here fetches. The data workers keep running underneath, so
     dismissing the panel restores a live frame rather than a frozen one.

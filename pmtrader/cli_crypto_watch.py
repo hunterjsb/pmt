@@ -15,8 +15,13 @@ Pairs with watch_ui.py, which owns every render function this uses.
 
 from __future__ import annotations
 
+import os
+import select
+import sys
+import termios
 import threading
 import time
+import tty
 
 import click
 
@@ -26,10 +31,70 @@ from cli_crypto_stats import _tape_scoreboard
 from engine import post as _engine_post
 from polymarket import positions, tape, wallet
 from watch_ui import (
-    _SB_EMPTY, _cbreak_stdin, _restore_stdin, _wait_key, build_header_panel,
-    build_help_modal, build_windows_table, header_height, window_rows,
-    windows_title,
+    _SB_EMPTY, build_header_panel, build_help_modal, build_windows_table,
+    header_height, window_rows, windows_title,
 )
+
+
+# ---------- terminal mode + key polling ----------
+
+def _cbreak_stdin() -> tuple[int, list] | None:
+    """Put stdin in cbreak (no line buffering, no echo) so a single 'q'
+    keypress is visible without Enter — SIGINT stays enabled (cbreak, unlike
+    raw mode, leaves ISIG alone), so Ctrl-C still works. None when stdin
+    isn't a real tty (piped input, a test harness) — termios would just raise.
+    """
+    if not sys.stdin.isatty():
+        return None
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    return fd, old
+
+
+def _restore_stdin(saved: tuple[int, list] | None) -> None:
+    """Undo _cbreak_stdin — must run even on an exception, or the shell is
+    left echo-less after the dashboard exits."""
+    if saved is None:
+        return
+    fd, old = saved
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        pass
+
+
+def _poll_key(timeout: float = 0.0) -> str | None:
+    """The waiting keypress (lowercased) or None. `timeout` is the select
+    wait in seconds; 0 (the default) polls without blocking at all.
+
+    os.read on the raw fd, NEVER sys.stdin.read — see docs/LESSONS.md#L30.
+    """
+    if not sys.stdin.isatty():
+        return None
+    try:
+        fd = sys.stdin.fileno()
+        ready, _, _ = select.select([fd], [], [], timeout)
+        if not ready:
+            return None
+        ch = os.read(fd, 1)
+        return ch.decode(errors="ignore").lower() or None
+    except Exception:
+        return None
+
+
+def _wait_key(timeout: float) -> str | None:
+    """Wait up to `timeout` for one keypress — the watch loop's ONLY pacing.
+
+    The loop sleeps inside select(), so a keypress wakes it within
+    microseconds instead of sitting in the tty buffer behind a sleep(1) and
+    whatever network work followed it. With no tty (piped input, a test
+    harness) there's nothing to select on, so it just paces the loop.
+    """
+    if not sys.stdin.isatty():
+        time.sleep(timeout)
+        return None
+    return _poll_key(timeout)
 
 
 # ---------- watch: the render/fetch split ----------
@@ -61,10 +126,9 @@ RENDER_EVERY_S = 1.0      # repaint cadence when no key changed anything
 # Windows panel geometry. WINDOWS_MAX_ROWS is a VIEW cap, and the panel title
 # names it ("N of M") — a cap the operator can't see reads as a dropped
 # window, which is the confusion this panel exists to end.
-# 16, not 8: this is now the dashboard's ONLY table. It inherited the
-# recent-windows strip's three rows and the arms table's whole slot, and it
-# carries the fleet's LIVE windows at the top — so a five-arm fleet spends
-# five rows before the decided tail even starts.
+# 16 because this is the dashboard's ONLY table and it carries the fleet's
+# LIVE windows at the top: a five-arm fleet spends five rows before the
+# decided tail even starts.
 WINDOWS_MAX_ROWS = 16
 WINDOWS_CHROME = 6        # panel border (2) + table border/header/rule (4)
 MIN_TAPE_ROWS = 6         # the tape never gets squeezed below this for a window row
@@ -196,8 +260,8 @@ class WatchFetcher:
 
     def _status_failed(self, exc: BaseException) -> None:
         # Deliberately NOT the last good arms: a stale committed-$ figure on a
-        # trading dashboard is worse than the arms table's red "engine
-        # unreachable or no arms", which is what an empty status renders as.
+        # trading dashboard is worse than the red "engine unreachable or no
+        # arms" an empty status renders as.
         self.state.update(status={})
 
     def _sb_failed(self, exc: BaseException) -> None:
@@ -295,8 +359,8 @@ def crypto_watch(since: float | None) -> None:
         return Panel(build_windows_table(sb, _t.time(), arms=arms, limit=rows,
                                          odds=snap.get("odds")),
                      title=windows_title(sb, arms, rows),
-                     # The strip carried the "h" hint; it lives on the panel
-                     # that gained the strip's glyphs.
+                     # The "h" hint rides the panel whose glyphs the modal
+                     # explains.
                      subtitle="[dim]h · controls[/dim]", border_style="dim")
 
     def _modal(width: int):
