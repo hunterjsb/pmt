@@ -149,7 +149,10 @@ R3 → R5/R6/R1 → R7/R8/R9.
    spread / pauses quotes (R8's VPIN). pascal-labs forensics = the behavioral blueprint of
    a profitable MM on exactly our market class.
 2. **Tail-snipe** — final 30–60s, banked-decided/flip-proof only, a formalization of the mode
-   we already trust.
+   we already trust. Extension candidate (2026-08-23): the 4h up/down series' final stretch is
+   the same trade — arm 4h windows with high min_elapsed and harvest banked-decided books with
+   the identical code path. Needs a look at 4h near-expiry liquidity first; adds zero
+   diversification (same ρ), so it waits for R7's fleet cap like everything else here.
 3. **Complete-set scanner** — Up + Down < $1.00 after fees; structural, low-directional.
 4. **Two-sided inventory rotator with directional tilt** — the pattern profitable wallets
    actually run at scale; biggest build, needs maker infra first.
@@ -161,7 +164,10 @@ force the harness to reproduce reality, then promote only what survives R4 and t
 calibration gate. Operator-approved bump 2026-08-23 (post-brakes/σ-floor/R9-instrumentation):
 btc5m 400/50, btc15m 350/25, eth5m+15m 350/50, sol5m unchanged 150/25 — weighted toward the
 wallet's proven edge (btc5m 30-1), clips deliberately NOT raised (clip size is the brake
-system's risk-rate lever), SOL flat until R1's aligned basis verdict.
+system's risk-rate lever), SOL flat until R1's aligned basis verdict. Sixth arm added
+2026-08-23 04:00Z: sol-updown-15m at 150/25/10 (same symbol we already price, guard already
+calibrated, and 15m accumulates more banked evidence per window than its 5m sibling). XRP/DOGE
+stay off pending the R1 aligned (TWAP-vs-TWAP) measurement, in flight tonight.
 
 - No further size increases without an R2 calibration pass (the 2026-08-23 bump above is
   the operator's call and the new baseline).
