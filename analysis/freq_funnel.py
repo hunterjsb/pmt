@@ -8,7 +8,7 @@ whether the quiet windows had any money in them at all.
 
 Four things the existing tooling does NOT do, and this does:
 
-  1. FUNNEL ORDERING. `pmt crypto shadow` attributes a refusal to every
+  1. FUNNEL ORDERING. `pmt crypto stats --gates` attributes a refusal to every
      category that would have refused it. This attributes each refused
      window-side moment to the ONE gate that bound FIRST in the engine's own
      order (feed -> basis guard -> book -> theta -> brakes -> chop -> min_fair

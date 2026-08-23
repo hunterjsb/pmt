@@ -135,6 +135,27 @@ def win_rate(windows: Sequence[dict]) -> float | None:
     return sum(1 for w in windows if w.get("won")) / len(windows)
 
 
+def streak(windows: Sequence[dict]) -> dict:
+    """{"current", "longest"} consecutive wins, ordered by settlement.
+
+    A payoff shape this lopsided (+2-8% up, -100% down) makes the run
+    length between losses the operator's real pulse: the book is only ever
+    as good as the streak the next loss interrupts. `current` counts back
+    from the newest settled window, so a loss most recently makes it 0 —
+    which is the honest answer, not a hidden number.
+
+    Ordered by `end_ts` here rather than trusting caller order: the
+    scoreboard builds its window list from a dict, so arrival order is
+    insertion order, not time.
+    """
+    ordered = sorted(windows, key=lambda w: float(w.get("end_ts") or 0.0))
+    longest = run = 0
+    for w in ordered:
+        run = run + 1 if w.get("won") else 0
+        longest = max(longest, run)
+    return {"current": run, "longest": longest}
+
+
 def gross_win_loss(windows: Sequence[dict]) -> tuple[float, float]:
     """(gross winning dollars, gross losing dollars as a positive number)."""
     gw = sum(float(w["pnl"]) for w in windows if float(w.get("pnl") or 0.0) > 0)
@@ -323,42 +344,5 @@ def summary(windows: Sequence[dict], *, bankroll: float | None = None,
         "utilization": utilization(windows, bankroll, span_s),
         "span_h": span_s / 3600.0,
         "bankroll": bankroll,
+        "streak": streak(windows),
     }
-
-
-def _fmt_pct(v: float | None, digits: int = 1, signed: bool = True) -> str:
-    if v is None:
-        return "—"
-    sign = "+" if signed else ""
-    return f"{v * 100:{sign}.{digits}f}%"
-
-
-def header_line(s: dict) -> str:
-    """One compact line of the whole effectiveness story, for a dashboard
-    header. Plain text (no markup) so any renderer can color it.
-
-    Deliberately leads with the money-weighted win rate: it is the number
-    the count win rate is pretending to be, and seeing 92% collapse to a
-    dollar-weighted figure beside a sub-1.00 profit factor is the entire
-    point of this module.
-    """
-    pf = s.get("profit_factor")
-    be = s.get("breakeven_win_rate")
-    rorc = s.get("rorc") or {}
-    bgr = s.get("bgr") or {}
-    # "need" hangs off the COUNT rate, not the dollar-weighted one: the
-    # break-even identity is a fraction-of-trades threshold, so pairing it
-    # with $W would compare two different denominators.
-    parts = [
-        f"$W {_fmt_pct(s.get('mww_rate'), 0, signed=False)}",
-        f"W {_fmt_pct(s.get('win_rate'), 0, signed=False)}"
-        + (f" (need {be * 100:.1f}%)" if be is not None else ""),
-        f"PF {pf:.2f}" if pf is not None else "PF —",
-        f"$ret {_fmt_pct(s.get('return_on_notional'), 2)}",
-        f"RoRC {_fmt_pct(rorc.get('per_hour'), 2)}/h",
-    ]
-    if bgr:
-        parts.append(f"growth {bgr['per_day_pct']:+.2f}%/d")
-    if s.get("utilization") is not None:
-        parts.append(f"util {s['utilization'] * 100:.1f}%")
-    return " · ".join(parts)

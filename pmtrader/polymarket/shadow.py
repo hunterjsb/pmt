@@ -7,7 +7,7 @@ still be net-positive (the loss it dodged outweighs the wins it missed), so
 every rollup here carries both sides, never just the missed-wins half.
 
 Pure (no network, no disk) so the episode/pricing logic is unit-testable
-with inline fixtures — `pmt crypto shadow` in cli.py does the I/O (tape
+with inline fixtures — `pmt crypto stats --gates` does the I/O (tape
 file, wallet activity, outcomes corpus refresh via polymarket.outcomes)
 and calls in.
 

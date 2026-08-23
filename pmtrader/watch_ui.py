@@ -611,53 +611,6 @@ class TapeCollapser:
         return None
 
 
-def _eff_table(s: dict) -> Table:
-    """The effectiveness block: each corrected number beside what it means."""
-    def signed(v: float | None, unit: str = "", pct: bool = True, digits: int = 2) -> str:
-        if v is None:
-            return "[dim]—[/dim]"
-        x = v * 100 if pct else v
-        return f"[{'green' if x >= 0 else 'red'}]{x:+,.{digits}f}{unit}[/]"
-
-    def rate(v: float | None, digits: int = 0) -> str:
-        return "[dim]—[/dim]" if v is None else f"{v * 100:.{digits}f}%"
-
-    rorc, bgr = s.get("rorc") or {}, s.get("bgr") or {}
-    wr, be = s.get("win_rate"), s.get("breakeven_win_rate")
-    # Show the growth denominator in the unit it actually has: "over 0.1d"
-    # hides that a %/day figure is extrapolated from three hours.
-    span = (f"{s['span_h'] / 24:.1f}d" if s["span_h"] >= 24 else f"{s['span_h']:.1f}h")
-    hold_m = (rorc.get("avg_hold_h") or 0) * 60
-    t = Table(title="Effectiveness — the win rate, corrected for size and time")
-    t.add_column("metric"); t.add_column("value", justify="right"); t.add_column("means")
-    t.add_row("$-weighted win rate", rate(s["mww_rate"]),
-              "share of DOLLARS at risk that won"
-              + (f" [dim](count: {wr * 100:.0f}%)[/dim]" if wr is not None else ""))
-    # The bar the headline has to clear: with -100% losses against +2-8%
-    # wins it sits in the nineties, which is the whole reason 92% flatters.
-    t.add_row("break-even win rate",
-              "[dim]—[/dim]" if be is None else
-              f"[{'red' if wr is not None and wr < be else 'green'}]{be * 100:.1f}%[/]",
-              "what THIS payoff shape needs just to stay flat")
-    t.add_row("profit factor",
-              "[dim]—[/dim]" if s["profit_factor"] is None else
-              f"[{'green' if s['profit_factor'] >= 1 else 'red'}]{s['profit_factor']:.2f}[/]",
-              f"gross wins ${s['gross_win']:,.0f} / gross losses ${s['gross_loss']:,.0f}"
-              " — under 1.00 the book loses")
-    t.add_row("return on notional", signed(s["return_on_notional"], "%"),
-              f"P&L per dollar put at risk (${s['notional']:,.0f} traded), time ignored")
-    t.add_row("RoRC", signed(rorc.get("per_hour"), "%/h"),
-              "return per dollar-HOUR at risk — [bold]trade quality[/bold]"
-              + (f" [dim](avg hold {hold_m:.1f}m)[/dim]" if hold_m else ""))
-    t.add_row("bankroll growth", signed(bgr.get("per_day_pct"), "%/d", pct=False),
-              "log growth of the whole book per calendar day — "
-              f"[bold]capital effectiveness[/bold] [dim](over {span})[/dim]")
-    t.add_row("utilization", rate(s["utilization"], 2),
-              "share of bankroll-hours actually at risk (the bridge: "
-              "growth ≈ RoRC × utilization)")
-    return t
-
-
 _UNDECIDED_YELLOW_USD = 300.0  # R7 speculative-exposure threshold zone
 
 
@@ -691,13 +644,19 @@ def _risk_exposure(arms: dict | None) -> tuple[float, float, float]:
     return committed, undecided, resting
 
 
-def build_risk_header(status: dict | None, sb: dict | None) -> str:
+def build_risk_header(status: dict | None, sb: dict | None,
+                       rtds: bool = True) -> str:
     """`committed $Y ($Z un-decided) · ◇resting $R · riding N windows $W` —
     the one-line exposure summary between the scoreboard and the arms table.
 
     Deliberately carries no capital figure: that is the top panel's, and two
     money-shaped lines stacked back to back read as one line printed twice.
     Reads only already-cached data (status/sb) — never fetches.
+
+    `rtds=False` drops the stream-health tail. The dashboard has a full-width
+    row for this line; `pmt crypto stats` prints it inside a panel that has
+    to hold 100 columns, and the two clauses answer different questions
+    anyway — stats gives the stream its own line.
     """
     committed, undecided, resting = _risk_exposure((status or {}).get("arms"))
     riding_n = (sb or {}).get("riding_n", 0)
@@ -715,9 +674,9 @@ def build_risk_header(status: dict | None, sb: dict | None) -> str:
     bits.append(f"riding {riding_n} windows ${riding_usd:,.2f}")
     # One socket feeds every stream-fed arm, so its state belongs on the
     # fleet's risk line, not buried per-arm.
-    rtds = _rtds_line(status)
-    if rtds:
-        bits.append(rtds)
+    health = _rtds_line(status) if rtds else ""
+    if health:
+        bits.append(health)
     return " · ".join(bits)
 
 

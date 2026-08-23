@@ -538,3 +538,91 @@ def test_spot_price_helper_survives_because_pricing_still_uses_it():
     from polymarket.crypto import spot_price
 
     assert callable(spot_price)
+
+
+# ---------- per-series median (the row the totals hide) ----------
+
+def test_series_carries_the_median_window_beside_the_total(monkeypatch):
+    # Three windows on one series: +1, +1, -8. The sum says the series is
+    # broken; the median says its typical window pays. Both are true, and the
+    # report needs both.
+    now = int(time.time())
+    rows = []
+    for i, (usd, redeem) in enumerate([(10.0, 11.0), (10.0, 11.0), (10.0, 2.0)]):
+        start = now - 20000 - i * 400
+        slug = f"btc-updown-5m-{start}"
+        rows.append({"type": "TRADE", "side": "BUY", "usdcSize": usd, "size": usd,
+                     "slug": slug, "timestamp": start + 10})
+        rows.append({"type": "REDEEM", "usdcSize": redeem, "outcome": "up",
+                     "slug": slug, "timestamp": start + 320})
+    _install_fake_pipeline(monkeypatch, rows, {}, {})
+
+    s = cc._tape_scoreboard(0.0)["series"]["btc 5m"]
+    assert s["pnl"] == pytest.approx(-6.0)   # +1 +1 -8
+    assert s["med"] == pytest.approx(1.0)
+    assert "pnls" not in s  # the accumulator never leaks into the payload
+
+
+def test_series_median_is_none_while_every_window_is_still_riding(monkeypatch):
+    now = int(time.time())
+    start = now - 60
+    rows = [{"type": "TRADE", "side": "BUY", "usdcSize": 5.0, "size": 5.0,
+             "slug": f"btc-updown-5m-{start}", "timestamp": start + 10}]
+    _install_fake_pipeline(monkeypatch, rows, {}, {})
+    assert cc._tape_scoreboard(0.0)["series"]["btc 5m"]["med"] is None
+
+
+def test_scoreboard_hands_back_the_raw_rows_only_when_asked(monkeypatch):
+    # The wallet walk is the slowest thing the report does; --gates and the
+    # maker attribution reuse it rather than paginating a second time.
+    _install_fake_pipeline(monkeypatch, [], {}, {})
+    assert "activity" not in cc._tape_scoreboard(0.0)
+    assert cc._tape_scoreboard(0.0, keep_activity=True)["activity"] == []
+
+
+# ---------- stats blocks over a box with no tapes ----------
+
+def test_stats_blocks_on_a_machine_with_no_engine_tapes(monkeypatch):
+    # tape.iter_records yields nothing when the file is absent; every block
+    # must come back empty so the renderer omits it, never raise.
+    monkeypatch.setattr(cc.tape, "iter_records", lambda *a, **k: iter(()))
+    blocks = cc._stats_blocks({"eff_windows": [], "activity": []}, {}, 0.0)
+    assert blocks["flags"] == {}
+    assert blocks["maker"]["rested"] == 0 and blocks["chase"]["acks"] == 0
+    assert blocks["fleet"]["peak_undecided"] is None
+
+
+def test_stats_blocks_splits_the_one_tape_read_into_evals_and_fires(monkeypatch):
+    recs = [{"ev": "eval", "slug": "btc-updown-5m-1787452500", "t": 1.0,
+             "fleet_room": 100.0, "sides": []},
+            {"ev": "fire", "slug": "btc-updown-5m-1787452500", "t": 2.0,
+             "ask": 0.94, "limit": 0.96}]
+
+    def fake_iter(path, floor=None, evs=None):
+        if path == cc.tape.ORDER_TAPE:
+            return iter(())
+        return iter(recs)
+
+    monkeypatch.setattr(cc.tape, "iter_records", fake_iter)
+    blocks = cc._stats_blocks({"eff_windows": [], "activity": []},
+                              {"fleet_undecided_cap": 350.0}, 0.0)
+    assert blocks["fleet"]["ticks"] == 1          # the eval record only
+    assert blocks["chase"]["chase_n"] == 1        # the fire record only
+    assert blocks["chase"]["chased"] == 1
+
+
+# ---------- the shadow command folded into stats ----------
+
+def test_shadow_is_gone_and_lives_on_as_a_stats_flag():
+    # Its gate cost/saved summary is `pmt crypto stats --gates` now: one
+    # report, one wallet walk, one place the operator looks.
+    assert "shadow" not in set(cc.crypto_group.commands)
+    assert not hasattr(cc, "crypto_shadow")
+    assert callable(cc._gates_report)
+
+
+def test_stats_exposes_full_and_gates_without_changing_the_default():
+    opts = {p.name for p in cc.crypto_stats.params}
+    assert {"since", "full", "gates", "as_json"} <= opts
+    defaults = {p.name: p.default for p in cc.crypto_stats.params}
+    assert defaults["full"] is False and defaults["gates"] is False

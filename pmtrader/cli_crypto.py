@@ -1,5 +1,6 @@
 """`pmt crypto ...` — up/down market pricing, the live trigger, and the
-fleet's decision-tape tooling (scoreboard, shadow ledger, watch dashboard).
+fleet's decision-tape tooling (scoreboard, watch dashboard, shadow ledger —
+the last folded into `stats --gates` rather than living as its own command).
 
 Split out of cli.py for size; registered onto the top-level `cli` group by
 cli.py (`from cli_crypto import crypto_group; cli.add_command(crypto_group)`).
@@ -13,6 +14,7 @@ dashboard and the tape/stats printers use lives in watch_ui.py.
 from __future__ import annotations
 
 import json
+import statistics
 import sys
 import threading
 import time
@@ -24,9 +26,9 @@ import stats_render
 from engine import post as _engine_post
 
 from cli_common import console, _api, _pnl_color
-from polymarket import effectiveness, tape, updown_slugs, wallet
+from polymarket import effectiveness, tape, updown_slugs, updown_stats, wallet
 from watch_ui import (
-    _SB_EMPTY, _brake_rich, _cbreak_stdin, _controls_panel, _eff_table,
+    _SB_EMPTY, _brake_rich, _cbreak_stdin, _controls_panel,
     _restore_stdin, _rtds_line, _safety_rich, _tape_render, _tape_slug, _wait_key,
     build_arms_table, build_header_panel, build_risk_header, build_windows_strip,
 )
@@ -385,19 +387,28 @@ def _impute_win_pnl(buy_usd: float, sell_usd: float, buy_shares: float) -> float
     return buy_shares * 1.0 + sell_usd - buy_usd
 
 
-def _tape_scoreboard(floor: float, sliding_floor: float | None = None) -> dict:
+def _tape_scoreboard(floor: float, sliding_floor: float | None = None,
+                      keep_activity: bool = False) -> dict:
     """Fetch the wallet's activity and grade it — the synchronous one-shot
     form used by `pmt crypto stats` and by anything that wants a fresh full
     walk. The watch dashboard instead keeps a wallet.ActivityLedger warm and
     calls score_activity() directly on its accumulated rows; both go through
     the SAME aggregation below, so the two never drift.
+
+    `keep_activity` hands the raw rows back under "activity". The wallet walk
+    is the slowest thing this report does, and the maker attribution and the
+    --gates ledger both need the same rows — paginating twice for one report
+    would be paying the price twice for one answer.
     """
     # Ground truth: every updown trade + redemption on the proxy wallet.
     # funder_address() RAISES on an unset addr, like every sibling command —
     # never fall through to a clean-looking "0W-0L" (docs/LESSONS.md#L26).
     addr = wallet.funder_address()
-    return score_activity(wallet.fetch_wallet_activity(addr, floor), floor,
-                          sliding_floor=sliding_floor)
+    rows = wallet.fetch_wallet_activity(addr, floor)
+    sb = score_activity(rows, floor, sliding_floor=sliding_floor)
+    if keep_activity:
+        sb["activity"] = rows
+    return sb
 
 
 def score_activity(rows: list[dict], floor: float,
@@ -482,7 +493,8 @@ def score_activity(rows: list[dict], floor: float,
             continue
         in_sliding = sliding_floor is not None and start >= sliding_floor
         s = series.setdefault(series_k,
-                               {"w": 0, "l": 0, "open": 0, "pnl": 0.0, "usd": 0.0, "est": 0})
+                               {"w": 0, "l": 0, "open": 0, "pnl": 0.0, "usd": 0.0,
+                                "est": 0, "pnls": []})
         s["usd"] += w["buy"]
         fired = fires.get(slug, [{}])[0].get("side")
         # Redemption is silent (no row at all) or slow far more often than a
@@ -511,6 +523,7 @@ def score_activity(rows: list[dict], floor: float,
             pnl = w["redeem"] + w["sell"] - w["buy"]
         s["w" if won else "l"] += 1
         s["pnl"] += pnl
+        s["pnls"].append(pnl)
         s["est"] += pnl_est
         wins, losses, net = wins + won, losses + (not won), net + pnl
         estimated += pnl_est
@@ -538,6 +551,12 @@ def score_activity(rows: list[dict], floor: float,
             cal.setdefault(b, [0, 0])
             cal[b][0] += 1
             cal[b][1] += f["side"] == won_side
+    # A series' TYPICAL window, which its total P&L hides: one -$300 tail on
+    # forty +$4 windows reads as a broken series by sum and a working one by
+    # median, and the difference is the whole sizing question.
+    for s in series.values():
+        pnls = s.pop("pnls")
+        s["med"] = statistics.median(pnls) if pnls else None
     # Recent-windows strip wants newest-first, capped small — this is a
     # display list, not the ledger (pmt crypto window/outcomes for the rest).
     windows = sorted(window_list, key=lambda r: r["end_ts"], reverse=True)[:12]
@@ -563,8 +582,8 @@ def effectiveness_summary(sb: dict, bal: dict | None) -> dict:
     back to None (metrics that need a bankroll come back None) when the
     balance call failed — never to a guess.
 
-    The watch header can call this on its own snapshot and render
-    effectiveness.header_line() from the result.
+    The watch header calls this on its own snapshot too, so the dashboard and
+    the report grade the same windows against the same bankroll.
     """
     cash = float((bal or {}).get("total") or 0.0)
     bankroll = cash + float(sb.get("riding_usd") or 0.0)
@@ -572,11 +591,28 @@ def effectiveness_summary(sb: dict, bal: dict | None) -> dict:
                                   bankroll=bankroll or None, now=time.time())
 
 
-def _eff_table(s: dict) -> Table:
-    """The effectiveness block. Lives in stats_render now — kept here as the
-    name every caller already imports, so there is exactly one implementation
-    of the block rather than two that can drift."""
-    return stats_render.effectiveness_table(s)
+def _stats_blocks(sb: dict, status: dict, floor: float) -> dict:
+    """The tape-derived half of the report: arm flags, the resting-bid
+    experiment, the order path, the fleet ration.
+
+    Two tape files, read once each and folded by polymarket.updown_stats.
+    Deliberately NOT part of score_activity: the watch dashboard re-scores
+    every 10s off its warm ledger and has no use for any of this, so putting
+    it there would charge the dashboard for a one-shot report's blocks.
+    """
+    evals = list(tape.iter_records(tape.UPDOWN_TAPE, floor=floor,
+                                    evs={tape.EV_EVAL, tape.EV_FIRE}))
+    fires = [r for r in evals if r.get("ev") == tape.EV_FIRE]
+    evals = [r for r in evals if r.get("ev") == tape.EV_EVAL]
+    orders = list(tape.iter_records(tape.ORDER_TAPE, floor=floor))
+    return {
+        "flags": updown_stats.arm_flags(status.get("arms")),
+        "maker": updown_stats.maker_summary(evals, orders,
+                                             sb.get("activity") or [],
+                                             sb.get("eff_windows") or []),
+        "chase": updown_stats.chase_summary(orders, fires),
+        "fleet": updown_stats.fleet_summary(evals, status.get("fleet_undecided_cap")),
+    }
 
 
 @crypto_group.command("stats")
@@ -585,17 +621,23 @@ def _eff_table(s: dict) -> Table:
                    "raw unix epoch if large (default: all time — the full "
                    "ledger of record). NOTE an hours-ago floor SLIDES — pin "
                    "an epoch for any number you intend to compare across runs")
+@click.option("--full", is_flag=True,
+              help="Also print calibration and a live-arms snapshot "
+                   "(both demoted: see analysis/r6_report.txt and `pmt crypto watch`)")
+@click.option("--gates", is_flag=True,
+              help="Also price every refusal on the tape — what our own gates "
+                   "cost and saved, per reason. Resolves (and REFRESHES on "
+                   "disk) the outcomes corpus, so it is markedly slower than "
+                   "the default report")
 @click.option("--json", "as_json", is_flag=True)
-def crypto_stats(since: float | None, as_json: bool) -> None:
-    """Fleet scoreboard: realized P&L (wallet-graded), win rate, calibration, live arms, capital."""
-    floor = _shadow_parse_since(since) if since else 0.0
+def crypto_stats(since: float | None, full: bool, gates: bool, as_json: bool) -> None:
+    """Fleet scoreboard: record + streak, per-symbol P&L, effectiveness, live experiments."""
+    floor = _parse_since(since) if since else 0.0
     try:
-        sb = _tape_scoreboard(floor)
+        sb = _tape_scoreboard(floor, keep_activity=True)
     except Exception as e:
         console.print(f"[red]data-api unreachable: {e}[/red]")
         sys.exit(1)
-    wins, losses, net, rolls = sb["wins"], sb["losses"], sb["net"], sb["rolls"]
-    series, cal, estimated = sb["series"], sb["cal"], sb["estimated"]
 
     status, bal = {}, {}
     try:
@@ -610,18 +652,25 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
         pass
 
     eff_s = effectiveness_summary(sb, bal)
+    blocks = _stats_blocks(sb, status, floor)
+    gates_report = _gates_report(sb.pop("activity", []), floor) if gates else None
 
     if as_json:
         click.echo(json.dumps({
-            "wins": wins, "losses": losses, "net_est": net, "rolls": rolls,
-            "estimated": estimated, "series": series,
-            "calibration": {str(k): v for k, v in cal.items()},
+            "wins": sb["wins"], "losses": sb["losses"], "net_est": sb["net"],
+            "rolls": sb["rolls"], "estimated": sb["estimated"],
+            "series": sb["series"],
+            "calibration": {str(k): v for k, v in sb["cal"].items()},
             "arms": status.get("arms", {}), "balance": bal,
             "windows": sb["windows"], "effectiveness": eff_s,
+            "maker": blocks["maker"], "chase": blocks["chase"],
+            "fleet": blocks["fleet"], "gates": gates_report,
         }, indent=2))
         return
 
-    console.print(stats_render.render_stats(sb, eff_s, bal, status, floor))
+    console.print(stats_render.render_stats(sb, eff_s, bal, status, floor,
+                                             blocks=blocks, full=full,
+                                             gates=gates_report))
 
 
 # ---------- watch: the render/fetch split ----------
@@ -785,7 +834,7 @@ def crypto_watch(since: float | None) -> None:
 
     collapser = watch_ui.TapeCollapser()
 
-    floor = _shadow_parse_since(since) if since else (_t.time() - WATCH_DEFAULT_LOOKBACK_H * 3600)
+    floor = _parse_since(since) if since else (_t.time() - WATCH_DEFAULT_LOOKBACK_H * 3600)
     floor_label = ("all time" if floor <= 0 else
                    datetime.fromtimestamp(floor, tz=timezone.utc).strftime("since %m-%d %H:%MZ"))
     lines: deque = deque(maxlen=200)
@@ -1633,7 +1682,7 @@ def crypto_outcomes(since: float, out_path: str | None, fetch_only: bool) -> Non
     console.print(f"[dim]{out_file}  ({len(merged)} total rows)[/dim]")
 
 
-def _shadow_parse_since(v: float | None) -> float:
+def _parse_since(v: float | None) -> float:
     """HOURS_AGO_OR_EPOCH: small values are hours-ago, big ones (a real Unix
     timestamp is always > 1e6 in hours-ago terms) are a raw epoch already."""
     import time as _t
@@ -1645,12 +1694,8 @@ def _shadow_parse_since(v: float | None) -> float:
     return _t.time() - v * 3600
 
 
-@crypto_group.command("shadow")
-@click.option("--since", type=float, default=None,
-              help="Hours-ago, or a raw epoch if the value is large (default: all tape)")
-@click.option("--json", "as_json", is_flag=True, help="Raw report JSON")
-def crypto_shadow(since: float | None, as_json: bool) -> None:
-    """Shadow P&L ledger: what our own gates cost/saved us, per refusal reason.
+def _gates_report(activity: list[dict], since_epoch: float) -> dict:
+    """The shadow ledger behind `pmt crypto stats --gates`.
 
     Every refused side on the decision tape — basis-guard gates, the
     safety/latched/distrust/avg_down brakes, and unbraked sides that just
@@ -1665,16 +1710,12 @@ def crypto_shadow(since: float | None, as_json: bool) -> None:
     as `pmt crypto outcomes`) — a window's winner is never guessed, so an
     unresolved window's episodes surface as an honest coverage gap instead
     of a silent zero.
-    """
-    import time as _t
 
+    `activity` is the caller's already-walked wallet history, not a fresh
+    fetch: this runs as one section of a report that has already paid for it.
+    """
     from polymarket import chainlink as ck
     from polymarket import outcomes, shadow
-
-    addr = _funder_or_usage_error()
-
-    since_epoch = _shadow_parse_since(since)
-    now = _t.time()
 
     try:
         with open(tape.UPDOWN_TAPE) as fh:
@@ -1683,63 +1724,14 @@ def crypto_shadow(since: float | None, as_json: bool) -> None:
         lines = []
 
     slugs = outcomes.extract_updown_slugs(lines)
-    windows = outcomes.window_universe(slugs, since_epoch, now)
-
-    floor = windows[0]["start"] if windows else since_epoch
-    try:
-        activity = wallet.fetch_wallet_activity(addr, floor)
-    except Exception as e:
-        console.print(f"[red]data-api unreachable: {e}[/red]")
-        sys.exit(1)
+    windows = outcomes.window_universe(slugs, since_epoch, time.time())
 
     wallet_wins = outcomes.wallet_outcomes(activity)
-    symbols = {w["symbol"] for w in windows}
-    rounds_by_symbol = {sym: ck.load_corpus(sym) for sym in symbols}
+    rounds_by_symbol = {w["symbol"]: ck.load_corpus(w["symbol"]) for w in windows}
     rows, _dropped = outcomes.build_outcomes(windows, wallet_wins, rounds_by_symbol)
 
-    existing = outcomes.load_outcomes()
-    merged, _added, _upgraded = outcomes.merge_outcomes(existing, rows)
+    merged, _added, _upgraded = outcomes.merge_outcomes(outcomes.load_outcomes(), rows)
     outcomes.write_outcomes(merged)
     winners = {slug: row["winner"] for slug, row in merged.items()}
 
-    report = shadow.build_report(lines, winners, activity, since=since_epoch)
-
-    if as_json:
-        console.print_json(json.dumps(report))
-        return
-
-    categories, totals, coverage = report["categories"], report["totals"], report["coverage"]
-
-    if totals["episodes"] == 0:
-        console.print("[dim]No refusals on the tape in range.[/dim]")
-        return
-
-    console.print(f"[bold]shadow P&L[/bold] — {totals['episodes']} episodes across "
-                  f"{coverage['windows']} windows")
-
-    t = Table(title="by refusal reason (hindsight-priced)")
-    cols = [("category", "left"), ("episodes", "right"), ("priced", "right"),
-            ("hit rate", "right"), ("missed wins", "right"), ("avoided losses", "right"),
-            ("net", "right"), ("verdict", "left")]
-    for name, justify in cols:
-        t.add_column(name, justify=justify)
-    for cat in shadow.CATEGORY_ORDER:
-        s = categories.get(cat)
-        if not s or s["episodes"] == 0:
-            continue
-        hr = f"{s['hit_rate'] * 100:.0f}%" if s["hit_rate"] is not None else "—"
-        net = s["net"]
-        net_style = "red" if net > 0 else "green"
-        t.add_row(cat, str(s["episodes"]), str(s["priced"]), hr,
-                  f"{s['missed_wins']:,.2f}", f"{s['avoided_losses']:,.2f}",
-                  f"[{net_style}]{net:+,.2f}[/{net_style}]", shadow.verdict(s))
-    console.print(t)
-
-    grand_net = totals["net"]
-    grand_style = "red" if grand_net > 0 else "green"
-    console.print(f"[bold]grand total[/bold]  missed wins {totals['missed_wins']:,.2f} · "
-                  f"avoided losses {totals['avoided_losses']:,.2f} · "
-                  f"net [{grand_style}]{grand_net:+,.2f}[/{grand_style}]")
-    console.print(f"[dim]coverage: {coverage['windows']} windows touched · "
-                  f"{coverage['unpriced_episodes']} unpriced episodes (no recorded ask) · "
-                  f"{coverage['skipped_unresolved']} skipped (window not yet resolved)[/dim]")
+    return shadow.build_report(lines, winners, activity, since=since_epoch)
