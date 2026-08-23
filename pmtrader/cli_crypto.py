@@ -209,6 +209,34 @@ def crypto_disarm(slug: str | None) -> None:
     console.print(f"disarmed: {reply.get('disarmed') or '(was idle)'} · {reply.get('arms', 0)} arms left")
 
 
+@crypto_group.command("fleet")
+@click.option("--cap", type=float, default=None,
+              help="USDC ceiling on total UN-DECIDED committed notional across all arms. "
+                   "0 turns the cap off. Omit to just read the current setting.")
+def crypto_fleet(cap: float | None) -> None:
+    """Read or set the R7 fleet-wide un-decided exposure cap.
+
+    The cap rations the one thing arms share: speculative committed
+    notional, summed across every armed window. Banked-decided capital is
+    outside it (R9 gates entry into that state), and so are exits, quiesce
+    and flip clips. Off by default — this is a deliberate ration, never a
+    default. It survives restarts in ~/.pmt/engine/arms-state.json.
+    """
+    if cap is None:
+        reply = _engine_post("/strategies/updown/command", {"action": "status"})
+        now = reply.get("fleet_undecided_cap", 0) or 0
+        state = f"${now:,.0f}" if now > 0 else "[yellow]off[/yellow]"
+        console.print(f"fleet un-decided cap: {state} · {reply.get('count', 0)} arms")
+        return
+    reply = _engine_post("/strategies/updown/command",
+                         {"action": "fleet", "undecided_cap_usdc": cap})
+    if reply.get("enabled"):
+        console.print(f"fleet un-decided cap: [green]${reply['undecided_cap_usdc']:,.0f}[/green] "
+                      f"· {reply.get('arms', 0)} arms")
+    else:
+        console.print(f"fleet un-decided cap: [yellow]off[/yellow] · {reply.get('arms', 0)} arms")
+
+
 @crypto_group.command("trigger")
 @click.option("--json", "as_json", is_flag=True, help="Raw status JSON")
 def crypto_trigger(as_json: bool) -> None:
@@ -250,6 +278,9 @@ def crypto_trigger(as_json: bool) -> None:
         console.print(f"{roll} {_tape_slug(slug):<14} {body}")
     if reply.get("pending_rolls"):
         console.print(f"[dim]pending rolls: {', '.join(reply['pending_rolls'])}[/dim]")
+    # Only when it's on: a line saying "no cap" every tick is noise.
+    if reply.get("fleet_undecided_cap"):
+        console.print(f"[dim]fleet un-decided cap: ${reply['fleet_undecided_cap']:,.0f}[/dim]")
 
 
 @crypto_group.command("tape")

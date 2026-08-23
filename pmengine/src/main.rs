@@ -82,6 +82,14 @@ enum Commands {
         /// Also write the report as JSONL here.
         #[arg(long)]
         out: Option<PathBuf>,
+
+        /// R7 fleet cap (USDC) on total UN-DECIDED committed notional across
+        /// every matched window. Passing this switches to the interleaved
+        /// driver: all matched slugs step in one global timestamp order
+        /// sharing one pool, instead of window-by-window. `--fleet-cap 0`
+        /// runs that same interleaved driver uncapped — the A/B baseline.
+        #[arg(long)]
+        fleet_cap: Option<f64>,
     },
 }
 
@@ -164,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Run { strategies, dry_run, max_ticks, skip_warmup }) => {
             run_strategies(strategies, dry_run, max_ticks, skip_warmup).await
         }
-        Some(Commands::Replay { mode, tape, book_tape, slug, params, outcomes, out }) => {
+        Some(Commands::Replay { mode, tape, book_tape, slug, params, outcomes, out, fleet_cap }) => {
             // reqwest::blocking builds its own mini tokio runtime; calling
             // it straight from #[tokio::main]'s worker thread panics on
             // drop (nested runtime). A plain OS thread sidesteps that —
@@ -172,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // std::thread::spawn, never inline on the async task.
             match std::thread::spawn(move || {
                 pmengine::replay::run(pmengine::replay::ReplayOpts {
-                    mode, tape, book_tape, slug, params, outcomes, out,
+                    mode, tape, book_tape, slug, params, outcomes, out, fleet_cap,
                 })
             })
             .join()

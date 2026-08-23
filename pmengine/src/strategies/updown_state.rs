@@ -50,15 +50,40 @@ pub(crate) struct ArmsState {
     pub(crate) arms: Vec<ArmParams>,
     #[serde(default)]
     pub(crate) rolls: Vec<RollRecord>,
+    /// R7's fleet-wide un-decided cap (USDC); 0 = off. Strategy-level, so
+    /// it sits beside the arms rather than inside one.
+    ///
+    /// Added under `serde(default)` and NOT behind a version bump on
+    /// purpose: a file written before R7 reads back as cap 0 (off, today's
+    /// behavior), and an older binary reading a newer file ignores the
+    /// unknown field instead of refusing the whole state and stranding a
+    /// live window. A version bump is for shapes that can't be read both
+    /// ways — this one can.
+    #[serde(default)]
+    pub(crate) fleet_undecided_cap: f64,
 }
 
 impl ArmsState {
     pub(crate) fn new(arms: Vec<ArmParams>, rolls: Vec<RollRecord>, now: f64) -> Self {
-        Self { version: STATE_VERSION, written_at: now, arms, rolls }
+        Self {
+            version: STATE_VERSION,
+            written_at: now,
+            arms,
+            rolls,
+            fleet_undecided_cap: 0.0,
+        }
     }
 
+    pub(crate) fn with_fleet_cap(mut self, cap: f64) -> Self {
+        self.fleet_undecided_cap = cap;
+        self
+    }
+
+    /// Nothing left to remember. A bare cap still counts as something: the
+    /// operator can ration a fleet before arming it, and `save` deletes the
+    /// file when this is true.
     pub(crate) fn is_empty(&self) -> bool {
-        self.arms.is_empty() && self.rolls.is_empty()
+        self.arms.is_empty() && self.rolls.is_empty() && self.fleet_undecided_cap <= 0.0
     }
 }
 

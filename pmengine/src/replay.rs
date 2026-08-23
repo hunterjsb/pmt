@@ -49,13 +49,21 @@ pub struct ReplayOpts {
     pub params: Option<PathBuf>,
     pub outcomes: Option<PathBuf>,
     pub out: Option<PathBuf>,
+    /// R7: `Some(cap)` switches to the interleaved fleet driver (every
+    /// matched window stepped in one global timestamp order, sharing one
+    /// un-decided pool). `Some(0.0)` is that same driver with no cap — the
+    /// only honest A/B baseline for a cap, since it differs from a capped
+    /// run in the cap and nothing else. `None` is the per-window driver.
+    pub fleet_cap: Option<f64>,
 }
 
 pub fn run(opts: ReplayOpts) -> Result<(), String> {
-    match opts.mode.as_str() {
-        "evals" => run_evals(&opts),
-        "full" => run_full(&opts),
-        other => Err(format!("unknown replay mode '{}' (want 'evals' or 'full')", other)),
+    match (opts.mode.as_str(), opts.fleet_cap) {
+        ("evals", None) => run_evals(&opts),
+        ("full", None) => run_full(&opts),
+        ("evals", Some(cap)) => run_fleet(&opts, cap, false),
+        ("full", Some(cap)) => run_fleet(&opts, cap, true),
+        (other, _) => Err(format!("unknown replay mode '{}' (want 'evals' or 'full')", other)),
     }
 }
 
@@ -433,20 +441,7 @@ fn replay_evals_window(
             EV_EVAL => {
                 let p_up = rec["p_up"].as_f64().unwrap_or(0.5);
                 last_p_up = Some(p_up);
-                let model = ModelEval {
-                    p_up,
-                    sig_bp: rec["sig_bp"].as_f64().unwrap_or(0.0),
-                    rho: rec["rho"].as_f64().unwrap_or(0.0),
-                    banked_decided: rec["banked_decided"].as_bool().unwrap_or(false),
-                    margin_bp: rec.get("margin_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    banked_margin_bp: rec.get("banked_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    cushion_bp: rec.get("cushion_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    // Tape written before the dynamic guard shipped has no
-                    // "guard_bp" field — fall back to the arm's static param,
-                    // matching what the engine actually enforced back then.
-                    guard_bp: rec.get("guard_bp").and_then(|v| v.as_f64()).unwrap_or(p.basis_guard_bp),
-                    flip_proof: false,
-                };
+                let model = model_from_eval_record(rec, p_up, p);
                 let view = view_from_sides(&rec["sides"], &sim);
                 let out = arm.decide(&view, Ok(model), now);
                 apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate);
@@ -466,6 +461,26 @@ fn replay_evals_window(
     });
     let pnl = outcome.as_deref().map(|w| settle_pnl(&sim, p, w));
     build_report(&p.slug, "evals", &sim, real, outcome, pnl)
+}
+
+/// Rebuild the model read that a recorded `eval` line captured. One
+/// implementation, shared by the per-window and the fleet driver — two
+/// copies of this parse would let the two drivers judge different engines.
+fn model_from_eval_record(rec: &Value, p_up: f64, p: &ArmParams) -> ModelEval {
+    ModelEval {
+        p_up,
+        sig_bp: rec["sig_bp"].as_f64().unwrap_or(0.0),
+        rho: rec["rho"].as_f64().unwrap_or(0.0),
+        banked_decided: rec["banked_decided"].as_bool().unwrap_or(false),
+        margin_bp: rec.get("margin_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        banked_margin_bp: rec.get("banked_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        cushion_bp: rec.get("cushion_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        // Tape written before the dynamic guard shipped has no "guard_bp"
+        // field — fall back to the arm's static param, matching what the
+        // engine actually enforced back then.
+        guard_bp: rec.get("guard_bp").and_then(|v| v.as_f64()).unwrap_or(p.basis_guard_bp),
+        flip_proof: false,
+    }
 }
 
 /// Rebuild a `GateReason` from a recorded `gated` tape line.
@@ -582,28 +597,62 @@ fn fetch_klines(
 }
 
 /// Cached 1m klines for `symbol` covering [start-2700, end). Fetches and
-/// appends only the missing range. The sole network call in this module,
-/// and only ever reached from `--mode full` — never from tests, never
-/// from evals mode.
+/// appends only the missing range (`ensure_klines`, the module's only
+/// network path) and is only ever reached from `--mode full` — never from
+/// tests, never from evals mode. The fleet driver calls `ensure_klines`
+/// itself, once per symbol over the union of that symbol's windows: this
+/// re-reads a multi-megabyte cache file, which is the entire runtime of a
+/// several-hundred-window run if done per window.
 fn klines_for_window(symbol: &str, start: i64, end: i64) -> Result<BTreeMap<i64, Kline>, String> {
-    let path = kline_cache_path(symbol)?;
-    let mut rows = load_kline_cache(&path);
-    let lo = start - KLINE_LOOKBACK_S;
+    let mut rows = load_kline_cache(&kline_cache_path(symbol)?);
+    ensure_klines(symbol, start - KLINE_LOOKBACK_S, end, &mut rows)?;
+    Ok(rows)
+}
+
+/// Top `rows` up so it covers [lo, hi) at minute resolution, fetching only
+/// the missing stretch and appending it to the on-disk cache.
+///
+/// Loops rather than fetching once: Binance caps a klines page at 500
+/// minutes, so a single call covers ~8h. A fleet run spans a whole night
+/// across several symbols, and a one-shot fetch would leave a silent hole
+/// in the middle of the feed rather than an error.
+fn ensure_klines(
+    symbol: &str,
+    lo: i64,
+    hi: i64,
+    rows: &mut BTreeMap<i64, Kline>,
+) -> Result<(), String> {
     let lo = lo - lo.rem_euclid(60);
-    let hi = end - end.rem_euclid(60);
-    if !cache_covers(&rows, lo, hi) {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("client: {}", e))?;
-        let fetched = fetch_klines(&client, symbol, lo)?;
-        let new_rows: Vec<Kline> = fetched.into_iter().filter(|r| !rows.contains_key(&r.t)).collect();
+    let hi = hi - hi.rem_euclid(60);
+    if cache_covers(rows, lo, hi) {
+        return Ok(());
+    }
+    let path = kline_cache_path(symbol)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("client: {}", e))?;
+    let mut cursor = lo;
+    while cursor < hi {
+        if rows.contains_key(&cursor) {
+            cursor += 60;
+            continue;
+        }
+        let fetched = fetch_klines(&client, symbol, cursor)?;
+        let new_rows: Vec<Kline> =
+            fetched.into_iter().filter(|r| !rows.contains_key(&r.t)).collect();
+        if new_rows.is_empty() {
+            // Binance has nothing there (delisted minute, or we asked past
+            // the tape's own edge). Stepping past it beats spinning.
+            cursor += 60;
+            continue;
+        }
         append_kline_rows(&path, &new_rows)?;
         for r in &new_rows {
             rows.insert(r.t, *r);
         }
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// Reconstruct the per_min/closes/rho feed at decision time `now`,
@@ -729,6 +778,240 @@ fn run_full(opts: &ReplayOpts) -> Result<(), String> {
         }
     }
     finalize(&opts.slug, "full", &reports, opts.out.as_deref())
+}
+
+// --- fleet mode (R7) -------------------------------------------------
+//
+// The per-window drivers above run each slug to completion before starting
+// the next, which is fine when arms are independent — and useless for a
+// fleet cap, whose whole subject is what several arms are doing to each
+// other AT THE SAME MOMENT. A per-slug "fleet" cap would cap nothing.
+//
+// So this driver does the one thing that makes the number honest: it
+// merges every matched window's records into a single global timestamp
+// order and steps them through their own `decide_fleet` against one shared
+// un-decided pool, exactly the way `Updown::on_tick` hands one `&mut f64`
+// to every arm in a tick.
+//
+// The pool is re-summed from live sim state before each record rather than
+// carried, mirroring the engine's per-tick pre-pass (and for the same
+// reason: committed notional is a position-tracker read, never a running
+// counter — the engine's oldest gotcha). Within one record the `&mut`
+// still does its job across the arm's two sides.
+//
+// What it is NOT: fills are still the per-window conservative FillSim, and
+// each window's book/model records are exactly the ones that window
+// recorded live. The interleaving is in time and in the shared budget, not
+// in liquidity.
+
+/// One window's live state inside an interleaved fleet run.
+struct FleetArm {
+    p: ArmParams,
+    arm: ArmState,
+    sim: FillSim,
+    last_p_up: Option<f64>,
+    real: RealTally,
+    /// Decide passes where the fleet cap — not this arm's own budget or a
+    /// window brake — is what stopped a clip.
+    fleet_blocks: usize,
+}
+
+impl FleetArm {
+    /// This arm's live contribution to the shared pool. `undecided_committed`
+    /// is the engine's own function: replay hands it the fill sim's cost
+    /// basis where the live tick hands it the position tracker, so there is
+    /// one definition of the pool and not two (L18).
+    fn undecided(&self, now: f64) -> f64 {
+        self.arm.undecided_committed(self.sim.cost_basis.values().sum(), now)
+    }
+
+    fn fleet_braked(&self) -> bool {
+        self.arm
+            .last_eval
+            .as_ref()
+            .and_then(|e| e["sides"].as_array())
+            .map(|sides| sides.iter().any(|s| s["brake"] == "fleet"))
+            .unwrap_or(false)
+    }
+}
+
+/// Every arm's records merged into one global timestamp order — the whole
+/// difference between a fleet run and a stack of independent window runs.
+///
+/// Sorted by `(t, arm index)`, never by t alone: records that share a
+/// timestamp have to break their tie the same way on every run, or the
+/// pool is spent in a different order and the A/B stops being repeatable
+/// (L33's complaint about non-reproducible studies, one layer down).
+fn interleave<'a>(recs_by_arm: &[&'a Vec<Value>]) -> Vec<(f64, usize, &'a Value)> {
+    let mut ordered: Vec<(f64, usize, &Value)> = Vec::new();
+    for (i, recs) in recs_by_arm.iter().enumerate() {
+        for rec in recs.iter() {
+            ordered.push((rec["t"].as_f64().unwrap_or(0.0), i, rec));
+        }
+    }
+    ordered.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
+    });
+    ordered
+}
+
+fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
+    let tape_path = opts.tape.clone().unwrap_or_else(default_eval_tape_path);
+    let source = if full {
+        opts.book_tape.clone().unwrap_or_else(default_book_tape_path)
+    } else {
+        tape_path.clone()
+    };
+    let records = load_jsonl(&source)?;
+    let windows = group_by_slug(&records, &opts.slug);
+    if windows.is_empty() {
+        return Err(format!("no records for slug '{}' in {}", opts.slug, source.display()));
+    }
+    let params_map = load_params_map(opts.params.as_deref())?;
+    if full && params_map.is_empty() {
+        return Err("--params is required for --mode full".to_string());
+    }
+    let outcomes = load_outcomes(opts.outcomes.as_deref())?;
+    let real_by_slug = load_real_tally(&tape_path);
+
+    // Build one arm per matched window, dropping any we cannot run before
+    // the interleave starts — a half-built fleet would misprice the pool.
+    let mut arms: Vec<FleetArm> = Vec::new();
+    let mut recs_by_arm: Vec<&Vec<Value>> = Vec::new();
+    for (slug, recs) in &windows {
+        let (p, tun) = match params_map.get(slug).cloned() {
+            Some(v) => v,
+            None if full => {
+                eprintln!("[replay] skipping '{}': no --params entry for this slug", slug);
+                continue;
+            }
+            None => {
+                eprintln!(
+                    "[replay] warning: no --params entry for '{}' — synthesizing minimal params",
+                    slug
+                );
+                synth_params(slug)?
+            }
+        };
+        let mut arm = ArmState::with_params(p.clone());
+        arm.subscribed = true;
+        if let Some(t) = tun {
+            arm.tunables = t;
+        }
+        arms.push(FleetArm {
+            p,
+            arm,
+            sim: FillSim::default(),
+            last_p_up: None,
+            real: real_by_slug.get(slug).cloned().unwrap_or_default(),
+            fleet_blocks: 0,
+        });
+        recs_by_arm.push(recs);
+    }
+    if arms.is_empty() {
+        return Err(format!("no window could be replayed for '{}'", opts.slug));
+    }
+
+    // Full mode needs klines; fetch each symbol ONCE over the union of its
+    // windows instead of per window — the cache file is megabytes and
+    // re-parsing it a few hundred times is the whole runtime otherwise.
+    let mut klines: HashMap<String, BTreeMap<i64, Kline>> = HashMap::new();
+    if full {
+        let mut spans: HashMap<String, (i64, i64)> = HashMap::new();
+        for a in &arms {
+            let e = spans.entry(a.p.symbol.clone()).or_insert((i64::MAX, i64::MIN));
+            e.0 = e.0.min(a.p.start as i64);
+            e.1 = e.1.max(a.p.end as i64);
+        }
+        for (symbol, (lo, hi)) in spans {
+            let mut rows = load_kline_cache(&kline_cache_path(&symbol)?);
+            ensure_klines(&symbol, lo - KLINE_LOOKBACK_S, hi, &mut rows)?;
+            klines.insert(symbol, rows);
+        }
+    }
+
+    let ordered = interleave(&recs_by_arm);
+    let mut room_low = f64::INFINITY;
+    for (now, i, rec) in ordered {
+        let mut fleet_room = if cap > 0.0 {
+            let undecided: f64 = arms.iter().map(|a| a.undecided(now)).sum();
+            (cap - undecided).max(0.0)
+        } else {
+            f64::INFINITY
+        };
+        room_low = room_low.min(fleet_room);
+
+        let a = &mut arms[i];
+        let out = if full {
+            let Some(rows) = klines.get(&a.p.symbol) else { continue };
+            let spot = rec["spot"].as_f64().unwrap_or(0.0);
+            let spot_age = rec["spot_age_s"].as_f64().unwrap_or(0.0);
+            let feed = feed_state_at(rows, a.p.start as i64, spot, now - spot_age, now);
+            let model = eval_model(&a.p, &feed, now, a.p.basis_guard_bp);
+            let view = view_from_book_record(rec, &a.sim, &a.p);
+            Some(a.arm.decide_fleet(&view, model, now, &mut fleet_room))
+        } else {
+            match rec.get("ev").and_then(|v| v.as_str()).unwrap_or("") {
+                EV_EVAL => {
+                    let p_up = rec["p_up"].as_f64().unwrap_or(0.5);
+                    a.last_p_up = Some(p_up);
+                    let model = model_from_eval_record(rec, p_up, &a.p);
+                    let view = view_from_sides(&rec["sides"], &a.sim);
+                    Some(a.arm.decide_fleet(&view, Ok(model), now, &mut fleet_room))
+                }
+                EV_GATED => Some(a.arm.decide_fleet(
+                    &ArmView::default(),
+                    Err(gate_from_record(rec)),
+                    now,
+                    &mut fleet_room,
+                )),
+                _ => None,
+            }
+        };
+        let Some(out) = out else { continue };
+        let fee_rate = a.p.fee_rate;
+        apply_fills(&mut a.arm, &mut a.sim, &out, now, fee_rate);
+        if a.fleet_braked() {
+            a.fleet_blocks += 1;
+        }
+    }
+
+    let mode = if full { "full" } else { "evals" };
+    let mut reports = Vec::new();
+    for a in &arms {
+        let outcome = outcomes.get(&a.p.slug).cloned().or_else(|| {
+            if full {
+                klines
+                    .get(&a.p.symbol)
+                    .and_then(|rows| settle_winner(rows, a.p.start as i64, a.p.end as i64))
+            } else {
+                a.last_p_up.map(|p| if p >= 0.5 { "up".into() } else { "down".into() })
+            }
+        });
+        let pnl = outcome.as_deref().map(|w| settle_pnl(&a.sim, &a.p, w));
+        let mut r = build_report(&a.p.slug, mode, &a.sim, &a.real, outcome, pnl);
+        r["fleet"] = serde_json::json!({"cap": cap, "blocks": a.fleet_blocks});
+        reports.push(r);
+    }
+    let windows_hit = reports.iter().filter(|r| r["fleet"]["blocks"].as_i64() != Some(0)).count();
+    // `peak un-decided` is the headline diagnostic even on a run that never
+    // blocks: it says how close the fleet ever came to the cap, which is
+    // what decides whether a cap is a constraint or a decoration.
+    let peak = if room_low.is_finite() {
+        format!("${:.0}", cap - room_low)
+    } else {
+        "n/a (uncapped)".to_string()
+    };
+    eprintln!(
+        "[replay] fleet cap ${:.0} — {} window(s), {} block(s) across {} window(s), \
+         peak un-decided {}",
+        cap,
+        reports.len(),
+        reports.iter().filter_map(|r| r["fleet"]["blocks"].as_i64()).sum::<i64>(),
+        windows_hit,
+        peak,
+    );
+    finalize(&opts.slug, mode, &reports, opts.out.as_deref())
 }
 
 #[cfg(test)]
@@ -898,6 +1181,155 @@ mod tests {
         assert_eq!(p.end, 1787446800.0 + 900.0);
         assert!(tun.is_none());
         assert!(synth_params("not-a-recognized-slug").is_err());
+    }
+
+    // --- R7 fleet mode ------------------------------------------------
+
+    /// Scratch dir for the file-driven fleet tests. Named per test so two
+    /// running in parallel never share a tape.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("pmengine-replay-fleet-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Two 15m windows on the same clock, their eval ticks alternating.
+    fn two_arm_tape(dir: &Path) -> (PathBuf, PathBuf) {
+        let side_pair = |ask: f64| {
+            serde_json::json!([
+                {"side": "up", "fair": 1.0, "ask": ask, "net": 1.0 - ask},
+                {"side": "down", "fair": 0.0, "ask": 1.0 - ask, "net": -1.0},
+            ])
+        };
+        let ev = |slug: &str, t: f64| {
+            serde_json::json!({
+                "t": t, "ev": "eval", "slug": slug, "p_up": 1.0, "sig_bp": 3.0,
+                "rho": 0.0, "banked_decided": false, "sides": side_pair(0.94),
+            })
+        };
+        // btc first at each timestamp; eth 0.1s behind it.
+        let tape_path = dir.join("tape.jsonl");
+        write_jsonl(
+            &tape_path,
+            &[
+                ev("btc-updown-15m-600", 1400.0),
+                ev("eth-updown-15m-600", 1400.1),
+                ev("btc-updown-15m-600", 1410.0),
+                ev("eth-updown-15m-600", 1410.1),
+            ],
+        )
+        .unwrap();
+
+        let entry = |slug: &str, sym: &str| {
+            serde_json::json!({
+                "slug": slug, "kind": "twap", "symbol": sym,
+                "token_up": format!("{}-u", slug), "token_down": format!("{}-d", slug),
+                "start": 600.0, "end": 1500.0,
+                "sigma_bp_per_min": 3.0, "fee_rate": 0.07, "size_usdc": 100.0,
+            })
+        };
+        let params_path = dir.join("params.json");
+        std::fs::write(
+            &params_path,
+            serde_json::json!([
+                entry("btc-updown-15m-600", "BTCUSDT"),
+                entry("eth-updown-15m-600", "ETHUSDT"),
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        (tape_path, params_path)
+    }
+
+    fn fleet_opts(tape: &Path, params: &Path, out: &Path, cap: f64) -> ReplayOpts {
+        ReplayOpts {
+            mode: "evals".to_string(),
+            tape: Some(tape.to_path_buf()),
+            book_tape: None,
+            slug: "".to_string(), // every slug is a prefix-match on ""
+            params: Some(params.to_path_buf()),
+            outcomes: None,
+            out: Some(out.to_path_buf()),
+            fleet_cap: Some(cap),
+        }
+    }
+
+    /// Per-window rows from a fleet run's `--out` file (the trailing
+    /// aggregate row is dropped).
+    fn fleet_rows(out: &Path) -> Vec<Value> {
+        let mut rows = load_jsonl(out).unwrap();
+        rows.pop();
+        rows
+    }
+
+    #[test]
+    fn interleave_orders_by_time_then_arm() {
+        let a: Vec<Value> = vec![serde_json::json!({"t": 2.0}), serde_json::json!({"t": 1.0})];
+        let b: Vec<Value> = vec![serde_json::json!({"t": 1.0}), serde_json::json!({"t": 3.0})];
+        let ordered = interleave(&[&a, &b]);
+        let keys: Vec<(f64, usize)> = ordered.iter().map(|(t, i, _)| (*t, *i)).collect();
+        assert_eq!(
+            keys,
+            vec![(1.0, 0), (1.0, 1), (2.0, 0), (3.0, 1)],
+            "global time order, ties broken by arm so a re-run is identical"
+        );
+    }
+
+    #[test]
+    fn fleet_cap_binds_across_windows_a_per_slug_run_could_not_see() {
+        // The point of the whole driver: two windows that never overlap in
+        // a per-slug run are competing for one pool here. Room for one
+        // $24.44 clip, two arms that both want it.
+        let dir = scratch("binds");
+        let (tape, params) = two_arm_tape(&dir);
+
+        let out = dir.join("capped.jsonl");
+        run(fleet_opts(&tape, &params, &out, 26.0)).unwrap();
+        let rows = fleet_rows(&out);
+        assert_eq!(rows.len(), 2);
+        let fires: i64 = rows.iter().map(|r| r["sim"]["fires"].as_i64().unwrap()).sum();
+        assert_eq!(fires, 1, "the pool funded exactly one clip across the fleet");
+
+        // btc leads eth by 0.1s at every tick, so btc is the one that eats
+        // the pool — order in, order out. eth never gets a look-in, and
+        // btc's own second tick is refused by the exposure it just built.
+        let btc = rows.iter().find(|r| r["slug"] == "btc-updown-15m-600").unwrap();
+        let eth = rows.iter().find(|r| r["slug"] == "eth-updown-15m-600").unwrap();
+        assert_eq!(btc["sim"]["fires"], 1);
+        assert_eq!(btc["fleet"]["blocks"], 1, "its own committed fills the pool on tick two");
+        assert_eq!(eth["sim"]["fires"], 0);
+        assert_eq!(eth["fleet"]["blocks"], 2, "both of eth's ticks name the fleet");
+    }
+
+    #[test]
+    fn fleet_cap_zero_is_the_uncapped_baseline() {
+        // `--fleet-cap 0` runs the SAME interleaved driver with no cap, so
+        // an A/B differs in the cap and in nothing else.
+        let dir = scratch("baseline");
+        let (tape, params) = two_arm_tape(&dir);
+
+        let out = dir.join("uncapped.jsonl");
+        run(fleet_opts(&tape, &params, &out, 0.0)).unwrap();
+        let rows = fleet_rows(&out);
+        for r in &rows {
+            assert_eq!(r["sim"]["fires"], 2, "every arm fires every tick when nothing rations it");
+            assert_eq!(r["fleet"]["blocks"], 0);
+        }
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn fleet_cap_is_reproducible() {
+        // L33's lesson at the harness level: the same frozen input twice
+        // has to give the same number, or an A/B proves nothing.
+        let dir = scratch("repro");
+        let (tape, params) = two_arm_tape(&dir);
+        let (a, b) = (dir.join("a.jsonl"), dir.join("b.jsonl"));
+        run(fleet_opts(&tape, &params, &a, 26.0)).unwrap();
+        run(fleet_opts(&tape, &params, &b, 26.0)).unwrap();
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), std::fs::read_to_string(&b).unwrap());
     }
 
     #[test]

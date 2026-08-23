@@ -261,6 +261,12 @@ pub(crate) struct ArmState {
     /// ask drifted back inside tolerance. Once the window looks wrong, it
     /// stays wrong for speculative entries; banked-decided still trades.
     brake_latched: bool,
+    /// R7: last model read's banked-decidedness, cached so the fleet
+    /// pre-pass can size the shared un-decided pool without running the
+    /// model a second time per tick. Decidedness moves once per window and
+    /// then stays, so a tick of staleness here costs nothing; the fast half
+    /// of the sum (committed + inflight) is always read fresh.
+    last_banked_decided: bool,
     pub(crate) last_eval: Option<serde_json::Value>,
     /// Throttle for eval/gated lines in the durable tape.
     last_tape_at: f64,
@@ -294,6 +300,13 @@ pub struct Updown {
     /// and past `end` nothing can recreate the arm.
     store: ArmStore,
     last_persist_at: f64,
+    /// R7 correlation-aware fleet cap: ceiling (USDC) on the total
+    /// un-decided committed+inflight notional the whole fleet may carry at
+    /// once. 0 = off, and off is the default — at rho 0.7 the arms lose
+    /// together, but the operator arms the cap deliberately, never by
+    /// upgrade. Strategy-level on purpose: an ArmParams knob would be one
+    /// budget per arm, which is the thing that already exists.
+    fleet_undecided_cap: f64,
 }
 
 struct RollTask {
@@ -417,6 +430,7 @@ impl ArmState {
             last_clip: std::collections::HashMap::new(),
             last_clip_ask: std::collections::HashMap::new(),
             brake_latched: false,
+            last_banked_decided: false,
             last_eval: None,
             last_tape_at: 0.0,
             last_book_at: 0.0,
@@ -426,6 +440,33 @@ impl ArmState {
 
     fn tokens(&self) -> [String; 2] {
         [self.p.token_up.clone(), self.p.token_down.clone()]
+    }
+
+    /// R7: this arm's contribution to the fleet's shared un-decided pool.
+    ///
+    /// Committed + still-inflight notional, but only while the window is
+    /// still a bet. Banked-decided capital left the pool the moment the
+    /// model banked it: R9's theta gate owns entry into that state, and
+    /// once there the exposure is no longer correlated with every other
+    /// speculative arm — which is the only thing this cap rations. A
+    /// closed window contributes nothing; its capital is resolved, not
+    /// speculative (the study's `cleanup` zeroing, analysis/r7_fleet_cap.py).
+    ///
+    /// `position_floor` is the caller's authoritative committed floor —
+    /// the live position tracker on real ticks, the fill sim's cost basis
+    /// in replay — so both drivers share one definition of the pool
+    /// (L18: three drifted copies of the same guard is how this goes wrong).
+    pub(crate) fn undecided_committed(&self, position_floor: f64, now: f64) -> f64 {
+        if self.last_banked_decided || now >= self.p.end {
+            return 0.0;
+        }
+        let inflight: f64 = self
+            .inflight
+            .values()
+            .filter(|(_, at)| now - *at < INFLIGHT_TTL_S)
+            .map(|(n, _)| *n)
+            .sum();
+        self.filled_usdc.max(position_floor) + inflight
     }
 
     fn stop_feed(&mut self) {
@@ -702,6 +743,26 @@ impl ArmState {
         model: Result<ModelEval, GateReason>,
         now: f64,
     ) -> DecideOut {
+        let mut uncapped = f64::INFINITY;
+        self.decide_fleet(view, model, now, &mut uncapped)
+    }
+
+    /// `decide` with R7's shared fleet budget threaded through.
+    ///
+    /// `fleet_room` is the whole fleet's remaining un-decided headroom for
+    /// this tick, decremented in place as arms consume it. It has to be
+    /// shared and mutable rather than recomputed per arm: `on_tick` walks
+    /// `arms` sequentially, so two arms in the SAME pass would otherwise
+    /// both read the same stale headroom and both fire, overshooting the
+    /// cap by as many arms as happen to want a clip. `f64::INFINITY` is the
+    /// cap-off case and makes every clamp below a no-op.
+    pub(crate) fn decide_fleet(
+        &mut self,
+        view: &ArmView,
+        model: Result<ModelEval, GateReason>,
+        now: f64,
+        fleet_room: &mut f64,
+    ) -> DecideOut {
         let p = self.p.clone();
         let mut actions = Vec::new();
         let mut tape_out = Vec::new();
@@ -843,6 +904,9 @@ impl ArmState {
             }
         };
         let (p_up, sig_bp) = (m.p_up, m.sig_bp);
+        // Cache for the fleet pre-pass. A gate (stale feed) leaves the last
+        // known value standing: a feed hiccup doesn't un-bank a window.
+        self.last_banked_decided = m.banked_decided;
 
         // Notional already committed. on_fill events are unreliable for
         // taker orders (fills often only surface via the periodic position
@@ -918,6 +982,36 @@ impl ArmState {
             } else {
                 None
             };
+            // R7 fleet cap: the fleet's shared un-decided headroom is one
+            // more ceiling on this clip's room — the arm's own budget/cap
+            // machinery above is untouched. Banked-decided clips are never
+            // clamped: that capital was never in the pool this rations.
+            let fleet_bound =
+                if m.banked_decided { f64::INFINITY } else { fleet_room.max(0.0) };
+            let clip_room = room.min(fleet_bound);
+            let sized = |r: f64| -> f64 {
+                if r > 5.0 {
+                    (p.clip_usdc / ask).min(ask_size).min(r / ask).floor()
+                } else {
+                    0.0
+                }
+            };
+            let size = sized(clip_room);
+            let cooled =
+                now - self.last_clip.get(token).copied().unwrap_or(0.0) >= p.clip_cooldown_s;
+            let gates_ok = brake.is_none()
+                && !chop_blocked
+                && fair >= fair_req
+                && net >= edge_req
+                && ask <= p.max_price
+                && cooled
+                && !self.inflight.contains_key(token);
+            // Label the fleet only when it is what stopped a clip that
+            // every other gate cleared — otherwise "fleet" would shadow the
+            // real reason. Unlike distrust/avg_down it never latches the
+            // window: a full fleet says nothing about THIS window's
+            // evidence, and the arm must be free to fire once room returns.
+            let fleet_stopped = gates_ok && size < 5.0 && sized(room) >= 5.0;
             let mut eval = serde_json::json!({
                 "side": side, "fair": fair, "ask": ask, "net": net,
                 "safety": (safety * 100.0).round() / 100.0,
@@ -927,24 +1021,15 @@ impl ArmState {
             }
             if let Some(b) = brake {
                 eval["brake"] = serde_json::json!(b);
+            } else if fleet_stopped {
+                eval["brake"] = serde_json::json!("fleet");
+                // What the fleet cost this side, so R7's own effect is
+                // priceable from the tape the way the basis guard's is.
+                eval["fleet_blocked"] = serde_json::json!(sized(room) * ask);
             }
             evals.push(eval);
 
-            let cooled =
-                now - self.last_clip.get(token).copied().unwrap_or(0.0) >= p.clip_cooldown_s;
-            let firing = brake.is_none()
-                && !chop_blocked
-                && fair >= fair_req
-                && net >= edge_req
-                && ask <= p.max_price
-                && room > 5.0
-                && cooled
-                && !self.inflight.contains_key(token);
-            if !firing {
-                continue;
-            }
-            let size = (p.clip_usdc / ask).min(ask_size).min(room / ask).floor();
-            if size < 5.0 {
+            if !(gates_ok && size >= 5.0) {
                 continue;
             }
             tracing::info!(
@@ -959,6 +1044,12 @@ impl ArmState {
                 "mode": if unlocked { "safe" } else { "spec" }, "rho": m.rho,
             }));
             room -= size * ask;
+            // Only speculative notional draws down the shared pool, and it
+            // draws down NOW so the next arm in this tick's loop — and this
+            // arm's other side — see the headroom this clip just spent.
+            if !m.banked_decided {
+                *fleet_room -= size * ask;
+            }
             self.last_clip.insert(token.clone(), now);
             self.last_clip_ask.insert(token.clone(), ask);
             self.inflight.insert(token.clone(), (size * ask, now));
@@ -967,7 +1058,11 @@ impl ArmState {
             actions.push(Action::Buy { token: token.clone(), price: limit, size });
         }
 
-        self.last_eval = Some(serde_json::json!({
+        // Only carried when a cap is actually set — an uncapped fleet has
+        // infinite room, which is not a number any consumer should see.
+        let fleet_left =
+            if fleet_room.is_finite() { Some(fleet_room.max(0.0)) } else { None };
+        let mut eval_rec = serde_json::json!({
             "state": "armed", "t": now, "p_up": p_up, "sig_bp": sig_bp,
             "rho": m.rho, "mode": if unlocked { "safe" } else { "spec" },
             "chop_blocked": chop_blocked, "banked_decided": m.banked_decided,
@@ -975,16 +1070,24 @@ impl ArmState {
             "cushion_bp": m.cushion_bp, "guard_bp": m.guard_bp,
             "committed": committed, "budget": budget, "room": room,
             "inflight": inflight_usdc, "sides": evals,
-        }));
+        });
+        if let Some(fr) = fleet_left {
+            eval_rec["fleet_room"] = serde_json::json!(fr);
+        }
+        self.last_eval = Some(eval_rec);
         if now - self.last_tape_at >= 5.0 {
             self.last_tape_at = now;
-            tape_out.push(serde_json::json!({
+            let mut rec = serde_json::json!({
                 "t": now, "ev": EV_EVAL, "slug": p.slug, "p_up": p_up,
                 "sig_bp": sig_bp, "rho": m.rho, "banked_decided": m.banked_decided,
                 "margin_bp": m.margin_bp, "banked_bp": m.banked_margin_bp,
                 "cushion_bp": m.cushion_bp, "guard_bp": m.guard_bp,
                 "committed": committed, "sides": evals,
-            }));
+            });
+            if let Some(fr) = fleet_left {
+                rec["fleet_room"] = serde_json::json!(fr);
+            }
+            tape_out.push(rec);
         }
 
         DecideOut { actions, tape: tape_out, finished: false }
@@ -993,13 +1096,18 @@ impl ArmState {
     /// Live-tick adapter around `decide`: snapshot the StrategyContext into
     /// an ArmView, run the pure pass, then do the I/O it prescribed — tape
     /// records to disk here, orders upstream as Signals.
-    fn tick(&mut self, ctx: &StrategyContext, now: f64) -> (Vec<Signal>, bool) {
+    fn tick(
+        &mut self,
+        ctx: &StrategyContext,
+        now: f64,
+        fleet_room: &mut f64,
+    ) -> (Vec<Signal>, bool) {
         if self.subscribed && now < self.p.end {
             self.record_book(ctx, now);
         }
         let view = arm_view(ctx, &self.p);
         let model = self.fair_p_up(now);
-        let out = self.decide(&view, model, now);
+        let out = self.decide_fleet(&view, model, now, fleet_room);
         for rec in out.tape {
             tape(rec);
         }
@@ -1074,7 +1182,27 @@ impl Updown {
             rolls: Vec::new(),
             store,
             last_persist_at: 0.0,
+            fleet_undecided_cap: 0.0,
         }
+    }
+
+    /// R7: the fleet's remaining shared un-decided headroom for one tick.
+    ///
+    /// Recomputed from live exposure every tick rather than carried: fills
+    /// land through the position reconcile, not through `on_fill` (the
+    /// engine's oldest gotcha), so a running counter would drift off the
+    /// truth within a window. `INFINITY` when no cap is set, which makes
+    /// every clamp downstream a no-op — cap-off is exactly today's engine.
+    fn fleet_room(&self, ctx: &StrategyContext, now: f64) -> f64 {
+        if self.fleet_undecided_cap <= 0.0 {
+            return f64::INFINITY;
+        }
+        let undecided: f64 = self
+            .arms
+            .values()
+            .map(|a| a.undecided_committed(position_floor(ctx, &a.p), now))
+            .sum();
+        (self.fleet_undecided_cap - undecided).max(0.0)
     }
 
     /// Rebuild from the durable store, then rewrite it clean.
@@ -1087,6 +1215,15 @@ impl Updown {
     /// startup position seed runs, so the budget comes back with the arm.
     pub(crate) fn recover(&mut self, now: f64) {
         let Some(state) = self.store.load() else { return };
+        // R7's cap comes back before any arm does: a restart that re-armed
+        // an uncapped fleet would quietly undo the operator's ration.
+        self.fleet_undecided_cap = state.fleet_undecided_cap.max(0.0);
+        if self.fleet_undecided_cap > 0.0 {
+            tracing::info!(
+                cap = self.fleet_undecided_cap,
+                "updown recovery — fleet un-decided cap restored"
+            );
+        }
         let plan = plan_recovery(&state, now);
         for p in plan.rearm {
             tracing::info!(
@@ -1139,7 +1276,8 @@ impl Updown {
         self.last_persist_at = now;
         let arms: Vec<ArmParams> = self.arms.values().map(|a| a.p.clone()).collect();
         let rolls: Vec<RollRecord> = self.rolls.iter().map(|t| t.record()).collect();
-        self.store.save(&ArmsState::new(arms, rolls, now));
+        self.store
+            .save(&ArmsState::new(arms, rolls, now).with_fleet_cap(self.fleet_undecided_cap));
     }
 
     /// Arm any due successor windows. Gamma hiccups retry every 10s; a
@@ -1225,9 +1363,15 @@ impl Strategy for Updown {
             })
             .collect();
 
+        // R7 pre-pass: one shared budget for the whole sweep below, spent
+        // down as arms consume it. Sizing it once per tick and handing out
+        // a &mut is what keeps two arms in the same pass from both seeing
+        // the same headroom and both firing into it.
+        let mut fleet_room = self.fleet_room(ctx, now);
+
         let mut finished = Vec::new();
         for (slug, arm) in self.arms.iter_mut() {
-            let (mut s, done) = arm.tick(ctx, now);
+            let (mut s, done) = arm.tick(ctx, now, &mut fleet_room);
             signals.append(&mut s);
             if done {
                 finished.push(slug.clone());
@@ -1339,6 +1483,26 @@ impl Strategy for Updown {
                     "cleanup": "next tick",
                 }))
             }
+            // R7 fleet cap. Strategy-level, not per-arm: the quantity being
+            // rationed is the SUM across arms, so there is no arm that owns
+            // it. Absent/0/negative all mean off, which is the default and
+            // is byte-for-byte today's behavior.
+            Some("fleet") => {
+                let cap = cmd
+                    .get("undecided_cap_usdc")
+                    .map(|v| v.as_f64().ok_or("undecided_cap_usdc must be a number"))
+                    .transpose()?
+                    .unwrap_or(0.0)
+                    .max(0.0);
+                self.fleet_undecided_cap = cap;
+                tracing::info!(cap, arms = self.arms.len(), "updown fleet un-decided cap set");
+                self.persist(unix_now());
+                Ok(serde_json::json!({
+                    "undecided_cap_usdc": cap,
+                    "enabled": cap > 0.0,
+                    "arms": self.arms.len(),
+                }))
+            }
             Some("status") => {
                 let arms: serde_json::Map<String, serde_json::Value> = self
                     .arms
@@ -1363,9 +1527,10 @@ impl Strategy for Updown {
                     self.rolls.iter().map(|t| t.next_slug.as_str()).collect();
                 Ok(serde_json::json!({
                     "arms": arms, "count": self.arms.len(), "pending_rolls": rolls,
+                    "fleet_undecided_cap": self.fleet_undecided_cap,
                 }))
             }
-            _ => Err("unknown action (arm | disarm | status)".to_string()),
+            _ => Err("unknown action (arm | disarm | fleet | status)".to_string()),
         }
     }
 }
@@ -1774,6 +1939,134 @@ mod tests {
         assert_eq!(buys(&out).len(), 1);
     }
 
+    // --- R7 correlation-aware fleet cap ---------------------------------
+    //
+    // The cap rations ONE quantity across the whole fleet: un-decided
+    // committed notional. These tests pin the three things that make that
+    // real — the shared budget survives an arm-to-arm handoff inside a
+    // single tick, banked-decided capital is outside the pool entirely,
+    // and an unset cap is byte-for-byte the old engine.
+
+    /// An undecided model that still clears every gate at t=1400 (rem=100s
+    /// unlocks the budget regardless of decidedness, and net ~0.056 sits
+    /// under the 0.15 distrust threshold).
+    fn undecided_up_model() -> ModelEval {
+        ModelEval { banked_decided: false, ..locked_up_model() }
+    }
+
+    #[test]
+    fn fleet_cap_rations_one_pool_across_arms_in_the_same_tick() {
+        // Two arms, both undecided, both wanting a $24.44 clip, into a pool
+        // with room for exactly one. This is the same-tick race: `on_tick`
+        // walks the arms sequentially, so the second arm MUST see what the
+        // first just spent, not the headroom the tick opened with.
+        let (mut a, mut b) = (armed(params("a")), armed(params("b")));
+        let mut room = 26.0;
+
+        let out_a = a.decide_fleet(&view_with_up_ask(0.94, 500.0), Ok(undecided_up_model()), 1400.0, &mut room);
+        assert_eq!(buys(&out_a).len(), 1, "first arm takes the pool");
+        assert!((room - (26.0 - 26.0 * 0.94)).abs() < 1e-9, "the clip drew the pool down in place");
+
+        let out_b = b.decide_fleet(&view_with_up_ask(0.94, 500.0), Ok(undecided_up_model()), 1400.0, &mut room);
+        assert!(buys(&out_b).is_empty(), "second arm finds the pool spent");
+        let side = &b.last_eval.as_ref().unwrap()["sides"][0];
+        assert_eq!(side["brake"], "fleet", "and says so — not 'budget', not silence");
+        assert!(
+            (side["fleet_blocked"].as_f64().unwrap() - 26.0 * 0.94).abs() < 1e-9,
+            "the record prices what the cap cost, the way the basis guard does"
+        );
+
+        // The control: hand each arm its own fresh headroom and both fire.
+        // That is precisely the overshoot a per-arm budget would allow.
+        let (mut a2, mut b2) = (armed(params("a")), armed(params("b")));
+        let (mut r1, mut r2) = (26.0, 26.0);
+        assert_eq!(buys(&a2.decide_fleet(&view_with_up_ask(0.94, 500.0), Ok(undecided_up_model()), 1400.0, &mut r1)).len(), 1);
+        assert_eq!(buys(&b2.decide_fleet(&view_with_up_ask(0.94, 500.0), Ok(undecided_up_model()), 1400.0, &mut r2)).len(), 1);
+    }
+
+    #[test]
+    fn fleet_cap_trims_a_clip_to_the_room_that_is_left() {
+        // Partial room is not a block: the clip shrinks to what the pool
+        // can still fund, mirroring the counterfactual's trimmed deltas.
+        let mut arm = armed(params("s"));
+        let mut room = 12.0;
+        let out = arm.decide_fleet(&view_with_up_ask(0.94, 500.0), Ok(undecided_up_model()), 1400.0, &mut room);
+        let b = buys(&out);
+        assert_eq!(b.len(), 1);
+        let Action::Buy { size, .. } = b[0] else { unreachable!() };
+        assert_eq!(*size, 12.0, "12.00 room / 0.94 floored, not the full 26-share clip");
+    }
+
+    #[test]
+    fn fleet_cap_exempts_banked_decided_fires() {
+        // A fully-spent pool must not stop banked-decided capital: it was
+        // never in the pool (R9 owns entry into that state), and blocking
+        // it would ration exactly the exposure this cap is not about.
+        let mut arm = armed(params("s"));
+        let mut room = 0.0;
+        let out = arm.decide_fleet(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.0, &mut room);
+        assert_eq!(buys(&out).len(), 1, "banked-decided fires through an empty fleet");
+        assert_eq!(room, 0.0, "and never draws the pool down further");
+        assert!(arm.last_eval.as_ref().unwrap()["sides"][0].get("brake").is_none());
+    }
+
+    #[test]
+    fn fleet_cap_off_is_inert() {
+        // The default path: `decide` is `decide_fleet` with an infinite
+        // pool, so an unset cap changes neither the fire nor the record.
+        let mut plain = armed(params("s"));
+        let out = plain.decide(&view_with_up_ask(0.94, 500.0), Ok(undecided_up_model()), 1400.0);
+        assert_eq!(buys(&out).len(), 1);
+        let eval = plain.last_eval.as_ref().unwrap();
+        assert!(eval.get("fleet_room").is_none(), "no cap, no fleet numbers in the tape");
+        assert!(eval["sides"][0].get("brake").is_none());
+
+        let mut capped = armed(params("s"));
+        let mut room = f64::INFINITY;
+        let out2 = capped.decide_fleet(&view_with_up_ask(0.94, 500.0), Ok(undecided_up_model()), 1400.0, &mut room);
+        assert_eq!(buys(&out2), buys(&out), "an infinite pool is the same engine");
+    }
+
+    #[test]
+    fn fleet_room_carries_into_the_eval_record_when_a_cap_is_set() {
+        let mut arm = armed(params("s"));
+        let mut room = 100.0;
+        arm.decide_fleet(&view_with_up_ask(0.94, 500.0), Ok(undecided_up_model()), 1400.0, &mut room);
+        let left = arm.last_eval.as_ref().unwrap()["fleet_room"].as_f64().unwrap();
+        assert!((left - (100.0 - 26.0 * 0.94)).abs() < 1e-9, "post-clip headroom, so the tape can price the cap");
+    }
+
+    #[test]
+    fn undecided_committed_counts_only_live_speculation() {
+        let mut arm = armed(params("s"));
+        arm.filled_usdc = 40.0;
+        arm.inflight.insert("s-u".into(), (10.0, 1400.0));
+        // Position floor wins when the tracker knows more than fills do.
+        assert_eq!(arm.undecided_committed(55.0, 1400.0), 65.0);
+        assert_eq!(arm.undecided_committed(10.0, 1400.0), 50.0);
+        // A dead inflight entry is not exposure — same TTL decide() uses.
+        assert_eq!(arm.undecided_committed(0.0, 1400.0 + INFLIGHT_TTL_S), 40.0);
+        // Banked-decided capital left the pool.
+        arm.last_banked_decided = true;
+        assert_eq!(arm.undecided_committed(55.0, 1400.0), 0.0);
+        // So did a closed window's — resolved, not speculative.
+        arm.last_banked_decided = false;
+        assert_eq!(arm.undecided_committed(55.0, 1500.0), 0.0);
+    }
+
+    #[test]
+    fn decide_caches_banked_decidedness_for_the_fleet_pre_pass() {
+        // The pre-pass reads this instead of running the model a second
+        // time per tick; a gate must leave the last known value standing,
+        // since a stale feed does not un-bank a window.
+        let mut arm = armed(params("s"));
+        assert!(!arm.last_banked_decided, "an unevaluated arm is speculative");
+        arm.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.0);
+        assert!(arm.last_banked_decided);
+        arm.decide(&ArmView::default(), Err(GateReason::plain("feed stale")), 1400.1);
+        assert!(arm.last_banked_decided, "a feed hiccup does not un-bank the window");
+    }
+
     fn armed_with_feed(banked_px: f64, spot: f64) -> (ArmState, f64) {
         let arm = ArmState::with_params(params("s"));
         let now = 1400.0;
@@ -2101,5 +2394,87 @@ mod tests {
         let d = s.on_command(&serde_json::json!({"action": "disarm"})).unwrap();
         assert_eq!(d["rolls_cancelled"], 1);
         assert!(s.rolls.is_empty());
+    }
+
+    #[test]
+    fn fleet_cap_round_trips_through_arm_state() {
+        // The cap is a fleet-level ration, so it has to survive a restart
+        // the way the arms do — a reboot that came back uncapped would
+        // quietly undo it right when the roll chain re-arms everything.
+        let (store, path) = tmp_store("fleetcap");
+        let mut s = Updown::with_store(store);
+        let (_slug, cmd) = arm_cmd(-30.0, true);
+        s.on_command(&cmd).unwrap();
+        let r = s
+            .on_command(&serde_json::json!({"action": "fleet", "undecided_cap_usdc": 250.0}))
+            .unwrap();
+        assert_eq!(r["undecided_cap_usdc"], 250.0);
+        assert_eq!(r["enabled"], true);
+
+        let mut fresh = Updown::with_store(ArmStore::at(path.clone()));
+        fresh.recover(unix_now());
+        assert_eq!(fresh.fleet_undecided_cap, 250.0);
+        assert_eq!(fresh.arms.len(), 1, "the arms came back with it");
+        assert_eq!(fresh.on_command(&serde_json::json!({"action": "status"})).unwrap()
+                       ["fleet_undecided_cap"], 250.0);
+
+        // Turning it off is a real state too: the file must not hand the
+        // old cap back on the next restart.
+        fresh.on_command(&serde_json::json!({"action": "fleet", "undecided_cap_usdc": 0})).unwrap();
+        let mut off = Updown::with_store(ArmStore::at(path));
+        off.recover(unix_now());
+        assert_eq!(off.fleet_undecided_cap, 0.0);
+    }
+
+    #[test]
+    fn a_bare_fleet_cap_persists_without_any_arms() {
+        // "absent = inert" still holds, but a cap alone is not nothing —
+        // the operator may ration the fleet before arming it.
+        let (store, path) = tmp_store("fleetcap-bare");
+        let mut s = Updown::with_store(store);
+        s.on_command(&serde_json::json!({"action": "fleet", "undecided_cap_usdc": 300.0}))
+            .unwrap();
+        assert!(path.exists(), "a cap with no arms is still state worth keeping");
+
+        let mut fresh = Updown::with_store(ArmStore::at(path.clone()));
+        fresh.recover(unix_now());
+        assert_eq!(fresh.fleet_undecided_cap, 300.0);
+        assert!(fresh.arms.is_empty());
+
+        fresh.on_command(&serde_json::json!({"action": "fleet"})).unwrap();
+        assert!(!path.exists(), "cap off and no arms clears the file again");
+    }
+
+    #[test]
+    fn a_pre_r7_state_file_recovers_as_uncapped() {
+        // Forward compat both ways: no version bump, so an old file loads
+        // and simply means "no cap" rather than being refused (which would
+        // strand a live window on the way back up).
+        let (_store, path) = tmp_store("fleetcap-oldfile");
+        let start = (unix_now() - 30.0) as i64;
+        let slug = format!("btc-updown-5m-{}", start);
+        std::fs::write(&path, serde_json::json!({
+            "version": 1, "written_at": 0.0, "rolls": [],
+            "arms": [{
+                "slug": slug, "kind": "twap", "symbol": "BTCUSDT",
+                "token_up": format!("{}-u", slug), "token_down": format!("{}-d", slug),
+                "start": start as f64, "end": (start + 300) as f64,
+                "sigma_bp_per_min": 3.0, "fee_rate": 0.07, "size_usdc": 250.0,
+            }],
+        }).to_string()).unwrap();
+
+        let mut s = Updown::with_store(ArmStore::at(path));
+        s.recover(unix_now());
+        assert_eq!(s.arms.len(), 1, "a pre-R7 file still recovers its arms");
+        assert_eq!(s.fleet_undecided_cap, 0.0);
+    }
+
+    #[test]
+    fn fleet_command_rejects_a_non_numeric_cap() {
+        let mut s = Updown::new();
+        assert!(s
+            .on_command(&serde_json::json!({"action": "fleet", "undecided_cap_usdc": "250"}))
+            .is_err());
+        assert_eq!(s.fleet_undecided_cap, 0.0, "a bad command leaves the fleet as it was");
     }
 }

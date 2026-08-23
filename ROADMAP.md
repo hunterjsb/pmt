@@ -143,8 +143,30 @@ R3 → R5/R6/R1 → R7/R8/R9.
   76d6bfc) stays dark — capping a calibrated model fixes nothing; the residual tail is R1's
   domain (settlement basis), defended by measured static guards + the dark dynamic guard,
   and by not trading formats whose basis tail exceeds their guard (sol15's epitaph).
-- **R7 Correlation-aware fleet cap** — cap total un-decided committed notional across arms;
-  at ρ 0.7 the arms lose together.
+- **R7 Correlation-aware fleet cap — BUILT DARK 2026-08-23, A/B says DO NOT ARM YET**
+  (`analysis/r7_fleet_cap.py` for the counterfactual, `analysis/r7_fleet_ab.py` for the
+  A/B, `pmengine replay --fleet-cap N`). Mechanism: `Updown::on_tick` sums every arm's
+  un-decided `committed + inflight` into one shared budget and hands `decide()` a
+  `&mut f64` it spends down within the tick — a per-arm recompute would let two arms in
+  the same pass both fire into the same headroom. Banked-decided fires are exempt (that
+  capital left the pool when the model banked it), exits/quiesce/flip untouched, blocked
+  clips carry brake `"fleet"` + `fleet_blocked` in the eval sides. Set with
+  `pmt crypto fleet --cap N`; persists in `arms-state.json`; **default 0 = off**.
+  - The counterfactual said +$194/night at $250 (41c per blocked dollar). Replaying the
+    same night through the engine as it stands **now** says +$27 (full mode, as-armed
+    sizes), -$89 at today's scaled budgets, -$76 over the full night in evals mode. The
+    difference is entirely R9: 100.0% of the counterfactual's +$194 came from windows
+    before 02:45Z, and the two that supplied all of its avoided loss
+    (btc-15m-1787449500, btc-5m-1787436000) now fire **zero** clips because the theta
+    gate refuses them at entry. R7 and R9 are substitutes over the exposure they both
+    reach, not complements. See docs/LESSONS.md#L36.
+  - The real fleet's un-decided exposure peaked at $423 pre-02:45Z and only $203 after:
+    on the real fills it crossed $250 in 172 of 10,093 timeline ticks (1.7%), every one
+    of them before 02:45Z. Arm the cap when the scale-up actually pushes concurrent
+    un-decided exposure back over it, and re-run the A/B on that night's tape first.
+  - Second-order effect worth watching: a fleet block DEFERS a clip rather than cancelling
+    it, which also defers `last_clip_ask`, the no-averaging-down anchor. One window
+    (btc-5m-1787461800) built $45 MORE size under the cap than without it.
 - **R8 Near-even late-flow guard** — when the book is still ~50/50 in the final 30–60s and
   late Binance flow is abnormal, cut or zero the size multiplier: that combination is the
   manipulation fingerprint the 5m literature documents. Formalization (issue #3): VPIN

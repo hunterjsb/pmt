@@ -395,3 +395,28 @@ Polymarket's WS is geoblocked.
 **Changed:** three independent exit conditions, any one sufficient:
 `--skip-warmup`, enough streamed WS book diffs, or a wall-clock deadline. A
 still-missing book is handled by each strategy's own `if book is None` guard.
+
+### <a id="L36"></a>L36 — A guard measured on last week's fills prices an engine that no longer exists
+
+**2026-08-23.** R7's fleet cap was justified by a counterfactual worth +$194 a
+night at $250 (41c net per dollar blocked), computed by replaying a cap against
+the real committed deltas of one measured night. Between that measurement and
+the build, R9's theta entry gate and the window brake latch shipped. Replaying
+the SAME night through the engine as it stands now, both windows that supplied
+the entire +$194 fire zero clips — R9 refuses them at entry, so there is no
+speculative pile-up left for a fleet cap to ration. The cap's remaining reach
+is late-window un-banked exposure that was mostly winning, and at $250 it grades
+between -$89 and +$42 depending on configuration, i.e. noise.
+
+The counterfactual was not wrong; it aged. Its own text even named the overlap
+("the same failure R9's theta gate targets from the entry side") without
+drawing the conclusion that the two mitigations are substitutes, not
+complements, for the exposure they both reach.
+
+**Changed:** a mitigation's A/B is re-run against the CURRENT decision core
+before it goes live, not just against the fills that motivated it —
+`analysis/r7_fleet_ab.py` drives `pmengine replay --fleet-cap` for exactly
+that, with a `policy=prer9` mode that reproduces the older engine so the two
+numbers can be put side by side instead of confused for each other. R7 ships
+dark; the operator arms it when the fleet's un-decided exposure is actually
+reaching the cap, which on the measured night it did only before 02:45Z.
