@@ -856,43 +856,42 @@ def market(slug_or_cid: str) -> None:
 @cli.command()
 @click.argument("query")
 @click.option("--keyword", default=None, help="Filter results to title keyword")
-def search(query: str, keyword: str | None) -> None:
-    """Free-text search across active events."""
-    api = _api()
-    events = api.search_markets(query)
-    rows = []
-    for e in events:
-        if e.get("closed") or e.get("archived"):
-            continue
-        for m in e.get("markets", []) or []:
-            if m.get("closed") or m.get("archived"):
-                continue
-            try:
-                outcomes = json.loads(m.get("outcomes", "[]"))
-                prices = json.loads(m.get("outcomePrices", "[]"))
-                idx = outcomes.index("Yes") if "Yes" in outcomes else -1
-                yes_p = float(prices[idx]) if idx != -1 and idx < len(prices) else None
-            except (ValueError, KeyError):
-                yes_p = None
-            if yes_p is None:
-                continue
-            title = m.get("question", "")
+@click.option("--tokens", "show_tokens", is_flag=True,
+              help="Also print outcome -> token id (the tradeable handles)")
+@click.option("--closed", "include_closed", is_flag=True, help="Include closed markets")
+def search(query: str, keyword: str | None, show_tokens: bool,
+           include_closed: bool) -> None:
+    """Free-text market discovery: events, market slugs, live prices.
+
+    Works for ANY outcome shape (team-vs-team, Up/Down, Yes/No) — the old
+    version silently dropped every non-Yes/No market, which is why finding
+    a sports match always ended in hand-written gamma calls. Exact slugs
+    (dashes, no spaces) resolve directly even when free search misses.
+    """
+    from polymarket.search import find_markets
+
+    events = find_markets(query, include_closed=include_closed)
+    if not events:
+        console.print(f"[yellow]nothing found for '{query}'[/yellow]")
+        return
+    for ev in events:
+        t = Table(title=ev["event"])
+        for col in ("market", "outcomes", "liq"):
+            t.add_column(col)
+        for m in ev["markets"]:
+            title = m["question"] or m["slug"]
             if keyword and keyword.lower() not in title.lower():
                 continue
-            rows.append({
-                "title": title[:55],
-                "yes_p": yes_p,
-                "no_p": 1 - yes_p,
-                "liq": float(m.get("liquidity", 0) or 0),
-                "end": (m.get("endDate", "") or "")[:10],
-                "cid": m.get("conditionId", ""),
-            })
-    rows.sort(key=lambda r: r["yes_p"])
-    t = Table(title=f"Search: {query}")
-    for col in ("YES", "NO", "Liq", "End", "Market"):
-        t.add_column(col)
-    for r in rows[:30]:
-        t.add_row(f"${r['yes_p']:.3f}", f"${r['no_p']:.3f}", f"${r['liq']:.0f}", r["end"], r["title"])
+            sides = " · ".join(
+                f"{s['outcome']} {s['price']:.3f}" if s["price"] is not None
+                else s["outcome"] for s in m["sides"])
+            t.add_row(m["slug"], sides, f"${m['liquidity']:,.0f}")
+        console.print(t)
+        if show_tokens:
+            for m in ev["markets"]:
+                for s in m["sides"]:
+                    if s["token"]:
+                        console.print(f"  [dim]{m['slug']}[/dim] {s['outcome']}: {s['token']}")
     console.print(t)
 
 
