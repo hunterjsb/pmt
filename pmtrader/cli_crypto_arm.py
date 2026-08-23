@@ -122,9 +122,13 @@ def _resolve_basis_guard(explicit: float | None, symbol: str) -> tuple[float, st
                    "losses in replay; 1.0 = require banked-decided to enter")
 @click.option("--settle-tw", type=float, default=0.0, show_default=True,
               help="Settlement TWAP width (seconds) the model prices against. "
-                   "0 keeps the engine's duration default; 60 is the measured "
-                   "truth at 5m (analysis/settle_width.md). Only terminal-"
-                   "aware paths consult it; range_avg arms ignore it.")
+                   "0 keeps the engine's duration default (30s at 5m — wrong: "
+                   "the measured truth is 60s everywhere, analysis/"
+                   "settle_width.md). LOAD-BEARING on stream-fed arms: it "
+                   "picks which stream topic the arm subscribes (a 5m rtds "
+                   "arm at the default reads twap_thirty, the wrong "
+                   "settlement series — worth -$630 in replay). rtds 5m arms "
+                   "are auto-raised to 60.")
 @click.option("--pay-up", type=float, default=0.0, show_default=True,
               help="Fill-chase buffer: a clip's limit may sit up to this many "
                    "cents above the decision ask, funded only by surplus edge "
@@ -183,6 +187,13 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
             f"--feed rtds does not support {r['kind']} markets — the settlement "
             "stream has no candle opens. Use --feed binance."
         )
+    # settle_tw picks the stream TOPIC on rtds arms (twap_topic_for), and the
+    # engine's <=300s default is 30 — the WRONG settlement series (feed_ab.md:
+    # -$630 fleet). Never let the feed flag ship alone.
+    if feed == "rtds" and (r["end"] - r["start"]) <= 300 and settle_tw < 60:
+        console.print("[yellow]--settle-tw raised to 60[/yellow] — a 5m rtds arm at the "
+                      "engine default would read the 30s stream, the wrong settlement series")
+        settle_tw = 60.0
     guard_bp, guard_warning = _resolve_basis_guard(basis_guard, r["symbol"])
     if guard_warning:
         console.print(f"[yellow]warning:[/yellow] {guard_warning}")
