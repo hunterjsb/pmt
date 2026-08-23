@@ -239,6 +239,34 @@ def main():
     out["neither"] = tally("neither (plain early/spec fires)",
                            lambda r: not r["carve"] and not r["late"])
 
+    # --- the split that decides the verdict --------------------------------
+    # docs/LESSONS.md L39 / analysis/fourh_fit.md: the range_avg "banked
+    # mass" is settlement arithmetic only under a range-average rule. Under
+    # the true terminal rule it is a MOMENTUM PROXY that works at 5m and
+    # lies with duration. If that is right, the carve-out should pay at 5m
+    # and be the whole hole at 15m. It is, and it is.
+    print("\n" + "=" * 118)
+    print("BY DURATION — the axis the waiver actually splits on")
+    print("=" * 118)
+    print(f"{'dur':>5} {'class':<22} {'fires':>6} {'notional':>11} {'W':>5} {'L':>5} {'NET':>11}")
+    print("-" * 74)
+    for dur in ("5m", "15m"):
+        for label, sel in (
+            ("carve-out waived", lambda r: bool(r["carve"])),
+            ("late unlock only", lambda r: r["late"] and not r["carve"]),
+            ("neither", lambda r: not r["late"] and not r["carve"]),
+            ("ALL", lambda r: True),
+        ):
+            sub = [r for r in graded if r["slug"].split("-")[2] == dur and sel(r)]
+            if not sub:
+                continue
+            net = sum(r["pnl"] for r in sub)
+            w = sum(1 for r in sub if r["pnl"] > 0)
+            print(f"{dur:>5} {label:<22} {len(sub):>6} "
+                  f"${sum(r['notional'] for r in sub):>10,.0f} {w:>5} {len(sub) - w:>5} "
+                  f"${net:>+10,.2f}")
+        print("-" * 74)
+
     # --- the three named events ------------------------------------------
     print("\n" + "=" * 118)
     print("NAMED EVENTS")

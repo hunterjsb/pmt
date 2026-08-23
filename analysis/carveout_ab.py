@@ -57,12 +57,28 @@ VARIANTS = {
     "m3":      {"late_clip_mult": 3.0},
     "m5":      {"late_clip_mult": 5.0},
     "m10":     {"late_clip_mult": 10.0},
+    "k110":    {"decided_k": 1.10},
+    "k115":    {"decided_k": 1.15},
+    "k135":    {"decided_k": 1.35},
+    # Probe, not a candidate: a 10-minute stale window is far wider than any
+    # policy would ship. If even THIS moves nothing, the knob is unreachable
+    # in this harness rather than merely unbinding.
+    "stale600": {"decided_stale_s": 600.0},
     "k125+m5":       {"decided_k": 1.25, "late_clip_mult": 5.0},
     "k125+stale30":  {"decided_k": 1.25, "decided_stale_s": 30.0},
     "k125+m5+stale30": {"decided_k": 1.25, "late_clip_mult": 5.0,
                         "decided_stale_s": 30.0},
     "k150+m3+stale30": {"decided_k": 1.5, "late_clip_mult": 3.0,
                         "decided_stale_s": 30.0},
+    # Duration-scoped. The whole measured effect of decided_k lives in the
+    # 15m book, where docs/LESSONS.md L39 / analysis/fourh_fit.md already say
+    # the range_avg "banked mass" is a momentum proxy that lies with
+    # duration. These two isolate that from the 5m book, which is where the
+    # fleet's actual edge is. `@` scopes a variant to one duration token.
+    "k125@15m": {"decided_k": 1.25, "@": "15m"},
+    "k150@15m": {"decided_k": 1.5, "@": "15m"},
+    "k125@5m":  {"decided_k": 1.25, "@": "5m"},
+    "k150@5m":  {"decided_k": 1.5, "@": "5m"},
 }
 
 
@@ -126,8 +142,9 @@ def build_params(tun, out_path):
             "basis_guard_bp": guard_floor.get(slug, t["basis_guard_bp"]),
             "roll": False,
         })
-        if tun:
-            e["tunables"] = tun
+        scope = tun.get("@") if tun else None
+        if tun and (scope is None or scope == dur):
+            e["tunables"] = {k: v for k, v in tun.items() if k != "@"}
         entries.append(e)
 
     with open(out_path, "w") as fh:
@@ -189,6 +206,7 @@ def main():
     ap.add_argument("--cap", type=float, default=500.0)
     ap.add_argument("--work", default=os.path.join(WORK, "ab"))
     ap.add_argument("--only", default=None, help="comma-separated variant subset")
+    ap.add_argument("--mode", default="full", choices=("full", "evals"))
     ap.add_argument("--json-out", default=os.path.join(WORK, "carveout-ab.json"))
     a = ap.parse_args()
     os.makedirs(a.work, exist_ok=True)
@@ -200,13 +218,14 @@ def main():
     runs = {}
     for name in names:
         params, n = build_params(VARIANTS[name], os.path.join(a.work, f"params-{name}.json"))
-        out = replay(a.bin, params, a.cap, os.path.join(a.work, f"run-{name}.jsonl"))
+        out = replay(a.bin, params, a.cap,
+                     os.path.join(a.work, f"run-{name}.jsonl"), a.mode)
         runs[name] = load(out)
         print(f"[run] {name:18} {n} windows -> {out}", file=sys.stderr)
 
     base = runs["base"]
     bs = summarize(base)
-    print(f"\ncorpus: {len(base)} windows, fleet cap ${a.cap:.0f}, --mode full")
+    print(f"\ncorpus: {len(base)} windows, fleet cap ${a.cap:.0f}, --mode {a.mode}")
     print(f"BASELINE (live policy): {bs['W']}W-{bs['L']}L  {bs['fires']} fires  "
           f"${bs['notional']:,.0f} notional  net ${bs['net']:+,.2f}")
 
