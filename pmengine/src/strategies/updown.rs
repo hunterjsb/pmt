@@ -772,19 +772,22 @@ impl ArmState {
         }
         self.last_book_at = now;
         // Signed print flow — the VPIN/R8 input, NOT backfillable. Counted
-        // by per-token high-water mark on trade timestamps: each sample
-        // takes every hub trade newer than the last one it recorded, so
-        // data-api's indexing lag shifts attribution by a sample or two
-        // but never drops a print. The wide fetch window covers the lag.
+        // by per-token high-water mark on trade timestamps over the FULL
+        // hub buffer (1h prune bound): any recency filter here re-creates
+        // the arrival-lag hole — data-api indexes prints minutes late, so
+        // a trade can enter the hub already older than a short window.
+        // The HWM alone dedupes; lag shifts a print's sample attribution
+        // but never drops it.
         let start_floor = self.p.start as i64 - 1;
         let (tok_up, tok_dn) = (self.p.token_up.clone(), self.p.token_down.clone());
         let hwm_map = &mut self.trade_hwm;
+        let empty: Vec<crate::orderbook::TradeRecord> = Vec::new();
         let mut flow = |token: &str| -> (i64, f64, f64) {
             let hwm = hwm_map.entry(token.to_string()).or_insert(start_floor);
             let mut n = 0i64;
             let (mut buys, mut sells) = (0.0, 0.0);
             let mut newest = *hwm;
-            for tr in ctx.recent_trades(token, 180) {
+            for tr in ctx.trade_history.get(token).unwrap_or(&empty) {
                 if tr.timestamp <= *hwm {
                     continue;
                 }
