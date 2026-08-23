@@ -849,6 +849,11 @@ impl ArmState {
             //     quote, because no ask exists to price the thesis against
             //     and nothing else stands between the model and un-decided
             //     exposure.
+            // theta 0 would make the evidence test vacuous — a resting bid
+            // with NO evidence gate is precisely the exposure this slice
+            // must never take, so the knob demands a real theta. The live
+            // fleet runs 0.3; a theta-0 arm simply never rests.
+            && self.p.theta > 0.0
             && s.safety >= self.p.theta
             // (c) outside the quiesce sweep. Structurally true here (the
             //     sweep returns before the side loop) and stated anyway,
@@ -2520,6 +2525,7 @@ mod tests {
     fn maker_arm(bid: bool) -> ArmState {
         let mut p = params("s");
         p.maker_bid = bid;
+        p.theta = 0.3; // resting demands a real theta; locked_up_model's safety 3.0 clears it
         armed(p)
     }
 
@@ -2596,6 +2602,20 @@ mod tests {
             "one cancel, not two — the engine batches per token and would \
              ask the CLOB to retire the same order id twice"
         );
+    }
+
+    #[test]
+    fn maker_never_rests_on_a_theta_zero_arm() {
+        // theta 0 makes the evidence test vacuous, so the knob demands a
+        // real theta: an evidence-free resting bid is exactly the exposure
+        // this slice exists to forbid.
+        let mut p = params("s");
+        p.maker_bid = true;
+        p.theta = 0.0;
+        let mut arm = armed(p);
+        let out = arm.decide(&view_no_ask_up(0.99), Ok(locked_up_model()), 1400.0);
+        assert!(maker_buys(&out).is_empty());
+        assert!(arm.maker_rest.is_empty());
     }
 
     #[test]
