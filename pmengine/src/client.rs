@@ -168,12 +168,23 @@ impl PolymarketClient {
             .map_err(|e| ClientError::InvalidPrivateKey(e.to_string()))?
             .with_chain_id(Some(POLYGON));
 
-        // Determine signature type
+        // Determine signature type. 3 = POLY_1271: a post-2026-05-04 deposit
+        // wallet, where the funder is a CONTRACT that validates the order
+        // through EIP-1271 rather than an address the EOA owns. Funder plumbing
+        // is identical to 1/2 (maker = funder); what differs is inside the
+        // signature — see `docs/deposit-wallet.md`.
         let sig_type = match config.signature_type {
             0 => SignatureType::Eoa,
             1 => SignatureType::Proxy,
             2 => SignatureType::GnosisSafe,
-            _ => SignatureType::Eoa,
+            3 => SignatureType::Poly1271,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "unknown PM_SIGNATURE_TYPE — falling back to EOA (0)"
+                );
+                SignatureType::Eoa
+            }
         };
 
         // Parse funder address if provided

@@ -24,7 +24,9 @@ pub struct Config {
     pub max_loss: f64,
     /// Strategy tick interval in milliseconds
     pub tick_interval_ms: u64,
-    /// Signature type (0=EOA, 1=PolyProxy, 2=GnosisSafe)
+    /// Signature type (0=EOA, 1=PolyProxy, 2=GnosisSafe, 3=Poly1271 deposit wallet).
+    /// 1/2/3 all need `funder_address`; only 3's funder is a contract that
+    /// validates the order itself (EIP-1271), which changes the signature shape.
     pub signature_type: u8,
     /// On engine startup, cancel any pre-existing user orders on the
     /// strategies' subscribed tokens. Treat the engine as the sole order
