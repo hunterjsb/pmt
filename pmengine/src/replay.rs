@@ -94,6 +94,12 @@ struct TunablesOverride {
     distrust_net: f64,
     #[serde(default = "default_avg_down_tol")]
     avg_down_tol: f64,
+    #[serde(default = "default_decided_k")]
+    decided_k: f64,
+    #[serde(default = "default_decided_stale_s")]
+    decided_stale_s: f64,
+    #[serde(default = "default_late_clip_mult")]
+    late_clip_mult: f64,
 }
 fn default_distrust_net() -> f64 {
     Tunables::default().distrust_net
@@ -101,9 +107,24 @@ fn default_distrust_net() -> f64 {
 fn default_avg_down_tol() -> f64 {
     Tunables::default().avg_down_tol
 }
+fn default_decided_k() -> f64 {
+    Tunables::default().decided_k
+}
+fn default_decided_stale_s() -> f64 {
+    Tunables::default().decided_stale_s
+}
+fn default_late_clip_mult() -> f64 {
+    Tunables::default().late_clip_mult
+}
 impl From<TunablesOverride> for Tunables {
     fn from(t: TunablesOverride) -> Self {
-        Tunables { distrust_net: t.distrust_net, avg_down_tol: t.avg_down_tol }
+        Tunables {
+            distrust_net: t.distrust_net,
+            avg_down_tol: t.avg_down_tol,
+            decided_k: t.decided_k,
+            decided_stale_s: t.decided_stale_s,
+            late_clip_mult: t.late_clip_mult,
+        }
     }
 }
 
@@ -510,7 +531,7 @@ pub(crate) fn replay_evals_window_traced(
             EV_EVAL => {
                 let p_up = rec["p_up"].as_f64().unwrap_or(0.5);
                 last_p_up = Some(p_up);
-                let model = model_from_eval_record(rec, p_up, p);
+                let model = model_from_eval_record(rec, p_up, p, &arm.tunables);
                 let view = view_from_sides(&rec["sides"], &sim);
                 let out = arm.decide(&view, Ok(model), now);
                 trace.extend(out.tape.iter().cloned());
@@ -537,12 +558,28 @@ pub(crate) fn replay_evals_window_traced(
 /// Rebuild the model read that a recorded `eval` line captured. One
 /// implementation, shared by the per-window and the fleet driver — two
 /// copies of this parse would let the two drivers judge different engines.
-fn model_from_eval_record(rec: &Value, p_up: f64, p: &ArmParams) -> ModelEval {
+fn model_from_eval_record(rec: &Value, p_up: f64, p: &ArmParams, tun: &Tunables) -> ModelEval {
+    // Evals mode replays the recorded decidedness as-is — it is the flag the
+    // live engine actually acted on. `decided_k` may only SUBTRACT from it,
+    // and only where the record carries the two numbers to judge by. The
+    // `> 1.0` guard is what makes the default provably inert: at k = 1.0 the
+    // recomputation would just be the record's own inequality, and on tape
+    // written before banked_bp/cushion_bp shipped it would read 0 > 0 and
+    // wrongly un-decide the window.
+    let mut banked_decided = rec["banked_decided"].as_bool().unwrap_or(false);
+    if banked_decided && tun.decided_k > 1.0 {
+        if let (Some(b), Some(c)) = (
+            rec.get("banked_bp").and_then(|v| v.as_f64()),
+            rec.get("cushion_bp").and_then(|v| v.as_f64()),
+        ) {
+            banked_decided = tun.decided(b, c, p_up);
+        }
+    }
     ModelEval {
         p_up,
         sig_bp: rec["sig_bp"].as_f64().unwrap_or(0.0),
         rho: rec["rho"].as_f64().unwrap_or(0.0),
-        banked_decided: rec["banked_decided"].as_bool().unwrap_or(false),
+        banked_decided,
         margin_bp: rec.get("margin_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
         banked_margin_bp: rec.get("banked_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
         cushion_bp: rec.get("cushion_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -912,7 +949,7 @@ pub(crate) fn replay_full_window_with(
         // guard runs live), so pass the operator's param unchanged: replay
         // output must match the exact static-guard behavior this window
         // ran under live.
-        let model = eval_model(p, &feed, now, p.basis_guard_bp);
+        let model = eval_model(p, &feed, now, p.basis_guard_bp, &arm.tunables);
         let view = view_from_book_record(rec, &sim, p);
         let out = arm.decide(&view, model, now);
         trace.extend(out.tape.iter().cloned());
@@ -1175,9 +1212,12 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
             let spot = rec["spot"].as_f64().unwrap_or(0.0);
             let spot_age = rec["spot_age_s"].as_f64().unwrap_or(0.0);
             let start = a.p.start as i64;
+            // Copied out before the feed's &mut borrow so the model read and
+            // the decide() that consumes it run on ONE tunables value.
+            let tun = a.arm.tunables;
             let Some(src) = a.feed_src.as_mut() else { continue };
             let feed = src.state_at(start, spot, now - spot_age, now);
-            let model = eval_model(&a.p, &feed, now, a.p.basis_guard_bp);
+            let model = eval_model(&a.p, &feed, now, a.p.basis_guard_bp, &tun);
             let view = view_from_book_record(rec, &a.sim, &a.p);
             Some(a.arm.decide_fleet(&view, model, now, &mut fleet_room))
         } else {
@@ -1185,7 +1225,7 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
                 EV_EVAL => {
                     let p_up = rec["p_up"].as_f64().unwrap_or(0.5);
                     a.last_p_up = Some(p_up);
-                    let model = model_from_eval_record(rec, p_up, &a.p);
+                    let model = model_from_eval_record(rec, p_up, &a.p, &a.arm.tunables);
                     let view = view_from_sides(&rec["sides"], &a.sim);
                     Some(a.arm.decide_fleet(&view, Ok(model), now, &mut fleet_room))
                 }
@@ -1329,7 +1369,11 @@ mod tests {
             replay_evals_window(&p, None, std::slice::from_ref(&rec), None, &RealTally::default());
         assert_eq!(blocked["sim"]["fires"], 0, "distrust brake holds under default tunables");
 
-        let old_policy = Tunables { distrust_net: f64::INFINITY, avg_down_tol: f64::INFINITY };
+        let old_policy = Tunables {
+            distrust_net: f64::INFINITY,
+            avg_down_tol: f64::INFINITY,
+            ..Tunables::default()
+        };
         let fired = replay_evals_window(&p, Some(old_policy), &[rec], None, &RealTally::default());
         assert_eq!(fired["sim"]["fires"], 1, "lifted tunables reproduce the old policy's fire");
     }
