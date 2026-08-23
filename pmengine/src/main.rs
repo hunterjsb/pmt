@@ -1,4 +1,6 @@
-use clap::{Args, Parser, Subcommand};
+#[cfg(private_strategies)]
+use clap::Args;
+use clap::{Parser, Subcommand};
 use pmengine::{Config, Engine};
 use std::path::PathBuf;
 use tracing::{info, Level};
@@ -50,9 +52,11 @@ enum Commands {
     ///
     /// Boxed: this is by far the widest variant, and an un-boxed one makes
     /// every other subcommand carry its footprint.
+    #[cfg(private_strategies)]
     Replay(Box<ReplayArgs>),
 }
 
+#[cfg(private_strategies)]
 #[derive(Args, Debug)]
 pub struct ReplayArgs {
     /// "evals" replays the recorded eval tape; "full" rebuilds the model from
@@ -196,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Run { strategies, dry_run, max_ticks, skip_warmup }) => {
             run_strategies(strategies, dry_run, max_ticks, skip_warmup).await
         }
+        #[cfg(private_strategies)]
         Some(Commands::Replay(args)) => {
             let ReplayArgs {
                 mode, tape, book_tape, slug, fixtures, only, bless, params, outcomes, out,
@@ -230,14 +235,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Commands:");
             eprintln!("  run <strategies...>  Run one or more strategies");
             eprintln!("  list                 List available strategies");
+            #[cfg(private_strategies)]
             eprintln!("  replay               Offline replay of the updown decision core");
             eprintln!();
             eprintln!("Examples:");
             eprintln!("  pmengine run updown --dry-run");
             eprintln!("  pmengine run updown --max-ticks 10");
             eprintln!("  pmengine list");
+            #[cfg(private_strategies)]
             eprintln!("  pmengine replay --mode evals --slug btc-updown-15m");
+            #[cfg(private_strategies)]
             eprintln!("  pmengine replay --mode full --slug xrp-updown-5m --params arms.json");
+            #[cfg(private_strategies)]
             eprintln!("  pmengine replay --fixtures fixtures");
             Ok(())
         }

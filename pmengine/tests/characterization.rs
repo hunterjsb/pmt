@@ -11,6 +11,12 @@
 //! fixture runner never reaches `klines_for_window` — replay's only network
 //! path. `characterization_offline.rs` proves the `~/.pmt` half.
 
+// No pmt-strategies submodule -> no updown, no replay tree, no fixtures:
+// this whole crate compiles to zero tests and skips cleanly. The documented
+// private gate sets PMENGINE_EXPECT_PRIVATE=1 so tests/flavor.rs fails
+// loudly if this skip ever happens where the private flavor was expected.
+#![cfg(private_strategies)]
+
 use pmengine::replay::fixtures::{self, Fixture};
 use std::path::PathBuf;
 

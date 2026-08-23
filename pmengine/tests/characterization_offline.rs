@@ -9,6 +9,10 @@
 //! dependency on the corpus fails loudly here instead of on a fresh
 //! checkout six months from now.
 
+// Skips cleanly without the pmt-strategies submodule — see
+// characterization.rs for why, and tests/flavor.rs for the loud-skip guard.
+#![cfg(private_strategies)]
+
 use pmengine::replay::fixtures;
 use std::path::PathBuf;
 
