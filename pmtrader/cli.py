@@ -1699,10 +1699,39 @@ def crypto_disarm(slug: str | None) -> None:
 
 
 @crypto_group.command("trigger")
-def crypto_trigger() -> None:
-    """Live state of the updown trigger: gates, model, edges."""
-    reply = _engine_post("/strategies/updown/command", {"action": "status"})
-    console.print_json(json.dumps(reply))
+@click.option("--json", "as_json", is_flag=True, help="Raw status JSON")
+def crypto_trigger(as_json: bool) -> None:
+    """Live state of the updown fleet: one line per arm."""
+    try:
+        reply = _engine_post("/strategies/updown/command", {"action": "status"})
+    except Exception as e:
+        raise click.UsageError(f"engine unreachable ({e}) — try: pmt engine start")
+    if as_json:
+        console.print_json(json.dumps(reply))
+        return
+    arms = reply.get("arms", {})
+    if not arms:
+        console.print("engine up · [yellow]no arms[/yellow] — pmt crypto arm <url> --size N")
+        return
+    for slug, a in arms.items():
+        e = a.get("eval") or {}
+        state = e.get("state", "?")
+        roll = "⟳" if a.get("roll") else " "
+        if state == "gated":
+            body = f"[yellow]gated[/yellow]   {e.get('reason', '')}"
+        elif state == "armed":
+            body = "[green]armed[/green]"
+            if "p_up" in e:
+                body += f"   p↑{e['p_up']:.4f} ρ{e.get('rho', 0):+.2f} {e.get('mode', '')}"
+            if e.get("banked_decided"):
+                body += " [cyan]BANKED[/cyan]"
+            committed = e.get("committed", a.get("filled_usdc", 0))
+            body += f"  ${committed:,.2f}/${e.get('budget', 0):,.0f}"
+        else:
+            body = state
+        console.print(f"{roll} {_tape_slug(slug):<14} {body}")
+    if reply.get("pending_rolls"):
+        console.print(f"[dim]pending rolls: {', '.join(reply['pending_rolls'])}[/dim]")
 
 
 def _tape_slug(slug: str) -> str:
