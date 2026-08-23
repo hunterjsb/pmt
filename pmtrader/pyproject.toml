@@ -38,7 +38,7 @@ include = ["polymarket*", "scanners*"]
 py-modules = [
     "cli", "cli_common", "cli_sports", "engine", "stats_render", "watch_ui",
     "cli_crypto", "cli_crypto_arm", "cli_crypto_data", "cli_crypto_fixture",
-    "cli_crypto_stats", "cli_crypto_watch",
+    "cli_crypto_stats", "cli_crypto_viz", "cli_crypto_watch",
 ]
 
 [tool.pytest.ini_options]

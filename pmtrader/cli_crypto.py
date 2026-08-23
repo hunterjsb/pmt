@@ -31,6 +31,7 @@ from cli_crypto_data import (
 )
 from cli_crypto_fixture import crypto_fixture
 from cli_crypto_stats import crypto_stats
+from cli_crypto_viz import crypto_viz
 from cli_crypto_watch import crypto_watch
 
 
@@ -42,6 +43,6 @@ def crypto_group() -> None:
 for _cmd in (
     crypto_activity, crypto_arm, crypto_basis, crypto_disarm, crypto_fixture,
     crypto_fleet, crypto_journal, crypto_outcomes, crypto_stats, crypto_tape,
-    crypto_trigger, crypto_updown, crypto_watch, crypto_window,
+    crypto_trigger, crypto_updown, crypto_viz, crypto_watch, crypto_window,
 ):
     crypto_group.add_command(_cmd)
