@@ -1,18 +1,37 @@
 """Validated updown outcomes — ground truth the replay harness (pmengine R4) needs.
 
-Priority is strict: wallet redemption beats Chainlink corpus inference,
-because for a traded window Polymarket's own settlement already picked the
-winner and paid (or didn't) — no inference needed. Chainlink corpus fills in
-windows we never traded, but only when the corpus can prove it was fresh
-enough at settlement time. That staleness guard exists because a stale
-step-extension once mislabeled 9/37 windows and poisoned an A/B: the corpus's
-last known round was well behind the window end, but a TWAP still happily
-holds the last value flat out to `end` — silently wrong, not obviously wrong.
-Windows the guard can't clear are dropped, never guessed.
+Priority is strict, and the ranking is the whole design (SOURCE_RANK below):
+
+  * **wallet** — Polymarket paid us (or paid us $0). The exchange's own money
+    moving; nothing beats it.
+  * **resolution** — the market's settled outcome off gamma. Also the
+    EXCHANGE's answer, not ours: it is the number redemptions are paid on.
+  * **chainlink** / **book** — OUR read of the settlement stream and of the
+    market's terminal book. Inference, and only for windows we never traded.
+
+The two bottom sources fill in windows we never traded, but only when they can
+prove they were trustworthy at settlement time. That staleness guard exists
+because a stale step-extension once mislabeled 9/37 windows and poisoned an
+A/B: the corpus's last known round was well behind the window end, but a TWAP
+still happily holds the last value flat out to `end` — silently wrong, not
+obviously wrong. Windows the guard can't clear are dropped, never guessed.
+
+WHY "resolution" IS ALLOWED TO GRADE THE W-L RECORD AND CHAINLINK IS NOT.
+The standing rule is that the model never grades itself — a confidently wrong
+final read (XRP basis, 2026-08-23) would otherwise book its own loss as a win,
+so chainlink/book labels are refused for W-L no matter how sure they look.
+Market resolution is not a read of ours at all: it is the exchange stating what
+it pays redeems on, the same authority that produced the wallet rows. And it is
+the ONLY evidence a LOSS can ever have — a losing position pays $0 and, when
+nobody bothers to redeem worthless tokens, emits no wallet row of any kind. A
+wallet-only W-L therefore books every win and can never book a silent loss,
+which is not a conservative ledger, it is a rigged one (2026-08-23: three
+resolved-lost windows sat "riding" for 13-25h hiding -$272.35).
 
 All functions here are pure (no network, no disk) so the priority/staleness
-logic is unit-testable with inline fixtures; `pmt crypto outcomes` in cli.py
-does the I/O (tape files, wallet activity, corpus, output file) and calls in.
+logic is unit-testable with inline fixtures; `pmt crypto outcomes` in
+cli_crypto_data.py does the I/O (tape files, wallet activity, gamma, corpus,
+output file) and calls in.
 """
 
 from __future__ import annotations
@@ -27,6 +46,14 @@ from .updown_slugs import parse_updown_slug  # re-exported: this module's origin
 
 OUTCOMES_PATH = Path.home() / ".pmt" / "corpus" / "outcomes.jsonl"
 
+# Strongest first. See the module docstring for why the line between
+# "resolution" and "chainlink" is where the W-L record is allowed to be graded.
+SOURCE_RANK = {"wallet": 3, "resolution": 2, "chainlink": 1, "book": 0}
+
+# Sources that may decide a WIN or a LOSS in the traded record: the exchange's
+# payment, and the exchange's settlement. Our own stream/book reads never do.
+TERMINAL_SOURCES = frozenset({"wallet", "resolution"})
+
 STALE_S = 600  # no round within 10min before the query span -> corpus too stale to trust
 
 # On-chain rounds land ~30s apart (deviation/heartbeat), so the corpus TWAP is a
@@ -35,6 +62,19 @@ STALE_S = 600  # no round within 10min before the query span -> corpus too stale
 # wallet), and one 15m window was wrong at 3.2bp. Below this floor the corpus
 # refuses to grade — the terminal book or nothing takes over.
 CK_NOISE_FLOOR_BP = 5.0
+
+
+def source_rank(source: str | None) -> int:
+    """Priority of an outcome source; an unknown source ranks below all of them
+    so a corpus row written by some future path can never silently outrank one
+    of these."""
+    return SOURCE_RANK.get(source or "", -1)
+
+
+def is_terminal_source(source: str | None) -> bool:
+    """May a corpus row with this source decide a W or an L? Only the two the
+    EXCHANGE authored (see module docstring) — never our own stream/book read."""
+    return (source or "") in TERMINAL_SOURCES
 
 
 def extract_updown_slugs(lines: Iterable[str]) -> set[str]:
@@ -153,7 +193,13 @@ def chainlink_outcome(window: dict, rounds: list[dict]) -> tuple[str | None, str
     return ("up" if settlement > reference else "down"), None
 
 
-# ---------- (c) gamma resolution — live tie-break when redemption is silent ----------
+# ---------- (c) market resolution — the exchange's own settled answer ----------
+
+# Settlement lands on gamma about a minute after a window ends (observed
+# closedTime - endDate: 54-150s across the 2026-08-23 audit set). Past this
+# a silent wallet is evidence about the REDEEM, never about the outcome.
+RESOLUTION_GRACE_S = 300
+
 
 def gamma_resolution(markets: list[dict]) -> dict:
     """{'resolved': bool, 'winner': 'up'|'down'|None} from a gamma
@@ -163,6 +209,12 @@ def gamma_resolution(markets: list[dict]) -> dict:
     `closed` alone isn't enough, a market can close for trading well before
     resolution proposes/finalizes. Tolerant of the malformed-JSON shapes
     gamma has emitted elsewhere (see scanner._parse_prices).
+
+    CALLERS MUST ASK GAMMA FOR CLOSED MARKETS. `/markets?slug=X` defaults to
+    closed=false and answers `[]` for every settled window — which lands here
+    as "not resolved" and is indistinguishable from a window still trading.
+    That default is the whole 2026-08-23 hidden-loss bug; the one fetcher is
+    cli_crypto_stats._gamma_resolution_cached and it pins the flag.
     """
     if not markets:
         return {"resolved": False, "winner": None}
@@ -187,7 +239,7 @@ def gamma_resolution(markets: list[dict]) -> dict:
 
 def grade_window(redeemed_usd: float, redeem_seen: bool, fired_side: str | None,
                   gamma: dict | None, now: float, end: float,
-                  grace_s: float = 300) -> tuple[bool | None, bool]:
+                  grace_s: float = RESOLUTION_GRACE_S) -> tuple[bool | None, bool]:
     """(won, estimated) for one window's wallet totals — worst case first.
 
     1. A paying redeem (>$0.5): WIN, ground truth from the wallet itself.
@@ -197,13 +249,24 @@ def grade_window(redeemed_usd: float, redeem_seen: bool, fired_side: str | None,
     3. No redeem event at all, still inside the settlement grace window:
        riding (None) — too soon to know either way.
     4. Past grace with no redeem: Polymarket doesn't reliably auto-redeem a
-       slow-paying WIN (2026-08-23 audit), so a silent wallet no longer
-       means LOSS. `gamma` — already fetched by the caller, or None on a
-       skipped/failed lookup — breaks the tie: resolved -> WIN/LOSS by
-       whether our side matches the winner; not yet resolved -> riding
-       (None); unreachable -> fall back to the old assume-LOSS heuristic,
-       flagged `estimated` so the UI can mark it as such instead of
-       presenting it as confirmed.
+       slow-paying WIN, and a LOST position pays $0 and posts NO ROW AT ALL
+       (2026-08-23 audit), so a silent wallet says nothing either way. The
+       market's own resolution — `gamma`, already fetched by the caller, or
+       None on a skipped/failed lookup — is what breaks the tie: resolved
+       -> WIN/LOSS by whether our side matches the winner; not yet resolved
+       -> riding (None); unreachable -> fall back to the old assume-LOSS
+       heuristic, flagged `estimated` so the UI can mark it as such instead
+       of presenting it as confirmed.
+
+    Step 4 is the ONE place the W-L record is decided by something other than
+    a wallet row, and it does not break the never-grade-yourself rule: the
+    resolution is the exchange's, not the model's — it is the number redeems
+    are paid on — and a loss can produce no other evidence. A chainlink or
+    terminal-book label never reaches here (see module docstring).
+
+    `fired_side` is the side we HELD. The tape's fire record names it, but the
+    tape rotates and the wallet's own BUY rows outlive it — callers should
+    fall back to those rather than lose a window to a missing fire.
     """
     if redeemed_usd > 0.5:
         return True, False
@@ -219,6 +282,23 @@ def grade_window(redeemed_usd: float, redeem_seen: bool, fired_side: str | None,
             return winner == fired_side, False
         return None, False  # resolved, but we can't tell which side we held
     return False, True
+
+
+# Share counts come back from data-api with sub-share dust (a 100-share exit
+# fills as 99.998625). Anything under this is not a position.
+DUST_SHARES = 0.01
+
+
+def exited_flat(buy_shares: float, sell_shares: float) -> bool:
+    """Did the wallet sell (essentially) everything it bought?
+
+    A window sold flat before settlement holds no outcome tokens, so it can
+    never produce a redeem row and no resolution can pay it: its P&L is
+    already fully realized as sold minus bought. Grading it off redeem
+    silence rides it forever — btc-updown-5m-1787419200 sat "riding $44.72"
+    for 26h having been closed out at $0.80 with +$35.28 booked.
+    """
+    return buy_shares > 0 and (buy_shares - sell_shares) <= DUST_SHARES
 
 
 # ---------- (d) terminal book — last-resort source for UNFILLED windows ----------
@@ -263,18 +343,26 @@ def book_outcome(window: dict, book_records: list[dict]) -> tuple[str | None, st
 
 def build_outcomes(windows: list[dict], wallet: dict[str, str],
                     rounds_by_symbol: dict[str, list[dict]],
-                    book_by_slug: dict[str, list[dict]] | None = None) -> tuple[list[dict], list[dict]]:
-    """Resolve every window by strict priority: wallet, then Chainlink.
+                    book_by_slug: dict[str, list[dict]] | None = None,
+                    resolution_by_slug: dict[str, str] | None = None) -> tuple[list[dict], list[dict]]:
+    """Resolve every window by strict priority: wallet, resolution, chainlink, book.
+
+    `resolution_by_slug` is {slug: 'up'|'down'} the caller already read off
+    gamma (empty/None when it skipped that lookup — this module stays pure).
 
     Returns (rows, dropped) — rows are {"slug","winner","source"} ready to
     merge into the outcomes corpus; dropped are {"slug","reason"} for
-    windows neither source could validate.
+    windows no source could validate.
     """
     rows, dropped = [], []
     for w in windows:
         slug = w["slug"]
         if slug in wallet:
             rows.append({"slug": slug, "winner": wallet[slug], "source": "wallet"})
+            continue
+        res = (resolution_by_slug or {}).get(slug)
+        if res:
+            rows.append({"slug": slug, "winner": res, "source": "resolution"})
             continue
         winner, reason = chainlink_outcome(w, rounds_by_symbol.get(w["symbol"]) or [])
         if winner is not None:
@@ -310,9 +398,11 @@ def load_outcomes(path: Path = OUTCOMES_PATH) -> dict[str, dict]:
 
 
 def merge_outcomes(existing: dict[str, dict], new_rows: list[dict]) -> tuple[dict[str, dict], int, int]:
-    """Merge new_rows into existing by slug. Wallet source upgrades a prior
-    chainlink row; nothing ever downgrades wallet, and chainlink never
-    overwrites chainlink (first write wins — the walk order doesn't matter).
+    """Merge new_rows into existing by slug, strictly by SOURCE_RANK: a row
+    only overwrites one it OUTRANKS. So wallet upgrades everything and is
+    never downgraded, resolution upgrades a chainlink/book guess, and a
+    same-source rewrite is refused (first write wins — the walk order can't
+    change the corpus).
 
     Returns (merged, n_added, n_upgraded).
     """
@@ -323,10 +413,7 @@ def merge_outcomes(existing: dict[str, dict], new_rows: list[dict]) -> tuple[dic
         if prev is None:
             merged[r["slug"]] = r
             added += 1
-        elif prev["source"] == "chainlink" and r["source"] == "wallet":
-            merged[r["slug"]] = r
-            upgraded += 1
-        elif prev["source"] == "book" and r["source"] in ("wallet", "chainlink"):
+        elif source_rank(r["source"]) > source_rank(prev.get("source")):
             merged[r["slug"]] = r
             upgraded += 1
     return merged, added, upgraded
