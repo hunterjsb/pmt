@@ -1268,7 +1268,7 @@ def crypto_fixture(slug: str, out_dir: str | None, mode: str, teaches: str | Non
     # The arm store decides which market data this window even HAS: a
     # stream-fed arm never read a kline, and a Binance arm has no place in
     # the recorder corpus. Resolved before the mode decision for that reason.
-    arms_path = Path.home() / ".pmt" / "engine" / "arms-state.json"
+    arms_path = Path(tape.ARMS_STATE)
     try:
         live = {a["symbol"]: a for a in json.loads(arms_path.read_text())["arms"]}
     except (OSError, ValueError, KeyError) as e:
@@ -1681,6 +1681,109 @@ def crypto_outcomes(since: float, out_path: str | None, fetch_only: bool) -> Non
     console.print(f"[dim]{added} new · {upgraded} upgraded chainlink→wallet · "
                   f"winner split {n_up} up / {n_down} down[/dim]")
     console.print(f"[dim]{out_file}  ({len(merged)} total rows)[/dim]")
+
+
+def _load_arms_state() -> list[dict]:
+    """The engine's persisted arms, or [] if there is no store yet.
+
+    Read-only and never fatal: the journal is a report, and an engine that has
+    never armed anything is a fact about the book, not an error.
+    """
+    try:
+        with open(tape.ARMS_STATE) as fh:
+            return json.load(fh).get("arms") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+@crypto_group.command("journal")
+@click.option("--since", type=float, default=None,
+              help="Backfill from here instead of the high-water mark: "
+                   "hours-ago if small, raw unix epoch if large, 0 for all "
+                   "time. Re-runs never duplicate a line, so a backfill is "
+                   "always safe to repeat")
+@click.option("--show", is_flag=True, help="Tail the journal instead of adding to it")
+@click.option("-n", default=20, show_default=True, help="--show: entries to tail")
+@click.option("--dry-run", is_flag=True,
+              help="Print the lines this run would add and write nothing")
+def crypto_journal(since: float | None, show: bool, n: int, dry_run: bool) -> None:
+    """Append the notable windows since the last run to the trade journal.
+
+    Writes to ~/.pmt/journal/journal.md — a PRIVATE location, never the repo,
+    because it is a running record of a real book. One terse timestamped line
+    per notable event: the day's biggest win and biggest loss, a latch that
+    refused a side which then lost, the first window of a new symbol or feed
+    or maker bid, a streak milestone, and any size/clip change since the last
+    run.
+
+    Grading reads the WHOLE book every run (a streak milestone and a "first"
+    are only true against all of it); the floor decides what gets WRITTEN, not
+    what gets read. Idempotent — a re-run, or an overlapping `--since`
+    backfill, adds nothing it has already said.
+    """
+    from polymarket import journal, outcomes, shadow
+
+    if show:
+        lines = journal.tail(n=n)
+        if not lines:
+            console.print(f"[dim]no journal yet — {journal.JOURNAL_PATH}[/dim]")
+            return
+        for ln in lines:
+            console.print(journal.styled(ln), highlight=False)
+        return
+
+    now = time.time()
+    state = journal.load_state()
+    since_epoch = None if since is None else (_parse_since(since) if since else 0.0)
+    floor = journal.floor_for(state, since_epoch, now)
+
+    try:
+        sb = _tape_scoreboard(0.0, keep_activity=True)
+    except Exception as e:
+        console.print(f"[red]data-api unreachable: {e}[/red]")
+        sys.exit(1)
+    activity = sb.pop("activity", [])
+    windows = sb.get("eff_windows") or []
+
+    # Two reads of the same file, deliberately: shadow's episode pipeline is
+    # line-based and tape.iter_records is the sanctioned parser. Neither gets
+    # a private copy of the other's loop for the sake of one pass.
+    try:
+        with open(tape.UPDOWN_TAPE) as fh:
+            tape_lines = fh.readlines()
+    except OSError:
+        tape_lines = []
+    evals = list(tape.iter_records(tape.UPDOWN_TAPE, evs={tape.EV_EVAL}))
+    orders = list(tape.iter_records(tape.ORDER_TAPE))
+    arms = _load_arms_state()
+
+    # The outcomes corpus as it stands on disk — read only. `pmt crypto
+    # outcomes` / `stats --gates` are what refresh it; a journal run must not
+    # go and grade windows as a side effect of writing a diary.
+    winners = {slug: row["winner"] for slug, row in outcomes.load_outcomes().items()
+               if row.get("winner")}
+
+    events = journal.detect(
+        windows=windows, tape_lines=tape_lines, orders=orders,
+        fires=list(shadow.iter_fires(tape_lines)), winners=winners,
+        maker=updown_stats.maker_summary(evals, orders, activity, windows),
+        arms=arms, state=state, now=now)
+    written = journal.select(events, state, floor)
+
+    for ln in journal.render_lines(written, ""):
+        console.print(journal.styled(ln), highlight=False)
+
+    if dry_run:
+        console.print(f"[yellow]dry run[/yellow] — {len(written)} line(s), nothing written")
+        return
+    journal.append(written)
+    journal.commit(state, written, now)
+    journal.note_scale(state, arms)
+    journal.save_state(state)
+    if written:
+        console.print(f"[green]{len(written)}[/green] line(s) → {journal.JOURNAL_PATH}")
+    else:
+        console.print("[dim]nothing notable since the last run[/dim]")
 
 
 def _parse_since(v: float | None) -> float:
