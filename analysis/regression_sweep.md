@@ -24,7 +24,10 @@ Baseline sanity, both suites green at `4dd28cd` + submodule `c8b0e53`:
 | # | rank | finding | one-line evidence |
 |---|---|---|---|
 | 1 | **CRITICAL** | The scoreboard silently drops every `4h` window — the ledger of record understates all-time updown realized flow by **+$164.35** and 6 wins | `SLUG_RE` requires a `m` duration token, `is_updown()` does not; corrected parser reproduces the raw wallet walk exactly (−$401.40, 263W-23L) |
+| 1b | **CRITICAL — cause unresolved** | 5m taker fire rate collapsed 11× post-restart (0.31/min → **0.027/min**, 1 fire vs 11.4 expected, Poisson P≤1 = 2.5e-4); the `safety` brake now catches **74%** of positive-EV sides vs 50%/52% before | evidence currently leans **regime, not regression** — `sol-5m`'s config did not change and it collapsed too (0/33 unbraked), and measured σ rose (eth-15m `sig_bp` p50 5.32→9.52) with `abs(margin_bp)` p50 2–3×. **Not resolvable on 37 min — run the replay A/B against pre-ship safety constants.** Do not disarm on this alone |
 | 2 | DEGRADED | `pmt` master carries a permanently-red commit `6cd24a8` (settle-width shipped ahead of its fixtures) | `gh run view 32661239407` → job `test` failed, `assert 60 == 30 where 60 = ck_settlement_width_s(300)`; green again 2m17s later at `9fa85da` |
+| 2b | DEGRADED | rtds reconnect rate is the worst of the three runs — 3 in 37 min (**0.081/min** vs 0.073 / 0.043); each blinds the RTDS health emitter for 26–55 s and gates all three rtds arms | all `err=stalled 31s with the socket open`, backoff 1→2→4 s; health-line gaps of 105.0 / 86.2 / 114.8 s land exactly on the three reconnects (the health task shares the thread) |
+| 2c | DEGRADED | The restart landed **mid-window**, so all three rtds arms sat out the entire 20:45–20:50 market (4m43s) waiting on a range-start reference | 53 consecutive `range-start reference not printed yet` records per rtds arm, `rem_s=284.3` at re-arm; every later roll acquired in ≤5 s (1 record per boundary). Self-healing — but **restart on a boundary** |
 | 3 | DEGRADED | `analysis/watch_load.md`'s reproduction appendix is now unrunnable — it greps a log line that no longer exists at any log level | `watch_load.md:435,438` grep `"Strategy command handled"`; `engine.rs:1651` is now `debug!` and dropped the `reply=` field, `main.rs:16` defaults to `info` |
 | 4 | LATENT | Replay's `TunablesOverride` defaults `decided_k` to the FLAT 1.0, not `Tunables::law(dur)` — a partial override silently un-applies the new 15m law | `replay.rs:110` `default_decided_k() = Tunables::default().decided_k`; `carveout_ab.py` variants `m3/m5/m10/stale30/stale600` and `r7_fleet_ab.py:48 LIFTED` all omit `decided_k` |
 | 5 | LATENT | pmt-strategies CI has not run against today's final pmt master — the public/private pairing is unverified by 4 commits | last private CI checked out pmt `8b3ae77` at 20:42:44Z; master HEAD is `4dd28cd` at 20:48:16Z |
@@ -42,6 +45,11 @@ Baseline sanity, both suites green at `4dd28cd` + submodule `c8b0e53`:
 | 17 | LATENT | **EU box:** a dead balance poller would be invisible — failures log at `debug!` under an `info` engine, and success logs only on change | `engine.rs:648` (debug on failure), `:643` (`if *w != b`); closed here by reconciling to chain truth, but the observability hole is real |
 | 18 | LATENT | **EU box:** no log rotation (~2.5 MB/day to a single file); desktop rotates, EU does not | unit appends to one `engine-systemd.log`, 59 KB in 34 min, 11 GB free |
 | 19 | LATENT | `spot_age_s` in the updown tape is mostly null and sometimes carries an absolute timestamp instead of an age — **pre-existing, both boxes** | EU 319/325 null; desktop 4904/5000 null with non-null values mixing real ages (6.1–7.9 s) and unix timestamps (1787516405.25) |
+| 20 | LATENT | Demoting `Strategy command handled` to `debug!` removed the exact metric `watch_load.md` used to *prove* a control-plane blackout — the next one will be invisible from the log | run C logs 0 of those lines vs 2298 / 1927 in the prior runs; the served/min + gap-percentile series is no longer computable. Needs an INFO-level counter to replace it |
+| 21 | LATENT | The stale-cancel storm is 8× smaller but **not fixed** — same order id refused 3× in 0.14 s, each a CLOB round-trip inside the tick arm | 46 warns/order (run A) → 5.9 warns/order (run C); `watch_load.md` §2.4 already called this "a second, independent bug worth its own ticket" |
+| 22 | LATENT | 15m arms have not fired since **07:40:35Z** — `min_fair=1.0` with `pay_up_max=0.0` makes them near-unfireable | **NOT** caused by `decided_k`: the last 15m fire predates the law by ~13 h. Their evals went *up* (145→436→712 matched-window) |
+| 23 | LATENT | Sub-minimum order sizing: engine computed a **$0.80** clip against the CLOB's $1 minimum and the order was rejected | `20:24:13.927210Z` `Order execution failed … {"error":"invalid amount for a marketable BUY order ($0.8), min size: $1"}`; one occurrence, run B |
+| 24 | LATENT | rtds subscribes 8 symbols to serve 3 consumers (~5/8 of 8.1 ev/s discarded) | **not a leak** — it was `rtds_symbols=8` at `rtds_consumers=1` too; fixed subscription set, wasted bandwidth only |
 
 ---
 
@@ -322,8 +330,9 @@ replay under a shadow HOME).
 
 | interaction | verdict | evidence |
 |---|---|---|
-| series allowlist × roll recovery × arms-state | **CLEAN** | local `PMENGINE_SERIES_ALLOWLIST=btc-updown,eth-updown,sol-updown,xrp-updown` correctly omits bnb; `arms-state.json` contains **0** bnb references and `rolls: []` — the refusal left no half-state |
+| series allowlist × roll recovery × arms-state | **CLEAN, and self-clearing** | local `PMENGINE_SERIES_ALLOWLIST=btc-updown,eth-updown,sol-updown,xrp-updown` correctly omits bnb. Durable-state recovery replayed the stale bnb arm once at `20:45:15.703830Z` and the guard refused it (one ERROR, exactly 1 in the run) — **and the next state write dropped it**: `arms-state.json` (mtime 21:27Z) lists 7 arms, `grep -o bnb` → **0**, `rolls: []`. The refusal left no half-state and will **not** recur on the next restart. *(Corrects an initial read that the ERROR would repeat every restart — the prune already happened.)* |
 | settle-tw auto-raise × non-rtds arms | **CLEAN** (not the money bug it looks like) | the auto-raise is gated `feed == "rtds"`, so `sol-updown-5m` (binance, $400, maker) sits at `settle_tw_s = 0.0` → `settle_tw_secs(300) = 30`, the width `settle_width.md` refuted 6–0. **But** all 7 live arms are `settle_rule = "range_avg"`, and `eval_range_avg` never reads `settle_tw` — grep of its body for `settle_tw`/`terminal_lock`/`tw` returns zero. `settle_tw_for` is consumed only by `eval_hybrid` (`updown_model.rs:569`) and `eval_terminal` (`:613`). On a binance-fed range_avg arm the knob is genuinely inert. It becomes live the moment that arm moves to `hybrid`/`terminal` or to the rtds feed. |
+| decided_k law — did it land, correctly scoped? | **CLEAN, verified live** | the tape does not log `k` but logs all three terms, so `abs(banked_bp)/cushion_bp` brackets it at the `banked_decided` boundary. Run C: btc-15m min-decided 1.2762 / max-undecided 1.0871; **eth-15m brackets 1.2492 < k ≤ 1.2589**; sol-15m 1.3712 / 1.1816 — all consistent with 1.25. sol-**5m** brackets 1.0408 / 0.9513 → k = 1.0. Runs A/B bracket btc-15m at 1.0. The law landed and is correctly duration-scoped |
 | decided_k law × replay tunables overrides | **override wins, but see #4** | explicit values are honoured; the hazard is *omitted* fields — `TunablesOverride`'s serde default is the flat `Tunables::default().decided_k` = 1.0, not `Tunables::law(dur)` = 1.25 above 300s. So on 15m windows `base` (no override → `ArmState` builds `Tunables::law` at `updown.rs:545`) runs k=1.25 while `m3`/`m5`/`m10`/`stale30`/`stale600` run k=1.0 — those five are not single-knob A/Bs any more. **Today's carve-out verdict is NOT retroactively invalidated**: `Tunables::law` landed in `c8b0e53` at 16:42:35-0400, after the analysis commits (`86a6eb4` 16:25, `07c9af9` 16:21, `69c9eec` 16:11). The confound bites the next re-run. `r7_fleet_ab.py:48 LIFTED` has the same shape. |
 | watch odds lane × PM_FUNDER_ADDRESS parsing | **CLEAN** | `cli_crypto_watch.py:189` uses `wallet.funder_address()`, which raises on unset rather than falling through to a clean-looking empty; `_odds_failed` clears odds to `{}` on any lane failure; the live `.env` line is a bare unquoted 42-char address with no inline comment. The only wrinkle is the 4h asymmetry noted in finding #1's blast radius. |
 
@@ -332,18 +341,29 @@ replay under a shadow HOME).
 **No arm is dead.** All 7 arms evaluate, gate, and roll. Only ~25 minutes of
 history, so fire counts prove nothing either way; eval/gate structure does.
 
-Per-arm, from `~/.pmt/engine/updown-tape.jsonl`:
+Per-arm `eval / gated / fire`, from `~/.pmt/engine/updown-tape.jsonl`, over
+**matched 37.0-minute windows** measured from each run's start (the tape
+throttles to ~1 record per arm per 5 s, so read eval:gate *share*, not
+absolute counts):
 
-| arm | run1 (pre) eval/gate/fire | run2 (pre) | **run3 (post-restart)** |
+| arm | A 17:31–18:08 | B 19:35–20:12 | **C 20:45–21:22** |
 |---|---|---|---|
-| btc-15m | 143 / 981 / 0 | 281 / 503 / 0 | **279 / 188 / 0** |
-| btc-5m *(rtds)* | 109 / 952 / 2 | 54 / 693 / 3 | **89 / 355 / 0** |
-| eth-15m | 120 / 1004 / 0 | 333 / 451 / 0 | **274 / 193 / 0** |
-| eth-5m *(rtds)* | 355 / 706 / 9 | 215 / 532 / 6 | **86 / 358 / 0** |
-| sol-15m | 262 / 862 / 0 | 240 / 544 / 0 | **267 / 200 / 0** |
-| sol-5m *(maker)* | 262 / 799 / 8 | 44 / 703 / 0 | **85 / 359 / 0** |
-| xrp-5m *(rtds, maker)* | 261 / 800 / 20 | 172 / 576 / 12 | **131 / 313 / 2** |
+| btc-15m | 26 / 393 / 0 | 151 / 267 / 0 | **243 / 188 / 0** |
+| btc-5m *(rtds)* | 33 / 366 / 0 | 23 / 375 / 1 | **86 / 325 / 0** |
+| eth-15m | 59 / 360 / 0 | 202 / 216 / 0 | **238 / 193 / 0** |
+| eth-5m *(rtds)* | 179 / 220 / 5 | 167 / 231 / 5 | **85 / 326 / 0** |
+| sol-15m | 60 / 359 / 0 | 83 / 335 / 0 | **231 / 200 / 0** |
+| sol-5m *(maker)* | 61 / 338 / 3 | 44 / 354 / 0 | **85 / 326 / 0** |
+| xrp-5m *(rtds, maker)* | 80 / 319 / 8 | 103 / 295 / 0 | **103 / 308 / 1** |
+| **5m total** | 353 / 1243 / **16** | 337 / 1255 / **6** | **359 / 1285 / 1** |
+| **15m total** | 145 / 1112 / 0 | 436 / 818 / 0 | **712 / 581 / 0** |
 | bnb-5m | 225 / 836 / 3 | 3 / 744 / 0 | *(partitioned to EU — expected)* |
+
+5m eval counts are statistically identical across all three windows (353 /
+337 / **359**), so the fire collapse in finding #1b is **not** eval
+starvation — it is the `safety` brake. `fleet_room` never hit 0 in run C
+(min 440.9 of 500), so it is not exposure-cap starvation either — it *did*
+hit 0.0 in run A.
 
 **Control-plane latency: the reconcile fix is measurably in the running
 binary.** Tick cadence against the configured 50 ms interval, parsed from
@@ -356,9 +376,27 @@ binary.** Tick cadence against the configured 50 ms interval, parsed from
 | **20:45Z (post-fix)** | 50.0 | **50.0** | **50.0** | 49 / 53 |
 
 Run 1 shows the pathology the commit message describes — the loop running up
-to 4.6× behind schedule, corroborating the "22% behind" claim. Run 3 has
-**zero excursions**: p90 and max both sit exactly on 50.0 ms. Per-tick work
-tightened too (max `elapsed_ms` 126 → 53).
+to 4.6× behind schedule, corroborating the "22% behind" claim (independently
+re-measured at **61.15 ms/tick, +22.3%**, against `watch_load.md` §2.4's
+61.2 ms / +22%: the two methods agree exactly). Run 3 has **zero
+excursions**: p90 and max both sit on 50.0 ms. Confirmed live from `/status`
+— `uptime_secs: 2226, tick_count: 44488` → **0.07% cumulative drift over 37
+minutes**.
+
+A 200-sample live probe of `GET /subscriptions` at 5 Hz, same methodology as
+`watch_load.md` §2.3, shows the fix on the wire:
+
+| | watch_load baseline | **now** | |
+|---|---|---|---|
+| p50 | 1.4 ms | **0.67 ms** | 2.1× |
+| **p90** | **246 ms** | **0.98 ms** | **251×** |
+| p99 | 442 ms | 110.55 ms | 4.0× |
+| max | 455 ms | 126.31 ms | 3.6× |
+| samples > 100 ms | 14.3% | **1.0%** (2/200) | 14× |
+
+**The 9.6 s blackout class is gone**, and the residual shape is the
+signature of the fix: the two slow samples sit at ~110–126 ms — the cost of
+**one** whole-account fetch, not 16 serialised ones.
 
 **The rtds gating profile is CLEAN — it matches the EU box independently.**
 The three newly-rtds arms each show ~55 `range-start reference not printed
@@ -457,7 +495,24 @@ engine and unrelated to bnb.
 - `settle_tw` is inert on the live fleet's range_avg arms.
 - Replay honours an explicit `decided_k` override.
 - The watch odds lane fails loud on an unset funder address.
-- No live arm is dead: all 7 evaluate, gate, and roll since the restart.
+- No live arm is dead: all 7 evaluate, gate, and roll since the restart; 5m
+  eval counts are statistically identical to both prior runs (353/337/359).
+- Maker bids ARE still resting on both maker arms — 0.27 post_only orders/min
+  in run C vs 0.27 (A) and 0.14 (B), ack 150–180 ms, resting notionals
+  matching the clips (sol ~49.5, xrp ~9.8).
+- `decided_k` is empirically 1.25 at 15m and 1.0 at 5m, measured off the tape.
+- Book/WS health: 60 s cadence exact and phase-locked, `ws_connected=true`
+  27/27, **`never_fed=0` in every sample**, `book_age` p50 17 ms / p90 132 ms
+  — better than run A, on par with run B. `ws_tokens=14` is correct for 7 arms.
+- `rtds_dropped_lagged=0` across all three runs — no consumer lag anywhere.
+- `fleet_room` never hit 0 in run C (min 440.9 of 500); it *did* hit 0.0 in A.
+- No message class disappeared: the stale-cancel and reconcile classes that
+  read as "gone" at 21:13Z both reappeared the moment order flow resumed at
+  21:19:59Z — the zeros were the fire drought, not a broken subsystem.
+- The engine is transacting: `/status` 21:19:27Z `open_orders:2,
+  total_exposure_usd:19.31, unrealized_pnl:4.90`; balance +$5.00 with
+  exposure cleared by 21:22:18Z.
+- The bnb allowlist refusal fired once and self-cleared from durable state.
 - The reconcile fix is in the running binary and works — tick cadence p90/max
   went from 151/230 ms to exactly 50.0/50.0 ms against a 50 ms interval.
 - The rtds arms' reference-wait / feed-stale rate matches the EU box's
