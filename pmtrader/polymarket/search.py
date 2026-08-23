@@ -56,10 +56,26 @@ def find_markets(query: str, limit: int = 8, include_closed: bool = False) -> li
     sometimes, direct lookup never does.
     """
     events: list[dict] = []
+    seen_ev: set[str] = set()
+    # Multi-word queries miss events indexed under variant names ("HLE1 vs
+    # T1" doesn't match "T1 HLE") — query the whole phrase AND each token,
+    # merge. Three requests max; recency sort below surfaces the live one.
+    variants = [query]
+    toks = [t for t in query.split() if len(t) >= 2]
+    if len(toks) >= 2:
+        variants += toks[:2]
     try:
-        d = _get(f"{hosts.GAMMA}/public-search",
-                 {"q": query, "limit_per_type": limit})
-        for ev in (d.get("events") or [])[:limit]:
+        gathered: list[dict] = []
+        for q in variants:
+            d = _get(f"{hosts.GAMMA}/public-search",
+                     {"q": q, "limit_per_type": limit})
+            for ev in (d.get("events") or [])[:limit]:
+                slug = ev.get("slug") or ""
+                if slug in seen_ev:
+                    continue
+                seen_ev.add(slug)
+                gathered.append(ev)
+        for ev in gathered:
             markets = [normalize_market(m) for m in (ev.get("markets") or [])]
             if not include_closed:
                 markets = [m for m in markets if not m["closed"]]
