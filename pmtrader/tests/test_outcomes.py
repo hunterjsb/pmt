@@ -3,6 +3,7 @@ here is inline fixtures (activity rows, synthetic Chainlink rounds, tape lines).
 """
 
 from polymarket.outcomes import (
+    book_outcome,
     build_outcomes,
     chainlink_outcome,
     ck_settlement_width_s,
@@ -261,7 +262,8 @@ def test_build_outcomes_drops_untraded_windows_with_stale_corpus():
     windows = [{"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}]
     rows, dropped = build_outcomes(windows, {}, {"btc": []})
     assert rows == []
-    assert dropped == [{"slug": "btc-updown-5m-1000", "reason": "no corpus data"}]
+    assert dropped == [{"slug": "btc-updown-5m-1000",
+                        "reason": "no corpus data; no terminal book samples"}]
 
 
 # ---------- outcomes corpus: append + dedupe, wallet upgrades chainlink ----------
@@ -318,3 +320,76 @@ def test_zero_size_dust_redeem_never_flips_blind():
     sized = [{"type": "REDEEM", "slug": "btc-updown-15m-1", "usdcSize": 0,
               "size": 265.0, "outcome": "Down"}]
     assert wallet_outcomes(sized) == {"btc-updown-15m-1": "up"}
+
+
+# ---------- terminal-book source ----------
+
+def _book(t, up_bid=None, up_ask=None, dn_bid=None, dn_ask=None):
+    return {"t": t, "up_bid": up_bid, "up_ask": up_ask, "dn_bid": dn_bid, "dn_ask": dn_ask}
+
+
+def test_book_outcome_grades_pinned_terminal_book():
+    w = {"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
+    recs = [_book(1290, up_bid=0.97, dn_ask=0.03), _book(1295, up_bid=0.98, dn_ask=0.02)]
+    assert book_outcome(w, recs) == ("up", None)
+
+
+def test_book_outcome_refuses_mid_window_tape():
+    # tape died at t=1200 with a decisive-looking book — a forecast, not a settlement
+    w = {"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
+    recs = [_book(1150, up_bid=0.97, dn_ask=0.02), _book(1200, up_bid=0.98, dn_ask=0.02)]
+    winner, reason = book_outcome(w, recs)
+    assert winner is None and reason == "no terminal book samples"
+
+
+def test_book_outcome_needs_two_agreeing_samples():
+    w = {"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
+    winner, reason = book_outcome(w, [_book(1295, up_bid=0.97, dn_ask=0.02)])
+    assert winner is None and reason == "terminal book ambiguous"
+
+
+def test_book_outcome_refuses_unpinned_or_contested_book():
+    w = {"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
+    # not pinned hard enough
+    recs = [_book(1290, up_bid=0.90, dn_ask=0.11), _book(1295, up_bid=0.91, dn_ask=0.10)]
+    assert book_outcome(w, recs)[0] is None
+    # pinned both ways across samples (flip at the wire) -> refuse
+    recs = [_book(1290, up_bid=0.97, dn_ask=0.02), _book(1294, up_bid=0.97, dn_ask=0.02),
+            _book(1299, dn_bid=0.96, up_ask=0.03)]
+    assert book_outcome(w, recs)[0] is None
+
+
+def test_build_outcomes_book_is_strictly_last():
+    w = {"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
+    book = {"btc-updown-5m-1000": [_book(1290, dn_bid=0.97, up_ask=0.02),
+                                    _book(1295, dn_bid=0.98, up_ask=0.02)]}
+    # chainlink says up and is fresh -> book (down) must NOT be consulted
+    rounds = {"btc": _rounds({960: 100.0, 1250: 110.0, 1300: 999.0})}
+    rows, _ = build_outcomes([w], {}, rounds, book)
+    assert rows == [{"slug": w["slug"], "winner": "up", "source": "chainlink"}]
+    # chainlink stale -> book grades
+    rows, dropped = build_outcomes([w], {}, {"btc": []}, book)
+    assert rows == [{"slug": w["slug"], "winner": "down", "source": "book"}]
+    assert dropped == []
+
+
+def test_merge_outcomes_wallet_and_chainlink_upgrade_book():
+    existing = {"s1": {"slug": "s1", "winner": "up", "source": "book"}}
+    merged, _, upgraded = merge_outcomes(existing, [{"slug": "s1", "winner": "down", "source": "wallet"}])
+    assert merged["s1"]["source"] == "wallet" and upgraded == 1
+    existing = {"s1": {"slug": "s1", "winner": "up", "source": "book"}}
+    merged, _, upgraded = merge_outcomes(existing, [{"slug": "s1", "winner": "down", "source": "chainlink"}])
+    assert merged["s1"]["source"] == "chainlink" and upgraded == 1
+    # book never overwrites anything
+    existing = {"s1": {"slug": "s1", "winner": "up", "source": "chainlink"}}
+    merged, _, upgraded = merge_outcomes(existing, [{"slug": "s1", "winner": "down", "source": "book"}])
+    assert merged["s1"]["source"] == "chainlink" and upgraded == 0
+
+
+def test_chainlink_outcome_refuses_margin_inside_noise_floor():
+    # ~2bp move: real settlements this close live inside flat-hold interpolation
+    # error (measured 2026-08-23: sub-1bp labels worse than a coin flip vs wallet)
+    w = {"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
+    rounds = _rounds({960: 100.0, 1250: 100.02, 1300: 100.02})
+    winner, reason = chainlink_outcome(w, rounds)
+    assert winner is None and "noise floor" in reason

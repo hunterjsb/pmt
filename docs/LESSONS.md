@@ -395,3 +395,21 @@ Polymarket's WS is geoblocked.
 **Changed:** three independent exit conditions, any one sufficient:
 `--skip-warmup`, enough streamed WS book diffs, or a wall-clock deadline. A
 still-missing book is handled by each strategy's own `if book is None` guard.
+
+### <a id="L36"></a>L36 — Corpus TWAP labels near zero margin are interpolation noise, not outcomes
+
+**2026-08-23.** The Chainlink round corpus grades untraded windows by flat-hold
+TWAP. Rounds land ~30s apart, so any settlement decided by less than the
+inter-round drift is invisible to it: measured against wallet + terminal-book
+witnesses over 48h (n=344 graded), sub-1bp chainlink labels were WORSE than a
+coin flip (1/6 vs wallet ground truth), and one 15m window was flat-out wrong
+at 3.2bp. 69 poisoned rows (16% of the corpus) had been feeding miss-rate
+studies. The tell that surfaced it: four windows where the entire market held
+0.99 through the final 100ms while our corpus said the other side — when the
+crowd and your derived label disagree, audit the label first.
+
+**Changed:** `chainlink_outcome` refuses to grade below `CK_NOISE_FLOOR_BP`
+(5bp). A new strictly-last `book` source grades from the market's own terminal
+book (samples inside the final 15s only, ≥2 agreeing 0.95-pinned samples, zero
+contradicting — a tape that died mid-window must not grade). True coin-flips
+with unpinned books drop, never guess. Corpus purged and regraded.

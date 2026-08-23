@@ -1,0 +1,11 @@
+geoblock binance.api/time: 451|dns=0.021562|conn=0.032407|tls=0.048663|ttfb=0.059435|tot=0.059520 body={   "code": 0,   "msg": "Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service if you believe you received this message in error
+geoblock binance.api/exchInfo: 451|dns=0.002069|conn=0.011803|tls=0.027841|ttfb=0.038815|tot=0.038887 body={   "code": 0,   "msg": "Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service if you believe you received this message in error
+geoblock binance.api/ticker: 451|dns=0.001245|conn=0.011308|tls=0.027315|ttfb=0.037417|tot=0.037496 body={   "code": 0,   "msg": "Service unavailable from a restricted location according to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service if you believe you received this message in error
+geoblock binance.vision/time: 200|dns=0.021992|conn=0.221122|tls=0.588894|ttfb=0.785493|tot=0.785570 body={"serverTime":1787476807506}
+geoblock binance.vision/ticker: 200|dns=0.001290|conn=0.185710|tls=0.560476|ttfb=0.745949|tot=0.746065 body={"symbol":"BTCUSDT","price":"76538.00000000"}
+geoblock clob/time: 200|dns=0.012366|conn=0.022954|tls=0.040436|ttfb=0.153157|tot=0.153259 body=1787476808
+geoblock clob/ok: 200|dns=0.001334|conn=0.012186|tls=0.029577|ttfb=0.141695|tot=0.141803 body="OK"
+geoblock gamma/markets: 200|dns=0.001231|conn=0.012079|tls=0.029389|ttfb=0.050094|tot=0.050193 body=[{"id":"559651","question":"Xi Jinping out before 2027?","conditionId":"0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7","slug":"xi-jinping-out-before-2027","resolutionSource":"","endDate":"2026-12-31T
+geoblock data-api/activity: 200|dns=0.001307|conn=0.012044|tls=0.033080|ttfb=0.056728|tot=0.056806 body=[]
+geoblock pm/geoblock: 200|dns=0.023031|conn=0.033445|tls=0.052505|ttfb=0.103656|tot=0.104431 body={"blocked":true,"ip":"2600:1700:3270:3af0:bf21:e87d:7f88:d250","country":"US","region":"SC"}
+geoblock clob/auth-derive: 401|dns=0.001337|conn=0.011958|tls=0.028552|ttfb=0.144069|tot=0.144135 body={"error":"Invalid L1 Request headers"} 

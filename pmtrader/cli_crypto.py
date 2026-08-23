@@ -1175,13 +1175,24 @@ def crypto_outcomes(since: float, out_path: str | None) -> None:
     symbols = {w["symbol"] for w in windows}
     rounds_by_symbol = {sym: ck.load_corpus(sym) for sym in symbols}
 
-    rows, dropped = build_outcomes(windows, wallet_wins, rounds_by_symbol)
+    # terminal-book fallback source: only samples near each window's end matter,
+    # so keep just the tail of each slug's book records while streaming the tape
+    from polymarket.outcomes import BOOK_TERMINAL_S
+    end_by_slug = {w["slug"]: w["end"] for w in windows}
+    book_by_slug: dict[str, list[dict]] = {}
+    for r in tape.iter_records(tape.BOOK_TAPE, floor=windows[0]["start"]):
+        end = end_by_slug.get(r.get("slug") or "")
+        if end is not None and r.get("t", 0) >= end - BOOK_TERMINAL_S:
+            book_by_slug.setdefault(r["slug"], []).append(r)
+
+    rows, dropped = build_outcomes(windows, wallet_wins, rounds_by_symbol, book_by_slug)
     existing = load_outcomes(out_file)
     merged, added, upgraded = merge_outcomes(existing, rows)
     write_outcomes(merged, out_file)
 
     n_wallet = sum(1 for r in rows if r["source"] == "wallet")
     n_chain = sum(1 for r in rows if r["source"] == "chainlink")
+    n_book = sum(1 for r in rows if r["source"] == "book")
     n_up = sum(1 for r in rows if r["winner"] == "up")
     n_down = sum(1 for r in rows if r["winner"] == "down")
 
@@ -1190,6 +1201,7 @@ def crypto_outcomes(since: float, out_path: str | None) -> None:
     t.add_column("n", justify="right")
     t.add_row("wallet", str(n_wallet))
     t.add_row("chainlink", str(n_chain))
+    t.add_row("book (terminal)", str(n_book))
     t.add_row("dropped (stale)", str(len(dropped)))
     console.print(t)
     console.print(f"[dim]{added} new · {upgraded} upgraded chainlink→wallet · "

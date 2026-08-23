@@ -29,6 +29,13 @@ OUTCOMES_PATH = Path.home() / ".pmt" / "corpus" / "outcomes.jsonl"
 
 STALE_S = 600  # no round within 10min before the query span -> corpus too stale to trust
 
+# On-chain rounds land ~30s apart (deviation/heartbeat), so the corpus TWAP is a
+# flat-hold interpolation. Measured against wallet + terminal-book witnesses
+# (2026-08-23, 48h, n=344): labels under 1bp were WORSE than a coin flip (1/6 vs
+# wallet), and one 15m window was wrong at 3.2bp. Below this floor the corpus
+# refuses to grade — the terminal book or nothing takes over.
+CK_NOISE_FLOOR_BP = 5.0
+
 
 def extract_updown_slugs(lines: Iterable[str]) -> set[str]:
     """Distinct updown slugs referenced in a tape file's lines. Tolerant of blank/bad JSON."""
@@ -134,6 +141,9 @@ def chainlink_outcome(window: dict, rounds: list[dict]) -> tuple[str | None, str
     reference = twap_over_window(rounds, ts_list, window["start"] - w, window["start"])
     if settlement is None or reference is None:
         return None, "stale: twap unavailable"  # belt-and-suspenders; guards above should prevent this
+    margin_bp = abs(settlement - reference) / reference * 1e4
+    if margin_bp < CK_NOISE_FLOOR_BP:
+        return None, f"margin {margin_bp:.1f}bp inside corpus noise floor"
     return ("up" if settlement > reference else "down"), None
 
 
@@ -205,10 +215,49 @@ def grade_window(redeemed_usd: float, redeem_seen: bool, fired_side: str | None,
     return False, True
 
 
+# ---------- (d) terminal book — last-resort source for UNFILLED windows ----------
+
+BOOK_TERMINAL_S = 15   # only book samples this close to window end count as terminal
+BOOK_PIN = 0.95        # winner bid must pin at least here, loser ask at most 1-here
+
+def book_outcome(window: dict, book_records: list[dict]) -> tuple[str | None, str | None]:
+    """(winner, drop_reason) from the market's own terminal book. Last-resort
+    source: wallet-first grading leaves every window we never FILLED
+    ungraded — which is exactly the missed-opportunity population the
+    latency/miss studies need (2026-08-23).
+
+    Only samples inside the final BOOK_TERMINAL_S of the window count — a
+    tape that stopped mid-window (restart, blackout) must not grade, because
+    a 0.96 book with minutes left is a forecast, not a settlement
+    (docs/LESSONS.md: drop, never guess). Needs >= 2 agreeing pinned samples
+    (winner bid >= BOOK_PIN, its opponent's ask <= 1-BOOK_PIN where quoted)
+    and zero samples pinned the other way.
+    """
+    end = window["end"]
+    term = [r for r in book_records
+            if (r.get("t") or 0) >= end - BOOK_TERMINAL_S and (r.get("t") or 0) <= end + 120]
+    if not term:
+        return None, "no terminal book samples"
+    up_w = dn_w = 0
+    for r in term:
+        ub, da = r.get("up_bid"), r.get("dn_ask")
+        db, ua = r.get("dn_bid"), r.get("up_ask")
+        if ub is not None and ub >= BOOK_PIN and (da is None or da <= 1 - BOOK_PIN):
+            up_w += 1
+        if db is not None and db >= BOOK_PIN and (ua is None or ua <= 1 - BOOK_PIN):
+            dn_w += 1
+    if up_w >= 2 and dn_w == 0:
+        return "up", None
+    if dn_w >= 2 and up_w == 0:
+        return "down", None
+    return None, "terminal book ambiguous"
+
+
 # ---------- priority merge ----------
 
 def build_outcomes(windows: list[dict], wallet: dict[str, str],
-                    rounds_by_symbol: dict[str, list[dict]]) -> tuple[list[dict], list[dict]]:
+                    rounds_by_symbol: dict[str, list[dict]],
+                    book_by_slug: dict[str, list[dict]] | None = None) -> tuple[list[dict], list[dict]]:
     """Resolve every window by strict priority: wallet, then Chainlink.
 
     Returns (rows, dropped) — rows are {"slug","winner","source"} ready to
@@ -222,10 +271,14 @@ def build_outcomes(windows: list[dict], wallet: dict[str, str],
             rows.append({"slug": slug, "winner": wallet[slug], "source": "wallet"})
             continue
         winner, reason = chainlink_outcome(w, rounds_by_symbol.get(w["symbol"]) or [])
-        if winner is None:
-            dropped.append({"slug": slug, "reason": reason})
-        else:
+        if winner is not None:
             rows.append({"slug": slug, "winner": winner, "source": "chainlink"})
+            continue
+        bwinner, breason = book_outcome(w, (book_by_slug or {}).get(slug) or [])
+        if bwinner is not None:
+            rows.append({"slug": slug, "winner": bwinner, "source": "book"})
+        else:
+            dropped.append({"slug": slug, "reason": f"{reason}; {breason}"})
     return rows, dropped
 
 
@@ -265,6 +318,9 @@ def merge_outcomes(existing: dict[str, dict], new_rows: list[dict]) -> tuple[dic
             merged[r["slug"]] = r
             added += 1
         elif prev["source"] == "chainlink" and r["source"] == "wallet":
+            merged[r["slug"]] = r
+            upgraded += 1
+        elif prev["source"] == "book" and r["source"] in ("wallet", "chainlink"):
             merged[r["slug"]] = r
             upgraded += 1
     return merged, added, upgraded
