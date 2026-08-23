@@ -1649,9 +1649,14 @@ def crypto_updown(ref: str, as_json: bool) -> None:
               help="Auto-rearm the next window in the series at close (same budget)")
 @click.option("--clip", type=float, default=25.0, show_default=True,
               help="Max notional per individual fire (position builds in clips)")
+@click.option("--basis-guard", type=float, default=3.0, show_default=True,
+              help="twap only: |projected margin| below this many bp is oracle "
+                   "noise, no trade. BTC is fine at 3; alts (ETH/SOL) need ~6 — "
+                   "both 2026-08-23 losses were thin-margin windows inside the "
+                   "real Chainlink-vs-Binance basis")
 def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
                side: str | None, quiesce: float, min_fair: float, min_elapsed: float,
-               roll: bool, clip: float) -> None:
+               roll: bool, clip: float, basis_guard: float) -> None:
     """Arm the pmengine updown trigger on a market.
 
     Prices the market (semantics, vol, fee) and hands the parameters to the
@@ -1674,7 +1679,7 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         "sigma_bp_per_min": r["sigma_bp_per_min"], "fee_rate": r["fee_rate"],
         "size_usdc": size, "min_edge": min_edge, "max_price": max_price,
         "quiesce_secs": quiesce, "min_fair": min_fair, "min_elapsed_frac": min_elapsed,
-        "roll": roll, "clip_usdc": clip,
+        "roll": roll, "clip_usdc": clip, "basis_guard_bp": basis_guard,
     }
     if side:
         payload["side_filter"] = side
@@ -1825,15 +1830,47 @@ _V2_ERA = 1787441100
 
 
 def _tape_scoreboard(floor: float) -> dict:
-    """Aggregate the decision tape into W-L / est P&L / calibration.
-
-    P&L assumes fires filled at their vwap up to the window's final
-    committed notional — an estimate; wallet balance is the truth.
+    """W-L / realized P&L graded by the WALLET (data-api activity), not the
+    model's own final read — a model that's confidently wrong (XRP basis,
+    2026-08-23) would otherwise grade its own loss as a win. The tape only
+    contributes fire records (stated fairs) for the calibration table.
     """
+    import os
     import time as _t
 
+    import requests
+
+    from polymarket import hosts
+
+    now = _t.time()
+    # Ground truth: every updown trade + redemption on the proxy wallet.
+    win_by_slug: dict[str, dict] = {}
+    addr = os.environ.get("PM_FUNDER_ADDRESS", "")
+    offset = 0
+    while addr:
+        rows = requests.get(
+            "https://data-api.polymarket.com/activity",
+            params={"user": addr, "limit": 500, "offset": offset},
+            headers=hosts.UA, timeout=15,
+        ).json() or []
+        for a in rows:
+            slug = a.get("slug") or ""
+            if "-updown-" not in slug or a["timestamp"] < floor:
+                continue
+            w = win_by_slug.setdefault(slug, {"buy": 0.0, "sell": 0.0,
+                                              "redeem": 0.0, "won": None})
+            usd = a.get("usdcSize") or 0.0
+            if a["type"] == "TRADE":
+                w["buy" if a.get("side") == "BUY" else "sell"] += usd
+            elif a["type"] == "REDEEM":
+                w["redeem"] += usd
+                if usd > 0.5:
+                    w["won"] = (a.get("outcome") or "").lower()
+        if len(rows) < 500 or (rows and rows[-1]["timestamp"] < floor):
+            break
+        offset += 500
+
     fires: dict[str, list] = {}
-    evals: dict[str, dict] = {}
     rolls = 0
     try:
         with open(_TAPE_PATH) as fh:
@@ -1843,43 +1880,42 @@ def _tape_scoreboard(floor: float) -> dict:
                     continue
                 if r["ev"] == "fire":
                     fires.setdefault(r["slug"], []).append(r)
-                elif r["ev"] == "eval":
-                    evals[r["slug"]] = r
                 elif r["ev"] == "roll":
                     rolls += 1
     except FileNotFoundError:
         pass
 
-    now = _t.time()
     series: dict[str, dict] = {}
     cal: dict[float, list] = {}
     wins = losses = 0
     net = 0.0
-    for slug, fs in fires.items():
-        ev = evals.get(slug)
-        if not ev:
-            continue
-        sym, dur = slug.split("-")[0], slug.split("-")[2]
+    for slug, w in win_by_slug.items():
+        parts = slug.split("-")
+        sym, dur = parts[0], parts[2]
         end = int(slug.rsplit("-", 1)[1]) + int(dur[:-1]) * 60
-        committed = ev["committed"]
-        if committed < 1:
+        if w["buy"] + w["sell"] + w["redeem"] < 1:
             continue
         s = series.setdefault(f"{sym} {dur}", {"w": 0, "l": 0, "open": 0, "pnl": 0.0, "usd": 0.0})
-        s["usd"] += committed
-        if now < end + 60:
+        s["usd"] += w["buy"]
+        # Redemption usually lands 1-2min after close; before that it's open.
+        if w["redeem"] == 0 and now < end + 300:
             s["open"] += 1
             continue
-        p_final = ev["p_up"]
-        if not (p_final > 0.995 or p_final < 0.005):
-            continue  # ambiguous close — excluded from the record
-        won_side = "up" if p_final > 0.5 else "down"
-        vwap = sum(f["size"] * f["ask"] for f in fs) / sum(f["size"] for f in fs)
-        won = fs[0]["side"] == won_side
-        pnl = committed / vwap - committed if won else -committed
+        pnl = w["redeem"] + w["sell"] - w["buy"]
+        won = w["redeem"] > 0.5
         s["w" if won else "l"] += 1
         s["pnl"] += pnl
         wins, losses, net = wins + won, losses + (not won), net + pnl
-        for f in fs:
+        # Winning outcome: the paying redeem row names it; else infer from
+        # our fired side (right if we won, flipped if we lost).
+        fired = fires.get(slug, [{}])[0].get("side")
+        if w["won"]:
+            won_side = w["won"]
+        elif fired:
+            won_side = fired if won else ("down" if fired == "up" else "up")
+        else:
+            won_side = ""
+        for f in fires.get(slug, []):
             b = min(int(f["fair"] * 20) / 20, 0.95)
             cal.setdefault(b, [0, 0])
             cal[b][0] += 1
@@ -1893,7 +1929,7 @@ def _tape_scoreboard(floor: float) -> dict:
               help="Hours of tape to include (default: the v2 fleet era)")
 @click.option("--json", "as_json", is_flag=True)
 def crypto_stats(since: float | None, as_json: bool) -> None:
-    """Fleet scoreboard: est P&L, win rate, calibration, live arms, capital."""
+    """Fleet scoreboard: realized P&L (wallet-graded), win rate, calibration, live arms, capital."""
     import time as _t
 
     floor = _t.time() - since * 3600 if since else _V2_ERA
@@ -1922,11 +1958,11 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
     n = wins + losses
     wr = f"{wins / n * 100:.0f}%" if n else "—"
     cap = f"${bal['total']:,.2f}" if bal else "?"
-    console.print(f"[bold]{wins}W-{losses}L[/bold] ({wr}) · est P&L "
+    console.print(f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L "
                   f"[{'green' if net >= 0 else 'red'}]{net:+,.2f}[/] · "
                   f"{rolls} rolls · capital {cap}")
 
-    t = Table(title="By series (est, tape-derived)")
+    t = Table(title="By series (wallet-graded)")
     for col in ("series", "record", "P&L", "notional"):
         t.add_column(col, justify="right")
     for k in sorted(series):
@@ -1999,7 +2035,7 @@ def crypto_watch(since: float | None) -> None:
         cap = f"${bal['total']:,.2f}" if bal else "…"
         color = "green" if net >= 0 else "red"
         return Panel(
-            f"[bold]{wins}W-{losses}L[/bold] ({wr}) · est P&L [{color}]{net:+,.2f}[/] · "
+            f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L [{color}]{net:+,.2f}[/] · "
             f"{sb['rolls']} rolls · capital {cap} · [dim]{_t.strftime('%H:%M:%S')}[/dim]",
             title="updown fleet", border_style="cyan")
 
