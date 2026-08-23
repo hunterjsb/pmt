@@ -226,3 +226,74 @@ def test_guard_bp_map_and_binance_symbols_stay_in_sync():
     for sym, guard in chainlink.GUARD_BP.items():
         assert sym in chainlink.BINANCE_SYMBOL, sym
         assert chainlink.guard_bp_for(chainlink.BINANCE_SYMBOL[sym]) == guard
+
+
+# ---------- refresh_corpus: the top-up `pmt crypto outcomes` runs before grading ----------
+
+def _rig_refresh(monkeypatch, corpus, appended, *, fetch_error=None):
+    """Stub load_corpus/fetch_rounds/append_corpus; record the hours each fetch asked for."""
+    asked: list[tuple[str, float]] = []
+
+    def fake_fetch(symbol, hours=24.0):
+        asked.append((symbol, hours))
+        if fetch_error:
+            raise fetch_error
+        return [{"round_id": 1, "price": 100.0, "updated_at": 0}]
+
+    monkeypatch.setattr(chainlink, "load_corpus", lambda sym, since=None: corpus.get(sym, []))
+    monkeypatch.setattr(chainlink, "fetch_rounds", fake_fetch)
+    monkeypatch.setattr(chainlink, "append_corpus",
+                         lambda sym, rounds: appended.setdefault(sym, len(rounds)))
+    return asked
+
+
+def test_refresh_corpus_reaches_back_to_the_last_round_on_disk(monkeypatch):
+    now = 1_800_000_000.0
+    corpus = {"btc": [{"round_id": 1, "price": 1.0, "updated_at": now - 6 * 3600}]}
+    asked = _rig_refresh(monkeypatch, corpus, {})
+
+    out = chainlink.refresh_corpus(["btc"], now - 90 * 3600, now)
+
+    assert asked == [("btc", 6.0)], "the gap since the last fetch, not the whole tape"
+    assert out["btc"] == {"new": 1, "hours": 6.0, "error": None}
+
+
+def test_refresh_corpus_falls_back_to_the_oldest_window_when_corpus_is_empty(monkeypatch):
+    now = 1_800_000_000.0
+    asked = _rig_refresh(monkeypatch, {}, {})
+
+    chainlink.refresh_corpus(["eth"], now - 10 * 3600, now)
+
+    assert asked == [("eth", 10.0)]
+
+
+def test_refresh_corpus_clamps_both_ends(monkeypatch):
+    now = 1_800_000_000.0
+    # Fresh corpus (minutes old) still reaches MIN_H; a months-old tape with an
+    # empty corpus must not turn a grading run into an unbounded RPC walk.
+    corpus = {"btc": [{"round_id": 1, "price": 1.0, "updated_at": now - 60}]}
+    asked = _rig_refresh(monkeypatch, corpus, {})
+
+    chainlink.refresh_corpus(["btc", "sol"], now - 2000 * 3600, now)
+
+    assert asked == [("btc", chainlink.REFRESH_MIN_H), ("sol", chainlink.REFRESH_MAX_H)]
+
+
+def test_refresh_corpus_reports_rpc_failure_instead_of_raising(monkeypatch):
+    now = 1_800_000_000.0
+    _rig_refresh(monkeypatch, {}, {}, fetch_error=RuntimeError("all RPC urls failed"))
+
+    out = chainlink.refresh_corpus(["btc"], now - 3600, now)
+
+    assert out["btc"]["error"] == "all RPC urls failed"
+    assert out["btc"]["new"] == 0
+
+
+def test_refresh_corpus_skips_a_symbol_with_no_feed(monkeypatch):
+    now = 1_800_000_000.0
+    asked = _rig_refresh(monkeypatch, {}, {})
+
+    out = chainlink.refresh_corpus(["pepe"], now - 3600, now)
+
+    assert asked == [], "no feed, no RPC call"
+    assert out["pepe"]["error"] is not None

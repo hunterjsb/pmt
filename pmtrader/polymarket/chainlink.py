@@ -289,6 +289,44 @@ def append_corpus(symbol: str, rounds: list[dict]) -> int:
     return len(new_rows)
 
 
+REFRESH_MIN_H = 3.0   # always reach past the last fetch, even if it was minutes ago
+REFRESH_MAX_H = 48.0  # ceiling on one walk (~48h is ~5.7k rounds/symbol at the 30s cadence)
+
+
+def refresh_corpus(symbols: list[str], since: float, now: float | None = None) -> dict[str, dict]:
+    """Top each symbol's corpus up to the live round, for callers about to grade off it.
+
+    Reaches back to the newest round already on disk (the gap since the last
+    run) or to `since` — the oldest window being graded — when the corpus is
+    empty, capped at REFRESH_MAX_H so a months-old tape can't turn a grading
+    run into an unbounded RPC walk. Filling a gap OLDER than the corpus is
+    `extend_corpus_backward`'s job, not this one.
+
+    Never raises: a per-symbol failure comes back as `error` so the caller can
+    warn and fall back to whatever corpus is already on disk. Unknown symbols
+    (a slug for a pair we have no feed for) are skipped with an error, never a
+    KeyError.
+
+    Returns {sym: {"new", "hours", "error"}}.
+    """
+    now = time.time() if now is None else now
+    out: dict[str, dict] = {}
+    for sym in symbols:
+        row: dict = {"new": 0, "hours": 0.0, "error": None}
+        out[sym] = row
+        if sym not in FEEDS:
+            row["error"] = "no Chainlink feed for this symbol"
+            continue
+        try:
+            newest = max((r["updated_at"] for r in load_corpus(sym)), default=0.0)
+            reach = now - (newest if newest > 0 else since)
+            row["hours"] = min(max(reach / 3600.0, REFRESH_MIN_H), REFRESH_MAX_H)
+            row["new"] = append_corpus(sym, fetch_rounds(sym, hours=row["hours"]))
+        except Exception as e:
+            row["error"] = str(e)
+    return out
+
+
 # ---------- basis: Chainlink vs Binance ----------
 
 def _fetch_minute_closes(binance_symbol: str, start_ms: int, end_ms: int) -> dict[int, float]:
