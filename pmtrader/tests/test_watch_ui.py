@@ -343,8 +343,8 @@ def test_the_arm_cell_fits_every_marker_at_once():
     c = Console(record=True, width=200)
     c.print(cc.build_windows_table({}, 1700000100.0, arms=arms))
     line = next(ln for ln in c.export_text().splitlines() if "doge" in ln)
-    cell = [x.strip() for x in line.strip("│").split("│")][1]
-    assert cell == "doge 15m ⟳≈◇", cell
+    cell = [x.strip() for x in line.strip("│").split("│")][0]
+    assert cell == "○ doge 15m ⟳≈◇", cell
     assert "…" not in cell, cell
     assert row["flags"] == "⟳≈◇"
 
@@ -366,6 +366,55 @@ def test_the_money_cell_fits_a_resting_bid_beside_a_four_figure_fill():
     c.print(cc.build_windows_table({}, 1000.0, arms=arms))
     row = next(ln for ln in c.export_text().splitlines() if "btc" in ln)
     assert "$1,204.50 ◇$450" in row, row
+
+
+_FOLD_ARM = {"btc-updown-5m-1700000300": {
+    "roll": True, "feed": "rtds", "maker_bid": True, "filled_usdc": 1204.50,
+    "resting_usdc": 450.0,
+    "eval": {"state": "armed", "mode": "safe", "p_up": 0.87, "rho": 0.4,
+             "banked_bp": 12.3, "cushion_bp": 9.3, "banked_decided": True,
+             "committed": 1204.50, "resting": 450.0,
+             "sides": [{"side": "up", "safety": 0.9, "brake": None},
+                       {"side": "down", "safety": -0.3, "brake": "distrust"}]}}}
+
+
+def test_nothing_the_arms_table_showed_became_invisible_in_the_fold():
+    """THE pin on killing the second table. Every field the arms table had a
+    column for must still be legible on the live row: countdown, state word,
+    gate reason / safety+brake badges, evidence, p_up, mode, rho, committed $
+    (with its resting bid) and the roll/feed/maker flags."""
+    from rich.console import Console
+
+    c = Console(record=True, width=200)
+    c.print(cc.build_windows_table({}, 1700000000.0, arms=_FOLD_ARM))
+    row = next(ln for ln in c.export_text().splitlines() if "btc 5m" in ln)
+    for was_a_column in (
+        "10:00",                    # T-
+        "armed",                    # state
+        "safe",                     # mode
+        "saf +0.90/-0.30",          # per-side safety badge
+        "down:distrust",            # brake badge
+        "+12.3/9.3bp",              # evidence
+        "p↑0.87",                   # p_up
+        "ρ+0.40",                   # rho
+        "$1,204.50 ◇$450",          # committed + the resting maker bid
+        "⟳≈◇",                      # flags
+    ):
+        assert was_a_column in row, (was_a_column, row)
+    assert "…" not in row, row
+
+
+def test_the_gate_reason_survives_the_fold_at_full_length():
+    # The arms table's widest cell; the compact form has to still fit.
+    from rich.console import Console
+
+    arms = {"btc-updown-5m-1700000300": {"roll": True, "eval": {
+        "state": "gated", "margin_bp": -4.9, "guard_bp": 6.0,
+        "reason": "basis guard: projected margin -4.9bp inside 6.0bp noise band"}}}
+    c = Console(record=True, width=200)
+    c.print(cc.build_windows_table({}, 1700000000.0, arms=arms))
+    row = next(ln for ln in c.export_text().splitlines() if "btc 5m" in ln)
+    assert "gated  margin -4.9 vs 6.0bp" in row, row
 
 
 def test_an_unreachable_engine_still_announces_itself_after_the_fold():
@@ -407,9 +456,11 @@ def _trades_text(sb, now=1787510500.0, width=160, limit=None, odds=None,
 
 
 def _glyph_column(out: str) -> str:
-    """The lifecycle column read straight down — what the chip strip used to
-    be, and the thing the merge is not allowed to lose."""
-    return "".join(ln.strip("│").split("│")[0].strip()
+    """The lifecycle glyphs read straight down — what the chip strip used to
+    be, and the thing the merge is not allowed to lose. They lead the `arm`
+    cell rather than owning a column, so they sit at a fixed offset on every
+    row and still read as a column by eye."""
+    return "".join(ln.strip("│").split("│")[0].strip()[0]
                    for ln in out.splitlines() if ln.startswith("│"))
 
 
@@ -455,7 +506,7 @@ def test_the_merged_table_carries_the_riding_chips_identity():
     out = _trades_text(sb)
     assert _glyph_column(out) == "◆✓"
     row = next(ln for ln in out.splitlines() if "bnb 5m" in ln)
-    assert "◆" in row and "$19.44" in row and "riding" in row
+    assert "◆ bnb 5m" in row and "$19.44" in row and "riding" in row
 
 
 def test_an_estimated_verdict_is_dim_in_the_glyph_column_like_its_chip_was():
@@ -607,7 +658,7 @@ def test_the_engines_committed_is_dim_until_the_wallet_confirms_it():
     slug = "btc-updown-5m-1787510700"
 
     def row_ansi(sb):
-        c = Console(record=True, width=100)
+        c = Console(record=True, width=200)
         c.print(cc.build_windows_table(sb, 1787510800.0, arms=_LIVE_ARMS))
         return next(ln for ln in c.export_text(styles=True).splitlines()
                     if "btc 5m" in ln)
@@ -684,17 +735,20 @@ def test_the_merged_table_fits_a_narrow_terminal_without_losing_a_column():
     paints the same on an 80-column terminal as on a 200-column one."""
     sb = {"windows": [_decided("btc-updown-5m-1787500000", -12436.76, 1787500300)],
           "riding_windows": [_riding("bnb-updown-5m-1787510100", 1787510400)]}
-    for width in (100, 140, 200):
+    for width in (90, 100, 120, 140, 200):
         out = _trades_text(sb, width=width, arms=_LIVE_ARMS)
         rows = [ln for ln in out.splitlines() if ln.startswith("│")]
         assert all(len(ln) <= width for ln in rows), width
-        # A narrow console squeezes columns, never drops one: the stage
-        # sequence and the row count survive at every width.
+        # One row per window at every width, and the lifecycle glyph survives
+        # the squeeze: Rich shrinks every no_wrap column equally, so a glyph
+        # with a column of its own would collapse to nothing on exactly the
+        # terminals that can least afford to lose it. Riding at the head of
+        # the `arm` cell it is the last thing to go.
         assert len(rows) == 4, (width, rows)
+        assert _glyph_column(out) == "○⊘◆✗", width
     # ...and at its natural width nothing is ellipsised, five-figure P&L
     # included.
     wide = _trades_text(sb, width=200, arms=_LIVE_ARMS)
-    assert _glyph_column(wide) == "○⊘◆✗"
     assert "…" not in wide and "-12,436.76" in wide
 
 
@@ -724,9 +778,9 @@ def test_a_riding_row_says_what_we_paid_and_what_it_is_worth_now():
     out = _trades_text(sb, odds={("bnb-updown-5m-1787510100", "up"): 0.99})
     row = next(ln for ln in out.splitlines() if "bnb 5m" in ln)
     cells = [c.strip() for c in row.strip("│").split("│")]
-    assert cells[:4] == ["◆", "bnb 5m", "1m", "held 5m00s"]
-    assert cells[4].startswith("20sh in ")   # wall clock is the reader's own tz
-    assert cells[5:] == ["up 0.97→0.99", "$19.44", "riding"]
+    assert cells[:3] == ["◆ bnb 5m", "1m", "held 5m00s"]
+    assert cells[3].startswith("20sh in ")   # wall clock is the reader's own tz
+    assert cells[4:] == ["up 0.97→0.99", "$19.44", "riding"]
 
 
 def test_the_now_column_is_blank_when_the_marks_feed_has_nothing():
@@ -738,7 +792,7 @@ def test_the_now_column_is_blank_when_the_marks_feed_has_nothing():
         out = _trades_text(sb, odds=odds)
         row = next(ln for ln in out.splitlines() if "bnb 5m" in ln)
         cells = [c.strip() for c in row.strip("│").split("│")]
-        assert cells[5] == "up 0.97→—", (odds, cells)
+        assert cells[4] == "up 0.97→—", (odds, cells)
 
 
 def test_the_now_column_colors_by_which_side_is_winning():

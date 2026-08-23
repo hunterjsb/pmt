@@ -900,8 +900,9 @@ def feed_row(status: dict | None) -> tuple | None:
 #     was ordered by these rows already), plus ◆ for a riding position and ○/⊘
 #     for the live head. Nothing the strip said is gone; the arm label, the
 #     P&L and the notional it compressed into a chip are now their own columns.
-#     The arms table's ⟳/≈/◇ flags ride in the `arm` cell for the same reason:
-#     a marker is a property of the row, not of a column of its own.
+#     Glyph and the arms table's ⟳/≈/◇ flags share the `arm` cell — both are
+#     properties of the row, not of a column of their own, and the glyph is
+#     safe there from Rich's narrow-console squeeze (see _WINDOWS_COLUMNS).
 #
 #  4. EVERY COLUMN IS REPURPOSED BY STAGE rather than duplicated. This is what
 #     made folding the arms table possible: a live un-filled window's money
@@ -941,10 +942,25 @@ def feed_row(status: dict | None) -> tuple | None:
 # otherwise read a confident $0.00 committed.
 
 _WINDOWS_COLUMNS = (
-    ("·", "left", 1),          # stage glyph — _STAGE_LEGEND
-    ("arm", "left", 12),       # "doge 15m ⟳≈◇" is the widest form
+    # Stage glyph + series + flags in ONE cell: "◆ doge 15m ⟳≈◇" is 14. The
+    # glyph does NOT get a column of its own — Rich squeezes every no_wrap
+    # column equally on a console narrower than the table, and a 1-wide column
+    # collapses to nothing, so the lifecycle would silently vanish first on
+    # exactly the terminals that can least afford to lose it. Riding at the
+    # head of a 14-wide cell it survives longest, and the cell ellipsises from
+    # the right, which sheds the flags before the label and the label before
+    # the glyph — the right order of importance.
+    ("arm", "left", 14),
     ("t", "right", 6),         # T- past "59:59" on a not-yet-open window
-    ("state", "left", 28),     # "gated  margin -4.9 vs 6.0bp" is 27
+    # Sized for the arms table's own worst case, which is a normal state and
+    # not a corner: an armed arm with both sides' safety read AND a brake on
+    # one of them — "armed safe  saf +0.90/-0.30  down:distrust" is 42. The
+    # gate reason ("gated  margin -4.9 vs 6.0bp", 27) fits well inside that.
+    # This and `read` are the two widest cells, so a console narrower than the
+    # table's natural ~149 squeezes THEM first — which is the right place for
+    # it to land: they are diagnostic prose, and every money column is sized to
+    # its longest value and must never lose a digit.
+    ("state", "left", 42),
     ("read", "right", 25),     # "+12.3/9.3bp p↑0.87 ρ+0.40" is 25
     ("position", "right", 15),  # "down 0.97→0.99" is 15
     ("$", "right", 15),        # "$1,234.56 ◇$450" is 15
@@ -1303,7 +1319,6 @@ def build_windows_table(sb: dict | None, now: float,
     rows = window_rows(sb, arms, limit)
     for w in rows:
         t.add_row(
-            _stage_cell(w),
             _arm_cell(w),
             _t_cell(w, now),
             _state_cell(w, now),
@@ -1315,7 +1330,7 @@ def build_windows_table(sb: dict | None, now: float,
     if not rows:
         # In the state cell, the widest one: a placeholder that ellipsizes is
         # worse than a short honest one, and this is the only column with room.
-        t.add_row("—", "—", "—", "[dim]no windows[/dim]", "—", "—", "—", "—")
+        t.add_row("—", "—", "[dim]no windows[/dim]", "—", "—", "—", "—")
     return t
 
 
@@ -1340,17 +1355,19 @@ def _arm_flags(a: dict) -> str:
 
 
 def _arm_cell(w: dict) -> str:
-    """`btc 5m ⟳≈◇` — the series plus, while some arm is actually on this
-    window, that arm's flags. A rolled-away window is just its series: the
-    markers describe a live arm, and there is no longer one here.
+    """`◆ btc 5m ⟳≈◇` — the row's whole identity: where the window is in its
+    life, which series it belongs to, and (while some arm is actually on it)
+    that arm's flags. A rolled-away window is just glyph + series: the markers
+    describe a live arm, and there is no longer one here.
 
-    The flags ride in this cell rather than a column of their own because they
-    are a property of the row, and a six-wide column of mostly-"·" is what the
-    fold was for.
+    Glyph and flags ride in this cell rather than columns of their own because
+    both are properties of the row — and because a 1-wide glyph column is the
+    first thing Rich squeezes out of existence on a narrow console.
     """
     label = _arm_label(w.get("slug", ""))
     flags = w.get("flags") or ""
-    return f"{label} [dim]{flags}[/dim]" if flags else label
+    cell = f"{_stage_cell(w)} {label}"
+    return f"{cell} [dim]{flags}[/dim]" if flags else cell
 
 
 def engine_row(status: dict | None) -> tuple | None:
@@ -1482,9 +1499,10 @@ def build_help_modal(width: int | None = None):
     legend = Table(box=None, pad_edge=False, padding=(0, 2), show_header=False)
     legend.add_column("what", justify="right", width=7, style="dim")
     legend.add_column("meaning", justify="left", overflow="fold")
-    legend.add_row("stage", f"[cyan]{_STAGE_LEGEND}[/cyan]")
-    legend.add_row("flags", f"[cyan]{_FLAG_LEGEND}[/cyan] [dim]— on the arm "
-                            "that is on this window right now[/dim]")
+    legend.add_row("stage", f"[cyan]{_STAGE_LEGEND}[/cyan] [dim]— it leads "
+                            "every `arm` cell[/dim]")
+    legend.add_row("flags", f"[cyan]{_FLAG_LEGEND}[/cyan] [dim]— trailing the "
+                            "arm that is on this window right now[/dim]")
     # The columns that change meaning with the stage are the whole trick of the
     # one-table fold, so the modal is where they are spelled out.
     legend.add_row("columns", "[dim]state · read: the engine's posture while a "
