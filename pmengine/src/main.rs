@@ -94,6 +94,12 @@ pub struct ReplayArgs {
     #[arg(long)]
     bless: bool,
 
+    /// Decision-trace JSONL (full mode): every tape record decide() emitted,
+    /// so a study can attribute a gate instead of bounding it by relaxing
+    /// knobs one at a time. Off unless given.
+    #[arg(long)]
+    trace: Option<PathBuf>,
+
     /// JSON array of arm params (+ optional "tunables" override) to run, one per slug.
     #[arg(long)]
     params: Option<PathBuf>,
@@ -203,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(private_strategies)]
         Some(Commands::Replay(args)) => {
             let ReplayArgs {
-                mode, tape, book_tape, slug, fixtures, only, bless, params, outcomes, out,
+                mode, tape, book_tape, slug, fixtures, only, bless, params, outcomes, out, trace,
                 fleet_cap, rtds_corpus,
             } = *args;
             // reqwest::blocking builds its own mini tokio runtime; calling
@@ -218,7 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => {
                     let slug = slug.ok_or("replay needs --slug (or --fixtures)")?;
                     pmengine::replay::run(pmengine::replay::ReplayOpts {
-                        mode, tape, book_tape, slug, params, outcomes, out, fleet_cap,
+                        mode, tape, book_tape, slug, params, outcomes, out, trace, fleet_cap,
                         rtds_corpus,
                     })
                 }
