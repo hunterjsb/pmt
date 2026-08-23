@@ -64,11 +64,30 @@ def _funder_or_usage_error() -> str:
 @click.option("--limit", "n", default=40, show_default=True, help="Rows to show")
 @click.option("--all", "show_all", is_flag=True,
               help="Every activity type, not just updown windows")
-def crypto_activity(n: int, show_all: bool) -> None:
-    """Recent wallet activity — the curl+jq boilerplate, built in."""
+@click.option("--refresh", is_flag=True,
+              help=f"Re-walk the full feed into {wallet.ACTIVITY_DUMP} first — the dump "
+                   f"the fixture freezer grades money against")
+def crypto_activity(n: int, show_all: bool, refresh: bool) -> None:
+    """Recent wallet activity — the curl+jq boilerplate, built in.
+
+    Printing is a live read and touches no file. `--refresh` additionally
+    rewrites the on-disk activity dump; it is the ONLY command that does, and
+    the fixture freezer refuses to grade a window the dump does not reach.
+    """
     import time as _t
 
     addr = _funder_or_usage_error()
+
+    if refresh:
+        try:
+            written = wallet.refresh_activity_dump(addr=addr)
+        except Exception as e:
+            console.print(f"[red]refresh failed: {e}[/red]")
+            sys.exit(1)
+        newest = wallet.activity_dump_coverage()
+        stamp = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(newest)) if newest else "empty"
+        console.print(f"[green]refreshed[/green] {wallet.ACTIVITY_DUMP} — "
+                      f"{written} rows, newest {stamp}")
 
     rows: list[dict] = []
     offset = 0

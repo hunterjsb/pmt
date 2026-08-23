@@ -1,13 +1,65 @@
 # systemd user units (proposal)
 
-Three units, none installed. They are checked in as a proposal so adopting
+Four units, none installed. They are checked in as a proposal so adopting
 them is a decision with a diff behind it, not a thing that happened.
 
 | unit | what it runs | restarts? |
 | --- | --- | --- |
 | `pmengine.service` | `pmengine ... run updown --skip-warmup`, same as `pmt engine start` | on failure, 5s→120s backoff, 5 tries / 5min |
 | `pmt-rtds-recorder.service` | `uv run python -m polymarket.rtds` in `pmtrader/` | on failure, 10s→300s backoff, 10 tries / 10min |
+| `pmt-print-recorder.service` | `uv run python -m polymarket.prints` in `pmtrader/` | on failure, 10s→300s backoff, 10 tries / 10min |
 | `pmt-backup.service` + `.timer` | `scripts/pmt-backup.sh` — ~/.pmt corpus + tapes → `s3://xanmc/pmt-backups/YYYY-MM-DD.tar.zst` | no. oneshot, daily 03:30, `Persistent=true` |
+
+## The print recorder, and why it is a second unit
+
+`~/.pmt/corpus/prints.jsonl` was written by a one-shot backfill
+(`analysis/firsthalf_harvest_prints.py`, now in the private vault). It walked
+the windows the book tape happened to hold, exhausted that list, and exited 0.
+Nothing killed it — **it was never continuous**, and its coverage stops at the
+newest window that existed when it ran:
+
+```
+legacy prints.jsonl   167,941 prints   2026-08-22T02:59:36Z → 08-23T07:39:00Z
+rtds corpus                            2026-08-23T08:28:55Z → forward, forever
+```
+
+Fifty minutes of dead space between them and **not one overlapping instant**.
+That makes print-vs-stream lead — does Polymarket print flow move before or
+after the Chainlink stream these markets settle on — not merely noisy but
+unmeasurable. `polymarket.prints` closes it by harvesting continuously, over
+the same windows, for as long as both recorders are up. On first start it finds
+~900 windows the backfill never covered, everything after 08:28:55Z of which
+overlaps the stream corpus.
+
+- **It polls `data-api /trades` after the bell, not during.** That endpoint
+  serves full print history per market long after a window resolves, and the
+  print timestamps are the exchange's, so a post-close harvest preserves the
+  lead signal at a fraction of the request budget a live poller would spend.
+  `--settle-lag` (default 180 s) is the wait; `--max-per-scan` (default 40)
+  caps a catch-up burst so a recorder that has been down for a day cannot open
+  the throttle on data-api all at once.
+- **Its window list is the engine's own book tape**, the same source the
+  backfill used, so the corpora stay comparable and it can only ever harvest
+  windows the engine actually watched.
+- **`prints-YYYYMMDD.jsonl`, rotated on PRINT time** rather than harvest time,
+  so a day's prints are one file that joins to `rtds-YYYYMMDD.jsonl` with no
+  filter. Unlike the RTDS corpus it is also **bounded**: `--retention-days`
+  (default 30) prunes old files, because print volume tracks market activity
+  rather than wall clock and the backfill alone was 54 MB.
+- **It seeds from the existing corpus at startup** — daily files plus the
+  legacy `prints.jsonl` — so a restart never re-fetches what it already has,
+  and the two files concatenate field-for-field with no shim.
+
+Why not fold it into `pmt-rtds-recorder.service`: that recorder is a websocket
+consumer whose whole job is to not miss a frame, and this one makes blocking
+REST calls to a host measured stalling for whole seconds under contention
+(`analysis/watch_load.md`). A multi-second HTTP call inside the stream reader's
+loop is the exact bug that document is about. Separate processes cannot do
+that to each other.
+
+Unlike the stream, prints are backfillable, so a gap here is recoverable —
+`uv run python -m polymarket.prints --once --stdout` runs a single catch-up
+pass and exits. That also makes this the safer of the two to try first.
 
 ## THE CAVEAT: auto-restart interacts with arm recovery
 
@@ -85,6 +137,7 @@ is tmpfs on this box).
 mkdir -p ~/.config/systemd/user
 cp deploy/systemd/pmengine.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-rtds-recorder.service ~/.config/systemd/user/
+cp deploy/systemd/pmt-print-recorder.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-backup.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-backup.timer ~/.config/systemd/user/
 systemctl --user daemon-reload

@@ -137,25 +137,34 @@ def _rtds_gap(coverage: tuple[float, float] | None, symbol: str,
 @click.option("--regen", is_flag=True,
               help="Overwrite an existing fixture. DELIBERATE: the commit message must say "
                    "which expectations moved and what moved them")
+@click.option("--refresh", is_flag=True,
+              help="Re-walk the wallet activity dump before grading (the one network call "
+                   "this command will make). Needed for any window newer than the dump")
+@click.option("--accounting-only", is_flag=True,
+              help="Repair ONLY the outcome money block of an existing fixture, leaving "
+                   "params, slices and expectations byte-identical. The correct repair for "
+                   "a fixture frozen against a stale activity dump — a full --regen would "
+                   "also re-derive as-armed params from TODAY's arm store")
 @click.option("--no-bless", is_flag=True, help="Write the fixture without expectations")
 @click.option("--engine", default=None, help="Path to the pmengine binary")
 def crypto_fixture(slug: str, out_dir: str | None, mode: str, teaches: str | None,
                    lessons_ref: str | None, eras: tuple[str, ...],
                    invariants: tuple[str, ...], param_overrides: tuple[str, ...],
-                   lifted_tunables: bool, note: str | None, regen: bool, no_bless: bool,
-                   engine: str | None) -> None:
+                   lifted_tunables: bool, note: str | None, regen: bool, refresh: bool,
+                   accounting_only: bool, no_bless: bool, engine: str | None) -> None:
     """Freeze ONE wallet-graded window into a committed characterization fixture.
 
-    Reads the local corpus only — no network, and never writes to a tape.
-    The window must be wallet-graded: a fixture is the ground truth other
-    measurements get checked against, so a chainlink/book-derived label is
-    refused rather than downgraded (docs/LESSONS.md#L36).
+    Reads the local corpus only — no network unless `--refresh` is passed — and
+    never writes to a tape. The window must be wallet-graded: a fixture is the
+    ground truth other measurements get checked against, so a chainlink/book-
+    derived label is refused rather than downgraded (docs/LESSONS.md#L36).
     """
     import subprocess
     import time as _t
     from pathlib import Path
 
     from polymarket import fixtures as fx
+    from polymarket import wallet
 
     parsed = updown_slugs.parse_updown_slug(slug)
     if parsed is None:
@@ -173,10 +182,11 @@ def crypto_fixture(slug: str, out_dir: str | None, mode: str, teaches: str | Non
     dest = out_path / f"{slug}.json"
     prior: dict = {}
     if dest.exists():
-        if not regen:
+        if not (regen or accounting_only):
             raise click.UsageError(
                 f"{dest} already exists. Re-freezing rewrites an expectation that a real "
-                f"trade is pinned to — pass --regen and say in the commit message what moved it."
+                f"trade is pinned to — pass --regen and say in the commit message what moved it. "
+                f"To fix ONLY a stale money block, --accounting-only leaves expectations alone."
             )
         # Carry the existing curation forward so a bare --regen re-cuts the
         # slice and re-blesses WITHOUT quietly dropping anything: the old
@@ -185,18 +195,82 @@ def crypto_fixture(slug: str, out_dir: str | None, mode: str, teaches: str | Non
         # declared invariants so omitting a flag cannot delete curator intent.
         prior = json.loads(dest.read_text())
 
+    if refresh:
+        try:
+            written = wallet.refresh_activity_dump()
+        except Exception as e:
+            raise click.UsageError(f"activity refresh failed: {e}")
+        click.echo(f"refreshed activity dump: {written} rows")
+
+    graded = next((r for r in _corpus_jsonl("outcomes.jsonl") if r.get("slug") == slug), None)
+    try:
+        # `end` makes a dump that stops before this window fatal rather than a
+        # silent row of zeros — the defect that put $0 buy/$0 redeem/$0 pnl on
+        # seven fixtures of windows that really traded.
+        acct = fx.wallet_accounting(_corpus_jsonl("activity.jsonl"), slug, window_end=end)
+        outcome = fx.build_outcome(graded, acct, slug)
+    except fx.FixtureError as e:
+        raise click.UsageError(str(e))
+
+    if accounting_only:
+        # WHY THIS EXISTS, and why it is not just --regen.
+        #
+        # A full regen re-derives the as-armed params from the LIVE arm store,
+        # which describes the arms running NOW. For a window whose arm retired
+        # hours ago that silently stamps today's configuration onto yesterday's
+        # trade — measured on xrp-updown-5m-1787485200: maker_bid False -> True,
+        # settle_tw_s None -> 60.0, and sigma_bp_per_min drifting with a re-cut
+        # slice. Those params feed the basis guard, so the blessed expectations
+        # move too (fires 2 -> 0 on that fixture) and a passing regression
+        # baseline gets rewritten to match a fiction.
+        #
+        # The money is the only thing that was ever wrong. Repair exactly that.
+        if not prior:
+            raise click.UsageError(
+                f"{dest} does not exist — --accounting-only repairs an existing fixture")
+        before = prior.get("outcome", {})
+        money = {k: outcome[k] for k in fx.OUTCOME_KEYS[2:]}
+        if before.get("winner") != outcome["winner"]:
+            raise click.UsageError(
+                f"{slug}: graded winner moved {before.get('winner')!r} -> "
+                f"{outcome['winner']!r}. That is a grading change, not an accounting "
+                f"repair — investigate before touching the fixture.")
+        moved = {k: (before.get(k), v) for k, v in money.items() if before.get(k) != v}
+        if not moved:
+            console.print(f"[dim]{slug}: accounting already matches the dump — unchanged[/dim]")
+            return
+        # A textual swap of the one block, so the commit is a diff of the money
+        # and literally nothing else — no key reordering, no float reformatting
+        # of the recorded eval/book/rtds slices.
+        dest.write_text(
+            fx.replace_top_level_block(dest.read_text(), "outcome", {**before, **money}))
+        console.print(f"[green]repaired accounting[/green] {dest}")
+        for k, (was, now) in sorted(moved.items()):
+            console.print(f"  - {k}: {was!r} -> {now!r}")
+
+        # Prove the surgical edit did not disturb the regression baseline: a
+        # plain replay, no --bless, so a moved expectation is a failure rather
+        # than a rewrite.
+        binary = _pmengine_binary(engine)
+        proc = subprocess.run(
+            [str(binary), "--log-level", "warn", "replay", "--fixtures", str(dest)],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            console.print(proc.stdout + proc.stderr)
+            raise click.UsageError(
+                f"{slug}: replay FAILED after an accounting-only repair. The money block "
+                f"is not supposed to move an expectation — this is a finding.")
+        console.print(f"  [green]replay still passes[/green] — expectations untouched")
+        return
+
+    # Slices are only needed to BUILD a fixture; --accounting-only returned above
+    # without reading a tape, so an old window whose tape has since rotated away
+    # can still have its money repaired.
     tape_recs = fx.slice_tape(tape.iter_records(tape.UPDOWN_TAPE), slug)
     if not tape_recs:
         raise click.UsageError(f"{slug}: no records in {tape.UPDOWN_TAPE}")
     book_recs = [fx.trim_book_record(r)
                  for r in fx.slice_tape(tape.iter_records(tape.BOOK_TAPE), slug)]
-
-    graded = next((r for r in _corpus_jsonl("outcomes.jsonl") if r.get("slug") == slug), None)
-    acct = fx.wallet_accounting(_corpus_jsonl("activity.jsonl"), slug)
-    try:
-        outcome = fx.build_outcome(graded, acct, slug)
-    except fx.FixtureError as e:
-        raise click.UsageError(str(e))
 
     symbol = fx.SYMBOL.get(slug.split("-")[0], "")
 
