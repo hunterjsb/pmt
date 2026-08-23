@@ -272,6 +272,10 @@ def _tape_render(line: str) -> str | None:
             else "no book"
         )
         banked = click.style("  BANKED", fg="cyan") if r.get("banked_decided") else ""
+        if r.get("maker_rest") is not None:
+            banked += click.style(f"  ◇RESTING @{r['maker_rest']:.3f}", fg="cyan", bold=True)
+        elif r.get("maker_candidate"):
+            banked += click.style("  ◇maker-candidate", fg="cyan")
         body = (
             f"{head} {_tape_tag('eval')} p↑{r['p_up']:.4f}  {book}"
             f"  ρ{r['rho']:+.2f}  {money(r['committed'])} in"
@@ -509,8 +513,14 @@ def build_arms_table(arms: dict | None, now: float) -> Table:
         rho = f"{e['rho']:+.2f}" if "rho" in e else "—"
         committed = e.get("committed", a.get("filled_usdc"))
         committed_s = f"${committed:,.2f}" if committed is not None else "—"
-        # "≈" = fed by the settlement stream rather than the Binance proxy.
-        flags = ("⟳" if a.get("roll") else "·") + ("≈" if a.get("feed") == "rtds" else "")
+        resting = a.get("resting_usdc") or e.get("resting") or 0.0
+        if resting > 0.005:
+            committed_s += f" [cyan]◇${resting:,.0f}[/cyan]"
+        # "≈" = settlement-stream fed; "◇" = maker bid armed (resting $ shows
+        # beside committed while a bid is actually on the book).
+        flags = (("⟳" if a.get("roll") else "·")
+                 + ("≈" if a.get("feed") == "rtds" else "")
+                 + ("◇" if a.get("maker_bid") else ""))
         t.add_row(_tape_slug(slug), _countdown_markup(slug, now), state,
                   _evidence_markup(e), p_up, _mode_text(e), rho, committed_s, flags)
     if not arms:
