@@ -370,14 +370,16 @@ def test_poll_key_none_when_not_a_tty(monkeypatch):
 
 def test_poll_key_reads_q_when_ready(monkeypatch):
     monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=True, chars="q"))
-    monkeypatch.setattr(cc.select, "select", lambda r, w, x, t: ([cc.sys.stdin], [], []))
+    monkeypatch.setattr(cc.select, "select", lambda r, w, x, t: ([0], [], []))
+    monkeypatch.setattr(cc.os, "read", lambda fd, n: b"q")
     assert cc._poll_key() == "q"
 
 
 def test_poll_key_returns_other_keys_lowercased(monkeypatch):
     monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=True, chars="x"))
-    monkeypatch.setattr(cc.select, "select", lambda r, w, x, t: ([cc.sys.stdin], [], []))
-    assert cc._poll_key() is not None
+    monkeypatch.setattr(cc.select, "select", lambda r, w, x, t: ([0], [], []))
+    monkeypatch.setattr(cc.os, "read", lambda fd, n: b"H")
+    assert cc._poll_key() == "h"
 
 
 def test_poll_key_none_when_nothing_ready(monkeypatch):

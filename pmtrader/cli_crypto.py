@@ -10,6 +10,7 @@ Rich console and one lazy PolymarketAPI loader across both files.
 from __future__ import annotations
 
 import json
+import os
 import re
 import select
 import sys
@@ -882,12 +883,21 @@ def _restore_stdin(saved: tuple[int, list] | None) -> None:
 
 
 def _poll_key() -> str | None:
-    """Non-blocking: the waiting keypress (lowercased) or None this tick."""
+    """Non-blocking: the waiting keypress (lowercased) or None this tick.
+
+    os.read on the raw fd, NOT sys.stdin.read — the TextIOWrapper's
+    buffering can demand more bytes than the tty has and block the whole
+    dashboard on a single keypress (operator-reported: h/q dead in watch).
+    """
     if not sys.stdin.isatty():
         return None
     try:
-        ready, _, _ = select.select([sys.stdin], [], [], 0)
-        return sys.stdin.read(1).lower() if ready else None
+        fd = sys.stdin.fileno()
+        ready, _, _ = select.select([fd], [], [], 0)
+        if not ready:
+            return None
+        ch = os.read(fd, 1)
+        return ch.decode(errors="ignore").lower() or None
     except Exception:
         return None
 
@@ -1246,7 +1256,7 @@ def crypto_window(slug: str) -> None:
         click.echo(line)
 
 
-_ORACLE_SYMBOLS = ["btc", "eth", "sol", "xrp", "doge", "all"]
+_ORACLE_SYMBOLS = ["btc", "eth", "sol", "xrp", "doge", "bnb", "all"]  # keep in sync with chainlink.SYMBOLS
 
 
 @crypto_group.command("oracle")
