@@ -53,7 +53,7 @@ don't record is a night the corpus can't judge.
 Priority per the 2026-08-23 review: **R4 first** (does the documented 5m manipulation signature
 exist in OUR books, and what does it cost by duration/moneyness), **R2 second** (reliability
 diagrams by p-bucket × ρ-regime × time-to-expiry become the gate on any size increase), then
-R3 → R5/R6/R1 → R7/R8.
+R3 → R5/R6/R1 → R7/R8/R9.
 
 - **R1 Oracle basis per symbol** — measured Chainlink-vs-Binance distribution → per-symbol
   guards with confidence, XRP verdict. Needs Phase 0 rounds data.
@@ -79,6 +79,13 @@ R3 → R5/R6/R1 → R7/R8.
 - **R8 Near-even late-flow guard** — when the book is still ~50/50 in the final 30–60s and
   late Binance flow is abnormal, cut or zero the size multiplier: that combination is the
   manipulation fingerprint the 5m literature documents.
+- **R9 Entry gate: banked evidence, not clock %** — the 50% `min_elapsed` gate is unswept
+  folklore with a known cliff failure (the −$370 window fired at the first legal tick, when
+  BTC still moves >10bp in the remaining time 29% of the time). Sweep `min_elapsed` per
+  duration on the corpus, then test the principled replacement: require the banked margin to
+  carry a minimum fraction of the decided-cushion before the first clip — a gate that opens
+  later in hot regimes and earlier in dead ones, which the clock only crudely approximates.
+  Our edge is banked-mass arithmetic; the entry gate should measure banked mass.
 
 ## Phase 3 — Strategy expansion (each gated by Phase 1)
 
