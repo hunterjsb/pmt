@@ -413,8 +413,9 @@ impl Engine {
 
     /// Stop watching a token at runtime. Cancels any open orders on the
     /// token first (locally + on Polymarket), releases their risk-manager
-    /// reservations, removes the book from the hub, and flags the
-    /// WebSocket for reconnect. Positions and order history are preserved.
+    /// reservations, drops the position from the exposure ledger, removes
+    /// the book from the hub, and flags the WebSocket for reconnect.
+    /// Order history is preserved.
     pub async fn unsubscribe_token(&mut self, token_id: &str) {
         if !self.subscribed_tokens.iter().any(|t| t == token_id) {
             return;
@@ -433,6 +434,14 @@ impl Engine {
             ),
         }
         self.risk_manager.release_orders_for_token(token_id);
+        // Unsubscribe means the engine no longer manages this token; a
+        // resolved/abandoned position must leave the exposure ledger too,
+        // or the risk manager counts every finished window forever (froze
+        // the whole fleet at the $1500 cap on 2026-08-23).
+        let released = self.positions.remove(token_id);
+        if released > rust_decimal::Decimal::ZERO {
+            tracing::info!(token_id = %token_id, notional = %released, "Unsubscribe: released position exposure");
+        }
         self.market_data.remove_book(token_id).await;
         self.subscribed_tokens.retain(|t| t != token_id);
         // Drop the condition_id mapping so the public-trade poller

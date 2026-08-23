@@ -136,6 +136,17 @@ impl PositionTracker {
         self.positions.get(token_id)
     }
 
+    /// Drop a token's position from the ledger, returning its notional.
+    /// For tokens the engine stops managing (e.g. a resolved binary whose
+    /// shares redeem on-chain) — a preserved entry would count as live
+    /// exposure forever and starve the risk manager.
+    pub fn remove(&mut self, token_id: &str) -> Decimal {
+        self.positions
+            .remove(token_id)
+            .map(|p| p.notional())
+            .unwrap_or(Decimal::ZERO)
+    }
+
     /// Apply a fill.
     pub fn apply_fill(&mut self, fill: &Fill) {
         let position = self.get_or_create(&fill.token_id);
