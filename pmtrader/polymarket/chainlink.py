@@ -52,25 +52,30 @@ SEL_GET_ROUND_DATA = "0x9a6fc8f5"
 PHASE_SHIFT = 64
 _AGG_MASK = (1 << PHASE_SHIFT) - 1
 
-# Polygon mainnet Chainlink proxy addresses — verified live 2026-08-22 via
+# Polygon mainnet Chainlink proxy addresses — verified live via
 # description()/decimals() eth_call (each description() echoed the pair
-# below exactly; decimals() returned 8 for all five).
+# below exactly; decimals() returned 8 for all of them). btc/eth/sol/xrp/doge
+# verified 2026-08-22, bnb 2026-08-23.
 FEEDS: dict[str, dict] = {
     "btc": {"pair": "BTC / USD", "address": "0xc907E116054Ad103354f2D350FD2514433D57F6f", "decimals": 8},
     "eth": {"pair": "ETH / USD", "address": "0xF9680D99D6C9589e2a93a78A04A279e509205945", "decimals": 8},
     "sol": {"pair": "SOL / USD", "address": "0x10C8264C0935b3B9870013e057f330Ff3e9C56dC", "decimals": 8},
     "xrp": {"pair": "XRP / USD", "address": "0x785ba89291f676b5386652eB12b30cF361020694", "decimals": 8},
     "doge": {"pair": "DOGE / USD", "address": "0xbaf9327b6564454F4a3364C33eFeEf032b4b4444", "decimals": 8},
+    "bnb": {"pair": "BNB / USD", "address": "0x82a6c4AF830caa6c97bb504425f6A66165C2c26e", "decimals": 8},
 }
 SYMBOLS = list(FEEDS)
 
-BINANCE_SYMBOL = {"btc": "BTCUSDT", "eth": "ETHUSDT", "sol": "SOLUSDT", "xrp": "XRPUSDT", "doge": "DOGEUSDT"}
+BINANCE_SYMBOL = {"btc": "BTCUSDT", "eth": "ETHUSDT", "sol": "SOLUSDT", "xrp": "XRPUSDT",
+                  "doge": "DOGEUSDT", "bnb": "BNBUSDT"}
 
 # Live per-arm basis guards (ROADMAP.md 2026-08-23): BTC 3bp, alts 6bp, XRP
 # off pending this exact data. DOGE isn't in the live fleet yet — no guard set.
 # Deployed per-arm guards as of 2026-08-23 (R1 aligned measurement + replay
 # A/B): btc 6, eth 8, sol 10. xrp/doge stay untradeable via Binance proxy.
-GUARD_BP: dict[str, float | None] = {"btc": 6.0, "eth": 8.0, "sol": 10.0, "xrp": None, "doge": None}
+# bnb: feed added 2026-08-23 for the R1 fit; no guard until its corpus is measured.
+GUARD_BP: dict[str, float | None] = {"btc": 6.0, "eth": 8.0, "sol": 10.0,
+                                     "xrp": None, "doge": None, "bnb": None}
 
 CORPUS_DIR = Path.home() / ".pmt" / "corpus"
 

@@ -72,8 +72,9 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
 # Per-arm basis guards as specified for this study (ROADMAP R6 spec) — NOT
 # necessarily identical to whatever chainlink.GUARD_BP holds live right now;
-# this is the input the study was asked to test.
-GUARD_BP = {"BTCUSDT": 6.0, "ETHUSDT": 8.0, "SOLUSDT": 10.0}
+# this is the input the study was asked to test. BNBUSDT is a fit candidate,
+# not live: 8bp is its R1 settlement-p95 proposal (`--symbols BNBUSDT`).
+GUARD_BP = {"BTCUSDT": 6.0, "ETHUSDT": 8.0, "SOLUSDT": 10.0, "BNBUSDT": 8.0}
 
 DURATIONS = [("5m", 300), ("15m", 900)]
 
