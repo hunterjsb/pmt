@@ -40,7 +40,7 @@ jobs:
       bumped: ${{ steps.check.outputs.bumped }}
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 2
 
@@ -75,7 +75,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
@@ -97,7 +97,7 @@ jobs:
           ls -lh target/lambda/pmproxy-lambda/bootstrap.zip
 
       - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::350985642081:role/pmproxy-ci-deploy
           aws-region: ${{ env.AWS_REGION }}
@@ -134,7 +134,7 @@ jobs:
           echo "url=${URL%/}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python for integration tests
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 

@@ -17,7 +17,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -38,7 +38,7 @@ jobs:
           tar -czvf pmproxy-aarch64-unknown-linux-gnu.tar.gz -C target/aarch64-unknown-linux-gnu/release pmproxy
 
       - name: Upload x86_64 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pmproxy-x86_64
           path: pmproxy/target/x86_64-unknown-linux-gnu/release/pmproxy
@@ -48,7 +48,7 @@ jobs:
         run: echo "version=${GITHUB_REF#refs/tags/pmproxy-}" >> $GITHUB_OUTPUT
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           name: pmproxy ${{ steps.version.outputs.version }}
           files: pmproxy/pmproxy-*.tar.gz

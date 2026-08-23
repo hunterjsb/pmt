@@ -15,7 +15,7 @@ use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
 use base64::engine::general_purpose::URL_SAFE;
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use polymarket_client_sdk_v2::auth::Credentials;
 use polymarket_client_sdk_v2::clob::client::{Client, Config as SdkConfig};
 use polymarket_client_sdk_v2::clob::types::{Side as SdkSide, SignatureType};

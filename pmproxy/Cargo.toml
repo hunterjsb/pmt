@@ -9,10 +9,10 @@ description = "Simple HTTP reverse proxy for Polymarket APIs"
 axum = { version = "0.8", features = ["ws"] }
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }
 
 # WebSocket client for upstream connections (EC2 only — Lambda doesn't support WS)
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = { version = "0.3", optional = true }
 
 # Async runtime
@@ -28,17 +28,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"  # used by chain.rs for JSON-RPC method allowlist parsing
 
 # Rate limiting
-governor = "0.6"
+governor = "0.10"
 dashmap = "6"
 
 # Error handling
-thiserror = "1"
+thiserror = "2"
 
 # Config (EC2 only)
 clap = { version = "4", features = ["derive"], optional = true }
 
 # Lambda runtime
-lambda_http = { version = "0.14", optional = true }
+lambda_http = { version = "1.3", optional = true }
 
 [features]
 default = ["ec2"]

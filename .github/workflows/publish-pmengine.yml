@@ -19,7 +19,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -44,7 +44,7 @@ jobs:
           tar -czvf pmengine-aarch64-unknown-linux-gnu.tar.gz -C target/aarch64-unknown-linux-gnu/release pmengine
 
       - name: Upload x86_64 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pmengine-x86_64
           path: pmengine/target/x86_64-unknown-linux-gnu/release/pmengine
@@ -54,7 +54,7 @@ jobs:
         run: echo "version=${GITHUB_REF#refs/tags/pmengine-}" >> $GITHUB_OUTPUT
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           name: pmengine ${{ steps.version.outputs.version }}
           files: pmengine/pmengine-*.tar.gz
