@@ -90,7 +90,13 @@ EPISODE_GAP_S = 20.0         # shadow.EPISODE_GAP_S
 
 # Era boundaries this study cites (polymarket/eras.py).
 STREAM_ERA = 1787484570.0    # e296336 11:29:30Z — arms can read the settlement stream
-POSTURE = 1787517900.0       # 20:45Z — today's posture (guards 6/8/16, sol g10, 15m at $1)
+POSTURE = 1787517900.0       # 20:45Z — the mark the operator named
+# The engine log dates the real boundaries: 17:31:11Z restart (15m re-armed at
+# $1, sol/xrp maker bids live), and 20:25:50Z / 20:25:55Z when btc and eth
+# joined xrp on rtds@60s. "20:45Z" sits INSIDE that last change, not at its
+# start, and a 14-minute slice cannot carry a conclusion — hence three cuts.
+REGIME_START = 1787506271.0  # 17:31:11Z engine restart
+POSTURE_TRUE = 1787516750.0  # 20:25:50Z btc rtds@60 — first fully-rtds 5m fleet
 
 # min_fair by (duration, era). The 5m fleet has run the CLI default 0.97 all
 # day (arms-state.json, and no 5m fire on the tape prices below it — the
@@ -379,6 +385,19 @@ def collapse(ticks: list[dict], gap_s: float = EPISODE_GAP_S) -> list[dict]:
 
 
 def _finish(slug, side, fam, tks) -> dict:
+    """One refusal run. Three entry prices, because the choice is load-bearing:
+
+      first  — the ask at the moment the gate FIRST refused. This is the
+               honest counterfactual for "the gate opened here and the clip
+               went out", and it is the headline convention.
+      median — the same run's typical price; the robustness check.
+      best   — the lowest ask anywhere in the run. shadow.py's convention,
+               kept for comparability, but it is a look-back-optimal entry:
+               a basis-guard run spans a whole window (median 35s, p90 237s),
+               and its cheapest tick is precisely the moment the book was
+               most sure that side was wrong — the moment our model was most
+               likely wrong with it. Treat `best` as the optimistic bound.
+    """
     asks = [t["ask"] for t in tks if t.get("ask") is not None]
     dists = [t["dist_bp"] for t in tks if t.get("dist_bp") is not None]
     return {
@@ -386,6 +405,8 @@ def _finish(slug, side, fam, tks) -> dict:
         "start": tks[0]["t"], "end": tks[-1]["t"], "n_ticks": len(tks),
         "sym": tks[0]["sym"], "dur": tks[0]["dur"],
         "best_ask": min(asks) if asks else None,
+        "first_ask": asks[0] if asks else None,
+        "med_ask": statistics.median(asks) if asks else None,
         "phase": tks[0]["phase"],
         # The CLOSEST the window ever came to clearing its guard in this run —
         # the number a 1bp relaxation would have had to beat.
@@ -394,15 +415,23 @@ def _finish(slug, side, fam, tks) -> dict:
     }
 
 
-def price(ep: dict, winners: dict, clip: float) -> dict:
-    if ep["best_ask"] is None:
+ASK_KEY = {"first": "first_ask", "median": "med_ask", "best": "best_ask"}
+
+
+def price(ep: dict, winners: dict, clip: float, conv: str = "first") -> dict:
+    ask = ep.get(ASK_KEY[conv])
+    if ask is None:
         return {**ep, "status": "unpriced", "clip": clip, "won": None, "pnl": None}
     w = winners.get(ep["slug"])
     if w is None:
         return {**ep, "status": "unresolved", "clip": clip, "won": None, "pnl": None}
     won = ep["side"] == w
-    return {**ep, "status": "priced", "clip": clip, "won": won,
-            "pnl": shadow_value(ep["best_ask"], clip, won)}
+    out = {**ep, "status": "priced", "clip": clip, "won": won,
+           "pnl": shadow_value(ask, clip, won), "entry_ask": ask}
+    for c, k in ASK_KEY.items():
+        out[f"pnl_{c}"] = (shadow_value(ep[k], clip, won)
+                           if ep.get(k) is not None else None)
+    return out
 
 
 # ------------------------------------------------------------- unfilled fires
@@ -439,7 +468,9 @@ def unfilled(tape: list[dict], activity: list[dict], winners: dict,
         p = parse_slug(slug)
         ep = {"slug": slug, "side": side, "family": "unfilled_fires",
               "start": min(f["t"] for f in fs), "end": max(f["t"] for f in fs),
-              "n_ticks": len(fs), "sym": p[0], "dur": p[1], "best_ask": avg,
+              "n_ticks": len(fs), "sym": p[0], "dur": p[1],
+              # One price: the volume-weighted ask the fires actually chased.
+              "best_ask": avg, "first_ask": avg, "med_ask": avg,
               "phase": (min(f["t"] for f in fs) - p[2]) / max(p[3] - p[2], 1e-9),
               "min_dist_bp": None, "last": fs[-1],
               "intended": notional, "filled": fills[(slug, side)],
@@ -452,6 +483,8 @@ def unfilled(tape: list[dict], activity: list[dict], winners: dict,
     return eps
 
 
+
+
 # ------------------------------------------------------------------ rollups
 
 def rollup(eps: list[dict], key=lambda e: e["family"]) -> dict:
@@ -460,7 +493,7 @@ def rollup(eps: list[dict], key=lambda e: e["family"]) -> dict:
         k = key(e)
         s = out.setdefault(k, {"episodes": 0, "priced": 0, "unresolved": 0, "unpriced": 0,
                                 "wins": 0, "losses": 0, "missed": 0.0, "avoided": 0.0,
-                                "ticks": 0})
+                                "ticks": 0, "net_best": 0.0, "net_median": 0.0})
         s["episodes"] += 1
         s["ticks"] += e.get("n_ticks", 0)
         st = e["status"]
@@ -476,80 +509,265 @@ def rollup(eps: list[dict], key=lambda e: e["family"]) -> dict:
             else:
                 s["losses"] += 1
                 s["avoided"] += -e["pnl"]
+            for c in ("best", "median"):
+                v = e.get(f"pnl_{c}")
+                if v is not None:
+                    s[f"net_{c}"] += v
     for s in out.values():
         s["net"] = s["missed"] - s["avoided"]
         s["hit"] = s["wins"] / s["priced"] if s["priced"] else None
     return out
 
 
-def fam_sort(name: str) -> int:
+def fam_sort(name) -> int:
     return FAMILY_ORDER.index(name) if name in FAMILY_ORDER else len(FAMILY_ORDER)
 
 
-def table(rows: dict, hours: float, title: str, keyname: str = "gate") -> str:
-    """missed / avoided / net per family, with net-per-hour."""
-    lines = [f"### {title}", "",
-             f"| {keyname} | episodes | priced | refused-side hit | missed wins | "
-             f"avoided losses | net | net/h |",
-             "|---|---:|---:|---:|---:|---:|---:|---:|"]
-    tot = {"episodes": 0, "priced": 0, "missed": 0.0, "avoided": 0.0, "wins": 0}
-    for k in sorted(rows, key=lambda x: fam_sort(x) if keyname == "gate" else str(x)):
-        s = rows[k]
-        tot["episodes"] += s["episodes"]; tot["priced"] += s["priced"]
-        tot["missed"] += s["missed"]; tot["avoided"] += s["avoided"]; tot["wins"] += s["wins"]
+def money(x: float) -> str:
+    return f"${x:,.2f}" if x >= 0 else f"-${-x:,.2f}"
+
+
+def table(rows: dict, hours: float, title: str, keyname: str = "gate",
+           order=None, note: str | None = None) -> str:
+    """missed / avoided / net per key, at the `first` convention, with the
+    `best` (shadow.py) and `median` nets beside it so the entry-price choice
+    is visible rather than assumed."""
+    keys = order or sorted(rows, key=(fam_sort if keyname == "gate" else str))
+    lines = [f"**{title}**", ""]
+    if note:
+        lines += [note, ""]
+    lines += [f"| {keyname} | eps | priced | refused-side hit | missed wins | "
+              f"avoided losses | **net** | net/h | net@median | net@best |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    tot = collections.Counter()
+    fl = collections.defaultdict(float)
+    for k in keys:
+        s = rows.get(k)
+        if not s:
+            continue
+        for f in ("episodes", "priced", "wins"):
+            tot[f] += s[f]
+        for f in ("missed", "avoided", "net_best", "net_median"):
+            fl[f] += s[f]
         hit = f"{s['hit']*100:.0f}%" if s["hit"] is not None else "—"
         lines.append(f"| {k} | {s['episodes']} | {s['priced']} | {hit} | "
-                     f"${s['missed']:,.2f} | ${s['avoided']:,.2f} | "
-                     f"${s['net']:+,.2f} | ${s['net']/hours:+,.2f} |")
-    net = tot["missed"] - tot["avoided"]
+                     f"{money(s['missed'])} | {money(s['avoided'])} | "
+                     f"**{money(s['net'])}** | {money(s['net']/hours)} | "
+                     f"{money(s['net_median'])} | {money(s['net_best'])} |")
+    net = fl["missed"] - fl["avoided"]
     hit = f"{tot['wins']/tot['priced']*100:.0f}%" if tot["priced"] else "—"
     lines.append(f"| **TOTAL** | {tot['episodes']} | {tot['priced']} | {hit} | "
-                 f"${tot['missed']:,.2f} | ${tot['avoided']:,.2f} | "
-                 f"${net:+,.2f} | ${net/hours:+,.2f} |")
+                 f"{money(fl['missed'])} | {money(fl['avoided'])} | "
+                 f"**{money(net)}** | {money(net/hours)} | "
+                 f"{money(fl['net_median'])} | {money(fl['net_best'])} |")
     lines.append("")
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------- main
+# ------------------------------------------------------- relaxation ladders
 
-def analyse(tape, winners, activity, arms, since: float, label: str) -> dict:
+def guard_ladder(tape, winners, clip_of, since: float, arms,
+                  steps=(0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)) -> list[dict]:
+    """What a basis-guard relaxation of X bp would actually have bought.
+
+    NOT a re-pricing of the refusal run: the counterfactual fires at the FIRST
+    tick whose |margin| clears the RELAXED guard (dist_bp = guard - |margin|
+    < X), at that tick's own ask on that tick's own side. One clip per window
+    per side, the same unit the live arm would have committed.
+
+    The theta gate is applied on top, exactly: a gated record carries
+    banked_bp and cushion_bp, so `side_safety` is computable and the R9 entry
+    gate (safety < theta refuses the first clip) is reproduced rather than
+    assumed away. min_fair/min_edge are NOT reproducible from a gated record
+    (no p_up), so every figure here is an UPPER bound on what the relaxation
+    buys — the fair/edge bar would refuse some of these clips downstream.
+    """
+    out = []
+    for step in steps:
+        # first qualifying tick per (slug, side)
+        opened: dict[tuple[str, str], dict] = {}
+        for r in tape:
+            if r.get("ev") != "gated" or r["t"] < since:
+                continue
+            if not (r.get("reason") or "").startswith("basis guard"):
+                continue
+            g, m = r.get("guard_bp"), r.get("margin_bp")
+            if g is None or m is None:
+                continue
+            if g - abs(m) >= step:
+                continue
+            side = guard_side(m)
+            ask = r.get("up_ask") if side == "up" else r.get("dn_ask")
+            if ask is None:
+                continue
+            p = parse_slug(r["slug"])
+            if not p:
+                continue
+            arm = arms.get((p[0], p[1])) or {}
+            theta = arm.get("theta", 0.3)
+            safety = None
+            if r.get("banked_bp") is not None and r.get("cushion_bp"):
+                signed = r["banked_bp"] if side == "up" else -r["banked_bp"]
+                safety = signed / max(r["cushion_bp"], 1e-9)
+            key = (r["slug"], side)
+            if key in opened:
+                continue
+            opened[key] = {"slug": r["slug"], "side": side, "ask": ask, "t": r["t"],
+                           "safety": safety, "theta": theta, "sym": p[0], "dur": p[1],
+                           "dist": g - abs(m), "margin_bp": m, "guard_bp": g}
+        row = {"step": step, "n": 0, "priced": 0, "wins": 0, "missed": 0.0, "avoided": 0.0,
+               "theta_n": 0, "theta_priced": 0, "theta_wins": 0,
+               "theta_missed": 0.0, "theta_avoided": 0.0}
+        for k, o in opened.items():
+            row["n"] += 1
+            w = winners.get(o["slug"])
+            clip = clip_of(o["slug"], o["sym"], o["dur"])
+            if w is None:
+                continue
+            won = o["side"] == w
+            pnl = shadow_value(o["ask"], clip, won)
+            row["priced"] += 1
+            row["wins"] += won
+            row["missed" if won else "avoided"] += pnl if won else -pnl
+            if o["safety"] is not None and o["safety"] >= o["theta"]:
+                row["theta_n"] += 1
+                row["theta_priced"] += 1
+                row["theta_wins"] += won
+                row["theta_missed" if won else "theta_avoided"] += pnl if won else -pnl
+        row["net"] = row["missed"] - row["avoided"]
+        row["theta_net"] = row["theta_missed"] - row["theta_avoided"]
+        out.append(row)
+    return out
+
+
+def side_ladder(ticks: list[dict], family: str, field: str, steps,
+                 winners, clip_of, extra_ok=None) -> list[dict]:
+    """First-crossing ladder for a side-level threshold gate.
+
+    Same shape as `guard_ladder`, and the same reason: a relaxed threshold
+    does not re-price the refusal run, it FIRES at the first tick the looser
+    bar admits, at that tick's own ask. Taking the run's last (or best) tick
+    instead would credit the relaxation with a price it could never have got.
+
+    `extra_ok(tick)` is the downstream gate the relaxation does not lift —
+    for min_fair that is min_edge, which still has to clear.
+    """
+    out = []
+    for step in steps:
+        opened: dict[tuple[str, str], dict] = {}
+        for tk in ticks:
+            if tk["family"] != family or tk.get(field) is None or tk.get("ask") is None:
+                continue
+            if tk[field] < step:
+                continue
+            if extra_ok is not None and not extra_ok(tk):
+                continue
+            opened.setdefault((tk["slug"], tk["side"]), tk)
+        row = {"step": step, "n": 0, "priced": 0, "wins": 0, "missed": 0.0, "avoided": 0.0}
+        for (slug, side), tk in opened.items():
+            row["n"] += 1
+            w = winners.get(slug)
+            if w is None:
+                continue
+            won = side == w
+            pnl = shadow_value(tk["ask"], clip_of(slug, tk["sym"], tk["dur"]), won)
+            row["priced"] += 1
+            row["wins"] += won
+            row["missed" if won else "avoided"] += pnl if won else -pnl
+        row["net"] = row["missed"] - row["avoided"]
+        out.append(row)
+    return out
+
+
+def ladder_table(rows, title, label, extra=False) -> str:
+    lines = [f"**{title}**", "",
+             f"| {label} | opens | priced | hit | missed wins | avoided losses | net |"
+             + (" | net after theta |" if extra else ""),
+             "|---|---:|---:|---:|---:|---:|---:|" + ("---:|" if extra else "")]
+    for r in rows:
+        hit = f"{r['wins']/r['priced']*100:.0f}%" if r["priced"] else "—"
+        line = (f"| {r['step']} | {r['n']} | {r['priced']} | {hit} | "
+                f"{money(r['missed'])} | {money(r['avoided'])} | **{money(r['net'])}** |")
+        if extra:
+            line += f" {money(r['theta_net'])} ({r['theta_priced']} clips) |"
+        lines.append(line)
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ clusters
+
+def phase_bucket(p: float) -> str:
+    if p < 1 / 3:
+        return "early (0-33%)"
+    if p < 2 / 3:
+        return "mid (33-66%)"
+    return "late (66-100%)"
+
+
+def cluster(eps, keyfn, title, hours, keyname, order=None) -> str:
+    return table(rollup(eps, keyfn), hours, title, keyname, order=order)
+
+
+def specimen(eps: list[dict], fam: str, n: int = 3, worst=True) -> list[dict]:
+    """The n episodes of a family with the largest |net| — the windows a
+    finding has to be able to point at."""
+    pool = [e for e in eps if e["family"] == fam and e["status"] == "priced"]
+    pool.sort(key=lambda e: e["pnl"], reverse=worst)
+    return pool[:n]
+
+
+# ------------------------------------------------------------------- fifteen
+
+def fifteen(tape, winners, clip_of, arms, since: float) -> dict:
+    """Why 15m has not fired, ordered by bind frequency, and what its refused
+    sides did — both at the arm's REAL $1 clip and at the clip a normally
+    sized 15m arm would have used."""
     rolls = roll_sizes(tape)
-    clips = clip_table(tape)
-    size_fallback = {k: (arms.get(k) or {}).get("size_usdc") for k in clips}
-    fired_index = {(round(r["t"], 3), r["slug"], r["side"]) for r in tape
-                   if r.get("ev") == "fire"}
-
-    ticks = build_ticks(tape, since, rolls, arms, size_fallback, fired_index)
-    eps = collapse(ticks)
-
-    # per-window real clip, else the (symbol,duration) measured clip, else the
-    # live arm's clip_usdc. Never a guess.
-    win_clip = collections.defaultdict(list)
+    fired = {(round(r["t"], 3), r["slug"], r["side"]) for r in tape if r.get("ev") == "fire"}
+    binds = collections.Counter()
+    win_gates = collections.Counter()
+    evals = 0
+    ticks = []
     for r in tape:
-        if r.get("ev") == "fire" and r.get("size") and r.get("ask"):
-            win_clip[r["slug"]].append(r["size"] * r["ask"])
-    priced = []
+        if r["t"] < since or "-15m-" not in r["slug"]:
+            continue
+        p = parse_slug(r["slug"])
+        sym, dur, start, end = p
+        if r.get("ev") == "gated":
+            fam = window_family(r.get("reason") or "")
+            if fam:
+                win_gates[fam] += 1
+            continue
+        if r.get("ev") != "eval":
+            continue
+        evals += 1
+        arm = arms.get((sym, dur)) or {}
+        min_fair = arm.get("min_fair", 0.97)
+        if start < FIFTEEN_SHUT_AT:
+            min_fair = 0.97
+        size_usdc = rolls.get(r["slug"], arm.get("size_usdc"))
+        for s in r.get("sides") or []:
+            if s.get("side") not in ("up", "down"):
+                continue
+            fam, ctx = side_family(r, s, size_usdc, min_fair, arm.get("theta"))
+            if fam == "cooldown" and (round(r["t"], 3), r["slug"], s["side"]) in fired:
+                fam = "fired"
+            binds[fam] += 1
+            if fam not in ("fired", "no_ask"):
+                ticks.append({"t": r["t"], "slug": r["slug"], "sym": sym, "dur": dur,
+                              "phase": (r["t"] - start) / max(end - start, 1e-9),
+                              "side": s["side"], "family": fam, "ask": s.get("ask"),
+                              "fair": s.get("fair"), "net": s.get("net"),
+                              "safety": s.get("safety")})
+    eps = collapse(ticks)
+    real, norm = [], []
     for ep in eps:
-        c = win_clip.get(ep["slug"])
-        if c:
-            clip, src = statistics.median(c), "window"
-        elif (ep["sym"], ep["dur"]) in clips and not (
-                ep["dur"] == "15m" and parse_slug(ep["slug"])[2] >= FIFTEEN_SHUT_AT):
-            clip, src = clips[(ep["sym"], ep["dur"])], "symbol"
-        else:
-            arm = arms.get((ep["sym"], ep["dur"])) or {}
-            clip, src = arm.get("clip_usdc", 25.0), "arm"
-        p = price(ep, winners, clip)
-        p["clip_src"] = src
-        priced.append(p)
-
-    priced.extend(unfilled(tape, activity, winners, since))
-    last_t = max(r["t"] for r in tape)
-    hours = (last_t - since) / 3600.0
-    return {"label": label, "since": since, "hours": hours, "episodes": priced,
-            "families": rollup([e for e in priced if e["family"] != "unfilled_fires"]),
-            "unfilled": [e for e in priced if e["family"] == "unfilled_fires"],
-            "all": rollup(priced)}
+        real.append(price(ep, winners, (arms.get((ep["sym"], ep["dur"])) or {})
+                          .get("clip_usdc", 1.0)))
+        norm.append(price(ep, winners, clip_of(ep["slug"], ep["sym"], "15m_norm")))
+    return {"evals": evals, "binds": binds, "window_gates": win_gates,
+            "episodes_real": real, "episodes_norm": norm}
 
 
 def self_check(tape, arms) -> tuple[list[str], int]:
@@ -594,6 +812,99 @@ def self_check(tape, arms) -> tuple[list[str], int]:
     return bad, skipped
 
 
+# --------------------------------------------------------------------- main
+
+SLICES = (
+    # name, epoch, what changed there and how it is dated
+    ("stream", STREAM_ERA,
+     "stream era — e296336 11:29:30Z, arms can read the settlement stream (eras.py)"),
+    ("regime", REGIME_START,
+     "today's regime — 17:31Z engine restart: 15m shut to $1, sol/xrp maker bids on"),
+    ("posture", POSTURE_TRUE,
+     "today's posture — 20:25:50Z, btc+eth join xrp on rtds@60s (engine log)"),
+    ("posture_asked", POSTURE,
+     "the operator's 20:45Z mark, inside the posture slice above"),
+)
+
+
+def make_clip_of(tape, arms):
+    """clip_of(slug, sym, dur) -> the notional ONE hypothetical clip commits.
+
+    Window's own median real fire notional, else the (symbol,duration) median
+    across the tape, else the live arm's clip_usdc. `dur == "15m_norm"` asks
+    for the 15m clip a NORMALLY sized 15m arm used (the $300-500 era), which
+    is the only honest way to price a counterfactual for arms currently
+    sized at $1.
+    """
+    win = collections.defaultdict(list)
+    sym_dur = collections.defaultdict(list)
+    for r in tape:
+        if r.get("ev") != "fire" or not r.get("size") or not r.get("ask"):
+            continue
+        p = parse_slug(r["slug"])
+        if not p:
+            continue
+        win[r["slug"]].append(r["size"] * r["ask"])
+        sym_dur[(p[0], p[1])].append(r["size"] * r["ask"])
+    fifteen_norm = statistics.median(
+        [v for (s, d), vs in sym_dur.items() if d == "15m" for v in vs] or [25.0])
+
+    def clip_of(slug, sym, dur):
+        if dur == "15m_norm":
+            return fifteen_norm
+        c = win.get(slug)
+        if c:
+            return statistics.median(c)
+        if (sym, dur) in sym_dur and not (
+                dur == "15m" and (parse_slug(slug) or [0, 0, 0])[2] >= FIFTEEN_SHUT_AT):
+            return statistics.median(sym_dur[(sym, dur)])
+        return (arms.get((sym, dur)) or {}).get("clip_usdc", 25.0)
+    return clip_of
+
+
+def analyse(tape, winners, activity, arms, since: float, label: str, clip_of) -> dict:
+    rolls = roll_sizes(tape)
+    size_fallback = {k: (arms.get(k) or {}).get("size_usdc") for k in arms}
+    fired_index = {(round(r["t"], 3), r["slug"], r["side"]) for r in tape
+                   if r.get("ev") == "fire"}
+    ticks = build_ticks(tape, since, rolls, arms, size_fallback, fired_index)
+    eps = [price(ep, winners, clip_of(ep["slug"], ep["sym"], ep["dur"]))
+           for ep in collapse(ticks)]
+    unf = unfilled(tape, activity, winners, since)
+    last_t = max(r["t"] for r in tape)
+    return {"label": label, "since": since, "hours": (last_t - since) / 3600.0,
+            "episodes": eps, "unfilled": unf,
+            "families": rollup(eps), "ticks": ticks}
+
+
+def fill_report(unf: list[dict], hours: float) -> str:
+    """The old 93%-hit unfilled leak, re-measured either side of pay-up.
+
+    `paid_up` is exact: a fire record carries `limit` beside `ask`, and a
+    limit above the ask is the chase actually submitted. Pre-pay-up fires
+    have limit == ask (or no limit field at all).
+    """
+    groups = {"pay-up off": [e for e in unf if not e["last"].get("limit")
+                             or e["last"]["limit"] <= e["last"]["ask"] + 1e-9],
+              "pay-up on": [e for e in unf if e["last"].get("limit")
+                            and e["last"]["limit"] > e["last"]["ask"] + 1e-9]}
+    lines = ["**unfilled fires — the pay-up test**", "",
+             "| cohort | (slug,side) fires | fully filled | intended $ | filled $ | "
+             "fill rate | unfilled $ | net of the gap |",
+             "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for name, es in groups.items():
+        if not es:
+            continue
+        intended = sum(e["intended"] for e in es)
+        filled = sum(min(e["filled"], e["intended"]) for e in es)
+        full = sum(1 for e in es if e["status"] == "filled")
+        net = sum(e["pnl"] for e in es if e["status"] == "priced")
+        lines.append(f"| {name} | {len(es)} | {full} | ${intended:,.0f} | ${filled:,.0f} | "
+                     f"{filled/intended*100:.1f}% | ${intended-filled:,.0f} | {money(net)} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -624,22 +935,109 @@ def main() -> int:
         print(f"[warn] {len(bad)} fires violate the assumed thresholds "
               f"— run --self-check", file=sys.stderr)
 
-    out = {"stream": analyse(tape, winners, activity, arms, STREAM_ERA, "stream era (11:29Z)"),
-           "posture": analyse(tape, winners, activity, arms, POSTURE, "today's posture (20:45Z)")}
+    clip_of = make_clip_of(tape, arms)
+    runs = {name: analyse(tape, winners, activity, arms, since,
+                          f"{name} · since {utc(since)}", clip_of)
+            for name, since, _why in SLICES}
+
+    print(f"# gate shadow 2 — tape through {utc(max(r['t'] for r in tape))}, "
+          f"{len(winners)} terminal-graded windows\n")
+    for name, since, why in SLICES:
+        r = runs[name]
+        print(f"## {name} — {why}")
+        print(f"_{r['hours']:.2f}h · episode = one refusal run, priced as ONE clip "
+              f"at the ask when the gate FIRST refused_\n")
+        print(table(r["families"], r["hours"], f"gate families · {name}"))
+        print(fill_report(r["unfilled"], r["hours"]))
+
+    st = runs["stream"]
+    eps = st["episodes"]
+    hours = st["hours"]
+    print("## clusters (stream era)\n")
+    print(cluster(eps, lambda e: e["sym"], "by symbol", hours, "symbol"))
+    print(cluster(eps, lambda e: f"{e['sym']} · {e['family']}",
+                  "by symbol x gate (top movers)", hours, "symbol · gate",
+                  order=[k for k, v in sorted(
+                      rollup(eps, lambda e: f"{e['sym']} · {e['family']}").items(),
+                      key=lambda kv: -abs(kv[1]["net"]))][:18]))
+    print(cluster(eps, lambda e: utc(e["start"], "%H") + ":00",
+                  "by hour", hours, "hour (UTC)",
+                  order=sorted({utc(e["start"], "%H") + ":00" for e in eps})))
+    print(cluster(eps, lambda e: phase_bucket(e["phase"]),
+                  "by window phase", hours, "phase",
+                  order=["early (0-33%)", "mid (33-66%)", "late (66-100%)"]))
+    print(cluster([e for e in eps if e["family"] == "basis_guard"],
+                  lambda e: phase_bucket(e["phase"]),
+                  "basis guard by window phase", hours, "phase",
+                  order=["early (0-33%)", "mid (33-66%)", "late (66-100%)"]))
+    print(cluster(eps, lambda e: e["dur"], "by duration", hours, "duration"))
+
+    print("## relaxation ladders (stream era — where an A/B should aim)\n")
+    print(ladder_table(guard_ladder(tape, winners, clip_of, STREAM_ERA, arms),
+                       "basis guard: relax by X bp — fires at the first tick that clears "
+                       "the looser guard, at that tick's ask", "relax (bp)", extra=True))
+    tk = st["ticks"]
+    print(ladder_table(side_ladder(tk, "theta", "safety",
+                                   (0.28, 0.25, 0.20, 0.15, 0.10, 0.05),
+                                   winners, clip_of),
+                       "theta: drop the entry bar to X — fires at the first tick whose "
+                       "per-side safety clears it, at that tick's ask (theta 0.30 live)",
+                       "theta -> X"))
+    print(ladder_table(side_ladder(tk, "min_fair", "fair",
+                                   (0.96, 0.95, 0.94, 0.92, 0.90, 0.85),
+                                   winners, clip_of,
+                                   extra_ok=lambda t: (t.get("net") is not None
+                                                       and t["net"] >= t["edge_req"])),
+                       "min_fair: drop the safe-mode fair bar to X — first tick that "
+                       "clears it AND still clears min_edge (min_fair 0.97 live)",
+                       "min_fair -> X"))
+    print(ladder_table(side_ladder(tk, "min_edge", "net",
+                                   (0.012, 0.010, 0.008, 0.005),
+                                   winners, clip_of,
+                                   extra_ok=lambda t: t.get("unlocked")),
+                       "min_edge: drop the safe-mode edge bar to X (safe-mode sides only; "
+                       "min_edge 0.015 live)", "min_edge -> X"))
+
+    print("## the 15m question\n")
+    f = fifteen(tape, winners, clip_of, arms, REGIME_START)
+    print(f"15m eval SIDES since {utc(REGIME_START)}: {sum(f['binds'].values())} "
+          f"across {f['evals']} eval records\n")
+    print("| gate holding 15m shut | side-evals | share |")
+    print("|---|---:|---:|")
+    tot = sum(f["binds"].values())
+    for k, v in f["binds"].most_common():
+        print(f"| {k} | {v} | {v/tot*100:.1f}% |")
+    print()
+    print("| window-level gate (15m) | ticks |")
+    print("|---|---:|")
+    for k, v in f["window_gates"].most_common():
+        print(f"| {k} | {v} |")
+    print()
+    fh = (max(r["t"] for r in tape) - REGIME_START) / 3600.0
+    print(table(rollup(f["episodes_real"]), fh,
+                "15m refused sides priced at the arm's REAL $1 clip", "gate"))
+    print(table(rollup(f["episodes_norm"]), fh,
+                "15m refused sides priced at a normally-sized 15m clip "
+                f"(${clip_of('x', 'x', '15m_norm'):.0f}) — the counterfactual", "gate"))
+
+    print("## specimens\n")
+    for fam in ("basis_guard", "theta", "min_fair", "latch", "feed_stale"):
+        for e in specimen(eps, fam, 2):
+            print(f"- **{fam}** {e['slug']} {e['side']} · {utc(e['start'])}-{utc(e['end'])} "
+                  f"· {e['n_ticks']} ticks · entry {e['entry_ask']} "
+                  f"(best {e['best_ask']}) · clip ${e['clip']:.0f} · "
+                  f"{'WON' if e['won'] else 'lost'} · {money(e['pnl'])}")
+    print()
+
     if args.json_out:
         dump = {k: {"label": v["label"], "since": v["since"], "hours": v["hours"],
                     "families": v["families"],
                     "episodes": [{kk: vv for kk, vv in e.items() if kk != "last"}
-                                 for e in v["episodes"]]}
-                for k, v in out.items()}
+                                 for e in v["episodes"] + v["unfilled"]]}
+                for k, v in runs.items()}
+        dump["fifteen"] = {"binds": dict(f["binds"]),
+                           "window_gates": dict(f["window_gates"])}
         json.dump(dump, open(args.json_out, "w"), indent=1, default=str)
-
-    for key in ("stream", "posture"):
-        r = out[key]
-        print(table(r["families"], r["hours"],
-                    f"{r['label']} — {r['hours']:.1f}h, gate families"))
-        print(table(rollup(r["unfilled"]), r["hours"],
-                    f"{r['label']} — unfilled fires"))
     return 0
 
 
