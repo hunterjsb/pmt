@@ -78,9 +78,12 @@ def test_wallet_outcomes_paying_redeem_names_winner():
 
 
 def test_wallet_outcomes_zero_redeem_flips_to_other_side():
-    # held "Down", it paid $0 -> the wallet lost, "up" actually won
+    # held "Down" (row carries our real share size), paid $0 -> "up" won.
+    # A SIZE is required for the flip since 2026-08-23: size-0 dust rows
+    # can carry the winner's label and must not be flipped blind.
     rows = [
-        {"type": "REDEEM", "slug": "btc-updown-15m-200", "outcome": "Down", "usdcSize": 0},
+        {"type": "REDEEM", "slug": "btc-updown-15m-200", "outcome": "Down",
+         "usdcSize": 0, "size": 120.0},
     ]
     assert wallet_outcomes(rows) == {"btc-updown-15m-200": "up"}
 
@@ -309,3 +312,16 @@ def test_write_and_load_outcomes_roundtrip(tmp_path):
 
 def test_load_outcomes_missing_file_is_empty(tmp_path):
     assert load_outcomes(tmp_path / "nope.jsonl") == {}
+
+
+def test_zero_size_dust_redeem_never_flips_blind():
+    # A $0 redeem with size 0 can carry the WINNER's label (live incident:
+    # -$265 loss recorded as a win). Only a sized row identifies our held
+    # loser; without one, wallet_outcomes must stay silent for the slug.
+    from polymarket.outcomes import wallet_outcomes
+    dust_only = [{"type": "REDEEM", "slug": "btc-updown-15m-1", "usdcSize": 0,
+                  "size": 0, "outcome": "Up"}]
+    assert wallet_outcomes(dust_only) == {}
+    sized = [{"type": "REDEEM", "slug": "btc-updown-15m-1", "usdcSize": 0,
+              "size": 265.0, "outcome": "Down"}]
+    assert wallet_outcomes(sized) == {"btc-updown-15m-1": "up"}
