@@ -30,10 +30,9 @@ don't record is a night the corpus can't judge.
 - **Sigma floor refresh on roll**: rolled arms currently clone the original arm-time σ floor
   forever; recompute from the feed's own trailing closes at each roll. (Smallest engine change,
   pending approval.)
-- **Polymarket trade flow** (added 2026-08-23, issue #3): the book tape records top-of-book but
-  not prints. VPIN-style toxicity (R8) needs signed volume — sample `recent_trades`
-  count/volume per armed token into the book recorder. Poly-side flow is NOT backfillable;
-  every unrecorded night is a night R8 can't be calibrated on.
+- ~~**Polymarket trade flow**~~ **SHIPPED 2026-08-23 05:30Z** (6242ceb): book tape now carries
+  signed print flow per sample (up/dn × n/buy_vol/sell_vol) — the VPIN/R8 input. Phase 0's
+  last forward-only gap is closed; the R8 corpus starts tonight.
 - Backfillable now: klines, Chainlink rounds, resolved outcomes, Binance aggTrade flow.
   Forward-only: books, spot ticks, Polymarket prints.
 
@@ -95,6 +94,24 @@ R3 → R5/R6/R1 → R7/R8/R9.
     day2). **DOGE not yet, but the closest alt candidate** — recheck after more corpus.
   - First measurement kept for the record: point-in-time p95 BTC 8.8 / ETH 13.6 / SOL 26.8 /
     XRP 49.2 / DOGE 37.4bp (upper bounds; outliers cluster in flash-move minutes).
+  - **Dynamic guard BUILT, ships dark** (041597e + 6242ceb): per-arm Chainlink poller with
+    LAG-ALIGNED samples (round.answer vs the Binance mark of the round's own updatedAt
+    minute — instantaneous spot comparison would measure trend speed, not basis), raise-only
+    p95 floor over the operator's param, oracle-tape corpus, status diagnostics. Activation
+    requires PMENGINE_DYNAMIC_GUARD=1 + restart — deliberately NOT live so the R9 night
+    attributes cleanly; deploy as its own change window after its oracle corpus warms up.
+  - Tooling (aab232b): `pmt crypto basis --aligned` = the weekly re-measurement;
+    `pmt crypto outcomes` = wallet-first validated outcomes for every replay A/B (stale
+    Chainlink is dropped, never guessed — a stale step-extension mislabeled 9/37 windows
+    on 2026-08-23 and briefly justified a guard change with wrong numbers).
+  - Corrected guard A/B for the record (validated outcomes): on the calm 2026-08-23 night,
+    btc guard 3 went 12-0 +$282 vs guard 6's 6-0 +$71 — the 6bp tightening cost winners and
+    saved nothing THAT night. Kept at 6 on the 48h non-stationary measurement; revisit
+    weekly with the corpus.
+  - **Fill-chasing** (audit: 32% of intended taker notional never crossed; re-quotes chase
+    the book upward): `pay_up_max` shipped dark (6242ceb, CLI `--pay-up`) — a clip's
+    marketable limit may chase by surplus edge over the floor only. Enable per-arm after
+    one clean night of print-flow data to measure against.
 - **R2 Calibration gate + fractional Kelly** — clip size from quarter-Kelly on post-fee,
   post-haircut edge; hard per-window %-of-bankroll cap; no size increases until each p-bucket
   shows calibration over ≥30 decided windows. (Current reality check: stated fair ≥0.95 hits 92%.)
@@ -126,10 +143,15 @@ R3 → R5/R6/R1 → R7/R8/R9.
   and Polymarket prints (needs the Phase 0 flow recorder); Bartlett & O'Hara (2026, Kalshi)
   show one-sided flow predicts maker losses — the same signal should gate our taker clips.
   Cheap v1 the corpus can already test: consecutive-same-side-flow counter.
-- **R9 Entry gate: banked evidence, not clock %** — the 50% `min_elapsed` gate is unswept
-  folklore with a known cliff failure (the −$370 window fired at the first legal tick, when
-  BTC still moves >10bp in the remaining time 29% of the time). Our edge is banked-mass
-  arithmetic; the entry gate should measure banked mass. Spec (2026-08-23 deep-research pass):
+- **R9 Entry gate: banked evidence, not clock % — DEPLOYED 2026-08-23 05:00Z** (7b1948d,
+  `--theta 0.3 --min-elapsed 0` fleet-wide): the 50% clock gate is RETIRED. First clip
+  requires side-signed |banked|/cushion ≥ θ; banked-lag makes entry self-gate ~2-3min in.
+  Replay validation: pure R9 went 11-0 on btc+eth over the validated night corpus (both
+  post-brake losses had entered at safety < 0.25; median winner 0.57). Deployed alongside:
+  window brake LATCH (first distrust/avg_down trip closes speculative entry for the window —
+  the audit showed brakes flagged 4/4 losses but blocked only 10-51% of exposure). θ=0.3 is
+  the opening value, re-swept as the full-window instrumentation corpus grows. Original spec
+  (kept for the record, 2026-08-23 deep-research pass):
   - `safety = |banked_margin_bp| / max(cushion_bp, ε)` — a dimensionless path-moneyness score
     from quantities `fair_p_up` already computes (the σ√(T/3) cushion is the standard
     Asian-average residual-risk term; the live 45m σ floor feeds it, so safety adapts to
