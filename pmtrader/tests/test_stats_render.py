@@ -176,22 +176,26 @@ def test_floor_label():
 
 # ---------- header ----------
 
-def test_gap_line_is_red_and_shouts_when_the_book_is_under_break_even():
-    line = sr._gap_line(_eff(win_rate=0.919, breakeven_win_rate=0.925))
-    assert "GAP -0.6pp" in line
-    assert "SHORT" in line and "red" in line
-    assert "green" not in line
+def test_gap_row_is_red_and_shouts_when_the_book_is_under_break_even():
+    row = " ".join(sr._gap_cells(_eff(win_rate=0.919, breakeven_win_rate=0.925)))
+    assert "GAP -0.6pp" in row
+    assert "SHORT" in row and "red" in row
+    assert "green" not in row
 
 
-def test_gap_line_is_green_when_the_bar_is_cleared():
-    line = sr._gap_line(_eff(win_rate=0.960, breakeven_win_rate=0.925))
-    assert "GAP +3.5pp" in line
-    assert "clear of break-even" in line and "green" in line
-    assert "red" not in line
+def test_gap_row_is_green_when_the_bar_is_cleared():
+    row = " ".join(sr._gap_cells(_eff(win_rate=0.960, breakeven_win_rate=0.925)))
+    assert "GAP +3.5pp" in row
+    assert "clear of break-even" in row and "green" in row
+    assert "red" not in row
 
 
-def test_gap_line_says_so_rather_than_guessing_without_a_break_even():
-    assert "not enough" in sr._gap_line(_eff(breakeven_win_rate=None))
+def test_gap_row_says_so_rather_than_guessing_without_a_break_even():
+    cells = sr._gap_cells(_eff(breakeven_win_rate=None))
+    assert "not enough" in " ".join(cells)
+    # ...and leaves the value cells EMPTY rather than printing a 0.0% bar: the
+    # bar is unknown, which is not the same claim as zero.
+    assert cells[1] == "" and cells[2] == ""
 
 
 def test_header_carries_record_pnl_capital_and_the_floor():
@@ -217,9 +221,10 @@ def test_header_shows_a_question_mark_not_a_zero_for_an_unreachable_balance():
 
 
 def test_header_notes_estimated_windows_only_when_there_are_some():
-    assert "~estimated" not in _render(sr.header_panel(_sb(), _eff(), None, {}, 0))
+    assert "estimated" not in _render(sr.header_panel(_sb(), _eff(), None, {}, 0))
     out = _render(sr.header_panel(_sb(estimated=3), _eff(), None, {}, 0))
-    assert "3 ~estimated" in out
+    assert "estimated" in out and "3 windows" in out
+    assert "gamma unreachable" in out
 
 
 def test_header_reports_committed_and_riding_exposure():
@@ -233,7 +238,7 @@ def test_header_reports_a_resting_maker_bid_only_when_one_is_on_the_book():
     arms = _arms()
     arms["btc-updown-5m-1787452500"]["resting_usdc"] = 45.0
     out = _render(sr.header_panel(_sb(), _eff(), None, {"arms": arms}, 0))
-    assert "resting $45.00" in out
+    assert "resting" in out and "$45.00" in out
 
 
 def test_header_never_repeats_the_effectiveness_table():
@@ -268,7 +273,7 @@ def test_header_reports_the_fleet_cap_and_how_close_it_came():
     out = _render(sr.header_panel(_sb(), _eff(), None, {}, 0,
                                   {"cap": 350.0, "ticks": 6459,
                                    "peak_undecided": 350.0, "blocked_usd": 100.88}))
-    assert "fleet cap $350" in out
+    assert "fleet cap" in out and "$350" in out
     assert "peak un-decided $350" in out and "6,459 ticks" in out
     assert "refused $101" in out
 
@@ -285,7 +290,115 @@ def test_header_says_so_when_a_cap_is_set_but_the_tape_never_saw_it():
     out = _render(sr.header_panel(_sb(), _eff(), None, {}, 0,
                                   {"cap": 350.0, "ticks": 0, "peak_undecided": None,
                                    "blocked_usd": 0.0}))
-    assert "fleet cap $350" in out and "no capped ticks" in out
+    assert "fleet cap" in out and "$350" in out and "no capped ticks" in out
+
+
+# ---------- header: the label/value grid ----------
+
+def _grid_lines(out: str) -> list[str]:
+    """The panel's content rows with border and panel padding stripped, so
+    column 0 is the grid's own column 0."""
+    lines = []
+    for ln in out.splitlines():
+        ln = ln.rstrip()
+        if ln.startswith("│") and ln.endswith("│"):
+            lines.append(ln[1:-1][1:])  # drop both borders, then the left pad
+    return lines
+
+
+def _value_col(line: str) -> int | None:
+    """Where this row's first value field starts, or None for a row that has
+    only a label."""
+    tail = line[sr._HDR_LABEL_W:]
+    return None if not tail.strip() else sr._HDR_LABEL_W + (len(tail) - len(tail.lstrip()))
+
+
+def _full_header(**kw):
+    """Every row the identity box can emit, at once."""
+    status = {"arms": _arms(),
+              "rtds": {"started": True, "connected": True, "events_per_s": 3.0,
+                        "last_event_age_s": 1.0, "consumers": 1, "reconnects": 7}}
+    status["arms"]["btc-updown-5m-1787452500"]["resting_usdc"] = 45.0
+    args = {"sb": _sb(estimated=3), "eff": _eff(), "bal": {"total": 1649.14},
+            "status": status, "floor": 0,
+            "fleet": {"cap": 350.0, "ticks": 6459, "peak_undecided": 350.0,
+                       "blocked_usd": 100.88},
+            "era_now": {"name": "stream", "sb": {"wins": 73, "losses": 0,
+                                                  "net": 336.91}}}
+    args.update(kw)
+    return sr.header_panel(args["sb"], args["eff"], args["bal"], args["status"],
+                           args["floor"], args["fleet"], era_now=args["era_now"],
+                           scope_label=args.get("scope_label"))
+
+
+def test_header_is_a_grid_with_one_value_column_for_every_row():
+    # The whole point of the grid: record, era, P&L, break-even, exposure,
+    # resting, fleet cap, feed and the estimated note all start their value
+    # field at the SAME column, so the numbers read down as a column.
+    lines = _grid_lines(_render(_full_header(), width=100))
+    cols = {_value_col(ln) for ln in lines}
+    cols.discard(None)
+    assert len(cols) == 1, f"ragged value column: {sorted(cols)}"
+
+
+def test_header_grid_labels_every_row_it_prints():
+    lines = _grid_lines(_render(_full_header(), width=100))
+    labels = [ln[:sr._HDR_LABEL_W].strip() for ln in lines]
+    assert labels == ["record", "era stream", "P&L", "break-even", "exposure",
+                      "resting", "fleet cap", "feed", "estimated"]
+
+
+def test_header_grid_puts_the_era_record_under_the_all_time_record():
+    # Same column shape on both rows is what lets the operator compare them by
+    # eye — that comparison is the reason the era row exists.
+    lines = _grid_lines(_render(_full_header(), width=100))
+    record, era = lines[0], lines[1]
+    assert record.index("147W-13L") == era.index("73W-0L")
+
+
+def test_header_grid_never_wraps_at_a_hundred_columns():
+    out = _render(_full_header(), width=100)
+    assert all(len(ln) <= 100 for ln in out.splitlines())
+    # A wrap would show up as extra content rows, not just a long line.
+    assert len(_grid_lines(out)) == 9
+
+
+def test_header_grid_holds_its_shape_when_every_number_grows_a_digit():
+    # The regression: "streak 101 (best 101)" on a dot-joined identity line
+    # pushed it past 100 columns and wrapped mid-token.
+    out = _render(_full_header(
+        sb=_sb(wins=1147, losses=113, net=-12436.76, rolls=12345, estimated=3),
+        eff=_eff(streak={"current": 101, "longest": 101}),
+        bal={"total": 123456.78}), width=100)
+    assert all(len(ln) <= 100 for ln in out.splitlines())
+    assert len(_grid_lines(out)) == 9
+    assert "streak" in out and "101" in out
+
+
+def test_header_grid_drops_rows_with_nothing_to_say():
+    # No cap, no resting bid, no stream, nothing estimated: those rows are
+    # absent, not padded with zeros.
+    out = _render(sr.header_panel(_sb(), _eff(), None, {}, 0), width=100)
+    labels = [ln[:sr._HDR_LABEL_W].strip() for ln in _grid_lines(out)]
+    assert labels == ["record", "P&L", "break-even", "exposure"]
+
+
+def test_header_grid_keeps_its_colour_semantics():
+    # Tabulating the box must not flatten it: the loss-red P&L, the green
+    # streak and the break-even verdict all still carry their style.
+    con = Console(file=io.StringIO(), width=100, force_terminal=True,
+                  color_system="truecolor", highlight=False)
+    con.print(_full_header())
+    out = con.file.getvalue()
+    assert "\x1b[" in out
+
+
+def test_header_grid_alignment_survives_a_scoped_era_view():
+    lines = _grid_lines(_render(_full_header(scope_label="era theta · 05:00Z→10:39Z"),
+                                width=100))
+    cols = {_value_col(ln) for ln in lines}
+    cols.discard(None)
+    assert len(cols) == 1
 
 
 
@@ -657,22 +770,23 @@ def test_era_footnote_states_the_rules_and_counts_the_eras():
     assert all(len(ln) <= 100 for ln in out.splitlines())
 
 
-def test_era_line_pairs_with_the_identity_row():
-    out = _plain([sr.era_line(_era("stream", 100.0, float("inf"), 73, 0, 336.91))],
-                 width=100)
-    assert "era stream" in out and "73W-0L" in out and "+336.91" in out
-    assert "all-time above is the ledger" in out
+def test_era_row_pairs_with_the_identity_row():
+    label, *cells = sr.era_cells(_era("stream", 100.0, float("inf"), 73, 0, 336.91))
+    out = _plain([" ".join(cells)], width=100)
+    assert label == "era stream"
+    assert "73W-0L" in out and "+336.91" in out
+    assert "vs all-time above" in out
 
 
-def test_era_line_says_scoped_when_the_whole_report_is_one_era():
-    # Under --era the row above is NOT all-time, so the tail must not say it is.
-    out = _plain([sr.era_line(_era("theta", 100.0, 200.0, 44, 1, 115.59), scoped=True)],
-                 width=100)
-    assert "scoped view" in out and "all-time above" not in out
+def test_era_row_says_scoped_when_the_whole_report_is_one_era():
+    # Under --era the row above is NOT all-time, so the note must not say it is.
+    cells = sr.era_cells(_era("theta", 100.0, 200.0, 44, 1, 115.59), scoped=True)
+    out = _plain([" ".join(cells[1:])], width=100)
+    assert "scoped" in out and "vs all-time above" not in out
 
 
-def test_era_line_is_absent_when_there_is_no_era_to_name():
-    assert sr.era_line(None) == ""
+def test_era_row_is_absent_when_there_is_no_era_to_name():
+    assert sr.era_cells(None) is None
 
 
 def test_era_span_label_marks_both_open_ends():
@@ -702,7 +816,7 @@ def test_render_stats_era_scope_relabels_the_header_and_keeps_every_era():
     assert "windows since" not in out
     for name in ("pre-brake", "brakes", "quiet", "stream"):
         assert name in out          # scoping the view hides no era
-    assert "scoped view" in out
+    assert "scoped" in out and "drop --era" in out
 
 
 def test_render_stats_says_why_the_era_table_is_missing_under_since():
