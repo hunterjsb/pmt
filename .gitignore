@@ -228,3 +228,4 @@ infra/
 # gate-shadow scratch (frozen tapes, shadow HOME, cached wallet walk)
 .work/
 .shadowhome/
+pmengine/target-eu/

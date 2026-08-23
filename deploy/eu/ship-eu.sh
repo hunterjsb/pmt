@@ -57,22 +57,33 @@ git -C "$REPO_ROOT" diff --quiet HEAD -- pmengine || DIRTY="-dirty"
 ARTIFACT="pmengine-aarch64-${SHA}${DIRTY}.tar.gz"
 KEY="$PREFIX/$ARTIFACT"
 
+# Cross artifacts are isolated from the native target/ (see incident note
+# below); defined here so --skip-build resolves the binary path too.
+CROSS_TARGET_DIR="$ENGINE/target-eu"
+
 # --- 2. cross-compile -------------------------------------------------------
 if [ "$SKIP_BUILD" -eq 0 ]; then
   say "cross build --release --target $TARGET --features ec2"
   command -v cross >/dev/null || die "cross absent: cargo install cross --git https://github.com/cross-rs/cross"
   LOG="$(mktemp)"
 
-  # Build scripts are compiled for the HOST and cached in target/release/build.
-  # Swap the container image for one with an older glibc and cargo happily
-  # reuses those host binaries — which the new container then cannot exec
-  # ("GLIBC_2.39 not found" from a *build script*, not from our binary). Stamp
-  # the image and wipe the cache whenever it changes.
-  STAMP="$ENGINE/target/.cross-image"
+  # Cross builds live in their OWN target dir. The 2026-08-23 incident: the
+  # image-change wipe below deleted target/release/pmengine — the binary the
+  # live systemd unit execs — leaving the fleet one restart from dark. An
+  # isolated CARGO_TARGET_DIR makes that impossible: the native binary and
+  # the cross cache can never share a directory again.
+  export CARGO_TARGET_DIR="$CROSS_TARGET_DIR"
+
+  # Build scripts are compiled for the HOST and cached in the cross target
+  # dir. Swap the container image for one with an older glibc and cargo
+  # happily reuses those host binaries — which the new container then cannot
+  # exec ("GLIBC_2.39 not found" from a *build script*, not from our binary).
+  # Stamp the image and wipe the CROSS cache (never the native one) on change.
+  STAMP="$CROSS_TARGET_DIR/.cross-image"
   if [ "$(cat "$STAMP" 2>/dev/null || true)" != "$CROSS_IMAGE" ]; then
-    say "cross image changed → clearing stale host build artifacts"
-    rm -rf "$ENGINE/target/release" "$ENGINE/target/$TARGET"
-    mkdir -p "$ENGINE/target"
+    say "cross image changed → clearing stale cross build artifacts"
+    rm -rf "$CROSS_TARGET_DIR/release" "$CROSS_TARGET_DIR/$TARGET"
+    mkdir -p "$CROSS_TARGET_DIR"
     printf '%s' "$CROSS_IMAGE" > "$STAMP"
   fi
 
@@ -97,7 +108,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   rm -f "$LOG"
 fi
 
-BIN="$ENGINE/target/$TARGET/release/pmengine"
+BIN="$CROSS_TARGET_DIR/$TARGET/release/pmengine"
 [ -x "$BIN" ] || die "no binary at $BIN"
 file "$BIN" | grep -q "ARM aarch64" || die "binary is not aarch64: $(file "$BIN")"
 
