@@ -1,6 +1,6 @@
 """Decision-tape file access — the updown strategy's append-only eval/fire/gate log.
 
-Every consumer (the fleet scoreboard, `pmt crypto shadow`, the `watch`
+Every consumer (the fleet scoreboard, `stats --gates`, the `watch`
 dashboard, `pmt crypto tape`) used to open the tape file and run its own
 json.loads loop with "fire"/"eval"/"gated"/... literals sprinkled through
 cli_crypto.py and polymarket/shadow.py. One place for the paths, the
@@ -25,6 +25,10 @@ from pathlib import Path
 ENGINE_DIR = Path.home() / ".pmt" / "engine"
 UPDOWN_TAPE = str(ENGINE_DIR / "updown-tape.jsonl")
 BOOK_TAPE = str(ENGINE_DIR / "book-tape.jsonl")
+# Phase 7 order-path telemetry (pmengine/src/order_tape.rs) — one record per
+# order decision. Its own file because the order path samples on a completely
+# different clock from the 5s eval throttle; joins to UPDOWN_TAPE on t+token.
+ORDER_TAPE = str(ENGINE_DIR / "order-latency-tape.jsonl")
 
 EV_FIRE = "fire"
 EV_EXIT = "exit"
@@ -32,6 +36,11 @@ EV_EVAL = "eval"
 EV_GATED = "gated"
 EV_ROLL = "roll"
 EV_CLEANUP = "cleanup"
+
+# ORDER_TAPE "stage" values — the leg of the order path a record describes.
+STAGE_ACK = "ack"
+STAGE_SUPPRESSED = "suppressed"
+STAGE_FILL = "fill"
 
 
 def iter_records(path: str, floor: float | None = None,

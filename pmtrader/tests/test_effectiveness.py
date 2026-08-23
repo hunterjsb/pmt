@@ -274,21 +274,11 @@ def test_summary_reports_the_whole_story_on_the_real_shape():
     assert s["bankroll"] == 1000.0
 
 
-def test_header_line_carries_every_headline_number():
-    ws = [_w(10, 0.5, True, entry_ts=3600, exit_ts=4500, end_ts=4500) for _ in range(11)]
-    ws.append(_w(265, -265.0, False, entry_ts=3600, exit_ts=0, end_ts=4500))
-    line = eff.header_line(eff.summary(ws, bankroll=1000.0, now=90000.0))
-    for token in ("$W ", "W 92%", "need ", "PF ", "$ret ", "RoRC ", "growth ", "util "):
-        assert token in line
-    assert "$W 29%" in line       # money-weighted win rate beside the count's 92%
-    # "need" is a fraction-of-trades bar, so it must sit on the COUNT rate
-    assert "W 92% (need" in line
-
-
-def test_header_line_dashes_undefined_metrics_instead_of_zeroing_them():
-    line = eff.header_line(eff.summary([]))
-    assert "PF —" in line and "$W —" in line
-    assert "growth" not in line and "util" not in line  # no bankroll -> omitted
+def test_header_line_is_gone_because_nothing_ever_read_it():
+    # A fourth rendering of the same six numbers, with a docstring naming a
+    # watch-header consumer that never existed. stats_render.effectiveness_table
+    # is the one place they are formatted.
+    assert not hasattr(eff, "header_line")
 
 
 # ---------- wiring: cli_crypto -> effectiveness ----------
@@ -355,7 +345,53 @@ def test_effectiveness_summary_without_a_balance_leaves_bankroll_metrics_undefin
 def test_eff_table_renders_dashes_on_an_empty_book():
     import io
 
+    import stats_render
     from rich.console import Console
     con = Console(file=io.StringIO(), width=200)
-    con.print(cc._eff_table(eff.summary([])))
+    con.print(stats_render.effectiveness_table(eff.summary([])))
     assert "—" in con.file.getvalue()
+    # the cli_crypto and watch_ui shims that used to wrap this are gone: one
+    # implementation, so the report and the dashboard cannot drift.
+    assert not hasattr(cc, "_eff_table")
+
+
+# ---------- streak (the run the next loss ends) ----------
+
+def _sw(won: bool, end_ts: float, pnl: float = 1.0) -> dict:
+    return {"won": won, "pnl": pnl if won else -10.0, "notional": 10.0,
+            "entry_ts": end_ts - 300, "exit_ts": end_ts + 30, "end_ts": end_ts}
+
+
+def test_streak_of_an_empty_book_is_zero_not_undefined():
+    assert eff.streak([]) == {"current": 0, "longest": 0}
+
+
+def test_streak_counts_the_run_back_from_the_newest_settled_window():
+    windows = [_sw(True, 100), _sw(True, 200), _sw(True, 300)]
+    assert eff.streak(windows) == {"current": 3, "longest": 3}
+
+
+def test_streak_a_loss_in_the_middle_splits_the_run_and_keeps_the_longer():
+    # 4 wins, a loss, then 2 wins: current is 2, longest is still 4.
+    windows = ([_sw(True, t) for t in (100, 200, 300, 400)]
+               + [_sw(False, 500)]
+               + [_sw(True, t) for t in (600, 700)])
+    assert eff.streak(windows) == {"current": 2, "longest": 4}
+
+
+def test_streak_current_is_zero_when_the_newest_window_lost():
+    windows = [_sw(True, 100), _sw(True, 200), _sw(False, 300)]
+    assert eff.streak(windows) == {"current": 0, "longest": 2}
+
+
+def test_streak_orders_by_settlement_not_by_arrival():
+    # The scoreboard builds its window list from a dict, so arrival order is
+    # insertion order. Handed the same set shuffled, the answer must not move.
+    ordered = [_sw(True, 100), _sw(False, 200), _sw(True, 300), _sw(True, 400)]
+    shuffled = [ordered[2], ordered[0], ordered[3], ordered[1]]
+    assert eff.streak(shuffled) == eff.streak(ordered) == {"current": 2, "longest": 2}
+
+
+def test_summary_carries_the_streak_so_both_reports_read_one_number():
+    s = eff.summary([_sw(True, 100), _sw(False, 200), _sw(True, 300)])
+    assert s["streak"] == {"current": 1, "longest": 1}

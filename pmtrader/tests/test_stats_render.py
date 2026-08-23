@@ -11,6 +11,7 @@ import io
 
 import pytest
 from rich.console import Console
+from rich.text import Text
 
 import stats_render as sr
 
@@ -21,15 +22,22 @@ def _render(renderable, width: int = 120) -> str:
     return con.file.getvalue()
 
 
+def _plain(lines: list[str], width: int = 120) -> str:
+    """Markup lines as the operator sees them — the block builders return
+    Rich markup, and asserting on the tags instead of the text would pass on
+    a report nobody could read."""
+    return _render(Text.from_markup("\n".join(lines)), width=width)
+
+
 # ---------- fixtures ----------
 
 def _sb(**kw) -> dict:
     sb = {"wins": 147, "losses": 13, "net": -436.76, "rolls": 335, "estimated": 0,
           "riding_n": 4, "riding_usd": 317.06,
           "series": {"btc 5m": {"w": 42, "l": 2, "open": 1, "pnl": -135.77,
-                                 "usd": 4799.0, "est": 0},
+                                 "usd": 4799.0, "est": 0, "med": 5.77},
                       "eth 5m": {"w": 33, "l": 0, "open": 0, "pnl": 132.36,
-                                 "usd": 2694.0, "est": 2}},
+                                 "usd": 2694.0, "est": 2, "med": 2.26}},
           "cal": {0.90: [17, 13], 0.95: [837, 744]}}
     sb.update(kw)
     return sb
@@ -42,21 +50,74 @@ def _eff(**kw) -> dict:
            "return_on_notional": -0.0236,
            "rorc": {"per_hour": -0.2469, "avg_hold_h": 0.095},
            "bgr": {"per_day_pct": -0.14}, "utilization": 0.0002,
-           "span_h": 5169.6, "bankroll": 1966.2}
+           "span_h": 5169.6, "bankroll": 1966.2,
+           "streak": {"current": 7, "longest": 41}}
     eff.update(kw)
     return eff
 
 
 def _arms(**kw) -> dict:
     arms = {"btc-updown-5m-1787452500": {
-                "roll": True, "filled_usdc": 0.0,
+                "roll": True, "filled_usdc": 0.0, "feed": "binance",
                 "eval": {"state": "armed", "p_up": 0.9601, "committed": -1e-15}},
             "bnb-updown-5m-1787452500": {
-                "roll": False, "filled_usdc": 12.5,
+                "roll": False, "filled_usdc": 12.5, "feed": "rtds",
+                "maker_bid": True,
                 "eval": {"state": "gated", "margin_bp": -4.9, "guard_bp": 6.0,
                           "reason": "basis guard: projected margin -4.9bp inside 6.0bp"}}}
     arms.update(kw)
     return arms
+
+
+def _flags(**kw) -> dict:
+    flags = {"btc 5m": {"feed": "binance", "maker_bid": False},
+             "eth 5m": {"feed": "rtds", "maker_bid": True}}
+    flags.update(kw)
+    return flags
+
+
+def _maker(**kw) -> dict:
+    m = {"candidates": 775, "candidate_windows": 56, "rested": 31,
+         "rested_windows": 5, "placed": 26, "fills": 1, "fill_usd": 49.0,
+         "fill_windows": 1, "wins": 1, "losses": 0, "pnl": 1.95}
+    m.update(kw)
+    return m
+
+
+def _chase(**kw) -> dict:
+    c = {"acks": 182, "suppressed": 2, "suppressed_share": 0.0109,
+         "ack_p50": 281.71, "ack_p90": 397.22, "sign_p50": 0.17,
+         "chase_n": 16, "chased": 15, "buffer_med_c": 1.29, "buffer_max_c": 4.0}
+    c.update(kw)
+    return c
+
+
+_EMPTY_MAKER = {"candidates": 0, "candidate_windows": 0, "rested": 0,
+                "rested_windows": 0, "placed": 0, "fills": 0, "fill_usd": 0.0,
+                "fill_windows": 0, "wins": 0, "losses": 0, "pnl": None}
+_EMPTY_CHASE = {"acks": 0, "suppressed": 0, "suppressed_share": None,
+                "ack_p50": None, "ack_p90": None, "sign_p50": None,
+                "chase_n": 0, "chased": 0, "buffer_med_c": None,
+                "buffer_max_c": None}
+
+
+def _gates(**kw) -> dict:
+    """A shadow.build_report() reply, trimmed to what the table reads."""
+    r = {"categories": {
+             "basis_guard": {"episodes": 923, "priced": 758, "hit_rate": 0.62,
+                              "missed_wins": 9734.0, "avoided_losses": 6944.0,
+                              "net": 2789.0},
+             "safety": {"episodes": 645, "priced": 561, "hit_rate": 0.46,
+                         "missed_wins": 5051.0, "avoided_losses": 8011.0,
+                         "net": -2959.0},
+             "distrust": {"episodes": 0, "priced": 0, "hit_rate": None,
+                           "missed_wins": 0.0, "avoided_losses": 0.0, "net": 0.0}},
+         "totals": {"episodes": 1568, "missed_wins": 14785.0,
+                     "avoided_losses": 14955.0, "net": -170.0},
+         "coverage": {"windows": 351, "unpriced_episodes": 32,
+                       "skipped_unresolved": 245}}
+    r.update(kw)
+    return r
 
 
 # ---------- scalars ----------
@@ -175,15 +236,64 @@ def test_header_reports_a_resting_maker_bid_only_when_one_is_on_the_book():
     assert "resting $45.00" in out
 
 
-def test_header_drops_the_effectiveness_line_on_an_empty_book():
-    out = _render(sr.header_panel(_sb(wins=0, losses=0), _eff(n=0), None, {}, 0))
-    assert "RoRC" not in out
+def test_header_never_repeats_the_effectiveness_table():
+    # The header used to carry a $W/PF/$ret/RoRC/BGR/util one-liner — the same
+    # six numbers the table two sections down explains, and the line that
+    # wrapped at 100 cols. One home per number.
+    out = _render(sr.header_panel(_sb(), _eff(), {"total": 1649.14}, {}, 0))
+    for label in ("RoRC", "BGR", "PF", "util"):
+        assert label not in out
 
 
-# ---------- series ----------
+def test_header_carries_the_streak_beside_the_record():
+    out = _render(sr.header_panel(_sb(), _eff(), None, {}, 0))
+    assert "streak 7" in out and "best 41" in out
 
-def test_series_table_shows_record_flags_pnl_and_a_win_rate_bar():
-    out = _render(sr.series_table(_sb()["series"], breakeven=0.925))
+
+def test_header_streak_of_zero_still_prints_because_a_loss_just_landed():
+    # A hidden zero would read as "no streak data"; it means the last window
+    # lost, which is the thing the operator most wants to see.
+    out = _render(sr.header_panel(_sb(), _eff(streak={"current": 0, "longest": 41}),
+                                  None, {}, 0))
+    assert "streak 0" in out and "best 41" in out
+
+
+def test_header_omits_the_streak_entirely_before_anything_is_graded():
+    out = _render(sr.header_panel(_sb(), _eff(streak={"current": 0, "longest": None}),
+                                  None, {}, 0))
+    assert "streak" not in out
+
+
+def test_header_reports_the_fleet_cap_and_how_close_it_came():
+    out = _render(sr.header_panel(_sb(), _eff(), None, {}, 0,
+                                  {"cap": 350.0, "ticks": 6459,
+                                   "peak_undecided": 350.0, "blocked_usd": 100.88}))
+    assert "fleet cap $350" in out
+    assert "peak un-decided $350" in out and "6,459 ticks" in out
+    assert "refused $101" in out
+
+
+def test_header_omits_the_fleet_line_when_no_cap_is_set():
+    # An uncapped fleet has infinite headroom — there is no ration to report.
+    out = _render(sr.header_panel(_sb(), _eff(), None, {}, 0,
+                                  {"cap": 0.0, "ticks": 0, "peak_undecided": None,
+                                   "blocked_usd": 0.0}))
+    assert "fleet cap" not in out
+
+
+def test_header_says_so_when_a_cap_is_set_but_the_tape_never_saw_it():
+    out = _render(sr.header_panel(_sb(), _eff(), None, {}, 0,
+                                  {"cap": 350.0, "ticks": 0, "peak_undecided": None,
+                                   "blocked_usd": 0.0}))
+    assert "fleet cap $350" in out and "no capped ticks" in out
+
+
+
+
+# ---------- by symbol ----------
+
+def test_symbol_table_shows_record_flags_net_median_and_a_win_rate_bar():
+    out = _render(sr.symbol_table(_sb()["series"], _flags(), breakeven=0.925))
     assert "42-2" in out and "1 open" in out
     assert "~2" in out  # eth's two ~estimated grades
     assert "-135.77" in out and "+132.36" in out
@@ -192,22 +302,54 @@ def test_series_table_shows_record_flags_pnl_and_a_win_rate_bar():
     assert "█" in out
 
 
-def test_series_bar_is_colored_against_the_break_even_bar():
-    losing = {"x": {"w": 8, "l": 2, "open": 0, "pnl": -50.0, "usd": 100.0, "est": 0}}
-    winning = {"x": {"w": 10, "l": 0, "open": 0, "pnl": 50.0, "usd": 100.0, "est": 0}}
+def test_symbol_table_carries_the_median_window_the_totals_hide():
+    # btc's -$135.77 total is one tail on 44 windows whose typical one paid
+    # +$5.77 — sum and median disagree, and that IS the sizing question.
+    out = _render(sr.symbol_table(_sb()["series"], _flags(), 0.925))
+    assert "+5.77" in out and "+2.26" in out
+
+
+def test_symbol_table_dashes_a_median_that_does_not_exist_yet():
+    series = {"x": {"w": 0, "l": 0, "open": 2, "pnl": 0.0, "usd": 50.0,
+                     "est": 0, "med": None}}
+    out = _render(sr.symbol_table(series, {}, 0.925))
+    assert "—" in out
+
+
+def test_symbol_table_names_the_feed_each_series_is_armed_on():
+    out = _render(sr.symbol_table(_sb()["series"], _flags(), 0.925))
+    assert "binance" in out          # btc 5m, taker on the proxy feed
+    assert "≈rtds" in out       # eth 5m, off the settlement stream
+    assert "◇" in out           # ...and resting maker bids
+
+
+def test_symbol_table_dashes_the_feed_for_a_series_with_no_live_arm():
+    # The series traded, but nothing armed is claiming these params now —
+    # which is not the same as "binance".
+    out = _render(sr.symbol_table(_sb()["series"], {}, 0.925))
+    assert "binance" not in out and "rtds" not in out
+    assert "—" in out
+
+
+def test_symbol_bar_is_colored_against_the_break_even_bar():
+    losing = {"x": {"w": 8, "l": 2, "open": 0, "pnl": -50.0, "usd": 100.0,
+                     "est": 0, "med": -1.0}}
+    winning = {"x": {"w": 10, "l": 0, "open": 0, "pnl": 50.0, "usd": 100.0,
+                      "est": 0, "med": 5.0}}
     con = Console(file=io.StringIO(), width=120)
     assert sr._rate_style(0.8, 0.925) == "red"
     assert sr._rate_style(1.0, 0.925) == "green"
     # and both still render without a break-even to measure against
     for series in (losing, winning):
-        con.print(sr.series_table(series, breakeven=None))
+        con.print(sr.symbol_table(series, {}, breakeven=None))
     assert "█" in con.file.getvalue()
 
 
-def test_series_table_rows_never_wrap():
-    out = _render(sr.series_table(_sb()["series"], 0.925), width=80)
+def test_symbol_table_rows_never_wrap_at_a_hundred_columns():
+    out = _render(sr.symbol_table(_sb()["series"], _flags(), 0.925), width=100)
     body = [ln for ln in out.splitlines() if ln.strip()]
     assert len(body) == 3  # header + two series, no continuation lines
+    assert all(len(ln) <= 100 for ln in out.splitlines())
 
 
 # ---------- effectiveness ----------
@@ -218,12 +360,21 @@ def test_effectiveness_table_pairs_every_number_with_what_it_means():
                   "return on notional", "RoRC", "bankroll growth", "utilization"):
         assert label in out
     assert "92.5%" in out and "0.79" in out and "-24.69%/h" in out
-    assert "$18,504" in out and "avg hold 5.7m" in out
-    assert "over 215.4d" in out  # a 5169h span reported in days, not hours
+    assert "$18,504" in out and "hold 5.7m" in out
+    assert "215.4d" in out  # a 5169h span reported in days, not hours
 
 
 def test_effectiveness_table_reports_a_short_span_in_hours():
-    assert "over 6.2h" in _render(sr.effectiveness_table(_eff(span_h=6.2)))
+    assert "6.2h" in _render(sr.effectiveness_table(_eff(span_h=6.2)))
+
+
+def test_effectiveness_table_never_wraps_at_a_hundred_columns():
+    # The prose column is written to the width it has; a folded explanation
+    # tore the alignment of every row under it.
+    out = _render(sr.effectiveness_table(_eff()), width=100)
+    body = [ln for ln in out.splitlines() if ln.strip()]
+    assert len(body) == 8  # header + seven metrics, one line each
+    assert all(len(ln) <= 100 for ln in out.splitlines())
 
 
 def test_effectiveness_table_dashes_every_undefined_metric():
@@ -236,7 +387,108 @@ def test_effectiveness_table_dashes_every_undefined_metric():
     assert out.count("—") >= 5
 
 
-# ---------- calibration ----------
+# ---------- the resting-bid experiment ----------
+
+def test_resting_block_separates_the_shadow_class_from_real_bids():
+    lines = _plain(sr.resting_lines(_maker()))
+    assert "candidates 775" in lines and "56 windows" in lines
+    assert "knob off" in lines
+    assert "rested 31" in lines and "placed 26" in lines
+
+
+def test_resting_block_labels_its_fill_attribution_as_experiment_grade():
+    lines = _plain(sr.resting_lines(_maker()))
+    assert "fills 1" in lines and "1W-0L" in lines and "+1.95" in lines
+    assert "experiment-grade" in lines
+    assert "not proven" in lines
+
+
+def test_resting_block_gets_the_window_count_grammar_right():
+    one = _plain(sr.resting_lines(_maker(fill_windows=1)))
+    many = _plain(sr.resting_lines(_maker(fill_windows=3)))
+    assert "in 1 window " in one
+    assert "in 3 windows" in many
+
+
+def test_resting_block_is_empty_when_the_tape_has_nothing_to_say():
+    assert sr.resting_lines(_EMPTY_MAKER) == []
+    assert sr.resting_lines({}) == []
+
+
+def test_resting_block_omits_the_fill_row_until_something_landed():
+    lines = _plain(sr.resting_lines(_maker(fills=0, wins=0, losses=0, pnl=None)))
+    assert "rested 31" in lines
+    assert "fills" not in lines and "experiment-grade" not in lines
+
+
+# ---------- the order path ----------
+
+def test_chase_block_reports_the_wire_and_what_the_matcher_suppressed():
+    lines = _plain(sr.chase_lines(_chase()))
+    assert "182 acked" in lines
+    assert "suppressed 2" in lines and "1.1%" in lines
+    assert "p50 282ms" in lines and "p90 397ms" in lines
+
+
+def test_chase_block_refuses_to_print_a_sub_millisecond_stage_as_zero():
+    # "sign p50 0ms" implies a stage that measured zero rather than one that
+    # is not a stage at all.
+    lines = _plain(sr.chase_lines(_chase(sign_p50=0.17)))
+    assert "0ms" not in lines and "sign <1ms" in lines
+    slow = _plain(sr.chase_lines(_chase(sign_p50=42.0)))
+    assert "sign p50 42ms" in slow
+
+
+def test_chase_block_prices_the_pay_up_buffer_actually_spent():
+    lines = _plain(sr.chase_lines(_chase()))
+    assert "15 of 16 priced fires chased" in lines
+    assert "median 1.29c" in lines and "max 4.00c" in lines
+
+
+def test_chase_block_is_empty_when_the_tape_has_nothing_to_say():
+    assert sr.chase_lines(_EMPTY_CHASE) == []
+    assert sr.chase_lines({}) == []
+
+
+def test_chase_block_prints_the_wire_even_before_any_fire_carried_a_limit():
+    lines = _plain(sr.chase_lines(_chase(chase_n=0, chased=0,
+                                             buffer_med_c=None, buffer_max_c=None)))
+    assert "182 acked" in lines
+    assert "pay-up" not in lines  # unknown, not zero
+
+
+def test_chase_block_lines_never_wrap_at_a_hundred_columns():
+    for line in sr.chase_lines(_chase()):
+        assert len(_render(line, width=100).rstrip("\n")) <= 100
+
+
+# ---------- gates ----------
+
+def test_gates_table_flips_the_money_color_because_net_is_a_refusal():
+    # POSITIVE net on this ledger means the gate turned down money (over-tight)
+    # — the opposite sign convention to every other money cell on the report.
+    from polymarket import shadow
+
+    con = Console(file=io.StringIO(), width=100, no_color=True, highlight=False)
+    con.print(sr.gates_table(_gates(), list(shadow.CATEGORY_ORDER), shadow.verdict))
+    out = con.file.getvalue()
+    assert "basis_guard" in out and "+2,789" in out
+    assert "safety" in out and "-2,959" in out
+    assert "over-tight" in out and "paying for itself" in out
+    # a category with zero episodes never gets a row
+    assert "distrust" not in out
+    assert all(len(ln) <= 100 for ln in out.splitlines())
+
+
+def test_gates_footer_carries_both_halves_and_the_coverage_gap():
+    lines = _plain(sr.gates_footer(_gates()))
+    assert "missed wins 14,785" in lines and "avoided losses 14,955" in lines
+    assert "-170" in lines
+    assert "351 windows" in lines and "32 unpriced" in lines
+    assert "245 unresolved" in lines
+
+
+# ---------- calibration (--full only) ----------
 
 def test_calibration_table_grades_each_bucket_against_its_own_stated_fair():
     out = _render(sr.calibration_table({0.90: [17, 13], 0.95: [837, 744]}))
@@ -247,72 +499,95 @@ def test_calibration_table_grades_each_bucket_against_its_own_stated_fair():
     assert sr._rate_style(1.0, 0.95) == "green"
 
 
-# ---------- live arms ----------
-
-def test_arms_table_compacts_a_basis_guard_reason_instead_of_wrapping_it():
-    out = _render(sr.arms_table(_arms()), width=100)
-    assert "margin -4.9 vs 6.0bp" in out
-    # the raw sentence is what used to blow the column and wrap the row
-    assert "projected margin" not in out
-    body = [ln for ln in out.splitlines() if ln.strip()]
-    assert len(body) == 3  # header + two arms
-    assert all(len(ln) <= 100 for ln in out.splitlines())
-
-
-def test_arms_table_falls_back_to_the_legacy_reason_sentence():
-    arms = {"btc-updown-5m-1787452500": {
-        "eval": {"state": "gated",
-                  "reason": "basis guard: projected margin +12.5bp inside 6.0bp"}}}
-    assert "margin +12.5 vs 6.0bp" in _render(sr.arms_table(arms))
-
-
-def test_arms_table_normalizes_float_dust_in_committed():
-    out = _render(sr.arms_table(_arms()))
-    assert "$0.00" in out and "$-0.00" not in out
-
-
-def test_arms_table_renders_state_roll_and_fair():
-    out = _render(sr.arms_table(_arms()))
-    assert "armed" in out and "gated" in out
-    assert "0.9601" in out
-    assert "⟳" in out and "·" in out  # rolling arm and a one-shot one
-    assert "btc 5m" in out  # slug rendered through updown_slugs.display
-
-
-def test_arms_table_tolerates_a_missing_or_half_built_eval():
-    # An engine restart mid-flight leaves last_eval None or partial.
-    out = _render(sr.arms_table({"btc-updown-5m-1787452500": {"eval": None},
-                                  "eth-updown-5m-1787452500": {}}))
-    assert "?" in out and "—" in out
-
-
 # ---------- the whole report ----------
 
-def test_render_stats_lays_out_every_section():
+def _blocks(**kw) -> dict:
+    b = {"flags": _flags(), "maker": _maker(), "chase": _chase(),
+         "fleet": {"cap": 350.0, "ticks": 6459, "peak_undecided": 350.0,
+                    "blocked_usd": 100.88}}
+    b.update(kw)
+    return b
+
+
+def test_render_stats_reads_top_down_in_the_order_the_operator_asks():
     out = _render(sr.render_stats(_sb(), _eff(), {"total": 1649.14},
                                   {"arms": _arms(), "pending_rolls": ["btc 5m"]},
-                                  1787452500))
+                                  1787452500, blocks=_blocks()))
     assert "updown fleet" in out and "windows since 08-23 02:35Z" in out
-    for header in ("by series", "effectiveness", "calibration", "live arms"):
-        assert header in out
-    assert "pending rolls: btc 5m" in out
-    # the header panel comes first, the sections after it, in reading order
-    order = [out.index(h) for h in ("updown fleet", "by series", "effectiveness",
-                                    "calibration", "live arms")]
+    order = [out.index(h) for h in ("updown fleet", "by symbol", "effectiveness",
+                                     "resting bids", "order path")]
     assert order == sorted(order)
 
 
-def test_render_stats_drops_sections_that_have_no_data():
+def test_render_stats_default_view_stays_focused():
+    # calibration is superseded by analysis/r6_report.txt; a static live-arms
+    # snapshot is `pmt crypto watch`'s job. Both are --full only.
+    out = _render(sr.render_stats(_sb(), _eff(), {"total": 1649.14},
+                                  {"arms": _arms()}, 0, blocks=_blocks()))
+    assert "calibration" not in out
+    assert "live arms" not in out
+
+
+def test_render_stats_full_restores_everything_demoted():
+    out = _render(sr.render_stats(_sb(), _eff(), {"total": 1649.14},
+                                  {"arms": _arms(), "pending_rolls": ["btc 5m"]},
+                                  0, blocks=_blocks(), full=True), width=140)
+    assert "calibration" in out
+    assert "live arms" in out and "pending rolls: btc 5m" in out
+    # and the demoted blocks come AFTER everything the default view shows
+    assert out.index("order path") < out.index("calibration") < out.index("live arms")
+
+
+def test_render_stats_full_uses_watchs_own_arms_table_not_a_second_one():
+    # A static snapshot that can drift from the live dashboard is worse than
+    # no snapshot: --full renders watch_ui.build_arms_table verbatim.
+    out = _render(sr.render_stats(_sb(), _eff(), None, {"arms": _arms()}, 0,
+                                  blocks=_blocks(), full=True), width=140)
+    for col in ("evidence", "p_up", "mode", "rho", "flags"):
+        assert col in out
+    assert not hasattr(sr, "arms_table")
+
+
+def test_render_stats_drops_every_block_that_has_no_data():
     out = _render(sr.render_stats({"wins": 0, "losses": 0, "net": 0.0, "rolls": 0},
-                                  _eff(n=0), None, None, 0))
-    for header in ("by series", "effectiveness", "calibration", "live arms"):
+                                  _eff(n=0, streak={"current": 0, "longest": None}),
+                                  None, None, 0,
+                                  blocks={"flags": {}, "maker": _EMPTY_MAKER,
+                                           "chase": _EMPTY_CHASE, "fleet": None},
+                                  full=True))
+    for header in ("by symbol", "effectiveness", "resting bids", "order path",
+                   "calibration", "live arms", "gates"):
         assert header not in out
     assert "0W-0L" in out
 
 
 def test_render_stats_survives_an_engine_that_never_answered():
     # status={} is what crypto_stats passes when engine.post() sys.exit()s.
-    out = _render(sr.render_stats(_sb(), _eff(), {"total": 1649.14}, {}, 0))
+    out = _render(sr.render_stats(_sb(), _eff(), {"total": 1649.14}, {}, 0,
+                                  blocks=_blocks()))
     assert "live arms" not in out
     assert "committed $0.00" in out
     assert "147W-13L" in out
+
+
+def test_render_stats_works_with_no_blocks_at_all():
+    # The tape folds are optional: a caller that hasn't computed them still
+    # gets the wallet half of the report.
+    out = _render(sr.render_stats(_sb(), _eff(), None, {}, 0))
+    assert "by symbol" in out and "effectiveness" in out
+    assert "resting bids" not in out and "order path" not in out
+
+
+def test_render_stats_adds_the_gates_section_only_when_asked():
+    out = _render(sr.render_stats(_sb(), _eff(), None, {}, 0, blocks=_blocks(),
+                                  gates=_gates()), width=100)
+    assert "gates" in out and "basis_guard" in out
+    assert "hindsight-priced" in out
+    assert all(len(ln) <= 100 for ln in out.splitlines())
+
+
+def test_render_stats_never_wraps_a_default_report_at_a_hundred_columns():
+    out = _render(sr.render_stats(_sb(), _eff(), {"total": 1649.14},
+                                  {"arms": _arms()}, 1787452500,
+                                  blocks=_blocks()), width=100)
+    assert all(len(ln) <= 100 for ln in out.splitlines())

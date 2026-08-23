@@ -2,17 +2,29 @@
 
 Every function here is pure: it takes dicts that have ALREADY been computed
 (the scoreboard from score_activity, the effectiveness summary, the CLOB
-balance, the engine's /status reply) and returns a Rich renderable. No
-network, no aggregation, no clock beyond a floor label. That split is the
-point: cli_crypto.py owns fetching and grading, this file owns pixels, and
-the report can be redesigned without touching a single number.
+balance, the engine's /status reply, the tape folds from
+polymarket.updown_stats) and returns a Rich renderable. No network, no
+aggregation, no clock beyond a floor label. That split is the point:
+cli_crypto.py owns fetching and grading, this file owns pixels, and the
+report can be redesigned without touching a single number.
 
-The layout is one header panel (the "am I making money" answer, with the
-break-even GAP given the loudest cell on the screen because it is the number
-that decides profitability) followed by rule-separated sections, in the order
-an operator actually asks the questions: what did it earn → where did it come
-from → is that any good once corrected for size and time → is the model
-honest → what is live right now.
+The default report reads top-down in the order an operator actually asks:
+
+    identity   who are we — record, streak, P&L, capital, break-even gap,
+               what is exposed right now
+    by symbol  where it came from, on which feed, and what a TYPICAL window
+               of that series pays
+    effectiveness   is any of that good once corrected for size and time
+    experiments     resting bids and pay-up — printed only when the tape has
+               something to say about them
+
+`--full` restores the two blocks that were demoted rather than deleted:
+calibration (superseded by analysis/r6_report.txt) and live arms (which is
+`pmt crypto watch`'s job, live, with four more columns).
+
+Nothing here may wrap at 100 columns. Every table is fixed-width and
+no-wrap; the prose in the effectiveness table is written to the width it
+has, not trimmed by the terminal.
 
 Colors follow the house convention shared with `pmt crypto watch`:
 green = win/evidence, yellow = gated/partial, red = loss/brake, dim = meta.
@@ -29,7 +41,6 @@ from rich.table import Table
 from rich.text import Text
 
 from cli_common import _pnl_color
-from polymarket import updown_slugs
 
 # Sub-cell resolution matters here: every win rate on this report lives in the
 # 80-100% band, where a whole-block bar has 10pp of resolution and shows the
@@ -42,6 +53,11 @@ _BAR_W = 10
 _NEAR_MISS = 0.05
 
 _HEADER_BORDER = "cyan"  # matches watch's "updown fleet" panel
+
+# Same glyphs watch_ui._ARMS_FLAG_LEGEND uses, so a flag means one thing
+# across both reports.
+_RTDS_MARK = "≈"
+_MAKER_MARK = "◇"
 
 
 # ---------- scalar formatting ----------
@@ -74,6 +90,10 @@ def _signed_pct(v: float | None, unit: str = "%", digits: int = 2,
         return "[dim]—[/dim]"
     x = v * 100 if scale else v
     return f"[{_pnl_color(x)}]{x:+,.{digits}f}{unit}[/]"
+
+
+def _ms(v: float | None) -> str:
+    return "[dim]—[/dim]" if v is None else f"{v:,.0f}ms"
 
 
 def _bar(frac: float | None, style: str = "cyan", width: int = _BAR_W) -> str:
@@ -111,9 +131,31 @@ def floor_label(floor: float) -> str:
     return f"windows since {stamp}"
 
 
+def _span_label(span_h: float | None) -> str:
+    """A duration in the unit it actually has: "over 0.1d" hides that a
+    %/day figure is extrapolated from three hours."""
+    h = span_h or 0.0
+    return f"{h / 24:.1f}d" if h >= 24 else f"{h:.1f}h"
+
+
 # ---------- header ----------
 
-def _record_line(sb: dict, bal: dict | None) -> str:
+def _streak_text(eff: dict) -> str:
+    """`streak 7 (best 41)` — the run of wins the next loss will end.
+
+    With losses paying -100% against wins paying a few percent, run length
+    between losses is the pulse the P&L total smooths away.
+    """
+    st = eff.get("streak") or {}
+    cur, best = st.get("current"), st.get("longest")
+    if best is None:
+        return ""
+    style = "green" if cur else "dim"
+    return f"[dim]streak[/dim] [{style}]{cur}[/{style}] [dim](best {best})[/dim]"
+
+
+def _record_line(sb: dict, eff: dict, bal: dict | None) -> str:
+    """The identity line: who this book is, in one row."""
     wins, losses = sb.get("wins", 0), sb.get("losses", 0)
     n = wins + losses
     # One decimal, not zero: rounded to "92%" the headline rate reads as if it
@@ -121,10 +163,14 @@ def _record_line(sb: dict, bal: dict | None) -> str:
     wr = _pct(wins / n, 1) if n else "[dim]—[/dim]"
     cap = f"[bold]${bal['total']:,.2f}[/bold]" if bal else "[dim]?[/dim]"
     net = _zeroed(sb.get("net", 0.0))
-    return (f"[bold]{wins}W-{losses}L[/bold] [dim]({wr})[/dim]"
-            f"     [dim]P&L[/dim] [bold {_pnl_color(net)}]{net:+,.2f}[/]"
-            f"     [dim]capital[/dim] {cap}"
-            f"     [dim]{sb.get('rolls', 0)} rolls[/dim]")
+    parts = [f"[bold]{wins}W-{losses}L[/bold] [dim]({wr})[/dim]",
+             f"[dim]P&L[/dim] [bold {_pnl_color(net)}]{net:+,.2f}[/]",
+             f"[dim]capital[/dim] {cap}"]
+    streak = _streak_text(eff)
+    if streak:
+        parts.append(streak)
+    parts.append(f"[dim]{sb.get('rolls', 0)} rolls[/dim]")
+    return "     ".join(parts)
 
 
 def _gap_line(eff: dict) -> str:
@@ -146,53 +192,42 @@ def _gap_line(eff: dict) -> str:
             f"  [dim]·[/dim]  [bold {style}]GAP {gap:+.1f}pp[/]  [{style}]{verdict}[/]")
 
 
-def _eff_line(eff: dict) -> str:
-    """The effectiveness story compressed to one line — the same numbers the
-    section below explains, here for the read that doesn't scroll."""
-    rorc, bgr = eff.get("rorc") or {}, eff.get("bgr") or {}
-    span_h = eff.get("span_h") or 0.0
-    span = f"{span_h / 24:.1f}d" if span_h >= 24 else f"{span_h:.1f}h"
-    parts = [
-        f"[dim]$W[/dim] {_pct(eff.get('mww_rate'))}",
-        f"[dim]PF[/dim] " + ("[dim]—[/dim]" if eff.get("profit_factor") is None else
-                             f"[{_pnl_color(eff['profit_factor'] - 1)}]"
-                             f"{eff['profit_factor']:.2f}[/]"),
-        f"[dim]$ret[/dim] {_signed_pct(eff.get('return_on_notional'))}",
-        f"[dim]RoRC[/dim] {_signed_pct(rorc.get('per_hour'), '%/h')}",
-        f"[dim]BGR[/dim] {_signed_pct(bgr.get('per_day_pct'), '%/d', scale=False)}",
-        f"[dim]util[/dim] {_pct(eff.get('utilization'), 2)}",
-    ]
-    return "  [dim]·[/dim]  ".join(parts) + f"   [dim]over {span}[/dim]"
-
-
-def _risk_line(sb: dict, status: dict | None) -> str:
-    """Money currently exposed: an arm's committed budget (and how much of it
-    hasn't banked-decided yet), any post-only bid still resting on the book,
-    plus notional still riding in unresolved windows. Shares _risk_exposure
-    with the watch header so the two reports can never disagree about what is
-    at risk."""
-    from watch_ui import _UNDECIDED_RED_USD, _UNDECIDED_YELLOW_USD, _risk_exposure
-
-    committed, undecided, resting = _risk_exposure((status or {}).get("arms"))
-    style = ("red" if undecided > _UNDECIDED_RED_USD else
-             "yellow" if undecided > _UNDECIDED_YELLOW_USD else "dim")
-    parts = [f"[dim]committed[/dim] ${_zeroed(committed):,.2f} "
-             f"[{style}](${_zeroed(undecided):,.2f} un-decided)[/{style}]"]
-    if resting > 0.005:  # only when a bid is actually on the book
-        parts.append(f"[cyan]◇resting[/cyan] ${_zeroed(resting):,.2f}")
-    parts.append(f"[dim]riding[/dim] {sb.get('riding_n', 0)} windows "
-                 f"${sb.get('riding_usd', 0.0):,.2f}")
-    return "  [dim]·[/dim]  ".join(parts)
+def _fleet_line(fleet: dict | None) -> str:
+    """The R7 ration and how close the fleet came to it. Absent entirely
+    when no cap is set — an uncapped fleet has no headroom to report."""
+    if not fleet or not fleet.get("cap"):
+        return ""
+    peak, cap = fleet.get("peak_undecided"), fleet["cap"]
+    if peak is None:
+        return f"[dim]fleet cap[/dim] ${cap:,.0f}  [dim](no capped ticks in range)[/dim]"
+    style = "yellow" if peak >= cap * 0.9 else "dim"
+    bits = (f"[dim]fleet cap[/dim] ${cap:,.0f}  [dim]·[/dim]  "
+            f"[dim]peak un-decided[/dim] [{style}]${peak:,.0f}[/{style}] "
+            f"[dim]over {fleet['ticks']:,} ticks[/dim]")
+    if fleet.get("blocked_usd", 0.0) > 0.5:
+        bits += f"  [dim]·[/dim]  [dim]refused[/dim] ${fleet['blocked_usd']:,.0f}"
+    return bits
 
 
 def header_panel(sb: dict, eff: dict, bal: dict | None, status: dict | None,
-                 floor: float) -> Panel:
-    """Record, P&L, capital, the break-even gap, the effectiveness one-liner
-    and live exposure — everything the operator came for, in four lines."""
-    lines = [_record_line(sb, bal), _gap_line(eff)]
-    if eff.get("n"):
-        lines.append(_eff_line(eff))
-    lines.append(_risk_line(sb, status))
+                 floor: float, fleet: dict | None = None) -> Panel:
+    """Identity, the break-even gap, live exposure, and the fleet ration.
+
+    The exposure line comes from watch's own build_risk_header, so the two
+    reports can never disagree about what is at risk.
+    """
+    from watch_ui import _rtds_line, build_risk_header
+
+    lines = [_record_line(sb, eff, bal), _gap_line(eff),
+             build_risk_header(status or {}, sb, rtds=False)]
+    fleet_line = _fleet_line(fleet)
+    if fleet_line:
+        lines.append(fleet_line)
+    # Own line, not the risk line's tail: one socket's health and the fleet's
+    # dollars answer different questions, and together they overrun 100 cols.
+    stream = _rtds_line(status or {})
+    if stream:
+        lines.append(stream)
     est = sb.get("estimated") or 0
     if est:
         lines.append(f"[dim]{est} ~estimated "
@@ -208,7 +243,7 @@ def header_panel(sb: dict, eff: dict, bal: dict | None, status: dict | None,
 # ---------- sections ----------
 
 def section(title: str, note: str = "") -> Rule:
-    """`── by series · wallet-graded ─────────`. The leading dashes are part of
+    """`── by symbol · wallet-graded ─────────`. The leading dashes are part of
     the title because Rich only draws the rule to one side of a left-aligned
     one, and a section header flush against column zero doesn't read as a
     divider."""
@@ -216,16 +251,37 @@ def section(title: str, note: str = "") -> Rule:
     return Rule(label, style="dim", align="left")
 
 
-def series_table(series: dict, breakeven: float | None = None) -> Table:
-    """Per-series record and P&L, with each series' win rate drawn against
-    the break-even bar: a green bar is a series paying for itself, a red one
-    is a series whose hit rate cannot cover its payoff shape.
+def _feed_cell(flags: dict | None) -> str:
+    """`binance` / `≈rtds` / `≈rtds ◇` — the market-data source this series
+    is armed on, plus the maker-bid flag. Dim when nothing is armed: the
+    series traded, but no live arm is claiming these params right now."""
+    if not flags:
+        return "[dim]—[/dim]"
+    feed = flags.get("feed") or "binance"
+    cell = f"[cyan]{_RTDS_MARK}rtds[/cyan]" if feed == "rtds" else "[dim]binance[/dim]"
+    if flags.get("maker_bid"):
+        cell += f" [cyan]{_MAKER_MARK}[/cyan]"
+    return cell
+
+
+def symbol_table(series: dict, flags: dict | None = None,
+                 breakeven: float | None = None) -> Table:
+    """Per-series record, feed, P&L and win rate, with each series' win rate
+    drawn against the break-even bar: a green bar is a series paying for
+    itself, a red one is a series whose hit rate cannot cover its payoff.
+
+    `median` is the row the totals hide. One -$300 tail on forty +$4 windows
+    reads as a broken series by sum and a working one by median, and which
+    of those is true is the whole sizing question.
     """
+    flags = flags or {}
     t = Table(box=None, pad_edge=False, padding=(0, 1))
-    t.add_column("series", justify="left", width=8, no_wrap=True)
+    t.add_column("symbol", justify="left", width=8, no_wrap=True)
+    t.add_column("feed", justify="left", width=9, no_wrap=True)
     t.add_column("W-L", justify="right", width=6, no_wrap=True)
-    t.add_column("", justify="left", width=9, no_wrap=True)  # open / ~estimated
-    t.add_column("P&L", justify="right", width=9, no_wrap=True)
+    t.add_column("", justify="left", width=8, no_wrap=True)  # open / ~estimated
+    t.add_column("net", justify="right", width=9, no_wrap=True)
+    t.add_column("median", justify="right", width=8, no_wrap=True)
     t.add_column("notional", justify="right", width=8, no_wrap=True)
     t.add_column("win %", justify="right", width=6, no_wrap=True)
     t.add_column("", justify="left", width=_BAR_W, no_wrap=True)
@@ -233,27 +289,24 @@ def series_table(series: dict, breakeven: float | None = None) -> Table:
         s = series[k]
         decided = s["w"] + s["l"]
         rate = s["w"] / decided if decided else None
-        flags = " ".join(x for x in (
+        marks = " ".join(x for x in (
             f"{s['open']} open" if s.get("open") else "",
             f"~{s['est']}" if s.get("est") else "") if x)
-        t.add_row(k, f"{s['w']}-{s['l']}",
-                  f"[dim]{flags}[/dim]" if flags else "",
-                  _money(s["pnl"]), f"${s['usd']:,.0f}",
+        t.add_row(k, _feed_cell(flags.get(k)), f"{s['w']}-{s['l']}",
+                  f"[dim]{marks}[/dim]" if marks else "",
+                  _money(s["pnl"]), _money(s.get("med")), f"${s['usd']:,.0f}",
                   _pct(rate), _bar(rate, _rate_style(rate, breakeven)))
     return t
 
 
 def effectiveness_table(eff: dict) -> Table:
-    """Each corrected number beside what it means. Borderless: the box drawing
-    was costing four columns that the explanation column needed, which is what
-    made the bankroll-growth row wrap in the first place.
+    """Each corrected number beside what it means. Borderless, and every
+    explanation is written to fit the width it has at 100 columns — the box
+    drawing plus a longer sentence is what used to wrap the growth row.
     """
     rorc, bgr = eff.get("rorc") or {}, eff.get("bgr") or {}
     wr, be = eff.get("win_rate"), eff.get("breakeven_win_rate")
-    span_h = eff.get("span_h") or 0.0
-    # Show the growth denominator in the unit it actually has: "over 0.1d"
-    # hides that a %/day figure is extrapolated from three hours.
-    span = f"{span_h / 24:.1f}d" if span_h >= 24 else f"{span_h:.1f}h"
+    span = _span_label(eff.get("span_h"))
     hold_m = (rorc.get("avg_hold_h") or 0) * 60
 
     t = Table(box=None, pad_edge=False, padding=(0, 1))
@@ -262,7 +315,7 @@ def effectiveness_table(eff: dict) -> Table:
     t.add_column("means", justify="left", overflow="fold")
     t.add_row("$-weighted win rate", _pct(eff.get("mww_rate")),
               "share of DOLLARS at risk that won"
-              + (f" [dim](count: {wr * 100:.1f}%)[/dim]" if wr is not None else ""))
+              + (f" [dim](count {wr * 100:.1f}%)[/dim]" if wr is not None else ""))
     t.add_row("break-even win rate",
               "[dim]—[/dim]" if be is None else
               f"[{_rate_style(wr, be)}]{be * 100:.1f}%[/]",
@@ -270,27 +323,101 @@ def effectiveness_table(eff: dict) -> Table:
     t.add_row("profit factor",
               "[dim]—[/dim]" if eff.get("profit_factor") is None else
               f"[{_pnl_color(eff['profit_factor'] - 1)}]{eff['profit_factor']:.2f}[/]",
-              f"gross wins ${eff['gross_win']:,.0f} / gross losses "
-              f"${eff['gross_loss']:,.0f} — under 1.00 the book loses")
+              f"gross wins ${eff['gross_win']:,.0f} / losses "
+              f"${eff['gross_loss']:,.0f} — under 1.00 loses")
     t.add_row("return on notional", _signed_pct(eff.get("return_on_notional")),
-              f"P&L per dollar put at risk (${eff['notional']:,.0f} traded), "
+              f"P&L per dollar at risk (${eff['notional']:,.0f} traded), "
               "time ignored")
     t.add_row("RoRC", _signed_pct(rorc.get("per_hour"), "%/h"),
               "return per dollar-HOUR at risk — [bold]trade quality[/bold]"
-              + (f" [dim](avg hold {hold_m:.1f}m)[/dim]" if hold_m else ""))
+              + (f" [dim](hold {hold_m:.1f}m)[/dim]" if hold_m else ""))
     t.add_row("bankroll growth", _signed_pct(bgr.get("per_day_pct"), "%/d", scale=False),
-              "log growth of the whole book per calendar day — "
-              f"[bold]capital effectiveness[/bold] [dim](over {span})[/dim]")
+              "book-wide log growth per day — [bold]capital "
+              f"effectiveness[/bold] [dim]({span})[/dim]")
     t.add_row("utilization", _pct(eff.get("utilization"), 2),
-              "share of bankroll-hours actually at risk "
-              "(the bridge: growth ≈ RoRC × utilization)")
+              "share of bankroll-hours at risk (growth ≈ RoRC × util)")
     return t
 
 
+# ---------- experiments ----------
+
+def resting_lines(maker: dict) -> list[str]:
+    """Maker step 0's ledger: what the slice reached, what rested, what
+    landed in it.
+
+    The fill row is labelled experiment-grade on purpose. A post-only order
+    id never reaches the wallet feed, so a "fill" here is any BUY on the same
+    slug and side at or below a price we were resting at — a taker clip that
+    crossed cheap satisfies that too. `placed` is the hard number beside it:
+    post-only acks the engine really did submit.
+    """
+    lines = []
+    if maker.get("candidates"):
+        lines.append(f"[dim]candidates[/dim] {maker['candidates']:,} ticks "
+                     f"[dim]across {maker['candidate_windows']:,} windows "
+                     f"(knob off — the class, unpriced)[/dim]")
+    if maker.get("rested"):
+        lines.append(f"[dim]rested[/dim] {maker['rested']:,} ticks "
+                     f"[dim]across {maker['rested_windows']:,} windows[/dim]"
+                     f"   [dim]placed[/dim] {maker.get('placed', 0):,} "
+                     f"[dim]post-only acks[/dim]")
+    if maker.get("fills"):
+        w, ln = maker.get("wins", 0), maker.get("losses", 0)
+        n_win = maker["fill_windows"]
+        lines.append(f"[dim]fills[/dim] {maker['fills']:,} "
+                     f"[dim]${maker['fill_usd']:,.0f} in {n_win} "
+                     f"window{'' if n_win == 1 else 's'}[/dim]   "
+                     f"[bold]{w}W-{ln}L[/bold]   "
+                     f"[dim]P&L[/dim] {_money(maker.get('pnl'))}")
+        lines.append("[yellow]experiment-grade attribution[/yellow] [dim]— a "
+                     "post-only fill is inferred from price/side, not proven[/dim]")
+    return lines
+
+
+def chase_lines(chase: dict) -> list[str]:
+    """The order path and the pay-up buffer, two lines.
+
+    Chase is reported as `used of allowed` because that is the decision it
+    informs: a buffer nothing spends is a knob to turn down, and one pinned
+    at its max is a knob starving fills.
+    """
+    lines = []
+    if chase.get("acks") or chase.get("suppressed"):
+        share = chase.get("suppressed_share")
+        line = (f"[dim]orders[/dim] {chase['acks']:,} acked  "
+                f"[dim]·[/dim]  [dim]suppressed[/dim] {chase['suppressed']:,} "
+                f"[dim]({_pct(share, 1)})[/dim]  [dim]·[/dim]  "
+                f"[dim]ack[/dim] p50 {_ms(chase.get('ack_p50'))} "
+                f"p90 {_ms(chase.get('ack_p90'))}")
+        # Build+sign is sub-millisecond on a warm tick cache; printing "0ms"
+        # implies a stage that measured zero rather than one that isn't a
+        # stage. It earns a cell only once it costs something.
+        sign = chase.get("sign_p50")
+        if sign is not None and sign >= 1.0:
+            line += f"  [dim]·[/dim]  [dim]sign[/dim] p50 {_ms(sign)}"
+        elif sign is not None:
+            line += "  [dim]·[/dim]  [dim]sign <1ms[/dim]"
+        lines.append(line)
+    if chase.get("chase_n"):
+        med, mx = chase.get("buffer_med_c"), chase.get("buffer_max_c")
+        lines.append(f"[dim]pay-up[/dim] {chase['chased']:,} of "
+                     f"{chase['chase_n']:,} priced fires chased  [dim]·[/dim]  "
+                     f"[dim]buffer[/dim] median {med:.2f}c "
+                     f"[dim]· max {mx:.2f}c above the ask[/dim]")
+    return lines
+
+
+# ---------- demoted to --full ----------
+
 def calibration_table(cal: dict) -> Table:
-    """Did a clip fired at a stated fair actually hit that often? The bar is
-    colored against the bucket's OWN fair, so an over-confident bucket goes
-    red without the operator doing the arithmetic."""
+    """Did a clip fired at a stated fair actually hit that often?
+
+    Demoted behind --full: analysis/r6_report.txt answers the same question
+    per symbol AND duration at four thresholds over thousands of samples,
+    and this table's hit attribution is partly circular — a window with no
+    redeem row and no gamma read takes its winning side FROM our fired side,
+    so those buckets can only ever agree with the win rate.
+    """
     t = Table(box=None, pad_edge=False, padding=(0, 1))
     t.add_column("fair ≥", justify="right", width=6, no_wrap=True)
     t.add_column("clips", justify="right", width=6, no_wrap=True)
@@ -306,62 +433,107 @@ def calibration_table(cal: dict) -> Table:
     return t
 
 
-_ARMS_COLUMNS = (
-    ("window", "left", 14),
-    ("state", "left", 34),
-    ("fair", "right", 8),
-    ("committed", "right", 11),
-    ("roll", "center", 4),
+# Sized to hold "paying for itself" whole at 100 columns — the verdict is the
+# column an operator reads first, and an ellipsized one says nothing. The two
+# money headers are abbreviated to pay for it; gates_footer spells them out.
+_GATES_COLUMNS = (
+    ("refusal", "left", 12),
+    ("episodes", "right", 8),
+    ("priced", "right", 6),
+    ("hit %", "right", 5),
+    ("missed W", "right", 9),
+    ("avoided L", "right", 9),
+    ("net", "right", 10),
+    ("verdict", "left", 18),
 )
 
 
-def arms_table(arms: dict | None) -> Table:
-    """Live arms. Fixed widths with ellipsis overflow: a basis-guard reason is
-    a whole sentence, and letting it wrap tore every other column's alignment
-    apart — it goes through the same compact `margin -4.9 vs 6.0bp` renderer
-    the watch dashboard uses."""
-    from watch_ui import _gated_reason_compact
+def gates_table(report: dict, category_order: list[str], verdict) -> Table:
+    """`--gates`: what our own refusals cost or saved, per reason.
 
+    Sign convention is the shadow ledger's, not the P&L's: `net` is the
+    counterfactual money the refusals turned down, so POSITIVE is a gate
+    that cost us (over-tight) and NEGATIVE is a gate paying for itself.
+    That inversion is why the colors are flipped here relative to every
+    other money cell on the report.
+    """
     t = Table(box=None, pad_edge=False, padding=(0, 1))
-    for col, justify, width in _ARMS_COLUMNS:
+    for col, justify, width in _GATES_COLUMNS:
         t.add_column(col, justify=justify, width=width, no_wrap=True,
                      overflow="ellipsis")
-    for slug, a in (arms or {}).items():
-        a = a if isinstance(a, dict) else {}
-        e = a.get("eval")
-        e = e if isinstance(e, dict) else {}
-        state = e.get("state", "?")
-        if state == "gated":
-            state = f"[yellow]gated[/yellow] [dim]{_gated_reason_compact(e.get('reason'), e)}[/dim]"
-        elif state == "armed":
-            state = "[green]armed[/green]"
-        else:
-            state = f"[dim]{state}[/dim]"
-        fair = f"{e['p_up']:.4f}" if "p_up" in e else "[dim]—[/dim]"
-        committed = e.get("committed", a.get("filled_usdc", 0)) or 0.0
-        t.add_row(updown_slugs.display(slug), state, fair,
-                  f"${_zeroed(committed):,.2f}",
-                  "[green]⟳[/green]" if a.get("roll") else "[dim]·[/dim]")
+    cats = report.get("categories") or {}
+    for cat in category_order:
+        s = cats.get(cat)
+        if not s or not s["episodes"]:
+            continue
+        hr = _pct(s["hit_rate"]) if s["hit_rate"] is not None else "[dim]—[/dim]"
+        net = s["net"]
+        t.add_row(cat, f"{s['episodes']:,}", f"{s['priced']:,}", hr,
+                  f"{s['missed_wins']:,.0f}", f"{s['avoided_losses']:,.0f}",
+                  f"[{_pnl_color(-net)}]{net:+,.0f}[/]", verdict(s))
     return t
+
+
+def gates_footer(report: dict) -> list[str]:
+    totals, cov = report["totals"], report["coverage"]
+    net = totals["net"]
+    return [
+        f"[bold]total[/bold]  [dim]missed wins[/dim] {totals['missed_wins']:,.0f}"
+        f"  [dim]·[/dim]  [dim]avoided losses[/dim] {totals['avoided_losses']:,.0f}"
+        f"  [dim]·[/dim]  [dim]net[/dim] [bold {_pnl_color(-net)}]{net:+,.0f}[/]",
+        f"[dim]{cov['windows']:,} windows · {cov['unpriced_episodes']:,} unpriced "
+        f"(no recorded ask) · {cov['skipped_unresolved']:,} unresolved[/dim]",
+    ]
 
 
 # ---------- the whole report ----------
 
 def render_stats(sb: dict, eff: dict, bal: dict | None, status: dict | None,
-                 floor: float) -> Group:
-    """The single renderable `pmt crypto stats` prints. Sections that have no
-    data drop out entirely rather than printing an empty box."""
+                 floor: float, *, blocks: dict | None = None,
+                 full: bool = False, gates: dict | None = None) -> Group:
+    """The single renderable `pmt crypto stats` prints.
+
+    `blocks` carries the tape folds (polymarket.updown_stats): arm flags,
+    the maker experiment, the order path, the fleet ration. Sections with no
+    data drop out entirely rather than printing an empty box — an experiment
+    block with nothing in it is a claim the report has no business making.
+    """
     status = status or {}
-    parts: list = [header_panel(sb, eff, bal, status, floor), ""]
+    blocks = blocks or {}
+    parts: list = [header_panel(sb, eff, bal, status, floor, blocks.get("fleet")), ""]
 
     series = sb.get("series") or {}
+    flags = blocks.get("flags") or {}
     if series:
-        parts += [section("by series", "wallet-graded"),
-                  series_table(series, eff.get("breakeven_win_rate")), ""]
+        note = "wallet-graded"
+        if any(f.get("feed") == "rtds" or f.get("maker_bid") for f in flags.values()):
+            note += f" · {_RTDS_MARK} stream-fed · {_MAKER_MARK} maker bid"
+        parts += [section("by symbol", note),
+                  symbol_table(series, flags, eff.get("breakeven_win_rate")), ""]
 
     if eff.get("n"):
         parts += [section("effectiveness", "the win rate, corrected for size and time"),
                   effectiveness_table(eff), ""]
+
+    resting = resting_lines(blocks.get("maker") or {})
+    if resting:
+        parts += [section("resting bids", "maker step 0 — no-ask windows")]
+        parts += resting + [""]
+
+    chase = chase_lines(blocks.get("chase") or {})
+    if chase:
+        parts += [section("order path", "pay-up and the wire")]
+        parts += chase + [""]
+
+    if gates:
+        from polymarket import shadow
+
+        parts += [section("gates", "what our refusals cost, hindsight-priced"),
+                  gates_table(gates, shadow.CATEGORY_ORDER, shadow.verdict)]
+        parts += gates_footer(gates) + [""]
+
+    if not full:
+        return Group(*parts)
 
     cal = sb.get("cal") or {}
     if cal:
@@ -370,7 +542,14 @@ def render_stats(sb: dict, eff: dict, bal: dict | None, status: dict | None,
 
     arms = status.get("arms") or {}
     if arms:
-        parts += [section("live arms"), arms_table(arms)]
+        # watch's own arms table, not a second one: a static snapshot that
+        # drifts from the live dashboard is worse than no snapshot.
+        import time as _t
+
+        from watch_ui import build_arms_table
+
+        parts += [section("live arms", "a snapshot — `pmt crypto watch` for live"),
+                  build_arms_table(arms, _t.time())]
         if status.get("pending_rolls"):
             parts.append(f"[dim]pending rolls: {', '.join(status['pending_rolls'])}[/dim]")
     return Group(*parts)
