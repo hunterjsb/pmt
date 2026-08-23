@@ -1832,6 +1832,7 @@ def crypto_tape(n: int, follow: bool, as_json: bool) -> None:
 
 
 _TAPE_PATH = "/var/home/hunter/.pmt/engine/updown-tape.jsonl"
+_BOOK_TAPE_PATH = "/var/home/hunter/.pmt/engine/book-tape.jsonl"
 _V2_ERA = 1787441100
 
 
@@ -2168,6 +2169,19 @@ def _activity_page(addr: str, offset: int) -> list[dict]:
     ).json() or []
 
 
+def _fetch_wallet_activity(addr: str, floor: float) -> list[dict]:
+    """Every activity row back to `floor` (paginate until stale or exhausted)."""
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        page = _activity_page(addr, offset)
+        rows.extend(page)
+        if len(page) < 500 or (page and page[-1]["timestamp"] < floor):
+            break
+        offset += 500
+    return rows
+
+
 @crypto_group.command("activity")
 @click.option("--limit", "n", default=40, show_default=True, help="Rows to show")
 @click.option("--all", "show_all", is_flag=True,
@@ -2358,15 +2372,66 @@ def crypto_oracle(symbol: str, hours: float) -> None:
                       f"{span} · {corpus_path(sym)}")
 
 
+def _print_aligned_basis(symbol: str, hours: float, no_fetch: bool) -> None:
+    """TWAP-vs-TWAP aligned basis (ROADMAP.md R1) — per-minute + settlement-shaped,
+    the report that measures the error which actually decides wins/losses at the wire.
+    """
+    from polymarket.chainlink import ALIGNED_FETCH_BUFFER_H, SYMBOLS, aligned_basis_report, extend_all
+
+    symbols = SYMBOLS if symbol == "all" else [symbol]
+
+    if not no_fetch:
+        console.print(f"[dim]extending corpus to >= {hours:g}h for {', '.join(s.upper() for s in symbols)} ...[/dim]")
+        for sym, r in extend_all(hours + ALIGNED_FETCH_BUFFER_H, symbols).items():
+            if r["top_up_error"]:
+                console.print(f"[red]  {sym:5s} top-up failed: {r['top_up_error']}[/red]")
+            if r["backfill_error"]:
+                console.print(f"[red]  {sym:5s} backfill failed: {r['backfill_error']}[/red]")
+            console.print(f"  {sym:5s} +{r['topped']:<4d} recent  +{r['backfilled']:<5d} backfilled")
+        console.print()
+
+    for sym in symbols:
+        report = aligned_basis_report(sym, hours=hours)
+        if not report["per_minute"]:
+            console.print(f"[bold]{sym.upper()}/USD[/bold]  [dim]no corpus data — "
+                           f"run: pmt crypto oracle --symbol {sym}[/dim]\n")
+            continue
+
+        t = Table(title=f"{sym.upper()}/USD aligned basis — last {hours:g}h "
+                        f"({report['n_rounds']} rounds, {report['span_h']:.1f}h span)")
+        t.add_column("variant", justify="left")
+        for col in ("n", "mean", "std", "p50", "p90", "p95", "p99", "max"):
+            t.add_column(col, justify="right")
+        for label, s in (("per-minute", report["per_minute"]),
+                          ("settlement-5m", report["settlement_5m"]),
+                          ("settlement-15m", report["settlement_15m"])):
+            if s is None:
+                t.add_row(label, *(["—"] * 8))
+            else:
+                t.add_row(label, str(s["n"]), f"{s['mean']:.2f}", f"{s['std']:.2f}", f"{s['p50']:.2f}",
+                          f"{s['p90']:.2f}", f"{s['p95']:.2f}", f"{s['p99']:.2f}", f"{s['max']:.2f}")
+        console.print(t)
+        console.print()
+
+
 @crypto_group.command("basis")
 @click.option("--symbol", type=click.Choice(_ORACLE_SYMBOLS), default="all", show_default=True)
 @click.option("--hours", type=float, default=24.0, show_default=True, help="Corpus window to analyze")
-def crypto_basis(symbol: str, hours: float) -> None:
+@click.option("--aligned", is_flag=True,
+              help="TWAP-vs-TWAP aligned basis (per-minute + settlement-shaped) instead of point-in-time")
+@click.option("--no-fetch", is_flag=True, help="--aligned only: skip corpus extension, use what's on disk")
+def crypto_basis(symbol: str, hours: float, aligned: bool, no_fetch: bool) -> None:
     """Chainlink-vs-Binance basis distribution — the R1 decision input for per-symbol guards.
 
     Joins stored Chainlink rounds (`pmt crypto oracle`) against Binance 1m
     closes and reports basis_bp = (chainlink/binance - 1) * 1e4 per round.
+    --aligned switches to the TWAP-vs-TWAP method (ROADMAP.md R1), which
+    strips out the point-in-time method's up-to-60s timing noise.
     """
+    if aligned:
+        _print_aligned_basis(symbol, hours, no_fetch)
+        return
+
     from polymarket.chainlink import SYMBOLS, GUARD_BP, basis_report
 
     symbols = SYMBOLS if symbol == "all" else [symbol]
@@ -2399,6 +2464,80 @@ def crypto_basis(symbol: str, hours: float) -> None:
             console.print(f"[green]guard {guard:.1f}bp covers p95 |basis| {p95abs:.1f}bp ✓[/green]\n")
         else:
             console.print(f"[red]guard {guard:.1f}bp TOO TIGHT — p95 |basis| {p95abs:.1f}bp[/red]\n")
+
+
+@crypto_group.command("outcomes")
+@click.option("--since", type=float, default=0.0, show_default=True,
+              help="Epoch: only windows starting at/after this time")
+@click.option("--out", "out_path", type=str, default=None,
+              help="Outcomes file to append/update (default: ~/.pmt/corpus/outcomes.jsonl)")
+def crypto_outcomes(since: float, out_path: str | None) -> None:
+    """Build the validated outcomes file the replay harness needs (JSONL: slug/winner/source).
+
+    Strict priority: wallet redemption (we traded it, Polymarket already
+    settled and paid) beats Chainlink corpus inference (windows we never
+    touched) — and a Chainlink read is refused outright if the corpus can't
+    prove it was fresh enough at settlement time. See polymarket.outcomes
+    for why that guard exists; it's the fix for a real mislabeling incident.
+    """
+    import os
+    import time as _t
+    from pathlib import Path
+
+    from polymarket import chainlink as ck
+    from polymarket.outcomes import (
+        OUTCOMES_PATH, build_outcomes, extract_updown_slugs, load_outcomes,
+        merge_outcomes, wallet_outcomes, window_universe, write_outcomes,
+    )
+
+    addr = os.environ.get("PM_FUNDER_ADDRESS", "")
+    if not addr:
+        raise click.UsageError("PM_FUNDER_ADDRESS not set")
+    out_file = Path(out_path) if out_path else OUTCOMES_PATH
+
+    now = _t.time()
+    slugs: set[str] = set()
+    for path in (_BOOK_TAPE_PATH, _TAPE_PATH):
+        try:
+            with open(path) as fh:
+                slugs |= extract_updown_slugs(fh)
+        except FileNotFoundError:
+            continue
+    windows = window_universe(slugs, since, now)
+    if not windows:
+        console.print("[dim]No closed updown windows in range.[/dim]")
+        return
+
+    try:
+        activity = _fetch_wallet_activity(addr, windows[0]["start"])
+    except Exception as e:
+        console.print(f"[red]data-api unreachable: {e}[/red]")
+        sys.exit(1)
+    wallet = wallet_outcomes(activity)
+
+    symbols = {w["symbol"] for w in windows}
+    rounds_by_symbol = {sym: ck.load_corpus(sym) for sym in symbols}
+
+    rows, dropped = build_outcomes(windows, wallet, rounds_by_symbol)
+    existing = load_outcomes(out_file)
+    merged, added, upgraded = merge_outcomes(existing, rows)
+    write_outcomes(merged, out_file)
+
+    n_wallet = sum(1 for r in rows if r["source"] == "wallet")
+    n_chain = sum(1 for r in rows if r["source"] == "chainlink")
+    n_up = sum(1 for r in rows if r["winner"] == "up")
+    n_down = sum(1 for r in rows if r["winner"] == "down")
+
+    t = Table(title=f"outcomes — {len(windows)} windows evaluated")
+    t.add_column("source", justify="left")
+    t.add_column("n", justify="right")
+    t.add_row("wallet", str(n_wallet))
+    t.add_row("chainlink", str(n_chain))
+    t.add_row("dropped (stale)", str(len(dropped)))
+    console.print(t)
+    console.print(f"[dim]{added} new · {upgraded} upgraded chainlink→wallet · "
+                  f"winner split {n_up} up / {n_down} down[/dim]")
+    console.print(f"[dim]{out_file}  ({len(merged)} total rows)[/dim]")
 
 
 @cli.group("sports")
