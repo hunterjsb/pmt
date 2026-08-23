@@ -1136,7 +1136,12 @@ impl Engine {
                     let elapsed = last_tick.elapsed();
                     last_tick = Instant::now();
 
-                    tracing::info!(tick = tick_count, elapsed_ms = elapsed.as_millis(), "Tick");
+                    // Every tick at INFO was ~20 lines/s and ~10MB of log an
+                    // hour; a 30s heartbeat proves the loop is alive just as
+                    // well. Liveness checks read the control plane, not this.
+                    if tick_count.is_multiple_of(600) {
+                        tracing::info!(tick = tick_count, elapsed_ms = elapsed.as_millis(), "Tick");
+                    }
 
                     // Periodic position reconcile against the data-api, every
                     // 30 ENGINE TICKS — so ~1.5s under the launcher's 50ms
