@@ -323,6 +323,11 @@ pub(crate) struct ArmState {
     /// Throttle for the book/spot recorder — its own cadence, see
     /// book_sample_due.
     last_book_at: f64,
+    /// token -> newest trade timestamp already recorded. Print flow is
+    /// counted by high-water mark, not sampling window: data-api indexes
+    /// trades tens of seconds late, so a "trades in the last 6s" filter
+    /// matches nothing ever (the 22k-rows-of-zeros bug, 2026-08-23).
+    trade_hwm: std::collections::HashMap<String, i64>,
 }
 
 pub struct Updown {
@@ -458,6 +463,7 @@ impl ArmState {
             last_eval: None,
             last_tape_at: 0.0,
             last_book_at: 0.0,
+            trade_hwm: std::collections::HashMap::new(),
         }
     }
 
@@ -764,17 +770,24 @@ impl ArmState {
         if now < self.p.start || !book_sample_due(now, self.last_book_at, self.p.end) {
             return;
         }
-        let prev_sample = self.last_book_at;
         self.last_book_at = now;
-        // Signed print flow since the previous sample — the VPIN/R8 input.
-        // Polymarket prints are NOT backfillable; second-precision trade
-        // timestamps mean a print on a sample boundary can count twice
-        // (replay dedupes on (t, side, size) if it matters).
-        let flow = |token: &str| -> (i64, f64, f64) {
-            let window = ((now - prev_sample).ceil() as i64 + 1).clamp(1, 60);
+        // Signed print flow — the VPIN/R8 input, NOT backfillable. Counted
+        // by per-token high-water mark on trade timestamps: each sample
+        // takes every hub trade newer than the last one it recorded, so
+        // data-api's indexing lag shifts attribution by a sample or two
+        // but never drops a print. The wide fetch window covers the lag.
+        let start_floor = self.p.start as i64 - 1;
+        let (tok_up, tok_dn) = (self.p.token_up.clone(), self.p.token_down.clone());
+        let hwm_map = &mut self.trade_hwm;
+        let mut flow = |token: &str| -> (i64, f64, f64) {
+            let hwm = hwm_map.entry(token.to_string()).or_insert(start_floor);
             let mut n = 0i64;
             let (mut buys, mut sells) = (0.0, 0.0);
-            for tr in ctx.recent_trades(token, window) {
+            let mut newest = *hwm;
+            for tr in ctx.recent_trades(token, 180) {
+                if tr.timestamp <= *hwm {
+                    continue;
+                }
                 let sz = tr.size.to_f64().unwrap_or(0.0);
                 n += 1;
                 if tr.side.eq_ignore_ascii_case("buy") {
@@ -782,11 +795,13 @@ impl ArmState {
                 } else {
                     sells += sz;
                 }
+                newest = newest.max(tr.timestamp);
             }
+            *hwm = newest;
             (n, buys, sells)
         };
-        let (up_tn, up_tbuy, up_tsell) = flow(&self.p.token_up);
-        let (dn_tn, dn_tbuy, dn_tsell) = flow(&self.p.token_down);
+        let (up_tn, up_tbuy, up_tsell) = flow(&tok_up);
+        let (dn_tn, dn_tbuy, dn_tsell) = flow(&tok_dn);
         let level = |token: &str, ask: bool| -> (Option<f64>, Option<f64>) {
             let l = ctx
                 .order_books
