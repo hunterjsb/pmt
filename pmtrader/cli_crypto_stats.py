@@ -42,7 +42,15 @@ _GAMMA_TTL_S = 120  # watch's scoreboard refreshes every 10s; a slug's resolutio
 def _gamma_resolution_cached(slug: str) -> dict | None:
     """outcomes.gamma_resolution(), cached ~120s per slug so the watch
     dashboard's 10s scoreboard refresh doesn't hammer gamma. None on any
-    fetch/parse failure — callers must degrade gracefully, never guess."""
+    fetch/parse failure — callers must degrade gracefully, never guess.
+
+    THE ONE gamma resolution fetch in the codebase, and `closed=true` is the
+    load-bearing part of it. Gamma's /markets defaults to closed=false, so
+    without the flag every SETTLED window answers `[]` — which parses as "not
+    resolved yet" and rides forever. That is exactly how three resolved-lost
+    windows hid -$272.35 from the ledger for 13-25h on 2026-08-23; a window
+    that has not settled still answers `[]` here, which is the honest riding.
+    """
     import time as _t
 
     import requests
@@ -54,7 +62,8 @@ def _gamma_resolution_cached(slug: str) -> dict | None:
     if hit and now - hit[0] < _GAMMA_TTL_S:
         return hit[1]
     try:
-        r = requests.get(f"{hosts.GAMMA}/markets", params={"slug": slug},
+        r = requests.get(f"{hosts.GAMMA}/markets",
+                          params={"slug": slug, "closed": "true"},
                           headers=hosts.UA, timeout=8)
         r.raise_for_status()
         result = outcomes.gamma_resolution(r.json())
@@ -64,14 +73,18 @@ def _gamma_resolution_cached(slug: str) -> dict | None:
     return result
 
 
-def _impute_win_pnl(buy_usd: float, sell_usd: float, buy_shares: float) -> float:
-    """A gamma-confirmed WIN whose real $1/share redeem row hasn't posted yet
-    (Polymarket's auto-redeemer can lag minutes): impute the payout as
+def _impute_win_pnl(buy_usd: float, sell_usd: float, buy_shares: float,
+                     sell_shares: float = 0.0) -> float:
+    """A resolution-confirmed WIN whose real $1/share redeem row hasn't posted
+    yet (Polymarket's auto-redeemer can lag minutes): impute the payout as
     shares*$1 — what it will actually pay — so the $ figure tracks the W/L
     figure instead of showing a fake loss until the real redeem row lands
     and naturally replaces this estimate on a later scan.
+
+    Only the shares still HELD redeem. Counting sold shares at $1 as well as
+    banking their sale proceeds books the same shares twice.
     """
-    return buy_shares * 1.0 + sell_usd - buy_usd
+    return max(buy_shares - sell_shares, 0.0) * 1.0 + sell_usd - buy_usd
 
 
 def _tape_scoreboard(floor: float, sliding_floor: float | None = None,
@@ -151,10 +164,19 @@ def score_activity(rows: list[dict], floor: float,
                    sliding_floor: float | None = None,
                    ceiling: float | None = None,
                    tape_records: list[dict] | None = None) -> dict:
-    """W-L / realized P&L graded by the WALLET (data-api activity), not the
-    model's own final read — a model that's confidently wrong (XRP basis,
-    2026-08-23) would otherwise grade its own loss as a win. The tape only
-    contributes fire records (stated fairs) for the calibration table.
+    """W-L / realized P&L graded by the EXCHANGE — the wallet's own rows
+    first, and the market's settled resolution where the wallet is silent.
+    Never the model's own final read: a model that's confidently wrong (XRP
+    basis, 2026-08-23) would otherwise grade its own loss as a win, so a
+    chainlink or terminal-book label never decides a W or an L here. The tape
+    only contributes fire records (stated fairs) for the calibration table.
+
+    Resolution is on the exchange's side of that line, not ours — it is what
+    redeems are paid on — and it is the only evidence a LOSS can ever have,
+    because a losing position pays $0 and posts no wallet row at all. Grading
+    on wallet rows alone books every win and no silent loss (2026-08-23:
+    -$272.35 hidden across three windows). polymarket.outcomes has the full
+    ranking; the fixture freezer stays stricter and still demands "wallet".
 
     Pure aggregation over already-fetched activity `rows` (plus the local
     tape file and the TTL-cached gamma cross-check) — no wallet pagination of
@@ -198,7 +220,8 @@ def score_activity(rows: list[dict], floor: float,
             continue
         w = win_by_slug.setdefault(slug, {"buy": 0.0, "sell": 0.0, "redeem": 0.0,
                                           "redeem_seen": False, "won": None,
-                                          "buy_shares": 0.0,
+                                          "buy_shares": 0.0, "sell_shares": 0.0,
+                                          "buy_sides": set(),
                                           "buy_ts_usd": 0.0, "exit_ts": 0.0})
         usd = a.get("usdcSize") or 0.0
         ts = float(a.get("timestamp") or 0.0)
@@ -206,9 +229,14 @@ def score_activity(rows: list[dict], floor: float,
             w["buy" if a.get("side") == "BUY" else "sell"] += usd
             if a.get("side") == "BUY":
                 w["buy_shares"] += a.get("size") or 0.0
+                w["buy_sides"].add((a.get("outcome") or "").lower())
                 # Exposure-time accumulators (polymarket.effectiveness): the
                 # average dollar's entry, and when the capital came back.
                 w["buy_ts_usd"] += usd * ts
+            else:
+                # Shares out, not dollars out: what decides whether anything
+                # is still held at settlement (outcomes.exited_flat).
+                w["sell_shares"] += a.get("size") or 0.0
         elif a["type"] == "REDEEM":
             w["redeem"] += usd
             w["redeem_seen"] = True
@@ -253,14 +281,30 @@ def score_activity(rows: list[dict], floor: float,
                                {"w": 0, "l": 0, "open": 0, "pnl": 0.0, "usd": 0.0,
                                 "est": 0, "pnls": []})
         s["usd"] += w["buy"]
-        fired = fires.get(slug, [{}])[0].get("side")
-        # Redemption is silent (no row at all) or slow far more often than a
-        # loss actually is — a gamma round-trip is only worth it once the
-        # grace window has passed with no redeem of either kind.
-        gamma = (_gamma_resolution_cached(slug)
-                 if w["redeem"] <= 0.5 and not w["redeem_seen"] and now >= end + 300
-                 else None)
-        won, is_est = outcomes.grade_window(w["redeem"], w["redeem_seen"], fired, gamma, now, end)
+        # The side we HELD. The tape's fire names it, but the tape rotates and
+        # the wallet's BUY rows don't — without the fallback a window whose
+        # fire aged out can never be graded against a resolution, and rides
+        # forever (btc-updown-5m-1787419200, 26h). Mixed sides in one window
+        # mean we can't say which we held, so say nothing.
+        fired = (fires.get(slug, [{}])[0].get("side")
+                 or (next(iter(w["buy_sides"])) if len(w["buy_sides"]) == 1 else None)
+                 or None)
+        no_redeem = w["redeem"] <= 0.5 and not w["redeem_seen"]
+        if no_redeem and outcomes.exited_flat(w["buy_shares"], w["sell_shares"]):
+            # Sold flat before settlement: nothing left to redeem, so no wallet
+            # row and no resolution is ever coming. The P&L is already fully
+            # realized, and its sign is the whole verdict.
+            won, is_est = (w["sell"] - w["buy"]) > 0, False
+            gamma = None
+        else:
+            # Redemption is silent (no row at all) or slow far more often than a
+            # loss actually is — a resolution round-trip is only worth it once
+            # the grace window has passed with no redeem of either kind.
+            gamma = (_gamma_resolution_cached(slug)
+                     if no_redeem and now >= end + outcomes.RESOLUTION_GRACE_S
+                     else None)
+            won, is_est = outcomes.grade_window(w["redeem"], w["redeem_seen"],
+                                                 fired, gamma, now, end)
         if won is None:
             s["open"] += 1
             # Still riding — its bought notional is speculative exposure the
@@ -276,11 +320,12 @@ def score_activity(rows: list[dict], floor: float,
             riding_list.append(_window_row(slug, w, end, fired, None, None, False))
             continue
         pnl_est = is_est
-        if won and w["redeem"] <= 0.5 and not w["redeem_seen"]:
-            # Gamma confirmed the win before Polymarket's redeemer posted the
-            # real payout row — impute it so the $ figure doesn't lag the W/L
-            # figure by however long the slow auto-redeem takes.
-            pnl = _impute_win_pnl(w["buy"], w["sell"], w["buy_shares"])
+        if won and no_redeem and not outcomes.exited_flat(w["buy_shares"], w["sell_shares"]):
+            # Resolution confirmed the win before Polymarket's redeemer posted
+            # the real payout row — impute it so the $ figure doesn't lag the
+            # W/L figure by however long the slow auto-redeem takes. A window
+            # sold flat has no shares left to pay and needs no estimate.
+            pnl = _impute_win_pnl(w["buy"], w["sell"], w["buy_shares"], w["sell_shares"])
             pnl_est = True
         else:
             pnl = w["redeem"] + w["sell"] - w["buy"]
@@ -568,6 +613,9 @@ def _gates_report(activity: list[dict], since_epoch: float) -> dict:
 
     wallet_wins = outcomes.wallet_outcomes(activity)
     rounds_by_symbol = {w["symbol"]: ck.load_corpus(w["symbol"]) for w in windows}
+    # No resolution lookups here on purpose: that is one gamma round-trip per
+    # ungraded window, and `pmt crypto outcomes` already banks them into the
+    # corpus — which load_outcomes below picks up for free.
     rows, _dropped = outcomes.build_outcomes(windows, wallet_wins, rounds_by_symbol)
 
     merged, _added, _upgraded = outcomes.merge_outcomes(outcomes.load_outcomes(), rows)

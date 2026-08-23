@@ -328,6 +328,42 @@ def _refresh_oracle_corpus(symbols: list[str], since: float, now: float) -> dict
     return result
 
 
+def _resolution_winners(windows: list[dict], existing: dict[str, dict],
+                         wallet_wins: dict[str, str], now: float) -> dict[str, str]:
+    """{slug: winner} off the markets' own settled resolutions.
+
+    One gamma round-trip per window that still needs one, and the skips are
+    what keep that bounded: a slug the wallet graded this run, or whose corpus
+    row is already wallet/resolution, is already at or above this source's
+    rank and is left alone — so the first run backfills and later runs cost
+    only the windows that closed since.
+
+    A window inside the settlement grace is skipped rather than asked: gamma
+    would honestly answer "not resolved" and we'd bake that into the corpus.
+    """
+    from polymarket import outcomes
+
+    todo = [w for w in windows
+            if now >= w["end"] + outcomes.RESOLUTION_GRACE_S
+            and w["slug"] not in wallet_wins
+            and not outcomes.is_terminal_source((existing.get(w["slug"]) or {}).get("source"))]
+    if not todo:
+        return {}
+    console.print(f"[dim]market resolution: querying gamma for {len(todo)} window(s) ...[/dim]")
+    out: dict[str, str] = {}
+    unreachable = 0
+    for w in todo:
+        res = _gamma_resolution_cached(w["slug"])
+        if res is None:
+            unreachable += 1
+        elif res.get("resolved") and res.get("winner"):
+            out[w["slug"]] = res["winner"]
+    if unreachable:
+        console.print(f"[yellow]{unreachable} resolution lookup(s) failed — "
+                       f"those windows fall through to chainlink/book[/yellow]")
+    return out
+
+
 @click.command("outcomes")
 @click.option("--since", type=float, default=0.0, show_default=True,
               help="Epoch: only windows starting at/after this time")
@@ -335,7 +371,12 @@ def _refresh_oracle_corpus(symbols: list[str], since: float, now: float) -> dict
               help="Outcomes file to append/update (default: ~/.pmt/corpus/outcomes.jsonl)")
 @click.option("--fetch-only", is_flag=True,
               help="Refresh the Chainlink corpus for the windows in range, then stop (no grading)")
-def crypto_outcomes(since: float, out_path: str | None, fetch_only: bool) -> None:
+@click.option("--resolution/--no-resolution", default=True, show_default=True,
+              help="Ask gamma for each ungraded window's settled outcome. One "
+                   "request per window that needs one — the first run backfills, "
+                   "later runs only pay for windows that closed since")
+def crypto_outcomes(since: float, out_path: str | None, fetch_only: bool,
+                    resolution: bool) -> None:
     """Build the validated outcomes file the replay harness needs (JSONL: slug/winner/source).
 
     Refreshes the Chainlink round corpus (~/.pmt/corpus/chainlink-{sym}.jsonl,
@@ -345,11 +386,13 @@ def crypto_outcomes(since: float, out_path: str | None, fetch_only: bool) -> Non
     already on disk; it never grades stale silently, because the staleness
     guards in polymarket.outcomes still refuse anything the corpus can't prove.
 
-    Strict priority: wallet redemption (we traded it, Polymarket already
-    settled and paid) beats Chainlink corpus inference (windows we never
-    touched) — and a Chainlink read is refused outright if the corpus can't
-    prove it was fresh enough at settlement time. See polymarket.outcomes
-    for why that guard exists; it's the fix for a real mislabeling incident.
+    Strict priority, strongest first: wallet redemption (Polymarket settled and
+    PAID us), then the market's own resolution off gamma (what it pays redeems
+    on — the exchange's answer, not ours), then Chainlink corpus inference and
+    the terminal book (our reads, for windows we never touched, and refused
+    outright when they can't prove they were trustworthy at settlement time).
+    See polymarket.outcomes for why those guards exist and for the line between
+    the sources allowed to grade a W-L and the ones that never are.
     """
     import time as _t
     from pathlib import Path
@@ -400,26 +443,29 @@ def crypto_outcomes(since: float, out_path: str | None, fetch_only: bool) -> Non
         if end is not None and r.get("t", 0) >= end - BOOK_TERMINAL_S:
             book_by_slug.setdefault(r["slug"], []).append(r)
 
-    rows, dropped = build_outcomes(windows, wallet_wins, rounds_by_symbol, book_by_slug)
     existing = load_outcomes(out_file)
+    resolution_by_slug = (_resolution_winners(windows, existing, wallet_wins, now)
+                          if resolution else {})
+
+    rows, dropped = build_outcomes(windows, wallet_wins, rounds_by_symbol, book_by_slug,
+                                    resolution_by_slug)
     merged, added, upgraded = merge_outcomes(existing, rows)
     write_outcomes(merged, out_file)
 
-    n_wallet = sum(1 for r in rows if r["source"] == "wallet")
-    n_chain = sum(1 for r in rows if r["source"] == "chainlink")
-    n_book = sum(1 for r in rows if r["source"] == "book")
+    by_source = {s: sum(1 for r in rows if r["source"] == s)
+                 for s in ("wallet", "resolution", "chainlink", "book")}
     n_up = sum(1 for r in rows if r["winner"] == "up")
     n_down = sum(1 for r in rows if r["winner"] == "down")
 
     t = Table(title=f"outcomes — {len(windows)} windows evaluated")
     t.add_column("source", justify="left")
     t.add_column("n", justify="right")
-    t.add_row("wallet", str(n_wallet))
-    t.add_row("chainlink", str(n_chain))
-    t.add_row("book (terminal)", str(n_book))
+    for label, key in (("wallet", "wallet"), ("resolution (gamma)", "resolution"),
+                        ("chainlink", "chainlink"), ("book (terminal)", "book")):
+        t.add_row(label, str(by_source[key]))
     t.add_row("dropped (stale)", str(len(dropped)))
     console.print(t)
-    console.print(f"[dim]{added} new · {upgraded} upgraded chainlink→wallet · "
+    console.print(f"[dim]{added} new · {upgraded} upgraded to a stronger source · "
                   f"winner split {n_up} up / {n_down} down[/dim]")
     console.print(f"[dim]{out_file}  ({len(merged)} total rows)[/dim]")
 

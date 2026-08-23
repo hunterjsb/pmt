@@ -155,6 +155,131 @@ def test_tape_scoreboard_without_sliding_floor_omits_sliding_key(monkeypatch):
     assert "sliding" not in sb
 
 
+# ---------- a LOST window is only ever visible in the market's resolution ----------
+#
+# The class of bug these pin (2026-08-23, real money): a losing position pays
+# $0 and posts NO wallet row at all, so grading W-L off wallet rows alone books
+# every win and can never book a silent loss. Three resolved-lost windows sat
+# "riding" for 13-25h hiding -$272.35.
+
+def test_a_resolved_window_we_lost_grades_as_a_loss_and_leaves_riding(monkeypatch):
+    """Filled position + no redeem row of any kind + the market resolved the
+    OTHER way. There is no wallet evidence and there never will be — the
+    resolution is the only thing that can decide this window."""
+    now = int(time.time())
+    start = now - 50_000                       # long past the settlement grace
+    slug = f"eth-updown-5m-{start}"
+    rows = [
+        {"type": "TRADE", "side": "BUY", "usdcSize": 147.91, "size": 1736.0,
+         "outcome": "Down", "slug": slug, "timestamp": start + 186},
+    ]
+    fires = {slug: [{"ev": "fire", "slug": slug, "side": "down", "fair": 0.99,
+                      "t": start + 186}]}
+    _install_fake_pipeline(monkeypatch, rows, fires,
+                            {slug: {"resolved": True, "winner": "up"}})
+
+    sb = cs._tape_scoreboard(0.0)
+    assert sb["riding_n"] == 0 and sb["riding_windows"] == []
+    assert (sb["wins"], sb["losses"]) == (0, 1)
+    assert sb["net"] == pytest.approx(-147.91)   # the whole stake, not $0
+    w, = sb["windows"]
+    assert w["won"] is False and w["est"] is False   # confirmed, not a guess
+
+
+def test_a_resolved_loss_is_graded_even_after_its_fire_rotated_off_the_tape(monkeypatch):
+    """The tape rotates; the wallet's BUY rows don't. Without the wallet-side
+    fallback the resolution can't be matched to a side and the window rides
+    forever — which is how btc-updown-5m-1787419200 showed side=None."""
+    now = int(time.time())
+    start = now - 50_000
+    slug = f"sol-updown-5m-{start}"
+    rows = [
+        {"type": "TRADE", "side": "BUY", "usdcSize": 106.12, "size": 237.0,
+         "outcome": "Down", "slug": slug, "timestamp": start + 210},
+    ]
+    _install_fake_pipeline(monkeypatch, rows, {},   # no fire record at all
+                            {slug: {"resolved": True, "winner": "up"}})
+
+    sb = cs._tape_scoreboard(0.0)
+    assert sb["riding_n"] == 0
+    assert (sb["wins"], sb["losses"]) == (0, 1)
+    w, = sb["windows"]
+    assert w["side"] == "down" and w["won"] is False
+
+
+def test_a_window_bought_on_both_sides_stays_riding_rather_than_guessing(monkeypatch):
+    """Two sides held and no fire: which one did we hold? Nothing here knows,
+    so it says nothing — the fallback is evidence, not a coin flip."""
+    now = int(time.time())
+    start = now - 50_000
+    slug = f"xrp-updown-5m-{start}"
+    rows = [
+        {"type": "TRADE", "side": "BUY", "usdcSize": 5.0, "size": 6.0,
+         "outcome": "Up", "slug": slug, "timestamp": start + 60},
+        {"type": "TRADE", "side": "BUY", "usdcSize": 5.0, "size": 6.0,
+         "outcome": "Down", "slug": slug, "timestamp": start + 90},
+    ]
+    _install_fake_pipeline(monkeypatch, rows, {},
+                            {slug: {"resolved": True, "winner": "up"}})
+
+    sb = cs._tape_scoreboard(0.0)
+    assert sb["riding_n"] == 1 and (sb["wins"], sb["losses"]) == (0, 0)
+
+
+def test_a_window_sold_flat_is_decided_by_its_realized_pnl_not_by_a_redeem(monkeypatch):
+    """btc-updown-5m-1787419200: bought 100sh @0.43, closed the lot out @0.80
+    before settlement. Nothing is left to redeem, so no wallet row and no
+    resolution is ever coming — waiting for one rode it for 26h at $44.72."""
+    now = int(time.time())
+    start = now - 90_000
+    slug = f"btc-updown-5m-{start}"
+    rows = [
+        {"type": "TRADE", "side": "BUY", "usdcSize": 44.7157, "size": 100.0,
+         "outcome": "Down", "slug": slug, "timestamp": start + 121},
+        {"type": "TRADE", "side": "SELL", "usdcSize": 79.9989, "size": 99.998625,
+         "outcome": "Down", "slug": slug, "timestamp": start + 201},
+    ]
+    # Resolution says our side won — irrelevant, the shares were already gone.
+    _install_fake_pipeline(monkeypatch, rows, {},
+                            {slug: {"resolved": True, "winner": "down"}})
+
+    sb = cs._tape_scoreboard(0.0)
+    assert sb["riding_n"] == 0 and sb["riding_windows"] == []
+    assert (sb["wins"], sb["losses"]) == (1, 0)
+    w, = sb["windows"]
+    # Realized, not imputed: the $1/share payout it never collected would be
+    # a $100 phantom on a window that made $35.
+    assert w["pnl"] == pytest.approx(35.2832) and w["est"] is False
+
+
+def test_the_resolution_lookup_asks_gamma_for_closed_markets(monkeypatch):
+    """THE bug. /markets?slug=X defaults to closed=false, so every SETTLED
+    window answers `[]` — which parses as "not resolved yet" and rides
+    forever. Drop the flag and the hidden-loss class comes straight back."""
+    seen = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return [{"outcomes": '["Up", "Down"]', "outcomePrices": '["1", "0"]'}]
+
+    def _get(url, params=None, headers=None, timeout=None):
+        seen.update(params or {})
+        return _Resp()
+
+    import requests
+    monkeypatch.setattr(requests, "get", _get)
+    cs._GAMMA_CACHE.clear()
+    try:
+        assert cs._gamma_resolution_cached("eth-updown-5m-1787462100") == {
+            "resolved": True, "winner": "up"}
+    finally:
+        cs._GAMMA_CACHE.clear()
+    assert seen.get("closed") == "true", "settled markets are invisible without it"
+
+
 # ---------- imputed win pnl (inline fixture) ----------
 
 def test_impute_win_pnl_no_sells():
@@ -163,8 +288,12 @@ def test_impute_win_pnl_no_sells():
     assert cs._impute_win_pnl(buy_usd=18.0, sell_usd=0.0, buy_shares=20.0) == pytest.approx(2.0)
 
 
-def test_impute_win_pnl_with_partial_sell():
-    assert cs._impute_win_pnl(buy_usd=18.0, sell_usd=3.0, buy_shares=20.0) == pytest.approx(5.0)
+def test_impute_win_pnl_only_imputes_the_shares_still_held():
+    # 20 bought for $18, 5 of them sold for $3: only 15 shares are left to
+    # redeem at $1. Imputing all 20 AND banking the $3 books those 5 twice
+    # (it would say +$5 on a window actually worth $15 + $3 - $18 = $0).
+    assert cs._impute_win_pnl(buy_usd=18.0, sell_usd=3.0, buy_shares=20.0,
+                               sell_shares=5.0) == pytest.approx(0.0)
 
 
 # ---------- per-series median (the row the totals hide) ----------
