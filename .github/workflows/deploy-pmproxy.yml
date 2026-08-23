@@ -99,7 +99,7 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: arn:aws:iam::350985642081:role/pmproxy-ci-deploy
+          role-to-assume: ${{ vars.PMPROXY_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       # Push new code directly via the Lambda API. Infrastructure config changes
