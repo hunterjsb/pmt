@@ -21,7 +21,7 @@ Two rules this module enforces rather than documents:
 
 Everything here is pure (no network, no ambient disk) so the slicing,
 param-reconstruction and redaction rules are unit-testable; `pmt crypto
-fixture` in cli_crypto.py does the I/O and calls in.
+fixture` in cli_crypto_fixture.py does the I/O and calls in.
 """
 
 from __future__ import annotations
@@ -217,7 +217,7 @@ def rtds_slice(rows: Iterable[dict], symbol: str, start: int,
 def wallet_accounting(activity_rows: Iterable[dict], slug: str) -> dict:
     """What the money did on one window, from wallet activity rows.
 
-    Mirrors cli_crypto.score_activity's aggregation over the same rows. The
+    Mirrors cli_crypto_stats.score_activity's aggregation over the same rows. The
     `winner` is NOT derived here — it comes from the graded outcomes corpus,
     which already applies L22/L23's dust-redeem rules; this only accounts.
     """

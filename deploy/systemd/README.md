@@ -54,8 +54,7 @@ What it ships, once a day, as one `.tar.zst` object:
 - `~/.pmt/corpus/**` — the RTDS stream recording (already one file per day, so
   a restore can take a single dark day back), the klines and Chainlink pulls
   behind every replay, the outcomes and activity corpora.
-- `~/.pmt/engine/*.jsonl` — `updown-tape`, `book-tape`, `order-latency-tape`,
-  `ledger-drift`.
+- `~/.pmt/engine/*.jsonl` — `updown-tape`, `book-tape`, `order-latency-tape`.
 - `~/.pmt/engine/arms-state.json` — what comes back after a restart.
 
 What it deliberately leaves behind: the rotated engine logs (`*.log`,

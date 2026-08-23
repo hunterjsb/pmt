@@ -8,9 +8,9 @@ PRIVATE location, never the repo, because it is a running record of a real
 book.
 
 Everything here is PURE detection over inputs the caller already read (graded
-windows from cli_crypto.score_activity, tape records from polymarket.tape,
-the shadow ledger's own episode pipeline, arms-state). cli_crypto does the
-I/O. Nothing below recomputes a grade, a streak, an episode or a clip size:
+windows from cli_crypto_stats.score_activity, tape records from
+polymarket.tape, the shadow ledger's own episode pipeline, arms-state).
+`pmt crypto journal` in cli_crypto_data.py does the I/O. Nothing below recomputes a grade, a streak, an episode or a clip size:
 every class is built out of the module that already owns that question, so a
 journal line cannot disagree with the report it was written beside.
 

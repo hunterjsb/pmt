@@ -138,8 +138,10 @@ get_order_book_depth(token_id)       # full ladder, not aggregated
 ```
 pmtrader/
 ├── cli.py              # pmt CLI (click)
-├── cli_crypto.py       # `pmt crypto ...` — up/down pricing, trigger, tape tooling
-├── cli_common.py       # the one Rich console + lazy API loader shared by both
+├── cli_crypto.py       # `pmt crypto ...` — command registration only; each
+│                    #   command lives in a cli_crypto_<area>.py beside it
+│                    #   (arm/stats/watch/data/fixture)
+├── cli_common.py       # the one Rich console + lazy API loader shared by all
 ├── engine.py           # pmengine control-plane client
 ├── scanners/           # market scanners (expiring, order-book)
 └── polymarket/

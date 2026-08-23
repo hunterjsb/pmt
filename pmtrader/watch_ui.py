@@ -2,7 +2,7 @@
 
 Every function here turns already-fetched data into text, Rich markup, or a
 Rich renderable. No network, no engine calls, no wallet walks — that all lives
-on cli_crypto's WatchFetcher thread (docs/LESSONS.md#L28), which is exactly why
+on cli_crypto_watch's WatchFetcher thread (docs/LESSONS.md#L28), which is why
 this file is unit-testable without a single mock: hand it a dict, read the
 string back.
 

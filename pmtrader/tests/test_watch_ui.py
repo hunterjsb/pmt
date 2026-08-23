@@ -7,7 +7,8 @@ Every dashboard render function must tolerate a missing/partial eval (an
 engine restart mid-watch leaves last_eval None or half-built) — several tests
 below exist specifically to pin that behavior down.
 
-The fetch/grade side of the same dashboard is tested in test_cli_crypto.py.
+The fetch/grade side of the same dashboard is tested in
+test_cli_crypto_watch.py and test_cli_crypto_stats.py.
 """
 
 from __future__ import annotations

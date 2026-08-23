@@ -3,10 +3,10 @@ high-water-mark / seen-key idempotency contract, state survival across runs,
 and the markdown the file actually accumulates.
 
 Every fixture below is inline — graded windows shaped like
-cli_crypto.score_activity's `eff_windows`, raw tape lines shaped like the
+cli_crypto_stats.score_activity's `eff_windows`, raw tape lines shaped like the
 engine's own, arms shaped like arms-state.json. No network, no ~/.pmt, no
 engine: the whole module is pure detection over already-read inputs, which is
-the point of keeping the I/O in cli_crypto.
+the point of keeping the I/O in cli_crypto_data.
 """
 
 from __future__ import annotations

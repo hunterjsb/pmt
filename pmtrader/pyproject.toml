@@ -33,7 +33,13 @@ build-backend = "setuptools.build_meta"
 include = ["polymarket*", "scanners*"]
 
 [tool.setuptools]
-py-modules = ["cli", "cli_crypto", "cli_sports", "cli_common", "engine", "stats_render", "watch_ui"]
+# Every top-level module ships explicitly — a cli_crypto_* module missing from
+# this list imports fine from the source tree and ImportErrors once installed.
+py-modules = [
+    "cli", "cli_common", "cli_sports", "engine", "stats_render", "watch_ui",
+    "cli_crypto", "cli_crypto_arm", "cli_crypto_data", "cli_crypto_fixture",
+    "cli_crypto_stats", "cli_crypto_watch",
+]
 
 [tool.pytest.ini_options]
 markers = [

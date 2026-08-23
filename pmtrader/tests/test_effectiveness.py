@@ -13,7 +13,7 @@ import math
 
 import pytest
 
-import cli_crypto as cc
+import cli_crypto_stats as cc
 from polymarket import effectiveness as eff
 
 
@@ -281,9 +281,9 @@ def test_header_line_is_gone_because_nothing_ever_read_it():
     assert not hasattr(eff, "header_line")
 
 
-# ---------- wiring: cli_crypto -> effectiveness ----------
+# ---------- wiring: cli_crypto_stats -> effectiveness ----------
 #
-# These live here rather than in test_cli_crypto.py so the whole metric —
+# These live here rather than in test_cli_crypto_stats.py so the whole metric —
 # accumulation, exposure timing, and the bankroll denominator — is pinned in
 # one file.
 
@@ -350,7 +350,7 @@ def test_eff_table_renders_dashes_on_an_empty_book():
     con = Console(file=io.StringIO(), width=200)
     con.print(stats_render.effectiveness_table(eff.summary([])))
     assert "—" in con.file.getvalue()
-    # the cli_crypto and watch_ui shims that used to wrap this are gone: one
+    # the cli_crypto_stats and watch_ui shims that used to wrap this are gone: one
     # implementation, so the report and the dashboard cannot drift.
     assert not hasattr(cc, "_eff_table")
 

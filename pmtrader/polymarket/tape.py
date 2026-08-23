@@ -3,7 +3,7 @@
 Every consumer (the fleet scoreboard, `stats --gates`, the `watch`
 dashboard, `pmt crypto tape`) used to open the tape file and run its own
 json.loads loop with "fire"/"eval"/"gated"/... literals sprinkled through
-cli_crypto.py and polymarket/shadow.py. One place for the paths, the
+the cli_crypto_* modules and polymarket/shadow.py. One place for the paths, the
 event-name constants, and (for full-file scans) the parsing loop itself.
 
 iter_records skips corrupt lines instead of raising — a line can be

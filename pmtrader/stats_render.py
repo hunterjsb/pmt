@@ -5,7 +5,7 @@ Every function here is pure: it takes dicts that have ALREADY been computed
 balance, the engine's /status reply, the tape folds from
 polymarket.updown_stats) and returns a Rich renderable. No network, no
 aggregation, no clock beyond a floor label. That split is the point:
-cli_crypto.py owns fetching and grading, this file owns pixels, and the
+cli_crypto_stats.py owns fetching and grading, this file owns pixels, and the
 report can be redesigned without touching a single number.
 
 The default report reads top-down in the order an operator actually asks:
