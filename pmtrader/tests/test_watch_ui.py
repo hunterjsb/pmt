@@ -13,8 +13,10 @@ The fetch/grade side of the same dashboard is tested in test_cli_crypto.py.
 from __future__ import annotations
 
 import json
+from collections import deque
 
 import click
+import pytest
 
 import watch_ui as cc
 
@@ -433,6 +435,308 @@ def test_build_arms_table_column_geometry_is_identical_across_states():
         }},
     })
     assert short[0] == long_[0] == long_[1]
+
+
+# ---------- tape run-collapsing ----------
+#
+# The collapser's ONE safety property: it may hide repetition, never a
+# transition. Most of what follows is that property stated once per material
+# field — if a trigger below stops breaking its run, a real state change went
+# invisible on the dashboard.
+
+_BTC = "btc-updown-5m-1700000000"
+_ETH = "eth-updown-5m-1700000000"
+_T0 = 1700000000
+
+
+def _collapse(*records, lines=None):
+    """Feed records (dicts) through a fresh collapser; return the rendered
+    deque, unstyled."""
+    c = cc.TapeCollapser()
+    lines = deque(maxlen=200) if lines is None else lines
+    for r in records:
+        c.add(json.dumps(r), lines)
+    return [click.unstyle(ln) for ln in lines]
+
+
+def _basis(i=0, slug=_BTC, margin=1.0, guard=6.0, **over):
+    r = {"t": _T0 + i, "slug": slug, "ev": "gated",
+         "reason": "basis guard: projected margin +1.0bp inside 6.0bp noise band",
+         "margin_bp": margin, "guard_bp": guard}
+    r.update(over)
+    return r
+
+
+def _eval(i=0, slug=_BTC, **over):
+    r = {"t": _T0 + i, "slug": slug, "ev": "eval", "p_up": 0.9800, "rho": 0.20,
+         "committed": 5.00, "banked_decided": False, "state": "armed", "mode": "safe",
+         "sides": [{"side": "up", "ask": 0.97, "net": 0.0100, "safety": 0.40},
+                    {"side": "down", "ask": 0.05, "net": -0.0200, "safety": -0.40}]}
+    r.update(over)
+    return r
+
+
+def _gate(i=0, slug=_BTC, reason="theta 0.12 below band 0.30", **over):
+    r = {"t": _T0 + i, "slug": slug, "ev": "gated", "reason": reason}
+    r.update(over)
+    return r
+
+
+def _fire(i=0, slug=_BTC, **over):
+    r = {"t": _T0 + i, "slug": slug, "ev": "fire", "side": "up", "ask": 0.97,
+         "fair": 0.99, "net": 0.01, "size": 10, "committed": 5.0, "rho": 0.1,
+         "mode": "safe"}
+    r.update(over)
+    return r
+
+
+# --- basis guard: the shape that already shipped, unchanged ---
+
+def test_basis_guard_run_collapses_every_arm_onto_one_line():
+    out = _collapse(_basis(0, _BTC, margin=1.0), _basis(1, _ETH, margin=-4.9),
+                    _basis(2, _BTC, margin=2.0))
+    assert len(out) == 1
+    assert "gated ×3" in out[0]
+    # freshest margin per symbol, sorted, on one line — the pre-abstraction shape
+    assert "basis bp/guard: btc +2.0/6 · eth -4.9/6" in out[0]
+
+
+def test_basis_guard_run_ends_on_any_other_event():
+    out = _collapse(_basis(0), _basis(1), _eval(2), _basis(3))
+    assert len(out) == 3
+    assert "gated ×2" in out[0]
+    assert "eval" in out[1]
+    assert "gated ×1" in out[2]  # a fresh run, counted from one
+
+
+def test_basis_guard_falls_back_to_the_regex_on_a_pre_structured_record():
+    out = _collapse(_basis(0, margin_bp=None, guard_bp=None,
+                            reason=("basis guard: projected margin -4.9bp inside "
+                                    "6.0bp noise band")))
+    assert "btc -4.9/6" in out[0]
+
+
+# --- eval runs ---
+
+def test_eval_run_collapses_with_a_count_and_its_span():
+    out = _collapse(*[_eval(i) for i in range(4)])
+    assert len(out) == 1
+    assert "×4" in out[0]
+    span = f"⟨{cc._hms(_T0)}→{cc._hms(_T0 + 3)}⟩"
+    assert span in out[0], out[0]
+    assert "p↑0.9800" in out[0]  # freshest values, rendered as a normal eval line
+
+
+def test_a_lone_eval_renders_byte_identically_to_an_uncollapsed_one():
+    # No ×1 and no span: a run of one is just a record, and the collapser must
+    # not change how the quiet case looks.
+    rec = _eval(0)
+    lines = deque()
+    cc.TapeCollapser().add(json.dumps(rec), lines)
+    assert lines[0] == cc._tape_render(json.dumps(rec))
+
+
+_MATERIAL = [
+    ("p_up", {"p_up": 0.9950}),                       # > 0.01
+    ("committed", {"committed": 5.50}),               # > $0.01
+    ("banked_decided", {"banked_decided": True}),
+    ("mode", {"mode": "spec"}),
+    ("quiesce_state", {"state": "quiesce"}),
+    ("maker_candidate", {"maker_candidate": True}),
+    ("maker_rest", {"maker_rest": 0.955}),
+    # best side flips to down on a net move far inside the 0.5¢ tolerance:
+    # WHICH side is best is discrete, not a number that drifted.
+    ("best_side", {"sides": [{"side": "up", "ask": 0.97, "net": 0.0100, "safety": 0.40},
+                              {"side": "down", "ask": 0.05, "net": 0.0101, "safety": -0.40}]}),
+    ("best_net", {"sides": [{"side": "up", "ask": 0.97, "net": 0.0180, "safety": 0.40},
+                             {"side": "down", "ask": 0.05, "net": -0.0200, "safety": -0.40}]}),
+    ("brake_set", {"sides": [{"side": "up", "ask": 0.97, "net": 0.0100, "safety": 0.40,
+                               "brake": "safety"},
+                              {"side": "down", "ask": 0.05, "net": -0.0200, "safety": -0.40}]}),
+    ("safety_badge", {"sides": [{"side": "up", "ask": 0.97, "net": 0.0100, "safety": 0.10},
+                                 {"side": "down", "ask": 0.05, "net": -0.0200,
+                                  "safety": -0.40}]}),
+    ("side_went_dark", {"sides": [{"side": "up", "ask": 0.97, "net": 0.0100, "safety": 0.40},
+                                   {"side": "down", "ask": 0.05, "net": -0.0200,
+                                    "safety": None}]}),
+]
+
+
+@pytest.mark.parametrize("name,change", _MATERIAL, ids=[n for n, _ in _MATERIAL])
+def test_every_material_change_ends_an_eval_run_and_renders_fresh(name, change):
+    out = _collapse(_eval(0), _eval(1), _eval(2, **change))
+    assert len(out) == 2, f"{name} was collapsed away: {out}"
+    assert "×2" in out[0]
+    assert "×" not in out[1], out[1]  # the fresh line is a run of one
+
+
+def test_sub_tolerance_wobble_does_not_end_an_eval_run():
+    # Every number moved, none of them far enough to repaint differently.
+    out = _collapse(
+        _eval(0),
+        _eval(1, p_up=0.9850, committed=5.005,
+              sides=[{"side": "up", "ask": 0.97, "net": 0.0140, "safety": 0.40},
+                     {"side": "down", "ask": 0.05, "net": -0.0200, "safety": -0.40}]))
+    assert len(out) == 1 and "×2" in out[0]
+
+
+def test_a_slow_drift_still_breaks_the_run_because_tolerance_is_anchored():
+    # 0.008 a tick is under tolerance every tick; chained comparison would let
+    # p_up walk anywhere. Anchored to the run's first record, it breaks.
+    out = _collapse(_eval(0, p_up=0.9800), _eval(1, p_up=0.9880), _eval(2, p_up=0.9960))
+    assert len(out) == 2, out
+    assert "×2" in out[0] and "0.9960" in out[1]
+
+
+def test_interleaved_arms_collapse_independently_instead_of_thrashing():
+    recs = []
+    for i in range(6):
+        recs += [_eval(i, _BTC), _eval(i, _ETH)]
+    out = _collapse(*recs)
+    assert len(out) == 2, out  # one live line per arm, not twelve
+    assert all("×6" in ln for ln in out)
+    assert "btc" in out[0] and "eth" in out[1]
+
+
+def test_one_arms_material_change_leaves_the_other_arms_run_alone():
+    recs = [_eval(0, _BTC), _eval(0, _ETH), _eval(1, _BTC), _eval(1, _ETH),
+            _eval(2, _BTC, p_up=0.5), _eval(2, _ETH)]
+    out = _collapse(*recs)
+    assert len(out) == 3, out
+    assert "×2" in out[0] and "btc" in out[0]      # btc's run, closed
+    assert "×3" in out[1] and "eth" in out[1]      # eth's run, still running
+    assert "btc" in out[2] and "×" not in out[2]   # btc's fresh line
+
+
+# --- non-basis gate runs ---
+
+def test_theta_gate_run_collapses_per_arm():
+    out = _collapse(*[_gate(i) for i in range(5)])
+    assert len(out) == 1
+    assert "×5" in out[0] and "theta 0.12 below band 0.30" in out[0]
+
+
+def test_a_creeping_counter_inside_the_reason_does_not_end_a_gate_run():
+    # String equality would end this run on every single tick and collapse
+    # nothing — the elapsed gate's whole reason is a counter.
+    out = _collapse(*[_gate(i, reason=f"window {40 + i}% elapsed, firing opens at 50%")
+                      for i in range(6)])
+    assert len(out) == 1 and "×6" in out[0]
+    assert "window 45% elapsed" in out[0]  # freshest
+
+
+def test_margin_drift_beyond_epsilon_ends_a_gate_run():
+    out = _collapse(_gate(0, margin_bp=1.0, guard_bp=6.0),
+                    _gate(1, margin_bp=1.4, guard_bp=6.0),   # within 0.5bp
+                    _gate(2, margin_bp=2.0, guard_bp=6.0))   # +1.0 off the anchor
+    assert len(out) == 2, out
+    assert "×2" in out[0] and "×" not in out[1]
+
+
+def test_a_stale_feed_ends_a_gate_run_as_the_spot_age_climbs():
+    out = _collapse(_gate(0, reason="feed stale", spot_age_s=0.4),
+                    _gate(1, reason="feed stale", spot_age_s=1.2),
+                    _gate(2, reason="feed stale", spot_age_s=5.1))
+    assert len(out) == 2, out
+
+
+def test_a_gate_and_an_eval_on_one_arm_never_share_a_run():
+    # An arm is gated or armed, never both — the transition must be visible.
+    out = _collapse(_gate(0), _gate(1), _eval(2), _eval(3), _gate(4))
+    assert len(out) == 3, out
+    assert "×2" in out[0] and "×2" in out[1] and "×" not in out[2]
+
+
+def test_a_gate_run_is_per_arm_not_fleet_wide():
+    out = _collapse(_gate(0, _BTC), _gate(0, _ETH), _gate(1, _BTC), _gate(1, _ETH))
+    assert len(out) == 2 and all("×2" in ln for ln in out)
+
+
+# --- what must never collapse ---
+
+@pytest.mark.parametrize("rec", [
+    {"ev": "fire", "side": "up", "ask": 0.97, "fair": 0.99, "net": 0.01, "size": 10,
+     "committed": 5.0, "rho": 0.1, "mode": "safe"},
+    {"ev": "exit", "side": "up", "size": 10, "bid": 0.95, "fair": 0.99},
+    {"ev": "roll", "size": 25},
+    {"ev": "cleanup"},
+    {"ev": "some-ev-this-build-has-never-heard-of"},
+], ids=["fire", "exit", "roll", "cleanup", "unknown"])
+def test_loud_events_never_collapse(rec):
+    out = _collapse(*[dict(rec, t=_T0 + i, slug=_BTC) for i in range(3)])
+    assert len(out) == 3, out
+
+
+def test_a_fire_ends_every_open_run():
+    out = _collapse(_eval(0, _BTC), _eval(0, _ETH), _fire(1), _eval(2, _BTC), _eval(2, _ETH))
+    assert len(out) == 5, out          # 2 evals, the fire, 2 fresh evals
+    assert all("×" not in ln for ln in out)
+
+
+def test_a_torn_line_is_dropped_without_ending_a_run():
+    # A half-written record is not a state change — it's a truncated write.
+    c = cc.TapeCollapser()
+    lines = deque()
+    c.add(json.dumps(_eval(0)), lines)
+    c.add('{"t": 170000000, "ev": "ev', lines)
+    c.add("[1, 2, 3]", lines)  # valid JSON, not a record
+    c.add(json.dumps(_eval(1)), lines)
+    assert len(lines) == 1 and "×2" in click.unstyle(lines[0])
+
+
+def test_a_malformed_record_is_dropped_rather_than_taking_the_dashboard_down():
+    # sides without "net" is the shape that raises inside the best-side pick —
+    # in the classifier AND in the renderer. Both are belted: the record is
+    # dropped, the deque is untouched, and nothing propagates.
+    c = cc.TapeCollapser()
+    lines = deque()
+    c.add(json.dumps(_eval(0)), lines)
+    c.add(json.dumps(_eval(1, sides=[{"side": "up"}])), lines)
+    c.add(json.dumps(_eval(2)), lines)
+    assert len(lines) == 2  # the run, then a fresh line after the break
+    assert "×" not in click.unstyle(lines[-1])
+
+
+# --- deque ownership ---
+
+def test_a_foreign_line_at_the_tail_is_never_overwritten():
+    c = cc.TapeCollapser()
+    lines = deque(maxlen=200)
+    c.add(json.dumps(_eval(0)), lines)
+    c.add(json.dumps(_eval(1)), lines)
+    foreign = "a line this collapser does not own"
+    lines.append(foreign)
+    c.add(json.dumps(_eval(2)), lines)
+    assert lines[-1] is foreign
+    assert "×3" in click.unstyle(lines[-2])  # the run edited the slot it owns
+
+
+def test_ownership_is_identity_not_equal_text():
+    # A different record that happens to render the same text is still someone
+    # else's line.
+    c = cc.TapeCollapser()
+    lines = deque(maxlen=200)
+    c.add(json.dumps(_eval(0)), lines)
+    twin = (lines[0] + " ")[:-1]  # equal text, distinct object
+    assert twin == lines[0] and twin is not lines[0]
+    lines.append(twin)
+    c.add(json.dumps(_eval(1)), lines)
+    assert lines[-1] is twin
+    assert "×2" in click.unstyle(lines[0])
+
+
+def test_a_run_whose_line_has_scrolled_out_of_reach_appends_instead():
+    # Past the lookback the run's line is off where the operator is looking;
+    # editing it there would be an invisible update.
+    c = cc.TapeCollapser()
+    lines = deque(maxlen=200)
+    c.add(json.dumps(_eval(0)), lines)
+    for i in range(cc._OWN_LOOKBACK + 1):
+        lines.append(f"other {i}")
+    c.add(json.dumps(_eval(1)), lines)
+    assert "×2" in click.unstyle(lines[-1])
+    assert lines[0].endswith("in") or "p↑" in click.unstyle(lines[0])
+
 
 # ---------- composed frame: every fact renders exactly once ----------
 

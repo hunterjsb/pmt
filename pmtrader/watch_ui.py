@@ -250,12 +250,15 @@ def _tape_tag(text: str) -> str:
     return f"{text:<{_TAPE_TAG_WIDTH}}"
 
 
+def _hms(t: float) -> str:
+    return time.strftime("%H:%M:%S", time.localtime(t))
+
+
 def _tape_head(r: dict) -> str:
     """`HH:MM:SS  slug-padded-to-14` — the fixed-width prefix shared by every
     tape-line renderer, so eval/fire/gated/roll/exit lines all column-align.
     14 is the widest current display() form (e.g. "doge 60m 23:40")."""
-    ts = time.strftime("%H:%M:%S", time.localtime(r.get("t", 0)))
-    return f"{ts}  {_tape_slug(r.get('slug', '')):<14}"
+    return f"{_hms(r.get('t', 0))}  {_tape_slug(r.get('slug', '')):<14}"
 
 
 def _tape_render(line: str) -> str | None:
@@ -263,6 +266,12 @@ def _tape_render(line: str) -> str | None:
         r = json.loads(line)
     except ValueError:
         return None
+    return _render_record(r, line)
+
+
+def _render_record(r: dict, raw: str) -> str:
+    """One parsed tape record as a rendered line; `raw` is the fallback for an
+    event this build doesn't know (never swallow a record we can't name)."""
     head = _tape_head(r)
 
     def money(v: float) -> str:
@@ -283,7 +292,7 @@ def _tape_render(line: str) -> str | None:
         return f"{head} {label} {r['size']:g}sh @ bid {r['bid']:.2f}  fair {r['fair']:.4f}"
     if ev == tape.EV_EVAL:
         sides = r.get("sides") or []
-        best = max(sides, key=lambda s: s["net"], default=None)
+        best = _best_side(sides)
         book = (
             f"{best['side']} @ {best['ask']:.2f} {best['net'] * 100:+.1f}¢"
             if best
@@ -311,66 +320,295 @@ def _tape_render(line: str) -> str | None:
                             fg="cyan")
     if ev == tape.EV_CLEANUP:
         return click.style(f"{head} ── window closed ──", dim=True)
-    return line.rstrip()
+    return raw.rstrip()
+
+
+# ---------- tape run-collapsing ----------
+#
+# On a quiet tape 99% of records repeat: four arms each print a basis-guard
+# gate, or the same theta gate, or an eval whose numbers haven't moved, every
+# second — and the events that matter (fires, exits, brakes, rolls) drown in
+# them. A "run" is consecutive records of one shape whose material state is
+# unchanged; it renders as ONE line, updated in place, carrying the FRESHEST
+# values plus ×N and the span it covers. Collapsing may hide repetition; it
+# must never hide a transition, which is what the tolerances below are sized
+# for and what every rule's signature exists to catch.
+
+_NUM_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
+
+_OWN_LOOKBACK = 8  # how deep under later output a live run's line may sit and still be updated
+
+
+def _run_suffix(run: _Run) -> str:
+    """`×12 ⟨23:40:01→23:43:20⟩`, or "" for a run of one — so an isolated
+    record renders byte-identically to an uncollapsed one and the count only
+    appears once there is something to count."""
+    if run.n < 2:
+        return ""
+    return click.style(f"  ×{run.n} ⟨{_hms(run.t0)}→{_hms(run.t1)}⟩", dim=True)
+
+
+def _within(anchor: dict, met: dict, tol: dict) -> bool:
+    """True while every metric is still within tolerance of the run's FIRST
+    record. Anchored, not chained: p_up creeping 0.002 a tick is a 0.6 move
+    across five minutes, and a tick-to-tick comparison would never once call
+    that material."""
+    if anchor.keys() != met.keys():
+        return False  # a field appearing or vanishing is itself a state change
+    return all(abs(met[k] - v) <= tol.get(k, 0.0) for k, v in anchor.items())
+
+
+class _Run:
+    """One in-flight run: what it is keyed on, its anchor, and the exact string
+    it owns in the caller's deque."""
+
+    __slots__ = ("rule", "arm", "sig", "anchor", "rec", "raw", "state", "n", "t0", "t1", "out")
+
+    def __init__(self, rule: _CollapseRule, arm: str | None, sig: tuple, anchor: dict) -> None:
+        self.rule, self.arm, self.sig, self.anchor = rule, arm, sig, anchor
+        self.rec: dict = {}
+        self.raw = ""
+        self.state: dict = {}   # rule-private accumulation across the run
+        self.n = 0
+        self.t0 = self.t1 = 0.0
+        self.out: str | None = None
+
+
+class _CollapseRule:
+    """One repetitive tape shape that may collapse.
+
+    `lane` is the run's identity: records in different lanes never join the
+    same run, and a `scope == "arm"` rule keeps one lane per slug so
+    interleaved arms don't tear each other's runs apart. Within a lane the run
+    continues while `signature` is identical AND every `metrics` value stays
+    within `tolerances` of the run's first record.
+    """
+
+    name = ""
+    scope = "arm"                    # "arm": a lane per slug; "global": one lane, any arm
+    tolerances: dict[str, float] = {}
+
+    def matches(self, r: dict) -> bool:
+        raise NotImplementedError
+
+    def lane(self, r: dict) -> str:
+        return f"{self.name}:{r.get('slug')}"
+
+    def signature(self, r: dict) -> tuple:
+        return ()
+
+    def metrics(self, r: dict) -> dict:
+        return {}
+
+    def fold(self, run: _Run, r: dict) -> None:
+        """Accumulate whatever the rendered line needs beyond the freshest record."""
+
+    def render(self, run: _Run) -> str:
+        return _render_record(run.rec, run.raw) + _run_suffix(run)
+
+
+class _BasisGuardRun(_CollapseRule):
+    """Every arm's basis-guard gate on ONE line: `btc +1.0/6 · eth -4.9/6`.
+
+    Global, not per-arm: the guard gates the whole fleet off the same
+    cross-venue basis, so a mixed run of arms is one fact, not four. The
+    margins themselves are freshest-value updates and never break the run —
+    the arms table carries them as a live column too.
+    """
+
+    name, scope = "basis", "global"
+
+    def matches(self, r: dict) -> bool:
+        return (r.get("ev") == tape.EV_GATED
+                and (r.get("reason") or "").startswith("basis guard"))
+
+    def lane(self, r: dict) -> str:
+        return "basis"
+
+    def fold(self, run: _Run, r: dict) -> None:
+        sym = (r.get("slug") or "?").split("-")[0]
+        margin, guard = r.get("margin_bp"), r.get("guard_bp")
+        if margin is not None and guard is not None:
+            run.state[sym] = f"{margin:+.1f}/{guard:.0f}"
+        else:
+            m = _MARGIN_RE.search(r.get("reason") or "")
+            run.state[sym] = f"{float(m.group(1)):+.1f}/{float(m.group(2)):.0f}" if m else "?"
+
+    def render(self, run: _Run) -> str:
+        per = " · ".join(f"{sym} {txt}" for sym, txt in sorted(run.state.items()))
+        return click.style(
+            f"{_hms(run.t1)}  {'':<14} {_tape_tag(f'gated ×{run.n}')} basis bp/guard: {per}",
+            fg="yellow", dim=True)
+
+
+class _EvalRun(_CollapseRule):
+    """Consecutive evals of ONE arm whose read hasn't moved.
+
+    An armed arm evaluates every tick and prints the same sentence until
+    something happens. What counts as "something" is the whole safety
+    argument for this rule: the tolerances are the width of the numbers as
+    DISPLAYED, so anything a reader could see change on the line breaks the
+    run and renders fresh.
+    """
+
+    name = "eval"
+    # p_up to 2dp, committed to the cent, best-side net to the half-cent it is
+    # printed in — below these the line would repaint identically anyway.
+    tolerances = {"p_up": 0.01, "committed": 0.01, "net": 0.005}
+
+    def matches(self, r: dict) -> bool:
+        return r.get("ev") == tape.EV_EVAL
+
+    def signature(self, r: dict) -> tuple:
+        sides = r.get("sides") or []
+        best = _best_side(sides)
+        rest = r.get("maker_rest")
+        return (
+            bool(r.get("banked_decided")),
+            tuple(_brake_sides(sides)),
+            _safety_is_strong(sides, r.get("p_up")),
+            # which sides even have a book: a side going dark is a transition
+            tuple(s.get("side") for s in sides if s.get("safety") is not None),
+            best.get("side") if best else None,
+            None if rest is None else round(rest, 3),  # a repriced maker bid is an action
+            bool(r.get("maker_candidate")),
+            _mode_text(r),
+        )
+
+    def metrics(self, r: dict) -> dict:
+        best = _best_side(r.get("sides") or [])
+        m = {"p_up": r.get("p_up"), "committed": r.get("committed"),
+             "net": best.get("net") if best else None}
+        return {k: v for k, v in m.items() if v is not None}
+
+
+class _GateRun(_CollapseRule):
+    """Consecutive identical non-basis gates of ONE arm (theta, safety, feed
+    stale, elapsed-percent) — these tick for minutes on end saying the same
+    thing.
+
+    The reason string is compared by SHAPE, never verbatim: it carries its own
+    counters ("window 42% elapsed") that creep every tick, and a verbatim
+    compare would end the run each time and collapse nothing. Whether the
+    numbers actually moved is decided by the structured fields below, so a
+    reworded reason can't silently change the rule's mind either.
+    """
+
+    name = "gate"
+    # half a bp of margin/guard jitter is noise; the spot-age gate trips at 5s,
+    # so a second of resolution still shows the feed going stale.
+    tolerances = {"margin_bp": 0.5, "guard_bp": 0.5, "spot_age_s": 1.0}
+
+    def matches(self, r: dict) -> bool:
+        return (r.get("ev") == tape.EV_GATED
+                and not (r.get("reason") or "").startswith("basis guard"))
+
+    def signature(self, r: dict) -> tuple:
+        return (_NUM_RE.sub("#", r.get("reason") or ""),
+                "up_ask" in r, r.get("up_ask") is None, r.get("dn_ask") is None)
+
+    def metrics(self, r: dict) -> dict:
+        return {k: r[k] for k in self.tolerances if r.get(k) is not None}
+
+
+def _best_side(sides: list[dict]) -> dict | None:
+    """The side the eval line prints — same pick as _render_record's."""
+    return max(sides, key=lambda s: s["net"], default=None)
 
 
 class TapeCollapser:
-    """Collapse runs of basis-guard-gated evals into ONE live summary line.
+    """Collapse runs of repetitive tape records into single live-updating lines.
 
-    On a quiet tape 99% of records are per-arm "gated basis guard" — four
-    arms each printing an identical-shaped line every eval drowned the
-    events that matter (fires, exits, brakes, rolls). A run of consecutive
-    basis-gated records, any mix of arms, renders as a single line holding
-    each arm's FRESHEST margin-vs-guard plus a run count, updated in place.
-    Any other event (including theta/brake gates, which are rare and
-    meaningful) ends the run and renders normally.
+    One rule per repetitive shape (see _CollapseRule). A record that matches no
+    rule — FIRE, EXIT, ROLL, CLEANUP, or any ev this build doesn't know —
+    never collapses and ends EVERY open run: those are the lines the whole
+    mechanism exists to make visible.
+
+    A record also ends the runs it contradicts rather than only its own: the
+    global basis run dies on anything that isn't a basis gate (an eval means
+    that arm cleared the guard), and an arm's own eval/gate runs die on each
+    other, since one arm cannot be both at once.
     """
 
-    def __init__(self) -> None:
-        self._by: dict[str, str] = {}   # symbol -> freshest "+1.0/6" text
-        self._n = 0
-        self._t = 0.0
-        self._out: str | None = None    # exactly what we last put in the deque
+    _RULES: tuple[_CollapseRule, ...] = (_BasisGuardRun(), _EvalRun(), _GateRun())
 
-    def _render(self) -> str:
-        ts = time.strftime("%H:%M:%S", time.localtime(self._t))
-        per = " · ".join(f"{sym} {txt}" for sym, txt in sorted(self._by.items()))
-        return click.style(
-            f"{ts}  {'':<14} {_tape_tag(f'gated ×{self._n}')} basis bp/guard: {per}",
-            fg="yellow", dim=True)
+    def __init__(self) -> None:
+        self._runs: dict[str, _Run] = {}
 
     def add(self, raw: str, lines) -> None:
         """Feed one raw tape line; appends/updates rendered output in `lines`."""
         try:
             r = json.loads(raw)
         except ValueError:
+            return  # torn mid-write line: not a record, so not a run break either
+        if not isinstance(r, dict):
             return
-        reason = (r.get("reason") or "") if r.get("ev") == tape.EV_GATED else ""
-        if reason.startswith("basis guard"):
-            sym = (r.get("slug") or "?").split("-")[0]
-            margin, guard = r.get("margin_bp"), r.get("guard_bp")
-            if margin is not None and guard is not None:
-                self._by[sym] = f"{margin:+.1f}/{guard:.0f}"
-            else:
-                m = _MARGIN_RE.search(reason)
-                self._by[sym] = f"{float(m.group(1)):+.1f}/{float(m.group(2)):.0f}" if m else "?"
-            self._n += 1
-            self._t = r.get("t", 0.0)
-            out = self._render()
-            if self._out is not None and lines and lines[-1] == self._out:
-                lines[-1] = out
-            else:
-                lines.append(out)
-            self._out = out
-            return
-        # any other event ends the run and renders normally
-        self._by, self._n, self._out = {}, 0, None
         try:
-            rendered = _tape_render(raw)
+            run = self._route(r, raw)
         except Exception:
-            return  # torn mid-write line must never take the dashboard down
+            run = None  # a malformed record must never take the dashboard down
+        if run is not None:
+            try:
+                out = run.rule.render(run)
+            except Exception:
+                return
+            slot = self._own_slot(run, lines)
+            if slot is None:
+                lines.append(out)
+            else:
+                lines[slot] = out
+            run.out = out
+            return
+        self._runs.clear()
+        try:
+            rendered = _render_record(r, raw)
+        except Exception:
+            return
         if rendered:
             lines.append(rendered)
+
+    def _route(self, r: dict, raw: str) -> _Run | None:
+        rule = next((ru for ru in self._RULES if ru.matches(r)), None)
+        if rule is None:
+            return None
+        lane, arm = rule.lane(r), r.get("slug")
+        sig, met = rule.signature(r), rule.metrics(r)
+        self._end_conflicting(lane, arm)
+        run = self._runs.get(lane)
+        if run is None or run.sig != sig or not _within(run.anchor, met, rule.tolerances):
+            run = self._runs[lane] = _Run(rule, arm, sig, met)
+        run.n += 1
+        run.t1 = r.get("t", 0.0)
+        if run.n == 1:
+            run.t0 = run.t1
+        run.rec, run.raw = r, raw
+        rule.fold(run, r)
+        return run
+
+    def _end_conflicting(self, lane: str, arm: str | None) -> None:
+        """Drop every run this record contradicts: any global run, and this
+        arm's other runs. Other arms' runs survive, which is the whole point of
+        per-arm lanes — four arms interleaving on the tape must not thrash."""
+        for k, run in list(self._runs.items()):
+            if k != lane and (run.rule.scope == "global" or run.arm == arm):
+                del self._runs[k]
+
+    @staticmethod
+    def _own_slot(run: _Run, lines) -> int | None:
+        """Index of the line this run owns, or None to append.
+
+        Identity, not equality: a foreign line that happens to render the same
+        text is never overwritten. Only the tail _OWN_LOOKBACK entries are
+        searched — past that the run's line has scrolled away from the action
+        and a fresh one below reads better than a stale one being edited
+        off-screen.
+        """
+        if run.out is None or not lines:
+            return None
+        for i in range(len(lines) - 1, max(-1, len(lines) - 1 - _OWN_LOOKBACK), -1):
+            if lines[i] is run.out:
+                return i
+        return None
 
 
 def _eff_table(s: dict) -> Table:
