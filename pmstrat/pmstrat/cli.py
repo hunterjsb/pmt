@@ -38,7 +38,7 @@ def print_usage():
 [bold]pmstrat[/bold] - Strategy DSL and backtesting for Polymarket
 
 [bold]Commands:[/bold]
-  transpile <name> [--all] [--force]     Transpile strategy to Rust
+  transpile <name> [--all] [--force] [--public]  Transpile strategy to Rust
   lint <name> [--all]                    Validate strategy without transpiling
   backtest <strategy.py> [--data FILE]   Run backtest on strategy
   scan                                   Scan for high-certainty expiring markets (live)
@@ -48,6 +48,7 @@ def print_usage():
   pmstrat transpile my_strategy          Transpile single strategy
   pmstrat transpile --all                Transpile all & regenerate registry
   pmstrat transpile --all --force        Force transpile even with errors
+  pmstrat transpile --all --public       Public-form mod.rs (no submodule; never commit)
 
 [bold]Lint Examples:[/bold]
   pmstrat lint my_strategy               Check single strategy for issues
@@ -286,10 +287,17 @@ def run_transpile(args: list[str]):
     # Parse args
     strategy_name = None
     transpile_all = False
+    # --public: emit the public-form mod.rs (no private decls) even though
+    # the pmt-strategies submodule is declared. Local iteration escape hatch
+    # for clones without submodule access — NEVER commit its output; the
+    # canonical mod.rs is regenerated with the submodule inited.
+    public = False
 
     for arg in args:
         if arg == "--all":
             transpile_all = True
+        elif arg == "--public":
+            public = True
         elif not arg.startswith("--"):
             strategy_name = arg
 
@@ -342,7 +350,11 @@ def run_transpile(args: list[str]):
 
         # Regenerate mod.rs
         console.print("[bold]Regenerating mod.rs registry...[/bold]")
-        regenerate_mod_rs(strategies_dir)
+        try:
+            regenerate_mod_rs(strategies_dir, public=public)
+        except RuntimeError as e:
+            console.print(f"[red]{e}[/red]")
+            raise SystemExit(1)
         console.print(f"  [green]✓[/green] mod.rs updated")
 
         summary = f"\n[green]Done![/green] Transpiled {transpiled} strategies"
@@ -366,7 +378,11 @@ def run_transpile(args: list[str]):
 
                 # Regenerate mod.rs
                 console.print("[bold]Regenerating mod.rs registry...[/bold]")
-                regenerate_mod_rs(strategies_dir)
+                try:
+                    regenerate_mod_rs(strategies_dir, public=public)
+                except RuntimeError as e:
+                    console.print(f"[red]{e}[/red]")
+                    raise SystemExit(1)
                 console.print(f"  [green]✓[/green] mod.rs updated")
 
                 console.print(f"\n[green]Done![/green]")
@@ -426,15 +442,24 @@ def transpile_single_strategy(name: str, strategies_dir: Path, tests_dir: Path |
     if meta and not meta.transpilable:
         raise SkippedStrategy(f"Strategy '{name}' has transpilable=False")
 
+    # A strategy whose .rs already lives in the private/ submodule mount is
+    # a private strategy: its transpile output stays there (never a public
+    # top-level copy that would shadow it), and its generated test file is
+    # gated on cfg(private_strategies) so public checkouts skip it cleanly.
+    private = (strategies_dir / "private" / f"{name}.rs").exists()
+
     # Transpile to Rust
-    output_path = strategies_dir / f"{name}.rs"
+    if private:
+        output_path = strategies_dir / "private" / f"{name}.rs"
+    else:
+        output_path = strategies_dir / f"{name}.rs"
     transpile_to_file(strategy_fn, str(output_path))
 
     # Generate tests if tests_dir is provided
     test_path = None
     if tests_dir is not None:
         test_path = tests_dir / f"test_{name}.rs"
-        generate_tests_to_file(strategy_fn, str(test_path))
+        generate_tests_to_file(strategy_fn, str(test_path), private=private)
 
     return str(output_path), str(test_path) if test_path else None
 

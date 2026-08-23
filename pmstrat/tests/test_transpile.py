@@ -1,11 +1,15 @@
 """Tests for the Python to Rust transpiler."""
 
 import ast
+
+import pytest
+
 from pmstrat.transpile import (
     transpile,
     RustCodeGen,
     MatchUnwrap,
     generate_mod_rs,
+    generate_tests,
     regenerate_mod_rs,
     scan_strategy_file,
 )
@@ -349,3 +353,188 @@ def test_helper_with_pub_struct_is_not_registered(tmp_path):
     assert "pub(crate) mod updown_oracle;" in content
     assert "OracleState" not in content
     assert 'm.insert("updown_oracle"' not in content
+
+
+# ---------------------------------------------------------------------------
+# private/ submodule mount (pm-trade/pmt-strategies) — the generator's half of
+# the public/private split: one committed mod.rs that compiles both ways.
+# ---------------------------------------------------------------------------
+
+def _write_split_strategies_dir(tmp_path):
+    """A strategies dir shaped like the post-split pmengine tree: the example
+    strategy public, updown + one helper mounted under private/."""
+    d = tmp_path / "strategies"
+    d.mkdir()
+    (d / "example.rs").write_text(
+        _STRATEGY_RS.format(name="example", struct="Example")
+    )
+    p = d / "private"
+    p.mkdir()
+    (p / "updown.rs").write_text(
+        "//! Multi-arm crypto trigger.\n"
+        "// The replay harness drives this module directly.\n"
+        "// pmstrat: pub(crate)\n\n"
+        + _STRATEGY_RS.format(name="updown", struct="Updown")
+    )
+    (p / "updown_model.rs").write_text(_HELPER_RS)
+    # Non-.rs submodule files the glob must ignore.
+    (p / "README.md").write_text("mount docs\n")
+    (p / "fixtures").mkdir()
+    (p / "fixtures" / "btc.json").write_text("{}")
+    return d
+
+
+def test_private_files_get_gated_path_decls(tmp_path):
+    """Every private item — mod decl, pub use, registry insert — is wrapped
+    in #[cfg(private_strategies)], with a #[path] decl keeping the module at
+    crate::strategies::<name>."""
+    d = _write_split_strategies_dir(tmp_path)
+
+    content = generate_mod_rs(d)
+
+    assert (
+        '#[cfg(private_strategies)]\n#[path = "private/updown.rs"]\npub(crate) mod updown;'
+        in content
+    )
+    assert (
+        '#[cfg(private_strategies)]\n#[path = "private/updown_model.rs"]\npub(crate) mod updown_model;'
+        in content
+    )
+    assert "#[cfg(private_strategies)]\npub use updown::Updown;" in content
+    assert '#[cfg(private_strategies)]\n    m.insert("updown", StrategyInfo' in content
+    # The public strategy stays ungated.
+    assert "\nmod example;" in content
+    assert "#[cfg(private_strategies)]\nmod example;" not in content
+    assert "pub use example::Example;" in content
+    assert 'm.insert("example", StrategyInfo' in content
+    # example's unconditional insert keeps `let mut m` used in public builds.
+    assert "#[allow(unused_mut)]" not in content
+    # README / fixtures in the mount never leak into the module tree.
+    assert "mod fixtures" not in content
+    assert "README" not in content
+
+
+def test_pub_crate_marker_honored_across_private_boundary(tmp_path):
+    """The content-based `// pmstrat: pub(crate)` scan survives the move into
+    private/ — updown keeps crate-wide visibility."""
+    d = _write_split_strategies_dir(tmp_path)
+
+    content = generate_mod_rs(d)
+
+    assert "pub(crate) mod updown;" in content
+    # And the helper is pub(crate) as always.
+    assert "pub(crate) mod updown_model;" in content
+
+
+def test_public_private_stem_collision_is_a_hard_error(tmp_path):
+    """The same module stem on both sides of the boundary is ambiguous —
+    refuse loudly, naming both paths, never shadow silently."""
+    d = _write_split_strategies_dir(tmp_path)
+    (d / "updown.rs").write_text(
+        _STRATEGY_RS.format(name="updown", struct="Updown")
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        generate_mod_rs(d)
+    msg = str(exc.value)
+    assert "updown" in msg
+    assert str(d / "updown.rs") in msg
+    assert str(d / "private" / "updown.rs") in msg
+
+
+def test_declared_but_empty_private_dir_refuses(tmp_path):
+    """.gitmodules declares the mount but the submodule is not initialized:
+    regenerating would silently drop every private strategy — hard error."""
+    repo = tmp_path / "repo"
+    d = repo / "strategies"
+    d.mkdir(parents=True)
+    (d / "example.rs").write_text(
+        _STRATEGY_RS.format(name="example", struct="Example")
+    )
+    # An uninitialized submodule leaves an EMPTY directory behind.
+    (d / "private").mkdir()
+    (repo / ".gitmodules").write_text(
+        '[submodule "strategies/private"]\n'
+        "\tpath = strategies/private\n"
+        "\turl = https://github.com/pm-trade/pmt-strategies.git\n"
+        "\tupdate = none\n"
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        regenerate_mod_rs(d)
+    assert "submodule not initialized" in str(exc.value)
+    assert "--public" in str(exc.value)
+    # The guard must refuse BEFORE writing anything.
+    assert not (d / "mod.rs").exists()
+
+
+def test_public_flag_emits_zero_private_decls(tmp_path):
+    """--public knowingly emits the public form: no private decls, no cfg
+    gates, and the uninitialized-submodule guard is bypassed."""
+    repo = tmp_path / "repo"
+    d = repo / "strategies"
+    d.mkdir(parents=True)
+    (d / "example.rs").write_text(
+        _STRATEGY_RS.format(name="example", struct="Example")
+    )
+    (d / "private").mkdir()
+    (repo / ".gitmodules").write_text(
+        '[submodule "strategies/private"]\n'
+        "\tpath = strategies/private\n"
+        "\turl = https://github.com/pm-trade/pmt-strategies.git\n"
+    )
+
+    regenerate_mod_rs(d, public=True)
+    content = (d / "mod.rs").read_text()
+    # The doc header still documents the private/ convention; what must be
+    # absent is any actual gate or path decl.
+    assert "#[cfg(private_strategies)]" not in content
+    assert '#[path = "private/' not in content
+    assert 'm.insert("example"' in content
+
+    # Even with the submodule INITED, --public skips private/ entirely.
+    split = _write_split_strategies_dir(tmp_path)
+    content = generate_mod_rs(split, public=True)
+    assert "updown" not in content
+    assert "#[cfg(private_strategies)]" not in content
+
+
+def test_generate_mod_rs_round_trips_with_private_files(tmp_path):
+    """Regeneration over the split tree is byte-stable — the committed
+    mod.rs never churns."""
+    d = _write_split_strategies_dir(tmp_path)
+
+    regenerate_mod_rs(d)
+    first = (d / "mod.rs").read_text()
+    regenerate_mod_rs(d)
+    second = (d / "mod.rs").read_text()
+
+    assert first == second
+    (d / "mod.rs").unlink()
+    regenerate_mod_rs(d)
+    assert (d / "mod.rs").read_text() == first
+
+
+def test_all_private_registry_carries_allow_unused_mut(tmp_path):
+    """With zero unconditional inserts a public build's `let mut m` is never
+    mutated — the generator must emit #[allow(unused_mut)] or public clippy
+    fails. Only reachable if every strategy went private."""
+    d = tmp_path / "strategies"
+    d.mkdir()
+    p = d / "private"
+    p.mkdir()
+    (p / "updown.rs").write_text(
+        _STRATEGY_RS.format(name="updown", struct="Updown")
+    )
+
+    content = generate_mod_rs(d)
+    assert "#[allow(unused_mut)]\npub fn registry()" in content
+
+
+def test_generated_tests_for_private_strategy_are_cfg_gated():
+    """A private strategy's generated test file opens with
+    #![cfg(private_strategies)] so a public checkout skips it cleanly."""
+    gated = generate_tests(simple_strategy, private=True)
+    assert gated.startswith("#![cfg(private_strategies)]\n")
+    ungated = generate_tests(simple_strategy)
+    assert "private_strategies" not in ungated
