@@ -11,7 +11,7 @@ import datetime
 from collections import defaultdict
 
 SYMS = ["btc", "eth", "sol", "bnb", "xrp"]
-VARIANTS = ["base", "rtds_liveguard", "rtds_streamguard", "rtds_floorguard"]
+VARIANTS = ["base", "rtds_tw30", "rtds_liveguard", "rtds_streamguard", "rtds_floorguard"]
 WARMUP_S = 7200.0
 
 

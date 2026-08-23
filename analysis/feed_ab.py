@@ -102,6 +102,34 @@ def load_corpus(rtds_dir):
     return samples, gaps, lines, [str(f) for f in files]
 
 
+def data_gaps(samples, min_s=5.0):
+    """Recorder holes read off the DATA, not off the recorder's own log.
+
+    The `gap` events only cover stalls a running recorder noticed. A hole
+    left by the process dying is invisible to them — 2026-08-23 has a 722s
+    one at 08:44:15Z whose only trace is the next `start` event. Spacing in
+    the spot topic finds both kinds.
+    """
+    out = []
+    for sym in SYMS:
+        rows = samples[sym][TOPIC_SPOT]
+        for (a, _, _), (b, _, _) in zip(rows, rows[1:]):
+            if b - a > min_s:
+                out.append((a, b, b - a, f"{sym} spot spacing"))
+    # One hole usually shows on every symbol at once; merge overlaps so the
+    # count is holes, not symbol-holes.
+    out.sort()
+    merged = []
+    for g in out:
+        if merged and g[0] <= merged[-1][1]:
+            last = merged[-1]
+            merged[-1] = (last[0], max(last[1], g[1]),
+                          max(last[1], g[1]) - last[0], last[3])
+        else:
+            merged.append(g)
+    return merged
+
+
 def corpus_span(samples):
     lo, hi = -math.inf, math.inf
     per = {}
@@ -408,10 +436,16 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
 
     print("[1/4] loading RTDS corpus ...", flush=True)
-    samples, gaps, lines, files = load_corpus(args.rtds_dir)
+    samples, logged_gaps, lines, files = load_corpus(args.rtds_dir)
     span, per_sym_span = corpus_span(samples)
-    print(f"      {lines} line(s) over {len(files)} file(s); {len(gaps)} recorder gap(s), "
-          f"{sum(g[2] for g in gaps):.0f}s total")
+    # Data-derived holes SUPERSEDE the recorder's own gap log: they cover
+    # the stalls it noticed AND the ones it died through.
+    gaps = data_gaps(samples)
+    print(f"      {lines} line(s) over {len(files)} file(s)")
+    print(f"      recorder self-logged gaps: {len(logged_gaps)}, "
+          f"{sum(g[2] for g in logged_gaps):.0f}s")
+    print(f"      holes found in the DATA:   {len(gaps)}, {sum(g[2] for g in gaps):.0f}s "
+          f"(worst {max(g[2] for g in gaps):.0f}s at {gaps[max(range(len(gaps)), key=lambda i: gaps[i][2])][0]:.0f})")
     print(f"      common span {span[0]:.0f}..{span[1]:.0f}")
     for s in SYMS:
         a, b = per_sym_span[s]
@@ -559,6 +593,10 @@ def main():
         "per_sym_span": per_sym_span,
         "recorder_gaps": [
             {"t_last": a, "t_back": b, "down_s": ds, "reason": r} for (a, b, ds, r) in gaps
+        ],
+        "recorder_gaps_selflogged": [
+            {"t_last": a, "t_back": b, "down_s": ds, "reason": r}
+            for (a, b, ds, r) in logged_gaps
         ],
         "comparable": {s: comparable[s] for s in SYMS},
         "excluded": {s: {k: v for k, v in excluded[s].items()} for s in SYMS},
