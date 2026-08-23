@@ -146,23 +146,35 @@ def test_tape_render_columns_align_across_event_types():
         assert line[len(head) + 1 + cc._TAPE_TAG_WIDTH] == " ", name
 
 
-# ---------- risk header: committed / undecided ----------
+# ---------- risk header: committed / undecided / resting ----------
 
-def test_risk_committed_sums_filled_and_flags_undecided():
+def test_risk_exposure_sums_filled_and_flags_undecided():
     arms = {
         "a": {"filled_usdc": 20.0, "eval": {"banked_decided": True}},
         "b": {"filled_usdc": 15.0, "eval": {"banked_decided": False}},
         "c": {"filled_usdc": 5.0, "eval": None},  # missing eval -> undecided
         "d": "not-a-dict",  # defensive: corrupt status entry, must not raise
     }
-    committed, undecided = cc._risk_committed(arms)
+    committed, undecided, resting = cc._risk_exposure(arms)
     assert committed == 40.0
     assert undecided == 20.0  # b (15) + c (5)
+    assert resting == 0.0
 
 
-def test_risk_committed_empty_or_none():
-    assert cc._risk_committed({}) == (0.0, 0.0)
-    assert cc._risk_committed(None) == (0.0, 0.0)
+def test_risk_exposure_sums_resting_from_either_engine_shape():
+    # arm-level `resting_usdc` is the current engine; `eval.resting` is the
+    # pre-status-field fallback and is only emitted when non-zero.
+    arms = {
+        "a": {"filled_usdc": 10.0, "resting_usdc": 45.0, "eval": {}},
+        "b": {"filled_usdc": 10.0, "eval": {"resting": 30.0}},
+        "c": {"filled_usdc": 10.0, "eval": {}},  # taker-only arm
+    }
+    assert cc._risk_exposure(arms)[2] == 75.0
+
+
+def test_risk_exposure_empty_or_none():
+    assert cc._risk_exposure({}) == (0.0, 0.0, 0.0)
+    assert cc._risk_exposure(None) == (0.0, 0.0, 0.0)
 
 
 def test_build_risk_header_color_thresholds():
@@ -170,7 +182,7 @@ def test_build_risk_header_color_thresholds():
 
     def undecided(amount):
         status = {"arms": {"a": {"filled_usdc": amount, "eval": {"banked_decided": False}}}}
-        return cc.build_risk_header(status, {"total": 1000.0}, sb)
+        return cc.build_risk_header(status, sb)
 
     assert "[red]" in undecided(600.0)
     assert "[yellow]" in undecided(400.0)
@@ -178,9 +190,26 @@ def test_build_risk_header_color_thresholds():
     assert "[red]" not in line and "[yellow]" not in line
 
 
-def test_build_risk_header_missing_balance_shows_ellipsis():
-    line = cc.build_risk_header({}, {}, {})
-    assert "capital …" in line
+def test_build_risk_header_never_repeats_the_top_panel_capital():
+    # The dupe this line was born with: capital belongs to the header panel
+    # directly above it, and two money lines back to back read as one line
+    # printed twice.
+    line = cc.build_risk_header(
+        {"arms": {"a": {"filled_usdc": 1.0, "eval": {}}}},
+        {"riding_n": 0, "riding_usd": 0.0})
+    assert "capital" not in line
+    assert line.startswith("committed ")
+
+
+def test_build_risk_header_shows_resting_only_when_a_bid_is_on_the_book():
+    sb = {"riding_n": 0, "riding_usd": 0.0}
+    resting = cc.build_risk_header(
+        {"arms": {"a": {"filled_usdc": 10.0, "resting_usdc": 45.0, "eval": {}}}}, sb)
+    assert "◇resting $45.00" in resting
+    # A taker-only fleet must not carry a "$0.00" field every tick.
+    flat = cc.build_risk_header(
+        {"arms": {"a": {"filled_usdc": 10.0, "resting_usdc": 0.0, "eval": {}}}}, sb)
+    assert "resting" not in flat
 
 
 # ---------- RTDS settlement-stream health ----------
@@ -219,14 +248,48 @@ def test_rtds_rich_tolerates_a_stream_that_has_never_printed():
     assert "no events yet" in line
 
 
-def test_risk_header_carries_the_stream_state_when_one_is_running():
+_LIVE_RTDS = {"started": True, "connected": True, "events": 10, "events_per_s": 8.0,
+              "last_event_age_s": 0.5, "consumers": 1}
+
+
+def test_has_rtds_arm_reads_the_arm_not_the_socket():
+    assert cc._has_rtds_arm({"a": {"feed": "rtds"}})
+    assert not cc._has_rtds_arm({"a": {"feed": "binance"}})
+    assert not cc._has_rtds_arm({"a": {}})          # pre-feed-field engine
+    assert not cc._has_rtds_arm({"a": "not-a-dict"})  # corrupt entry, no raise
+    assert not cc._has_rtds_arm({})
+    assert not cc._has_rtds_arm(None)
+
+
+def test_rtds_line_is_silent_once_no_arm_reads_the_stream():
+    # The socket is opened lazily by the first rtds arm and OUTLIVES it. A
+    # health line for a stream nothing is trading on is a line that never goes
+    # away, and a line that never goes away stops being read.
+    assert cc._rtds_line({"arms": {"a": {"feed": "binance"}}, "rtds": _LIVE_RTDS}) == ""
+    assert cc._rtds_line({"arms": {}, "rtds": _LIVE_RTDS}) == ""
+    assert cc._rtds_line(None) == ""
+    assert "rtds" in cc._rtds_line({"arms": {"a": {"feed": "rtds"}}, "rtds": _LIVE_RTDS})
+
+
+def test_rtds_line_still_reports_a_dark_stream_an_arm_depends_on():
+    # feed=="rtds" is the arm's config, not the socket's state — a DOWN stream
+    # is exactly when the line matters most.
+    dark = cc._rtds_line({"arms": {"a": {"feed": "rtds"}},
+                          "rtds": {"started": True, "connected": False, "events": 5,
+                                   "events_per_s": 0.0, "last_event_age_s": 60.0,
+                                   "consumers": 0}})
+    assert "[red]rtds DOWN[/red]" in dark
+
+
+def test_risk_header_carries_the_stream_state_when_an_arm_reads_it():
     sb = {"riding_n": 0, "riding_usd": 0.0}
-    status = {"arms": {}, "rtds": {"started": True, "connected": True,
-                                    "events": 10, "events_per_s": 8.0,
-                                    "last_event_age_s": 0.5, "consumers": 1}}
-    assert "rtds" in cc.build_risk_header(status, {"total": 10.0}, sb)
-    # ...and stays out of the way when none is.
-    assert "rtds" not in cc.build_risk_header({"arms": {}}, {"total": 10.0}, sb)
+    status = {"arms": {"a": {"filled_usdc": 1.0, "feed": "rtds", "eval": {}}},
+              "rtds": _LIVE_RTDS}
+    assert "rtds" in cc.build_risk_header(status, sb)
+    # ...and stays out of the way when the fleet is binance-only.
+    binance = {"arms": {"a": {"filled_usdc": 1.0, "feed": "binance", "eval": {}}},
+               "rtds": _LIVE_RTDS}
+    assert "rtds" not in cc.build_risk_header(binance, sb)
 
 
 def test_arms_table_marks_which_feed_an_arm_reads():
@@ -245,6 +308,56 @@ def test_arms_table_marks_which_feed_an_arm_reads():
     btc = next(ln for ln in out if "btc" in ln)
     assert "≈" in xrp, xrp
     assert "≈" not in btc, btc
+
+
+def test_flag_column_fits_every_marker_at_once():
+    # ⟳ + ≈ + ◇ on one arm is a real state (a rolling, stream-fed, maker
+    # arm). The column was sized for "roll" alone and silently ellipsised the
+    # third marker when maker step 0 added it.
+    from rich.console import Console
+
+    arms = {"xrp-updown-5m-1700000000": {"filled_usdc": 1.0, "roll": True,
+                                          "feed": "rtds", "maker_bid": True,
+                                          "eval": None}}
+    c = Console(record=True, width=160)
+    c.print(cc.build_arms_table(arms, now=1700000100.0))
+    out = c.export_text().splitlines()
+    row = next(ln for ln in out if "xrp" in ln)
+    # last cell, i.e. between the final two column separators
+    flags = row.rsplit("│", 3)[-2]
+    assert flags.strip() == "⟳≈◇", row
+    assert "…" not in flags, row
+    # ...and the header still names what the column now holds.
+    header = next(ln for ln in out if "window" in ln)
+    assert "flags" in header and "roll" not in header
+
+
+def test_committed_column_fits_a_resting_bid_beside_a_four_figure_fill():
+    # The resting $ was added into the committed cell without widening it.
+    from rich.console import Console
+
+    arms = {"btc-updown-5m-9999999999": {
+        "filled_usdc": 1204.50, "roll": True, "resting_usdc": 450.0,
+        "eval": {"state": "armed", "committed": 1204.50, "resting": 450.0}}}
+    c = Console(record=True, width=160)
+    c.print(cc.build_arms_table(arms, now=1000.0))
+    row = next(ln for ln in c.export_text().splitlines() if "btc" in ln)
+    assert "$1,204.50 ◇$450" in row, row
+
+
+def test_controls_panel_legend_names_every_arms_table_marker():
+    # The overlay is the only place the glyphs are spelled out.
+    from rich.console import Console
+    import io
+
+    con = Console(file=io.StringIO(), width=160)
+    con.print(cc._controls_panel())
+    out = con.file.getvalue()
+    for glyph in ("⟳", "≈", "◇"):
+        assert glyph in out, glyph
+    # ONE content line: the strip slot is 3 rows and a second would be clipped.
+    body = [ln for ln in out.splitlines() if ln.startswith("│")]
+    assert len(body) == 1, body
 
 
 # ---------- recent-windows strip ----------
@@ -321,7 +434,62 @@ def test_build_arms_table_column_geometry_is_identical_across_states():
     })
     assert short[0] == long_[0] == long_[1]
 
-# ---------- terminal cbreak / quit helpers ----------
+# ---------- composed frame: every fact renders exactly once ----------
+
+_CAP = 4231.55
+_FRAME_ARMS = {
+    "btc-updown-5m-9999999999": {
+        "filled_usdc": 120.0, "roll": True, "feed": "binance", "maker_bid": True,
+        "resting_usdc": 45.0,
+        "eval": {"state": "armed", "p_up": 0.87, "mode": "safe", "rho": 0.4,
+                 "banked_bp": 12.3, "cushion_bp": 9.3, "banked_decided": True,
+                 "committed": 120.0, "resting": 45.0,
+                 "sides": [{"side": "up", "safety": 0.9}]}},
+    "xrp-updown-5m-9999999999": {
+        "filled_usdc": 80.0, "roll": True, "feed": "rtds", "maker_bid": False,
+        "eval": {"state": "gated", "reason": "basis guard",
+                 "margin_bp": -4.9, "guard_bp": 6.0}},
+}
+
+
+def _frame_text(width: int = 160) -> str:
+    """Every panel one watch frame paints, rendered into one string — the only
+    place a fact duplicated ACROSS builders is visible."""
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+
+    status = {"arms": _FRAME_ARMS, "rtds": dict(_LIVE_RTDS)}
+    sb = {"wins": 40, "losses": 6, "net": 512.25, "rolls": 12, "estimated": 0,
+          "riding_n": 2, "riding_usd": 200.0, "windows": [],
+          "sliding": {"wins": 9, "losses": 2, "net": 61.5, "rolls": 3, "estimated": 0}}
+    snap = {"status": status, "bal": {"total": _CAP}, "sb": sb, "sb_stale": False,
+            "sb_fetched_at": 1700000000.0, "err": None}
+    c = Console(record=True, width=width)
+    c.print(cc.build_header_panel(snap, "since 08-23 04:00Z", None))
+    c.print(Text.from_markup(cc.build_risk_header(status, sb)))
+    c.print(cc.build_arms_table(_FRAME_ARMS, now=1700000000.0))
+    c.print(Panel(Text.from_markup(cc.build_windows_strip(sb["windows"])),
+                  title="recent windows", border_style="dim"))
+    return c.export_text()
+
+
+def test_composed_frame_shows_the_capital_figure_exactly_once():
+    # The regression: build_risk_header led with the same "capital $X" the
+    # header panel already carried, one row above it — two dense money lines
+    # back to back that read as one line printed twice.
+    out = _frame_text()
+    assert out.count(f"{_CAP:,.2f}") == 1, out
+    assert out.count("capital") == 1, out
+
+
+def test_composed_frame_puts_each_fact_in_its_own_place():
+    head, risk = _frame_text().splitlines()[1], _frame_text().splitlines()[3]
+    # top panel: the scoreboard's sliding pulse, capital, all-time
+    assert "9W-2L" in head and "capital" in head and "all-time" in head
+    # risk line: exposure only — nothing the panel above already said
+    assert "committed" in risk and "riding" in risk
+    assert "capital" not in risk and "all-time" not in risk and "W-" not in risk
 
 class _FakeStdin:
     def __init__(self, isatty=True, chars=""):

@@ -165,6 +165,14 @@ def test_header_reports_committed_and_riding_exposure():
     out = _render(sr.header_panel(_sb(), _eff(), None, {"arms": _arms()}, 0))
     assert "$12.50" in out and "un-decided" in out  # gated arm never banked-decided
     assert "riding 4 windows $317.06" in out
+    assert "resting" not in out  # taker-only arms carry no "$0.00" field
+
+
+def test_header_reports_a_resting_maker_bid_only_when_one_is_on_the_book():
+    arms = _arms()
+    arms["btc-updown-5m-1787452500"]["resting_usdc"] = 45.0
+    out = _render(sr.header_panel(_sb(), _eff(), None, {"arms": arms}, 0))
+    assert "resting $45.00" in out
 
 
 def test_header_drops_the_effectiveness_line_on_an_empty_book():

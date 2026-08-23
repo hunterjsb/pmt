@@ -167,18 +167,22 @@ def _eff_line(eff: dict) -> str:
 
 def _risk_line(sb: dict, status: dict | None) -> str:
     """Money currently exposed: an arm's committed budget (and how much of it
-    hasn't banked-decided yet) plus notional still riding in unresolved
-    windows. Shares _risk_committed with the watch header so the two reports
-    can never disagree about what is at risk."""
-    from watch_ui import _UNDECIDED_RED_USD, _UNDECIDED_YELLOW_USD, _risk_committed
+    hasn't banked-decided yet), any post-only bid still resting on the book,
+    plus notional still riding in unresolved windows. Shares _risk_exposure
+    with the watch header so the two reports can never disagree about what is
+    at risk."""
+    from watch_ui import _UNDECIDED_RED_USD, _UNDECIDED_YELLOW_USD, _risk_exposure
 
-    committed, undecided = _risk_committed((status or {}).get("arms"))
+    committed, undecided, resting = _risk_exposure((status or {}).get("arms"))
     style = ("red" if undecided > _UNDECIDED_RED_USD else
              "yellow" if undecided > _UNDECIDED_YELLOW_USD else "dim")
-    return (f"[dim]committed[/dim] ${_zeroed(committed):,.2f} "
-            f"[{style}](${_zeroed(undecided):,.2f} un-decided)[/{style}]"
-            f"  [dim]·[/dim]  [dim]riding[/dim] {sb.get('riding_n', 0)} windows "
-            f"${sb.get('riding_usd', 0.0):,.2f}")
+    parts = [f"[dim]committed[/dim] ${_zeroed(committed):,.2f} "
+             f"[{style}](${_zeroed(undecided):,.2f} un-decided)[/{style}]"]
+    if resting > 0.005:  # only when a bid is actually on the book
+        parts.append(f"[cyan]◇resting[/cyan] ${_zeroed(resting):,.2f}")
+    parts.append(f"[dim]riding[/dim] {sb.get('riding_n', 0)} windows "
+                 f"${sb.get('riding_usd', 0.0):,.2f}")
+    return "  [dim]·[/dim]  ".join(parts)
 
 
 def header_panel(sb: dict, eff: dict, bal: dict | None, status: dict | None,

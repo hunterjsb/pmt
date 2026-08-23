@@ -87,6 +87,12 @@ def _brake_rich(sides: list[dict]) -> str:
                      for side, b in _brake_sides(sides))
 
 
+def _has_rtds_arm(arms: dict | None) -> bool:
+    """True when some arm is actually reading the settlement stream."""
+    return any(isinstance(a, dict) and a.get("feed") == "rtds"
+               for a in (arms or {}).values())
+
+
 def _rtds_rich(h: dict | None) -> str:
     """One line for the shared RTDS settlement-stream supervisor, or "" when
     nothing has ever armed on it.
@@ -111,6 +117,20 @@ def _rtds_rich(h: dict | None) -> str:
     if h.get("err") and not h.get("connected"):
         bits.append(str(h["err"])[:48])
     return f"{head} [dim]{' · '.join(bits)}[/dim]"
+
+
+def _rtds_line(status: dict | None) -> str:
+    """_rtds_rich, but silent unless an arm is reading the stream right now.
+
+    The socket is opened lazily by the first rtds arm and outlives it — once
+    every stream-fed arm has rolled to binance or retired, its health is no
+    longer a fact about the fleet, and a line that never goes away stops
+    being read.
+    """
+    status = status or {}
+    if not _has_rtds_arm(status.get("arms")):
+        return ""
+    return _rtds_rich(status.get("rtds"))
 
 
 def _click_fg_bold(style: str) -> tuple[str | None, bool]:
@@ -234,9 +254,7 @@ def _tape_head(r: dict) -> str:
     """`HH:MM:SS  slug-padded-to-14` — the fixed-width prefix shared by every
     tape-line renderer, so eval/fire/gated/roll/exit lines all column-align.
     14 is the widest current display() form (e.g. "doge 60m 23:40")."""
-    import time as _t
-
-    ts = _t.strftime("%H:%M:%S", _t.localtime(r.get("t", 0)))
+    ts = time.strftime("%H:%M:%S", time.localtime(r.get("t", 0)))
     return f"{ts}  {_tape_slug(r.get('slug', '')):<14}"
 
 
@@ -271,17 +289,17 @@ def _tape_render(line: str) -> str | None:
             if best
             else "no book"
         )
-        banked = click.style("  BANKED", fg="cyan") if r.get("banked_decided") else ""
+        tags = click.style("  BANKED", fg="cyan") if r.get("banked_decided") else ""
         if r.get("maker_rest") is not None:
-            banked += click.style(f"  ◇RESTING @{r['maker_rest']:.3f}", fg="cyan", bold=True)
+            tags += click.style(f"  ◇RESTING @{r['maker_rest']:.3f}", fg="cyan", bold=True)
         elif r.get("maker_candidate"):
-            banked += click.style("  ◇maker-candidate", fg="cyan")
+            tags += click.style("  ◇maker-candidate", fg="cyan")
         body = (
             f"{head} {_tape_tag('eval')} p↑{r['p_up']:.4f}  {book}"
             f"  ρ{r['rho']:+.2f}  {money(r['committed'])} in"
         )
         extras = "  ".join(x for x in (_safety_ansi(sides, r.get("p_up")), _brake_ansi(sides)) if x)
-        return click.style(body, dim=True) + banked + ("  " + extras if extras else "")
+        return click.style(body, dim=True) + tags + ("  " + extras if extras else "")
     if ev == tape.EV_GATED:
         def ask(v: float | None) -> str:
             return f"{v:.2f}" if v is not None else "—"
@@ -315,9 +333,7 @@ class TapeCollapser:
         self._out: str | None = None    # exactly what we last put in the deque
 
     def _render(self) -> str:
-        import time as _t
-
-        ts = _t.strftime("%H:%M:%S", _t.localtime(self._t))
+        ts = time.strftime("%H:%M:%S", time.localtime(self._t))
         per = " · ".join(f"{sym} {txt}" for sym, txt in sorted(self._by.items()))
         return click.style(
             f"{ts}  {'':<14} {_tape_tag(f'gated ×{self._n}')} basis bp/guard: {per}",
@@ -410,32 +426,42 @@ _UNDECIDED_YELLOW_USD = 300.0  # R7 speculative-exposure threshold zone
 _UNDECIDED_RED_USD = 500.0
 
 
-def _risk_committed(arms: dict | None) -> tuple[float, float]:
-    """(committed, undecided) USDC summed across a /status reply's arms.
+def _risk_exposure(arms: dict | None) -> tuple[float, float, float]:
+    """(committed, undecided, resting) USDC summed across a /status reply's arms.
 
     committed = every arm's filled_usdc. undecided = the slice of that still
     sitting in arms whose last eval hasn't banked-decided (including a
     missing eval entirely, e.g. right after an engine restart) — that's
-    speculative exposure that could still flip.
+    speculative exposure that could still flip. resting = notional tied up in
+    post-only bids sitting on the book: not exposure yet, but one fill away,
+    and it is already spending the arm's budget.
+
+    `resting_usdc` is arm-level and always present on a current engine;
+    `eval.resting` is the pre-status-field fallback (only emitted when > 0).
     """
-    committed = undecided = 0.0
+    committed = undecided = resting = 0.0
     for a in (arms or {}).values():
         if not isinstance(a, dict):
             continue
         filled = a.get("filled_usdc") or 0.0
         committed += filled
         e = a.get("eval")
-        if not (isinstance(e, dict) and e.get("banked_decided")):
+        e = e if isinstance(e, dict) else {}
+        if not e.get("banked_decided"):
             undecided += filled
-    return committed, undecided
+        resting += a.get("resting_usdc") or e.get("resting") or 0.0
+    return committed, undecided, resting
 
 
-def build_risk_header(status: dict | None, bal: dict | None, sb: dict | None) -> str:
-    """`capital $X · committed $Y ($Z un-decided) · riding N windows $W` —
-    the one-line risk summary between the scoreboard and the arms table.
-    Reads only already-cached data (status/bal/sb) — never fetches."""
-    committed, undecided = _risk_committed((status or {}).get("arms"))
-    cap = f"${bal['total']:,.2f}" if bal else "…"
+def build_risk_header(status: dict | None, sb: dict | None) -> str:
+    """`committed $Y ($Z un-decided) · ◇resting $R · riding N windows $W` —
+    the one-line exposure summary between the scoreboard and the arms table.
+
+    Deliberately carries no capital figure: that is the top panel's, and two
+    money-shaped lines stacked back to back read as one line printed twice.
+    Reads only already-cached data (status/sb) — never fetches.
+    """
+    committed, undecided, resting = _risk_exposure((status or {}).get("arms"))
     riding_n = (sb or {}).get("riding_n", 0)
     riding_usd = (sb or {}).get("riding_usd", 0.0)
     color = ("red" if undecided > _UNDECIDED_RED_USD else
@@ -443,12 +469,18 @@ def build_risk_header(status: dict | None, bal: dict | None, sb: dict | None) ->
     undecided_s = f"${undecided:,.2f} un-decided"
     if color:
         undecided_s = f"[{color}]{undecided_s}[/{color}]"
-    line = (f"capital {cap} · committed ${committed:,.2f} ({undecided_s}) · "
-            f"riding {riding_n} windows ${riding_usd:,.2f}")
+    bits = [f"committed ${committed:,.2f} ({undecided_s})"]
+    # Only when a bid is actually on the book — a "◇resting $0.00" every tick
+    # on a taker-only fleet is noise.
+    if resting > 0.005:
+        bits.append(f"[cyan]◇resting ${resting:,.2f}[/cyan]")
+    bits.append(f"riding {riding_n} windows ${riding_usd:,.2f}")
     # One socket feeds every stream-fed arm, so its state belongs on the
     # fleet's risk line, not buried per-arm.
-    rtds = _rtds_rich((status or {}).get("rtds"))
-    return f"{line} · {rtds}" if rtds else line
+    rtds = _rtds_line(status)
+    if rtds:
+        bits.append(rtds)
+    return " · ".join(bits)
 
 
 def _window_chip(w: dict) -> str:
@@ -471,26 +503,34 @@ def build_windows_strip(windows: list[dict] | None) -> str:
 
 
 # Fixed widths (+ ellipsis overflow below) so the arms table's geometry never
-# jitters as state/reason text length changes tick to tick.
+# jitters as state/reason text length changes tick to tick. `committed` is
+# sized for "$1,234.56 ◇$450" — the resting bid shares the cell — and `flags`
+# for all three markers at once plus its header; both were paid for out of the
+# slack in evidence/p_up/mode/rho, each of which is now its longest value
+# ("-100.0/100.0bp", "0.87", "quiesce", "+0.40") rather than a round number.
+# T- keeps 6: an arm placed on a not-yet-open window counts down past "59:59".
 _ARMS_COLUMNS = (
     ("window", "left", 14),
     ("T-", "right", 6),
     ("state", "left", 34),
-    ("evidence", "right", 15),
-    ("p_up", "right", 6),
-    ("mode", "left", 8),
-    ("rho", "right", 6),
-    ("committed", "right", 12),
-    ("roll", "right", 4),
+    ("evidence", "right", 14),
+    ("p_up", "right", 5),
+    ("mode", "left", 7),
+    ("rho", "right", 5),
+    ("committed", "right", 16),
+    ("flags", "right", 6),
 )
+
+_ARMS_FLAG_LEGEND = "⟳ roll · ≈ stream-fed · ◇ maker bid"
 
 
 def build_arms_table(arms: dict | None, now: float) -> Table:
     """Live-arms table: countdown, state (compact gate reason for a gated
     arm, safety/brake badges for an armed one), banked-vs-cushion evidence,
-    model read (p_up/mode/rho), committed $, roll flag. Every cell tolerates
-    a missing/partial eval — an engine restart mid-watch leaves last_eval
-    None or half-built.
+    model read (p_up/mode/rho), committed $ (+ any resting maker bid), and
+    the roll/feed/maker flags (_ARMS_FLAG_LEGEND). Every cell tolerates a
+    missing/partial eval — an engine restart mid-watch leaves last_eval None
+    or half-built.
     """
     t = Table(expand=True, pad_edge=False)
     for col, justify, width in _ARMS_COLUMNS:
@@ -516,8 +556,8 @@ def build_arms_table(arms: dict | None, now: float) -> Table:
         resting = a.get("resting_usdc") or e.get("resting") or 0.0
         if resting > 0.005:
             committed_s += f" [cyan]◇${resting:,.0f}[/cyan]"
-        # "≈" = settlement-stream fed; "◇" = maker bid armed (resting $ shows
-        # beside committed while a bid is actually on the book).
+        # _ARMS_FLAG_LEGEND, in that order. "·" keeps the roll slot occupied so
+        # the feed/maker markers never shift column between arms.
         flags = (("⟳" if a.get("roll") else "·")
                  + ("≈" if a.get("feed") == "rtds" else "")
                  + ("◇" if a.get("maker_bid") else ""))
@@ -598,12 +638,15 @@ _SB_EMPTY = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "series": {}, "cal"
 
 def _controls_panel():
     """The 'h' help overlay — swaps into the strip slot so toggling never
-    changes the layout geometry."""
+    changes the layout geometry. ONE content line: the slot is 3 rows, and a
+    second line would be clipped rather than grow the panel. The --since hint
+    lives in `--help` instead; it can't be changed mid-watch, whereas the flag
+    legend explains glyphs that are on screen right now."""
     from rich.panel import Panel
     return Panel(
-        "[bold]q[/bold] quit · [bold]h[/bold] toggle controls · Ctrl-C also quits"
-        "  [dim]|[/dim]  refresh: tape 1s · engine 2s · scoreboard 10s · balance 60s"
-        "  [dim]|[/dim]  [dim]--since floors the sliding P&L (hours or epoch)[/dim]",
+        "[bold]q[/bold] quit · [bold]h[/bold] controls · Ctrl-C quits"
+        f"  [dim]|[/dim]  [cyan]{_ARMS_FLAG_LEGEND}[/cyan]"
+        "  [dim]|[/dim]  refresh: tape 1s · engine 2s · scoreboard 10s · balance 60s",
         title="controls", border_style="cyan")
 
 
