@@ -421,6 +421,51 @@ def test_zero_size_dust_redeem_never_flips_blind():
     assert wallet_outcomes(sized) == {"btc-updown-15m-1": "up"}
 
 
+# The rows below are the REAL wallet activity for btc-updown-15m-1787457600
+# (2026-08-23 04:00Z), trimmed to the fields the grader reads. The window that
+# taught the grader L22 cannot be a characterization fixture — an unsized
+# redeem is exactly what stops the wallet naming a side, so the window grades
+# `resolution`, and fixtures take wallet truth only (fixtures/README.md). It is
+# pinned HERE instead, against the rows that actually did the damage.
+_L22_SLUG = "btc-updown-15m-1787457600"
+_L22_ACTIVITY = [
+    # 23 BUY DOWN clips, $265.21 / 440 shares, the position that lost.
+    *({"type": "TRADE", "slug": _L22_SLUG, "side": "BUY", "outcome": "Down",
+       "size": 440.0 / 23, "usdcSize": 265.21 / 23} for _ in range(23)),
+    # The poison: a $0 REDEEM with ZERO size carrying the WINNER's label.
+    {"type": "REDEEM", "slug": _L22_SLUG, "side": "", "outcome": "Up",
+     "size": 0, "usdcSize": 0},
+]
+
+
+def test_l22_real_rows_leave_the_wallet_silent():
+    # Pre-662c527 the unsized row was read as "we held Up and got $0", flipping
+    # the winner to DOWN — the side we actually bought — and booking this
+    # -$265.21 loss as a WIN in the ground-truth corpus. The size-0 row names
+    # nothing, so the grader must decline the slug entirely.
+    assert wallet_outcomes(_L22_ACTIVITY) == {}
+
+
+def test_l22_window_grades_resolution_up_not_a_wallet_win():
+    w = {"slug": _L22_SLUG, "symbol": "btc", "dur_s": 900,
+         "start": 1787457600, "end": 1787458500}
+    wallet = wallet_outcomes(_L22_ACTIVITY)
+    rows, dropped = build_outcomes([w], wallet, {}, None, {_L22_SLUG: "up"})
+    # UP won, so the 23 DOWN clips lost — and the source is the exchange's own
+    # settlement, never the wallet, because the wallet declined above.
+    assert rows == [{"slug": _L22_SLUG, "winner": "up", "source": "resolution"}]
+    assert dropped == []
+
+
+def test_l22_a_sized_redeem_would_still_have_named_the_loser():
+    # The discriminator is `size`, not the label: give the same $0 redeem the
+    # real position's shares and the flip is trustworthy again.
+    sized = [*_L22_ACTIVITY[:-1],
+             {"type": "REDEEM", "slug": _L22_SLUG, "outcome": "Down",
+              "size": 440.0, "usdcSize": 0}]
+    assert wallet_outcomes(sized) == {_L22_SLUG: "up"}
+
+
 # ---------- terminal-book source ----------
 
 def _book(t, up_bid=None, up_ask=None, dn_bid=None, dn_ask=None):
