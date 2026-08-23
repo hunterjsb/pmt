@@ -29,6 +29,10 @@ BOOK_TAPE = str(ENGINE_DIR / "book-tape.jsonl")
 # order decision. Its own file because the order path samples on a completely
 # different clock from the 5s eval throttle; joins to UPDOWN_TAPE on t+token.
 ORDER_TAPE = str(ENGINE_DIR / "order-latency-tape.jsonl")
+# Not a tape — the engine's live arm store, rewritten on every mutation. It
+# lives here anyway because it is the same directory under the same rule:
+# one place for the paths, so a consumer can't drift onto a stale copy.
+ARMS_STATE = str(ENGINE_DIR / "arms-state.json")
 
 EV_FIRE = "fire"
 EV_EXIT = "exit"

@@ -44,7 +44,10 @@ DEFAULT_MIN_FAIR = 0.97    # crypto arm's --min-fair default (the safety gate)
 DEFAULT_MIN_EDGE = 0.015   # crypto arm's --min-edge default
 EPISODE_GAP_S = 20.0       # tape re-records ~every 5s; a bigger gap is a new episode
 
-BRAKE_CATEGORIES = ("safety", "latched", "distrust", "avg_down")
+# Named because the journal calls this one brake out by itself — the latch is
+# the only refusal whose SAVE is a story rather than a statistic.
+BRAKE_LATCHED = "latched"
+BRAKE_CATEGORIES = ("safety", BRAKE_LATCHED, "distrust", "avg_down")
 CATEGORY_ORDER = ("basis_guard", *BRAKE_CATEGORIES, "sub_threshold", "unfilled_fires")
 
 _MARGIN_RE = re.compile(r"projected margin ([+-]?\d+(?:\.\d+)?)bp")

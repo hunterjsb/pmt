@@ -1,0 +1,23 @@
+# Nightly trigger for pmt-backup.service.
+#
+# PROPOSAL, not installed. See README.md in this directory.
+#
+# 03:30 local: after the engine's 03:00/03:30 log rotation has settled and
+# well inside the quiet end of the night, but before the box's morning. It is
+# the only unit here that is uncontroversial to enable — it reads files and
+# writes to S3, it never places an order.
+
+[Unit]
+Description=nightly pmt corpus backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+# The box powers off every night on purpose, so the scheduled run is MISSED
+# more often than not. Persistent= is what makes this unit work at all: the
+# backup fires on the next boot instead of silently skipping the dark night.
+Persistent=true
+AccuracySec=1m
+Unit=pmt-backup.service
+
+[Install]
+WantedBy=timers.target

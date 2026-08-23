@@ -1,12 +1,13 @@
 # systemd user units (proposal)
 
-Two units, neither installed. They are checked in as a proposal so adopting
+Three units, none installed. They are checked in as a proposal so adopting
 them is a decision with a diff behind it, not a thing that happened.
 
 | unit | what it runs | restarts? |
 | --- | --- | --- |
 | `pmengine.service` | `pmengine ... run updown --skip-warmup`, same as `pmt engine start` | on failure, 5s→120s backoff, 5 tries / 5min |
 | `pmt-rtds-recorder.service` | `uv run python -m polymarket.rtds` in `pmtrader/` | on failure, 10s→300s backoff, 10 tries / 10min |
+| `pmt-backup.service` + `.timer` | `scripts/pmt-backup.sh` — ~/.pmt corpus + tapes → `s3://xanmc/pmt-backups/YYYY-MM-DD.tar.zst` | no. oneshot, daily 03:30, `Persistent=true` |
 
 ## THE CAVEAT: auto-restart interacts with arm recovery
 
@@ -42,13 +43,63 @@ Before enabling, be sure you want:
    no writes. Deleting `~/.pmt/engine/arms-state.json` while the engine is
    stopped is a hard reset.
 
+## The backup unit is the one without a caveat
+
+`pmt-backup` reads files and writes to S3. It never places an order, never
+touches the engine, and cannot bring a position back — so unlike the two units
+above, enabling it is not a risk decision.
+
+What it ships, once a day, as one `.tar.zst` object:
+
+- `~/.pmt/corpus/**` — the RTDS stream recording (already one file per day, so
+  a restore can take a single dark day back), the klines and Chainlink pulls
+  behind every replay, the outcomes and activity corpora.
+- `~/.pmt/engine/*.jsonl` — `updown-tape`, `book-tape`, `order-latency-tape`,
+  `ledger-drift`.
+- `~/.pmt/engine/arms-state.json` — what comes back after a restart.
+
+What it deliberately leaves behind: the rotated engine logs (`*.log`,
+`*.log.gz`) and the recorder's own log/pidfile. They are the bulk of the
+directory and the tapes already carry structurally what the logs carry in
+prose.
+
+Two things worth knowing before enabling it:
+
+1. **It reads tapes the engine is actively appending to.** `tar` exits 1 with
+   "file changed as we read it", which the script treats as normal rather than
+   fatal — a JSONL tail torn mid-line is exactly what `tape.iter_records`
+   already skips, so the archive stays restorable.
+2. **One object per day, skipped if it already exists.** That is what makes
+   `Persistent=true` safe: the box powers off nightly, the 03:30 run is missed
+   more often than not, and the catch-up run on the next boot costs one
+   `s3 ls` if the day is already up there. `--force` overwrites; `--dry-run`
+   prints the member list and the destination and uploads nothing.
+
+`--date YYYY-MM-DD` backfills under another day's key. Env overrides:
+`PMT_HOME`, `PMT_BACKUP_S3`, `PMT_AWS`, `PMT_BACKUP_ZSTD_LEVEL`,
+`PMT_BACKUP_TMPDIR` (staging is `/var/tmp` by default and never `/tmp`, which
+is tmpfs on this box).
+
 ## Install
 
 ```sh
 mkdir -p ~/.config/systemd/user
 cp deploy/systemd/pmengine.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-rtds-recorder.service ~/.config/systemd/user/
+cp deploy/systemd/pmt-backup.service ~/.config/systemd/user/
+cp deploy/systemd/pmt-backup.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
+```
+
+The backup, end to end, before trusting the timer with it:
+
+```sh
+scripts/pmt-backup.sh --dry-run          # member list + destination, no upload
+systemctl --user start pmt-backup.service
+journalctl --user -u pmt-backup -n 50
+
+systemctl --user enable --now pmt-backup.timer
+systemctl --user list-timers pmt-backup.timer
 ```
 
 Start one without enabling it at boot (the way to try it):

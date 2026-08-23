@@ -1,0 +1,29 @@
+# pmt corpus backup — ~/.pmt corpus + tapes + arm state to S3, as a systemd
+# USER service driven by pmt-backup.timer.
+#
+# PROPOSAL, not installed. See README.md in this directory.
+#
+# No Restart= and no StartLimit*: a oneshot that fails tonight should fail
+# quietly and be tried again tomorrow, not retry into a dead network. The
+# script skips a day already uploaded, so a catch-up run costs one s3 ls.
+
+[Unit]
+Description=pmt corpus backup — ~/.pmt corpus + tapes to S3
+Documentation=file:///var/home/hunter/Desktop/code/pmt/deploy/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/var/home/hunter/Desktop/code/pmt/scripts/pmt-backup.sh
+
+# The engine is live while this runs. Reading 250MB off the same disk it is
+# appending tapes to must never be the reason a fire missed its tick.
+Nice=10
+IOSchedulingClass=idle
+
+# zstd -T0 on a full corpus, plus the upload. Generous, but a backup killed
+# halfway is a day of stream nobody can get back.
+TimeoutStartSec=1800
+
+SyslogIdentifier=pmt-backup
