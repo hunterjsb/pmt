@@ -279,6 +279,9 @@ pub struct StrategyRuntime {
     /// IDs of strategies that are paused — skipped in `tick()` until resumed.
     /// Keyed by id (not index) so it survives strategy removal/reordering.
     paused: std::collections::HashSet<String>,
+    /// This engine's series partition, read once at construction. `None` =
+    /// unpartitioned, which is every box that doesn't set the env var.
+    series: Option<crate::series_guard::SeriesAllowlist>,
 }
 
 impl StrategyRuntime {
@@ -287,7 +290,18 @@ impl StrategyRuntime {
             strategies: Vec::new(),
             last_tick_at: Vec::new(),
             paused: std::collections::HashSet::new(),
+            series: crate::series_guard::SeriesAllowlist::from_env(),
         }
+    }
+
+    /// Override the series partition. Tests inject one instead of mutating
+    /// the process environment.
+    pub fn with_series_allowlist(
+        mut self,
+        series: Option<crate::series_guard::SeriesAllowlist>,
+    ) -> Self {
+        self.series = series;
+        self
     }
 
     /// Pause a strategy: it stops being ticked until `resume`. Returns the
@@ -322,7 +336,20 @@ impl StrategyRuntime {
     }
 
     /// Route a control-plane command to a strategy by id.
+    ///
+    /// An `arm` naming a slug outside this engine's series partition never
+    /// reaches the strategy — the operator gets the refusal back. This is the
+    /// one chokepoint every externally-issued arm passes through, whatever
+    /// strategy it targets.
     pub fn command(&mut self, id: &str, cmd: &serde_json::Value) -> Result<serde_json::Value, String> {
+        if cmd.get("action").and_then(|a| a.as_str()) == Some("arm") {
+            if let Some(slug) = cmd.get("slug").and_then(|s| s.as_str()) {
+                if let Err(refusal) = crate::series_guard::check(self.series.as_ref(), slug) {
+                    tracing::error!(strategy_id = %id, slug = %slug, "{}", refusal);
+                    return Err(refusal);
+                }
+            }
+        }
         let strategy = self
             .strategies
             .iter_mut()
@@ -455,6 +482,92 @@ impl StrategyRuntime {
 impl Default for StrategyRuntime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::series_guard::SeriesAllowlist;
+
+    /// Records every command that got past the guard.
+    struct Recorder {
+        seen: Vec<serde_json::Value>,
+    }
+
+    impl Strategy for Recorder {
+        fn id(&self) -> &str {
+            "rec"
+        }
+        fn subscriptions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn on_tick(&mut self, _ctx: &StrategyContext) -> Vec<Signal> {
+            Vec::new()
+        }
+        fn on_command(&mut self, cmd: &serde_json::Value) -> Result<serde_json::Value, String> {
+            self.seen.push(cmd.clone());
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    fn runtime(series: Option<SeriesAllowlist>) -> StrategyRuntime {
+        let mut rt = StrategyRuntime::new().with_series_allowlist(series);
+        rt.register(Box::new(Recorder { seen: Vec::new() }));
+        rt
+    }
+
+    fn arm(slug: &str) -> serde_json::Value {
+        serde_json::json!({"action": "arm", "slug": slug, "size_usdc": 100.0})
+    }
+
+    #[test]
+    fn an_unset_allowlist_arms_anything() {
+        let mut rt = runtime(None);
+        assert!(rt.command("rec", &arm("btc-updown-5m-1755990000")).is_ok());
+        assert!(rt.command("rec", &arm("xrp-updown-5m-1755990000")).is_ok());
+    }
+
+    #[test]
+    fn an_arm_inside_the_partition_reaches_the_strategy() {
+        let mut rt = runtime(SeriesAllowlist::parse("xrp-updown-5m,sol-updown-5m"));
+        assert!(rt.command("rec", &arm("xrp-updown-5m-1755990000")).is_ok());
+        assert!(rt.command("rec", &arm("sol-updown-5m-1755990300")).is_ok());
+    }
+
+    #[test]
+    fn an_arm_outside_the_partition_is_refused_before_the_strategy_sees_it() {
+        let mut rt = runtime(SeriesAllowlist::parse("xrp-updown-5m"));
+        let err = rt
+            .command("rec", &arm("btc-updown-5m-1755990000"))
+            .expect_err("outside the partition");
+        assert!(err.contains("btc-updown-5m-1755990000"), "{err}");
+        assert!(err.contains(crate::series_guard::SERIES_ALLOWLIST_VAR), "{err}");
+
+        // The refusal has to happen HERE — a strategy that saw the command
+        // would already have started feeds for the market.
+        let seen = rt.command("rec", &arm("xrp-updown-5m-1")).expect("allowed");
+        assert_eq!(seen["ok"], true);
+    }
+
+    #[test]
+    fn the_guard_only_gates_arms() {
+        // disarm/status/fleet must keep working on a partitioned box —
+        // refusing them would strand orders the operator is trying to pull.
+        let mut rt = runtime(SeriesAllowlist::parse("xrp-updown-5m"));
+        for action in ["disarm", "status", "fleet"] {
+            let cmd = serde_json::json!({"action": action, "slug": "btc-updown-5m-1"});
+            assert!(rt.command("rec", &cmd).is_ok(), "{action} must not be gated");
+        }
+    }
+
+    #[test]
+    fn a_slugless_arm_is_left_to_the_strategy_to_reject() {
+        // No slug means nothing to partition on; the strategy's own param
+        // parsing owns that error, and the guard must not shadow it.
+        let mut rt = runtime(SeriesAllowlist::parse("xrp-updown-5m"));
+        let cmd = serde_json::json!({"action": "arm"});
+        assert!(rt.command("rec", &cmd).is_ok());
     }
 }
 
