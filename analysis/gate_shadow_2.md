@@ -296,8 +296,9 @@ it does not:
 | feed_stale | btc/eth/sol/bnb | 293 | 520 | 356 | 2% | 1 |
 
 Quiesce starts at 93.3% elapsed on a 5m window, so "held past 90%" means the
-window was shut for its whole tradeable life. **13 such windows**, 11 of them
-xrp — and at **20:45:00Z all three rtds arms lost the same window at once**
+window was shut for its whole tradeable life. **13 windows lost that way to
+`reference_wait`** (11 xrp, 1 btc, 1 eth) and 4 more to `feed_stale` — and at
+**20:45:00Z all three rtds arms lost the same window at once**
 (`btc/eth/xrp-updown-5m-1787517900`, 52 ticks each): one missing 20:44Z
 settlement mark took out the fleet's three largest arms simultaneously.
 
@@ -306,11 +307,15 @@ $1000/$150, rtds, **winner DOWN**; the down side was quoted 0.72–0.91 for the
 entire window and the arm could not read a price to compare it to:
 
 ```
-20:45:00  ROLL size=1000
-20:45:18   6.3%  GATED range-start reference not printed yet  up_ask=0.16 dn_ask=0.85
-...  (52 consecutive ticks, unchanged reason)
-20:49:XX  92.0%  GATED range-start reference not printed yet
+20:45:00   0.0%  ROLL   size=1000
+20:45:18   6.3%  GATED  range-start reference not printed yet  up_ask=0.16 dn_ask=0.85
+...        (52 consecutive ticks, one reason, never clearing)
+20:49:36  92.0%  GATED  range-start reference not printed yet  up_ask=0.05 dn_ask=0.96
+20:50:00 100.0%  CLEANUP
 ```
+
+By 20:49:36Z the book had DOWN at 0.96 and the arm still could not price it.
+The window resolved DOWN.
 
 The next window (20:50Z) cleared in one tick on all three arms, so this is a
 transient relay/mark gap, not a persistent config fault.
@@ -477,7 +482,7 @@ experiment that would have to win first.
 | 3 | **Fix `reference_wait`, don't relax it** | 13 whole-window write-offs incl. 3 arms at once; ~2% of armed windows | ✅ mechanism is certain | Not a gate A/B — a hub change: seed `per_min[start-60]` from the hub's `SymbolHistory` (or a REST backfill) when the live mark is missing, then `replay --mode full` over the 13 windows and confirm they price at all. The regression test is that they stop gating |
 | 4 | **Maker bids on btc + eth** (they have none; sol/xrp do) | eth realizes 16% of a $110 clip, btc 64%; the fleet deploys $6.3k against 637 armed windows | ✅ depth measurement is exact | `maker_bid` is an `ArmParams` field: `replay --mode full` btc/eth with `maker_bid` on vs off over the book tape. `analysis/maker_grading.md` already has the grading harness |
 | 5 | **15m at a real size with theta 0.3** | +$518 / 3.7h at a $24 clip — but 54% hit and 0 fires possible at $1 | ❌ counterfactual about an arm that does not exist | `analysis/fifteen_stream_ab.sh` already exists. Re-run it with `size_usdc`/`clip_usdc` at the pre-08:15Z values, theta 0.3 vs 1.0, `settle_rule` range_avg vs hybrid, over the 17:31Z+ corpus. Do not touch live 15m until it wins — `range_avg`'s 15m record is what shut these arms |
-| 6 | **Basis guard −1bp** (btc 6→5, eth 8→7, sol 10→9) | +$529 raw, **+$83 after the theta gate** (22 clips) / 9.8h | ⚠️ small, and mostly re-blocked downstream | `basis_guard_bp` is an `ArmParams` field. Worth running only *after* #2 — the relaxation's value is bounded by theta, and 90% of what a 1bp loosen opens is refused again by the entry gate. ROADMAP:288 applies |
+| 6 | **Basis guard −1bp** (btc 6→5, eth 8→7, sol 10→9) | +$529 raw, **+$83 after the theta gate** (22 clips) / 9.8h | ⚠️ small, and mostly re-blocked downstream | `basis_guard_bp` is an `ArmParams` field. Worth running only *after* #2 — the relaxation's value is bounded by theta — of the 330 clips a 1bp loosen opens, 22 survive the entry gate. ROADMAP:288 applies |
 | 7 | **Basis guard carve-out on dear sides** (skip the guard when the refused side's ask ≥ 0.80) | +$85 / 9.8h, +$66 / 3.7h; 189 + 79 opens, 85% hit | ✅ all 3 conventions, both slices | Needs a knob (`guard_ask_bypass`). Robust but small; sequence it behind #1 and #2 |
 
 **Explicitly NOT candidates.** `min_fair` has no marginal band at all — relaxing
