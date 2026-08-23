@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import re
 
-SLUG_RE = re.compile(r"^([a-z]+)-updown-(\d+)m-(\d+)$")
+# h durations are real traded history: requiring the m token silently
+# dropped every 4h window from the ledger — six settled WINS (+$164.35)
+# rode invisible until a raw wallet walk caught the gap (regression_sweep).
+SLUG_RE = re.compile(r"^([a-z]+)-updown-(\d+)([mh])-(\d+)$")
 
 
 def parse_updown_slug(slug: str) -> dict | None:
@@ -19,9 +22,9 @@ def parse_updown_slug(slug: str) -> dict | None:
     m = SLUG_RE.match(slug)
     if not m:
         return None
-    sym, dur_m, start_s = m.groups()
+    sym, dur_n, dur_unit, start_s = m.groups()
     start = int(start_s)
-    dur_s = int(dur_m) * 60
+    dur_s = int(dur_n) * (3600 if dur_unit == "h" else 60)
     return {"symbol": sym, "dur_s": dur_s, "start": start, "end": start + dur_s}
 
 
@@ -39,7 +42,9 @@ def parse(slug: str) -> tuple[str, int, int, int, str] | None:
 
 
 def series_key(symbol: str, dur_s: int) -> str:
-    """'btc 15m' from ('btc', 900)."""
+    """'btc 15m' from ('btc', 900); hour formats keep their own unit ('btc 4h')."""
+    if dur_s >= 3600 and dur_s % 3600 == 0:
+        return f"{symbol} {dur_s // 3600}h"
     return f"{symbol} {dur_s // 60}m"
 
 
