@@ -122,28 +122,19 @@ def test_impute_win_pnl_with_partial_sell():
 
 # ---------- watch: the render/fetch thread split ----------
 
-class _FakeLedger:
-    """Stands in for wallet.ActivityLedger: records refreshes, serves rows."""
 
-    def __init__(self, rows=None, boom=None):
-        self.rows = list(rows or [])
-        self.refreshes = 0
-        self.boom = boom
-
-    def refresh(self, addr):
-        self.refreshes += 1
-        if self.boom:
-            raise self.boom
-        return 0
-
-
-def _fetcher(monkeypatch, *, ledger=None, sb=None, status=None, bal=None):
-    """A WatchFetcher with every network seam replaced."""
+def _fetcher(monkeypatch, *, sb=None, status=None, bal=None, sb_boom=None):
+    """A WatchFetcher with every network seam replaced. The scoreboard seam
+    is _tape_scoreboard — the SAME function `pmt crypto stats` runs, which
+    is the whole point: one acquisition path, one truth."""
     state = cc.WatchState()
-    f = cc.WatchFetcher(state, sliding_floor=0.0, ledger=ledger or _FakeLedger())
+    f = cc.WatchFetcher(state, sliding_floor=0.0)
     monkeypatch.setattr(cc.wallet, "funder_address", lambda: "0xabc")
-    monkeypatch.setattr(cc, "score_activity",
-                        lambda rows, floor, sliding_floor=None: sb or {"wins": 1})
+    def _fake_scoreboard(floor, sliding_floor=None):
+        if sb_boom and sb_boom[0] is not None:
+            raise sb_boom[0]
+        return sb or {"wins": 1}
+    monkeypatch.setattr(cc, "_tape_scoreboard", _fake_scoreboard)
     monkeypatch.setattr(cc, "_engine_post",
                         (lambda *a, **k: status) if not isinstance(status, BaseException)
                         else _raiser(status))
@@ -186,31 +177,29 @@ def test_watch_state_update_swaps_whole_objects():
         st.update(bogus=1)                     # typo'd field must not vanish silently
 
 
-def test_fetcher_publishes_scoreboard_off_the_ledger(monkeypatch):
-    led = _FakeLedger(rows=[{"slug": "x"}])
-    state, f = _fetcher(monkeypatch, ledger=led, sb={"wins": 7})
+def test_fetcher_scoreboard_is_the_stats_path(monkeypatch):
+    state, f = _fetcher(monkeypatch, sb={"wins": 7})
     f.fetch_sb()
     snap = state.read()
-    assert led.refreshes == 1                  # incremental refresh, not a full walk
     assert snap["sb"] == {"wins": 7}
     assert snap["sb_stale"] is False and snap["sb_fetched_at"] is not None
 
 
 def test_fetcher_scoreboard_failure_keeps_last_value_and_marks_stale(monkeypatch):
-    led = _FakeLedger()
-    state, f = _fetcher(monkeypatch, ledger=led, sb={"wins": 7})
+    boom = [None]
+    state, f = _fetcher(monkeypatch, sb={"wins": 7}, sb_boom=boom)
     f.tick(0.0)                                # first pass: everything succeeds
     good = state.read()["sb"]
     assert good == {"wins": 7}
 
-    led.boom = ConnectionError("data-api down")
+    boom[0] = ConnectionError("data-api down")
     f.tick(1000.0)
     snap = state.read()
     assert snap["sb"] is good                  # last good numbers still on screen
     assert snap["sb_stale"] is True
     assert "ConnectionError" in snap["err"]
 
-    led.boom = None                            # recovery clears both markers
+    boom[0] = None                             # recovery clears both markers
     f.tick(2000.0)
     snap = state.read()
     assert snap["sb_stale"] is False and snap["err"] is None
@@ -292,16 +281,15 @@ def test_render_path_is_never_blocked_by_a_slow_fetch(monkeypatch):
     must not delay the loop that reads keys and repaints."""
     import threading
 
-    led = _FakeLedger()
-    state, f = _fetcher(monkeypatch, ledger=led)
+    state, f = _fetcher(monkeypatch)
     started = threading.Event()
 
-    def slow_refresh(addr):
+    def slow_scoreboard(floor, sliding_floor=None):
         started.set()
-        time.sleep(1.5)  # a full wallet walk, the old inline cost
-        return 0
+        time.sleep(1.5)  # the full wallet walk, now the sb fetch's real cost
+        return {"wins": 1}
 
-    led.refresh = slow_refresh
+    monkeypatch.setattr(cc, "_tape_scoreboard", slow_scoreboard)
     stop = threading.Event()
     th = threading.Thread(target=f.loop, args=(stop,), daemon=True)
     th.start()

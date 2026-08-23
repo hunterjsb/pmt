@@ -743,11 +743,9 @@ class WatchFetcher:
     the activity feed instead of re-walking the whole history.
     """
 
-    def __init__(self, state: WatchState, sliding_floor: float,
-                 ledger: "wallet.ActivityLedger | None" = None) -> None:
+    def __init__(self, state: WatchState, sliding_floor: float) -> None:
         self.state = state
         self.sliding_floor = sliding_floor
-        self.ledger = wallet.ActivityLedger() if ledger is None else ledger
         self._due: dict[str, float] = {"status": 0.0, "sb": 0.0, "bal": 0.0}
 
     # -- individual fetches: each may raise; tick() belts them --
@@ -760,11 +758,14 @@ class WatchFetcher:
         self.state.update(status=status if isinstance(status, dict) else {})
 
     def fetch_sb(self) -> None:
-        addr = wallet.funder_address()
-        self.ledger.refresh(addr)
-        # Always grade the FULL history (floor 0) and derive both the sliding
-        # (recent-pulse) and all-time figures from that one pass.
-        sb = score_activity(self.ledger.rows, 0.0, sliding_floor=self.sliding_floor)
+        # THE SAME full walk `pmt crypto stats` does — one code path, one
+        # truth. The incremental ActivityLedger this replaced disagreed with
+        # stats five separate ways (mutating redeem rows, seam re-serves,
+        # mid-walk mutations, ...); a stateful cache of a mutable feed is a
+        # bug factory, and the full history is a handful of pages fetched on
+        # a worker thread. If pagination cost ever actually hurts, the fix
+        # is a floor at strategy genesis — never a second code path.
+        sb = _tape_scoreboard(0.0, sliding_floor=self.sliding_floor)
         self.state.update(sb=sb, sb_stale=False, sb_fetched_at=time.time(), err=None)
 
     def fetch_bal(self) -> None:
