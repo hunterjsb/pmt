@@ -1791,20 +1791,23 @@ def crypto_tape(n: int, follow: bool, as_json: bool) -> None:
         proc.terminate()
 
 
-@crypto_group.command("stats")
-@click.option("--since", type=float, default=None,
-              help="Hours of tape to include (default: the v2 fleet era)")
-@click.option("--json", "as_json", is_flag=True)
-def crypto_stats(since: float | None, as_json: bool) -> None:
-    """Fleet scoreboard: est P&L, win rate, calibration, live arms, capital."""
+_TAPE_PATH = "/var/home/hunter/.pmt/engine/updown-tape.jsonl"
+_V2_ERA = 1787441100
+
+
+def _tape_scoreboard(floor: float) -> dict:
+    """Aggregate the decision tape into W-L / est P&L / calibration.
+
+    P&L assumes fires filled at their vwap up to the window's final
+    committed notional — an estimate; wallet balance is the truth.
+    """
     import time as _t
 
-    floor = _t.time() - since * 3600 if since else 1787441100  # v2 fleet era
     fires: dict[str, list] = {}
     evals: dict[str, dict] = {}
     rolls = 0
     try:
-        with open("/var/home/hunter/.pmt/engine/updown-tape.jsonl") as fh:
+        with open(_TAPE_PATH) as fh:
             for line in fh:
                 r = json.loads(line)
                 if r["t"] < floor:
@@ -1816,7 +1819,7 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
                 elif r["ev"] == "roll":
                     rolls += 1
     except FileNotFoundError:
-        raise click.UsageError("no tape yet")
+        pass
 
     now = _t.time()
     series: dict[str, dict] = {}
@@ -1852,6 +1855,22 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
             cal.setdefault(b, [0, 0])
             cal[b][0] += 1
             cal[b][1] += f["side"] == won_side
+    return {"wins": wins, "losses": losses, "net": net, "rolls": rolls,
+            "series": series, "cal": cal}
+
+
+@crypto_group.command("stats")
+@click.option("--since", type=float, default=None,
+              help="Hours of tape to include (default: the v2 fleet era)")
+@click.option("--json", "as_json", is_flag=True)
+def crypto_stats(since: float | None, as_json: bool) -> None:
+    """Fleet scoreboard: est P&L, win rate, calibration, live arms, capital."""
+    import time as _t
+
+    floor = _t.time() - since * 3600 if since else _V2_ERA
+    sb = _tape_scoreboard(floor)
+    wins, losses, net, rolls = sb["wins"], sb["losses"], sb["net"], sb["rolls"]
+    series, cal = sb["series"], sb["cal"]
 
     status, bal = {}, {}
     try:
@@ -1912,6 +1931,115 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
         console.print(t)
         if status.get("pending_rolls"):
             console.print(f"[dim]pending rolls: {', '.join(status['pending_rolls'])}[/dim]")
+
+
+@crypto_group.command("watch")
+@click.option("--since", type=float, default=None,
+              help="Hours of tape history for the scoreboard")
+def crypto_watch(since: float | None) -> None:
+    """Full-screen live dashboard: scoreboard + arms + streaming tape."""
+    import time as _t
+    from collections import deque
+
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.text import Text
+
+    floor = _t.time() - since * 3600 if since else _V2_ERA
+    lines: deque = deque(maxlen=200)
+    offset = 0
+    try:
+        with open(_TAPE_PATH) as fh:
+            for raw in fh.readlines()[-60:]:
+                r = _tape_render(raw)
+                if r:
+                    lines.append(r)
+            offset = fh.tell()
+    except FileNotFoundError:
+        pass
+
+    sb = _tape_scoreboard(floor)
+    status: dict = {}
+    bal: dict = {}
+
+    def header() -> Panel:
+        wins, losses, net = sb["wins"], sb["losses"], sb["net"]
+        n = wins + losses
+        wr = f"{wins / n * 100:.0f}%" if n else "—"
+        cap = f"${bal['total']:,.2f}" if bal else "…"
+        color = "green" if net >= 0 else "red"
+        return Panel(
+            f"[bold]{wins}W-{losses}L[/bold] ({wr}) · est P&L [{color}]{net:+,.2f}[/] · "
+            f"{sb['rolls']} rolls · capital {cap} · [dim]{_t.strftime('%H:%M:%S')}[/dim]",
+            title="updown fleet", border_style="cyan")
+
+    def arms_table() -> Table:
+        t = Table(expand=True, pad_edge=False)
+        for col in ("window", "state", "committed", "fair", "roll"):
+            t.add_column(col, justify="left" if col == "state" else "right")
+        arms = status.get("arms") or {}
+        for slug, a in arms.items():
+            e = a.get("eval") or {}
+            state = e.get("state", "?")
+            if state == "gated":
+                state = (e.get("reason") or "gated")[:48]
+            fair = f"{e['p_up']:.4f}" if "p_up" in e else "—"
+            t.add_row(_tape_slug(slug), state,
+                      f"${e.get('committed', a.get('filled_usdc', 0)):,.2f}",
+                      fair, "⟳" if a.get("roll") else "·")
+        if not arms:
+            t.add_row("—", "[red]engine unreachable or no arms[/red]", "", "", "")
+        return t
+
+    def tape_panel(height: int) -> Panel:
+        shown = list(lines)[-max(height - 2, 1):]
+        return Panel(Text.from_ansi("\n".join(shown)), title="tape", border_style="dim")
+
+    layout = Layout()
+    layout.split_column(
+        Layout(name="head", size=3),
+        Layout(name="arms", size=10),
+        Layout(name="tape", ratio=1),
+    )
+
+    tick = 0
+    try:
+        with Live(layout, refresh_per_second=4, screen=True) as live:
+            while True:
+                try:
+                    with open(_TAPE_PATH) as fh:
+                        fh.seek(offset)
+                        for raw in fh:
+                            r = _tape_render(raw)
+                            if r:
+                                lines.append(r)
+                        offset = fh.tell()
+                except FileNotFoundError:
+                    pass
+                if tick % 2 == 0:
+                    try:
+                        status = _engine_post("/strategies/updown/command",
+                                              {"action": "status"})
+                    except Exception:
+                        status = {}
+                if tick % 10 == 0:
+                    sb = _tape_scoreboard(floor)
+                # Balance is a slow call — after first paint, then per minute.
+                if tick % 60 == 1:
+                    try:
+                        bal = _api().get_usdc_balance()
+                    except Exception:
+                        pass
+                layout["arms"].size = max(len(status.get("arms") or {}), 1) + 4
+                layout["head"].update(header())
+                layout["arms"].update(arms_table())
+                h = live.console.size.height - 3 - layout["arms"].size
+                layout["tape"].update(tape_panel(h))
+                tick += 1
+                _t.sleep(1)
+    except KeyboardInterrupt:
+        pass
 
 
 @cli.group("sports")
