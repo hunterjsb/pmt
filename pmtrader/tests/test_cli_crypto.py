@@ -363,27 +363,27 @@ def test_cbreak_stdin_noop_when_not_a_tty(monkeypatch):
     cc._restore_stdin(None)  # must not raise
 
 
-def test_quit_requested_false_when_not_a_tty(monkeypatch):
+def test_poll_key_none_when_not_a_tty(monkeypatch):
     monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=False))
-    assert cc._quit_requested() is False
+    assert cc._poll_key() is None
 
 
-def test_quit_requested_reads_q_when_ready(monkeypatch):
+def test_poll_key_reads_q_when_ready(monkeypatch):
     monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=True, chars="q"))
     monkeypatch.setattr(cc.select, "select", lambda r, w, x, t: ([cc.sys.stdin], [], []))
-    assert cc._quit_requested() is True
+    assert cc._poll_key() == "q"
 
 
-def test_quit_requested_false_for_other_keys(monkeypatch):
+def test_poll_key_returns_other_keys_lowercased(monkeypatch):
     monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=True, chars="x"))
     monkeypatch.setattr(cc.select, "select", lambda r, w, x, t: ([cc.sys.stdin], [], []))
-    assert cc._quit_requested() is False
+    assert cc._poll_key() is not None
 
 
-def test_quit_requested_false_when_nothing_ready(monkeypatch):
+def test_poll_key_none_when_nothing_ready(monkeypatch):
     monkeypatch.setattr(cc.sys, "stdin", _FakeStdin(isatty=True, chars=""))
     monkeypatch.setattr(cc.select, "select", lambda r, w, x, t: ([], [], []))
-    assert cc._quit_requested() is False
+    assert cc._poll_key() is None
 
 
 def test_quit_requested_swallows_select_errors(monkeypatch):
@@ -393,4 +393,13 @@ def test_quit_requested_swallows_select_errors(monkeypatch):
         raise OSError("bad fd")
 
     monkeypatch.setattr(cc.select, "select", boom)
-    assert cc._quit_requested() is False  # never raises, dashboard must survive
+    assert cc._poll_key() is None  # never raises, dashboard must survive
+
+
+def test_controls_panel_renders():
+    from rich.console import Console
+    import io
+    con = Console(file=io.StringIO(), width=160)
+    con.print(cc._controls_panel())
+    out = con.file.getvalue()
+    assert "quit" in out and "controls" in out

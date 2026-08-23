@@ -881,15 +881,26 @@ def _restore_stdin(saved: tuple[int, list] | None) -> None:
         pass
 
 
-def _quit_requested() -> bool:
-    """Non-blocking: True if 'q' is waiting on stdin this tick."""
+def _poll_key() -> str | None:
+    """Non-blocking: the waiting keypress (lowercased) or None this tick."""
     if not sys.stdin.isatty():
-        return False
+        return None
     try:
         ready, _, _ = select.select([sys.stdin], [], [], 0)
-        return bool(ready) and sys.stdin.read(1).lower() == "q"
+        return sys.stdin.read(1).lower() if ready else None
     except Exception:
-        return False
+        return None
+
+
+def _controls_panel():
+    """The 'h' help overlay — swaps into the strip slot so toggling never
+    changes the layout geometry."""
+    from rich.panel import Panel
+    return Panel(
+        "[bold]q[/bold] quit · [bold]h[/bold] toggle controls · Ctrl-C also quits"
+        "  [dim]|[/dim]  refresh: tape 1s · engine 2s · scoreboard 10s · balance 60s"
+        "  [dim]|[/dim]  [dim]--since floors the sliding P&L (hours or epoch)[/dim]",
+        title="controls", border_style="cyan")
 
 
 @crypto_group.command("watch")
@@ -994,7 +1005,8 @@ def crypto_watch(since: float | None) -> None:
 
     def strip_panel() -> Panel:
         return Panel(Text.from_markup(build_windows_strip(sb.get("windows"))),
-                     title="recent windows", border_style="dim")
+                     title="recent windows", subtitle="[dim]h = controls[/dim]",
+                     border_style="dim")
 
     def tape_panel(height: int) -> Panel:
         shown = list(lines)[-max(height - 2, 1):]
@@ -1010,12 +1022,16 @@ def crypto_watch(since: float | None) -> None:
     )
 
     tick = 0
+    show_controls = False
     saved_term = _cbreak_stdin()
     try:
         with Live(layout, refresh_per_second=4, screen=True) as live:
             while True:
-                if _quit_requested():
+                key = _poll_key()
+                if key == "q":
                     break
+                if key == "h":
+                    show_controls = not show_controls
                 # Final belt: nothing reachable from this tick — engine,
                 # data-api, disk — may tear the dashboard down. Note it in
                 # the header and keep ticking; only Ctrl+C or 'q' stops this.
@@ -1059,7 +1075,8 @@ def crypto_watch(since: float | None) -> None:
                     layout["head"].update(header())
                     layout["risk"].update(risk_panel())
                     layout["arms"].update(arms_table())
-                    layout["strip"].update(strip_panel())
+                    layout["strip"].update(
+                        _controls_panel() if show_controls else strip_panel())
                     h = live.console.size.height - 3 - 1 - 3 - layout["arms"].size
                     layout["tape"].update(tape_panel(h))
                     tick_err = None
