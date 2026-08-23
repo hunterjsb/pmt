@@ -202,18 +202,27 @@ instruction:
 - FAK/FOK ("market" order types) don't support `post_only` — irrelevant to maker mode,
   that's updown's taker path.
 
-**Required engine change — currently `Urgency::Low` is a complete no-op.**
-`OrderManager::place_order` takes `_urgency: Urgency` and drops it entirely
-(**[pmengine:order.rs:96-103]**); it never calls the SDK order builder's `.order_type(...)`
-or `.post_only(...)` — both of which exist and work
-(`polymarket_client_sdk_v2-0.6.0-canary.1/src/clob/order_builder.rs:88-96`, confirmed by
-reading the vendored SDK source directly). The builder's own default is `OrderType::GTC`,
-`post_only: Some(false)` when unset (`order_builder.rs:319-320`). **Every order pmengine has
-ever placed, live, is a plain crossing-allowed GTC order regardless of which `Urgency` a
-strategy asked for** — updown always asks for `Urgency::High` anyway
-(**[pmengine:strategies/updown.rs:1160,1166]**, comment: "All clip orders are High
-urgency"), so this has never mattered until now. It is exactly the gap maker mode needs
-closed, and closing it is the correct Phase 3.1 slice #0 (§6).
+**Required engine change — `Urgency::Low` was a complete no-op. SHIPPED (step 0).**
+`OrderManager::place_order` took `_urgency: Urgency` and dropped it entirely, so **every
+order pmengine had ever placed, live, was a plain crossing-allowed GTC order regardless of
+which `Urgency` a strategy asked for** — updown always asks for `Urgency::High` anyway, so
+it never mattered until now.
+
+As of step 0 `Urgency::Low` maps through `order.rs::wire_shape` to the SDK builder's
+`.post_only(true)`. Verified against the vendored **0.7.0** source (not the 0.6.0-canary
+this brief was drafted from): `OrderBuilder::post_only` at `src/clob/order_builder.rs:93-97`,
+`build()` defaulting to `OrderType::GTC` + `post_only: Some(false)` at lines 325-326 and
+refusing postOnly on anything but GTC/GTD at 334, and `SignedOrder`'s hand-written
+`Serialize` emitting `postOnly` beside `order`/`orderType`/`owner` at
+`src/clob/types/mod.rs:867-869`. pmengine POSTs that `SignedOrder` through its own L2 path
+(`client.rs::l2_post`), so the flag reaches the wire without going through the SDK's own
+`post_order`. Note the field was **already on the wire as `postOnly: false`** for every
+order ever placed — step 0 only flips its value, it does not add a field.
+
+One consequence the brief's own §1.3/§2 pricing must respect: rejection is not repricing, so
+`order.rs` rounds a post-only price AWAY from the book (`ToZero` for a bid, `AwayFromZero`
+for an ask) instead of to nearest. Half-up on a coarse tick would lift a 0.985 bid to 0.99 —
+above the `max_price` the strategy clamped it under, and straight into a rejection.
 
 ---
 
@@ -407,13 +416,16 @@ trade flow" is forward-only anyway, so retrofitting deeper history isn't an opti
    wants one reproducible number against one specific recorded night (ROADMAP:52-61), not a
    distribution.
 
-**A new `Action` variant is needed, not a reinterpretation of `Buy`/`Sell`.**
-`Action::Buy`/`Sell` mean "fire a taker clip" at every existing call site (updown, and every
-branch of `apply_fills`); overloading them for "place/refresh a resting quote" would corrupt
-updown's own replay semantics the moment the two strategies' actions are ever processed by
-shared code. Add `Action::Quote { token: String, side: Side, price: f64, size: f64 }`
-(resting) and keep `Action::Buy`/`Sell` meaning immediate/taker exactly as today, so
-`apply_fills` dispatches on the variant rather than re-deriving intent from `Urgency`.
+**Resting and taking must be distinguishable in the action stream, not inferred.**
+Overloading `Action::Buy` for "place/refresh a resting quote" would corrupt updown's own
+replay semantics the moment shared code processed both. Step 0 ships the smaller form of
+this brief's `Action::Quote` proposal: `Action::Buy` carries a `post_only: bool`, so
+`apply_fills` dispatches on the flag rather than re-deriving intent from `Urgency`, and the
+Buy→Signal mapping stays single. `replay.rs` currently **skips** post-only buys entirely —
+an honest under-fill (§5.3's safe direction) until the conservative queue-ahead model lands
+as step 2. A separate `Quote` variant is still the right shape once maker mode grows a
+two-sided quoting strategy of its own (§5.1); one flag on `Buy` is what a single resting bid
+needs.
 
 **Acceptance bar mirrors Phase 1's own**: before any maker A/B result is trusted, reproduce
 at least one recorded night's fills within tolerance using the conservative queue model —
@@ -428,14 +440,33 @@ reality"), just pointed at resting fills instead of marketable ones.
 Every step gated per ROADMAP:231 ("replay A/B win → one small-size live night → full
 size"). Nothing below step 4 touches a live order.
 
-**0. Post-only plumbing (engine only, no strategy).**
-Wire `Urgency::Low` → the SDK order builder's `.post_only(true)` inside
-`OrderManager::place_order` (**[pmengine:order.rs:96-103]**). Unit-test only: assert a
-`Low`-urgency `Buy` produces a builder call with `post_only(true)`, a `High`-urgency one
-doesn't. Zero live behavior change today — nothing currently emits `Urgency::Low` except
-the already-dead example strategies (`market_maker.rs`, `dynamic_market_maker.rs`), and
-updown exclusively emits `High`. Ships alone, reviewed alone, near-zero risk — this is the
-literal smallest shippable slice of Phase 3.1.
+**0. Post-only plumbing + the optimistic resting bid. SHIPPED, DARK.**
+Two halves, both inert until an operator arms them:
+
+*Plumbing.* `Urgency::Low` → `.post_only(true)` (§2). `Placement` carries the flag back so
+the Phase 7 order tape labels a resting quote (`"post_only": true`, additive — absent on a
+taker line, so every tape line already on disk still reads correctly).
+
+*The slice.* An `ArmParams.maker_bid` knob (`serde(default)` off; `pmt crypto arm
+--maker-bid`) on the ONE miss class a taker cannot reach: the 9.6% of armed time where our
+side is bid near 1.00 and **nothing is offered at any price**, median 82% elapsed
+(analysis/freq_funnel_report.md). Deliberately not a market maker — early-window maker
+measured negative everywhere (0.5¢ half-spread against 3.65¢/5s drift), which is why every
+one of §1's quoting mechanics is *absent* here. One post-only bid, priced
+`min(fair − edge_req, best_bid + tick, max_price)` floored onto the tick grid, only when
+ALL of: no ask at all · `side_safety ≥ theta` on that side · outside the quiesce window ·
+not brake-latched · not chop-blocked · `fair ≥ fair_req` · the avg-down brake clears at that
+price · cooled · nothing in flight. The bid's notional counts against the arm's budget and
+R7's fleet pool from the moment it RESTS (it is un-decided speculative exposure, not
+un-committed cash), it re-quotes through the existing delta matcher only when its price
+actually moves, and the quiesce sweep, a window close, a gate, and an ask reappearing each
+pull it.
+
+*Shadow first.* With the knob OFF the slice still stamps `"maker_candidate": true` (plus
+`maker_px` / `maker_size`) on the eval record for every moment it WOULD have quoted, with
+`ask` left null so the funnel still charges the moment to `book_quoted`.
+`analysis/freq_funnel.py` reports the count and would-be notional. **That measurement is
+the gate on arming it**, per ROADMAP:231 — read the counts, then arm ONE symbol.
 
 **1. Pure `decide()` core + quoting math, no live wiring.**
 New `src/strategies/maker.rs` with `ArmParams`/`ArmView`/`Action::Quote`/`decide()`

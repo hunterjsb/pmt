@@ -156,6 +156,17 @@ def _resolve_basis_guard(explicit: float | None, symbol: str) -> tuple[float, st
                    "Gaussian p_up 0.99+ is fiction in the tails (>3-sigma "
                    "jumps ~hourly). With min_edge 1.5c, 0.98 makes ~0.945 the "
                    "max ask a non-flip-proof clip pays. 1.0 disables")
+@click.option("--maker-bid/--no-maker-bid", default=False, show_default=True,
+              help="Maker step 0: rest ONE post-only bid on the side the model "
+                   "wants when the book has NOTHING to lift. That miss class is "
+                   "9.6% of armed time — bid pinned near 1.00 with no offer at "
+                   "any price, median 82% through the window — and no taker "
+                   "knob reaches it, because it is supply, not a gate. NOT a "
+                   "market maker: early-window maker measured negative "
+                   "everywhere (0.5c half-spread against 3.65c of drift per "
+                   "5s), so this is a narrow, late-window, theta-approved "
+                   "resting bid. Off by default. Read the maker_candidate "
+                   "counts on the tape before arming it, and arm ONE symbol")
 @click.option("--feed", type=click.Choice(["binance", "rtds"]), default="binance",
               show_default=True,
               help="Market data source. 'binance' is the venue proxy every arm "
@@ -168,7 +179,7 @@ def _resolve_basis_guard(explicit: float | None, symbol: str) -> tuple[float, st
 def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
                side: str | None, quiesce: float, min_fair: float, min_elapsed: float,
                roll: bool, clip: float, basis_guard: float | None, theta: float,
-               pay_up: float, p_cap: float, feed: str) -> None:
+               pay_up: float, p_cap: float, maker_bid: bool, feed: str) -> None:
     """Arm the pmengine updown trigger on a market.
 
     Prices the market (semantics, vol, fee) and hands the parameters to the
@@ -203,15 +214,17 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         "quiesce_secs": quiesce, "min_fair": min_fair, "min_elapsed_frac": min_elapsed,
         "roll": roll, "clip_usdc": clip, "basis_guard_bp": guard_bp,
         "theta": theta, "pay_up_max": pay_up, "p_cap": p_cap, "feed": feed,
+        "maker_bid": maker_bid,
     }
     if side:
         payload["side_filter"] = side
     reply = _engine_post("/strategies/updown/command", payload)
     rolling = " · rolling" if roll else ""
+    making = " · maker-bid" if maker_bid else ""
     console.print(f"[green]armed[/green] {reply.get('armed')}  "
                   f"[dim]{r['kind']} · {r['rem_s']:.0f}s left · size ${size:.0f} · "
                   f"min edge {min_edge * 100:.0f}¢ · σ {r['sigma_bp_per_min']:.2f}bp/min · "
-                  f"guard {guard_bp:.1f}bp · feed {feed}{rolling}[/dim]")
+                  f"guard {guard_bp:.1f}bp · feed {feed}{rolling}{making}[/dim]")
     console.print(f"[dim]market now: {r['verdict']}[/dim]")
 
 

@@ -388,6 +388,35 @@ pub(crate) fn pay_up_limit(ask: f64, net: f64, edge_req: f64, pay_up_max: f64, m
     (ask + (net - edge_req).max(0.0).min(pay_up_max)).min(max_price)
 }
 
+/// Maker step 0's resting-bid price (docs/maker-design.md §6 step 0).
+///
+/// Three clamps, tightest wins: the edge floor still has to hold at the
+/// price we'd actually pay — and a maker pays NO fee, so there is no fee
+/// term here the way `pay_up_limit`'s caller has one; we improve the book
+/// by at most one tick, never leaping the queue we cannot see; and
+/// `max_price` is the same hard cap a clip has.
+///
+/// The result is floored onto the `tick` grid because the pure core has no
+/// per-market tick size. The order path floors again to the market's real
+/// tick, so a coarser market can only make the bid CHEAPER, never richer.
+pub(crate) fn maker_bid_price(
+    fair: f64,
+    edge_req: f64,
+    best_bid: f64,
+    max_price: f64,
+    tick: f64,
+) -> f64 {
+    let px = (fair - edge_req).min(best_bid + tick).min(max_price);
+    if tick <= 0.0 {
+        return px;
+    }
+    // The epsilon is load-bearing: 0.985/0.001 is 984.999999999999886 in
+    // binary, and a bare floor would shave a whole tick off every price
+    // that already sits exactly ON the grid.
+    let ticks = (px / tick + 1e-9).floor();
+    ((ticks * tick) * 1e6).round() / 1e6
+}
+
 /// Settlement TWAP width for a window: 30s for 5m markets, 60s otherwise
 /// (the post-2026-08-07 Chainlink stream widths).
 pub(crate) fn settle_tw_secs(window_secs: f64) -> f64 {
@@ -698,6 +727,38 @@ mod tests {
         assert_eq!(pay_up_limit(0.90, 0.015, 0.015, 0.02, 0.985), 0.90, "no surplus, no chase");
         assert_eq!(pay_up_limit(0.90, 0.05, 0.015, 0.0, 0.985), 0.90, "disabled by default");
         assert_eq!(pay_up_limit(0.98, 0.05, 0.015, 0.02, 0.985), 0.985, "max_price caps");
+    }
+
+    #[test]
+    fn maker_bid_price_takes_the_tightest_of_its_three_clamps() {
+        let tick = 0.001;
+        // The edge floor binds: fair is capped well under the book.
+        assert_eq!(
+            maker_bid_price(0.98, 0.015, 0.99, 0.985, tick), 0.965,
+            "fair minus the edge floor, with no fee term — makers pay none"
+        );
+        // The book binds: never leap a queue we cannot see by more than a tick.
+        assert_eq!(
+            maker_bid_price(1.0, 0.015, 0.50, 0.985, tick), 0.501,
+            "one tick above the standing best bid, no further"
+        );
+        // max_price binds: the same hard cap a clip has.
+        assert_eq!(
+            maker_bid_price(1.0, 0.005, 0.99, 0.985, tick), 0.985,
+            "max_price is a ceiling for a resting bid too"
+        );
+    }
+
+    #[test]
+    fn maker_bid_price_floors_onto_the_tick_grid() {
+        // A price that already sits ON the grid must survive intact — the
+        // naive floor loses a whole tick here, because 0.985/0.001 is
+        // 984.99999999999989 in binary.
+        assert_eq!(maker_bid_price(1.0, 0.015, 0.99, 0.99, 0.001), 0.985);
+        // An off-grid price floors DOWN, never up: rounding a maker bid
+        // toward the book makes it more aggressive than it was priced.
+        assert_eq!(maker_bid_price(0.9999, 0.015, 0.99, 0.99, 0.001), 0.984);
+        assert_eq!(maker_bid_price(1.0, 0.015, 0.99, 0.99, 0.01), 0.98, "coarser grid, cheaper bid");
     }
 
     #[test]

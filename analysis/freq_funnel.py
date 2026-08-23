@@ -277,6 +277,14 @@ def classify_tick(tick: dict, w: dict, fired_before: bool) -> dict:
     sd = next((s for s in (tick.get("sides") or []) if s.get("side") == side), None)
     if sd is None or sd.get("ask") is None:
         out["stage"] = "book_quoted"
+        # Maker step 0's shadow: with `maker_bid` off, the engine still
+        # stamps the moments where a post-only bid WOULD have rested, so the
+        # opportunity is countable before any capital rides on it. Absent on
+        # every tape line written before that shipped.
+        if sd is not None and sd.get("maker_candidate"):
+            out["maker_candidate"] = True
+            out["maker_px"] = sd.get("maker_px")
+            out["maker_size"] = sd.get("maker_size")
         return out
     out["ask"], out["fair"], out["net"] = sd.get("ask"), sd.get("fair"), sd.get("net")
     out["safety"] = sd.get("safety")
@@ -748,6 +756,22 @@ def render(t0: float, t1: float, wins: dict, rows: list[dict], book: dict,
                 f"median {pctl(bidq, .50):.3f}  p75 {pctl(bidq, .75):.3f}")
         add("  Reading: the side we want is bid up near 1.00 and NOBODY IS "
             "OFFERING. No gate setting reaches this time — it is supply.")
+        cand = [r for r in bq if r.get("maker_candidate")]
+        if cand:
+            notional = sum((r.get("maker_px") or 0.0) * (r.get("maker_size") or 0.0)
+                           for r in cand)
+            add(f"  MAKER STEP 0 SHADOW: {len(cand)} of {len(bq)} "
+                f"({100.0 * len(cand) / len(bq):.0f}%) cleared the resting-bid "
+                f"condition set")
+            add(f"  (theta-approved, un-latched, inside the sweep) — "
+                f"${notional:,.0f} of would-be quotes at "
+                f"median px {pctl([r['maker_px'] for r in cand], .50):.3f}.")
+            add("  That is what `pmt crypto arm --maker-bid` would have reached. "
+                "Arm ONE symbol.")
+        else:
+            add("  (no maker_candidate stamps on this tape — either the engine "
+                "predates maker step 0")
+            add("   or nothing cleared its condition set.)")
     add("")
 
     # basis guard counterfactual layers

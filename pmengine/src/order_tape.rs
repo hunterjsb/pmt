@@ -118,6 +118,7 @@ fn pending() -> &'static PendingMap {
 
 /// Build the ack record. Split from the write so its shape is testable
 /// without a filesystem.
+#[allow(clippy::too_many_arguments)]
 fn placed_record(
     decision_id: &str,
     token_id: &str,
@@ -125,6 +126,7 @@ fn placed_record(
     price: Decimal,
     size: Decimal,
     order_id: &str,
+    post_only: bool,
     t: &OrderTimings,
 ) -> serde_json::Value {
     let mut rec = serde_json::json!({
@@ -139,6 +141,11 @@ fn placed_record(
         "order_id": order_id,
     });
     let map = rec.as_object_mut().expect("json! built an object");
+    // Additive and only when true: every tape line ever written lacks the
+    // key, so a reader defaults it to false and old tape stays readable.
+    if post_only {
+        map.insert("post_only".to_string(), serde_json::Value::Bool(true));
+    }
     // Cumulative offsets from build start — the report's t_sign_done /
     // t_send / t_ack. Per-stage costs are differences; keeping the raw
     // offsets means a reader never has to trust our subtraction.
@@ -206,9 +213,11 @@ pub fn record_placed(
     price: Decimal,
     size: Decimal,
     order_id: &str,
+    post_only: bool,
     t: &OrderTimings,
 ) {
-    let record = placed_record(decision_id, token_id, side, price, size, order_id, t);
+    let record =
+        placed_record(decision_id, token_id, side, price, size, order_id, post_only, t);
     arm_fill(
         order_id,
         PendingFill {
@@ -309,7 +318,7 @@ mod tests {
         let mut t = stamped();
         t.ack = None;
         assert_eq!(t.offset_ms(t.ack), None);
-        let rec = placed_record("d1", "tok", "buy", dec!(0.98), dec!(25), "0xabc", &t);
+        let rec = placed_record("d1", "tok", "buy", dec!(0.98), dec!(25), "0xabc", false, &t);
         assert!(rec.get("sign_done_ms").is_some());
         assert!(
             rec.get("ack_ms").is_none(),
@@ -320,7 +329,7 @@ mod tests {
     #[test]
     fn placed_record_shape() {
         let t = stamped();
-        let rec = placed_record("d1", "tok7", "buy", dec!(0.98), dec!(25), "0xabc", &t);
+        let rec = placed_record("d1", "tok7", "buy", dec!(0.98), dec!(25), "0xabc", false, &t);
         assert_eq!(rec["stage"], "ack");
         assert_eq!(rec["decision_id"], "d1");
         assert_eq!(rec["token"], "tok7");
@@ -333,6 +342,20 @@ mod tests {
         assert!((rec["ack_ms"].as_f64().unwrap() - 171.0).abs() < 0.01);
         // One line, one object — the tape is JSONL, not pretty JSON.
         assert!(!serde_json::to_string(&rec).unwrap().contains('\n'));
+    }
+
+    #[test]
+    fn post_only_is_additive_and_absent_on_a_taker_line() {
+        let t = stamped();
+        let taker = placed_record("d1", "tok7", "buy", dec!(0.94), dec!(26), "0xabc", false, &t);
+        assert!(
+            taker.get("post_only").is_none(),
+            "a taker line must read exactly as every line already on disk"
+        );
+        let maker = placed_record("d2", "tok7", "buy", dec!(0.98), dec!(25), "0xdef", true, &t);
+        assert_eq!(maker["post_only"], true, "a resting quote says so");
+        assert_eq!(maker["stage"], "ack", "and is otherwise an ordinary ack line");
+        assert_eq!(maker["suppressed"], false);
     }
 
     #[test]

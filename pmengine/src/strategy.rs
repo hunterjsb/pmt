@@ -9,10 +9,12 @@ use std::sync::Arc;
 
 /// Urgency level for order execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-/// NOTE: currently advisory only. OrderManager::place_order binds this as
-/// `_urgency` and every order goes out as a plain limit — nothing here
-/// changes order type or crosses a spread. Strategies that need to cross
-/// (updown emits High) must price the limit marketably themselves.
+/// NOTE: only `Low` reaches the wire as a distinct order — it maps to the
+/// CLOB's `postOnly` flag on a GTC order (docs/maker-design.md §2), which
+/// REJECTS rather than reprices an order that would cross. Medium / High /
+/// Immediate are all still advisory: they go out as plain crossing-allowed
+/// GTC limits, so a strategy that needs to cross (updown's taker clips emit
+/// High) must price the limit marketably itself.
 pub enum Urgency {
     /// Willing to wait (intent: post-only)
     Low,

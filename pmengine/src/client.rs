@@ -423,7 +423,7 @@ impl PolymarketClient {
             .map_err(|e| ClientError::OrderError(format!("JSON parse error: {} (body: {})", e, body)))
     }
 
-    /// Place a limit order.
+    /// Place a limit order (crossing allowed — the taker path).
     pub async fn place_limit_order(
         &self,
         token_id: &str,
@@ -431,19 +431,26 @@ impl PolymarketClient {
         price: Decimal,
         size: Decimal,
     ) -> Result<String, ClientError> {
-        self.place_limit_order_timed(token_id, side, price, size, &mut OrderTimings::start())
+        self.place_limit_order_timed(token_id, side, price, size, false, &mut OrderTimings::start())
             .await
     }
 
     /// `place_limit_order`, stamping each stage into `t` for the Phase 7
     /// tape. The stamps are bare `Instant` reads — no allocation, no
     /// syscall past the clock — so measuring the hot path costs it nothing.
+    ///
+    /// `post_only` sets the CLOB's `postOnly` flag alongside the builder's
+    /// default `GTC`. Polymarket REJECTS a post-only order that would match
+    /// immediately rather than repricing it (docs/maker-design.md §2), so
+    /// the caller must have clamped the price inside the book already — a
+    /// bounced order spends rate-limit budget and returns nothing.
     pub async fn place_limit_order_timed(
         &self,
         token_id: &str,
         side: Side,
         price: Decimal,
         size: Decimal,
+        post_only: bool,
         t: &mut OrderTimings,
     ) -> Result<String, ClientError> {
         if self.dry_run {
@@ -460,6 +467,7 @@ impl PolymarketClient {
                 side = ?side,
                 price = %price,
                 size = %size,
+                post_only = post_only,
                 "[DRY RUN] Would place order"
             );
             return Ok(fake_id);
@@ -474,13 +482,20 @@ impl PolymarketClient {
         let token_id_u256 = U256::from_str(token_id)
             .map_err(|e| ClientError::OrderError(format!("Invalid token_id: {}", e)))?;
 
-        // Use SDK to build and sign order
-        let order = self.inner
+        // Use SDK to build and sign order. The builder's own defaults are
+        // GTC + postOnly:false, and `SignedOrder` serializes `postOnly`
+        // beside `order`/`orderType`/`owner` — so this only ever flips a
+        // field the wire already carried, it does not add one.
+        let mut builder = self.inner
             .limit_order()
             .token_id(token_id_u256)
             .side(sdk_side)
             .price(price)
-            .size(size)
+            .size(size);
+        if post_only {
+            builder = builder.post_only(true);
+        }
+        let order = builder
             .build()
             .await
             .map_err(|e| ClientError::OrderError(e.to_string()))?;
@@ -503,6 +518,7 @@ impl PolymarketClient {
             side = ?side,
             price = %price,
             size = %size,
+            post_only = post_only,
             "Order placed"
         );
 

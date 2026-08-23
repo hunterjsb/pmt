@@ -1533,6 +1533,7 @@ impl Engine {
                                             placed.price,
                                             placed.size,
                                             &placed.order_id,
+                                            placed.post_only,
                                             &placed.timings,
                                         );
                                     }
@@ -1945,6 +1946,7 @@ impl Engine {
                     placed.price,
                     placed.size,
                     &placed.order_id,
+                    placed.post_only,
                     &placed.timings,
                 );
                 Ok(placed.order_id)

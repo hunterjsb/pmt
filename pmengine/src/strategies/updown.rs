@@ -27,7 +27,8 @@
 use crate::position::Fill;
 use crate::strategies::updown_model::{
     append_jsonl, avg_down_blocks, budget_unlocked, book_sample_due, distrust_blocks, eval_model,
-    lag1_autocorr, pay_up_limit, safety_gate_blocks, settle_tw_secs, shape_klines, side_safety,
+    lag1_autocorr, maker_bid_price, pay_up_limit, safety_gate_blocks, settle_tw_secs, shape_klines,
+    side_safety,
     FeedState, GateReason, ModelEval, Tunables, BINANCE_DATA, EV_BOOK, EV_CLEANUP, EV_EVAL,
     EV_EXIT, EV_FIRE, EV_GATED, EV_ROLL, KLINE_LOOKBACK_S,
 };
@@ -176,7 +177,29 @@ pub(crate) struct ArmParams {
     /// refusing the whole state and stranding a live window.
     #[serde(default = "d_feed")]
     pub feed: String,
+    /// Maker step 0 (docs/maker-design.md §6): rest ONE post-only bid on
+    /// the side the model wants when the book has NOTHING to lift. That is
+    /// 9.6% of armed time — bid pinned near 1.00 with no offer at any
+    /// price, median 82% elapsed, exactly when the model is finally
+    /// confident (analysis/freq_funnel_report.md). No taker parameter
+    /// reaches that time; it is supply, not a gate.
+    ///
+    /// Deliberately NOT a general maker: measured early-window maker was
+    /// negative everywhere (a 0.5c half-spread against 3.65c of drift per
+    /// 5s). This is a narrow, late-window, theta-approved resting bid.
+    ///
+    /// `serde(default)` = off, no version bump — a pre-existing
+    /// arms-state.json reads back as today's engine, and an older binary
+    /// ignores the field rather than refusing the whole state and
+    /// stranding a live window (same contract as `feed` and the fleet cap).
+    #[serde(default)]
+    pub maker_bid: bool,
 }
+
+/// Price grid the pure core floors a resting bid onto. These markets quote
+/// at 0.001 or finer; `OrderManager` floors again to the token's real tick,
+/// so a coarser market only ever makes the bid cheaper.
+const MAKER_TICK: f64 = 0.001;
 
 /// The Binance proxy feed — the default, and what every existing arm runs.
 pub(crate) const FEED_BINANCE: &str = "binance";
@@ -236,7 +259,11 @@ pub(crate) enum Action {
     Subscribe(String),
     Unsubscribe(String),
     Cancel(String),
-    Buy { token: String, price: f64, size: f64 },
+    /// `post_only` distinguishes a resting maker bid from a crossing taker
+    /// clip. Every consumer must dispatch on this flag rather than
+    /// re-deriving intent downstream (docs/maker-design.md §5.3): the two
+    /// are different orders on the wire and different events in a fill sim.
+    Buy { token: String, price: f64, size: f64, post_only: bool },
     Sell { token: String, price: f64, size: f64 },
 }
 
@@ -300,6 +327,14 @@ pub(crate) struct ArmState {
     /// trades tens of seconds late, so a "trades in the last 6s" filter
     /// matches nothing ever (the 22k-rows-of-zeros bug, 2026-08-23).
     trade_hwm: std::collections::HashMap<String, i64>,
+    /// Maker step 0: token -> (price, notional) of the ONE post-only bid
+    /// resting on that side. No TTL, unlike `inflight` — a resting quote
+    /// is meant to sit there. It is un-decided speculative exposure the
+    /// whole time it rests, so its notional counts against the arm's
+    /// budget and the R7 fleet pool exactly like a clip's does. Empty
+    /// whenever `maker_bid` is off, which makes every sum below identical
+    /// to the pre-maker engine.
+    maker_rest: std::collections::HashMap<String, (f64, f64)>,
 }
 
 /// Safety write cadence for the arm store. Every mutation writes too — this
@@ -457,6 +492,19 @@ fn fetch_gamma_tokens(slug: &str) -> Result<(String, String), String> {
     parse_gamma_tokens(&body)
 }
 
+/// Order a token's book pulled, unless this pass already did.
+///
+/// The engine batches cancels per token and asks the CLOB to retire every
+/// non-matching open order on it, so a second Cancel for the same token
+/// puts the same order id in one request twice. Harmless before maker step
+/// 0 (nothing emitted two cancels for one token in a pass); now the
+/// maker-pull and a taker fire on the same side can both want one.
+fn cancel_once(actions: &mut Vec<Action>, token: &str) {
+    if !actions.iter().any(|a| matches!(a, Action::Cancel(t) if t == token)) {
+        actions.push(Action::Cancel(token.to_string()));
+    }
+}
+
 /// Append one JSONL record to the durable tape at ~/.pmt/engine/. The tape
 /// is the cross-session dataset for calibrating gate parameters — every
 /// fire, exit, and periodic eval survives reboots, unlike engine stdout.
@@ -495,6 +543,7 @@ impl ArmState {
             last_tape_at: 0.0,
             last_book_at: 0.0,
             trade_hwm: std::collections::HashMap::new(),
+            maker_rest: std::collections::HashMap::new(),
         }
     }
 
@@ -526,7 +575,24 @@ impl ArmState {
             .filter(|(_, at)| now - *at < INFLIGHT_TTL_S)
             .map(|(n, _)| *n)
             .sum();
-        self.filled_usdc.max(position_floor) + inflight
+        self.filled_usdc.max(position_floor) + inflight + self.resting_usdc()
+    }
+
+    /// Notional tied up by resting post-only bids. Zero unless `maker_bid`
+    /// is armed, so every budget sum that adds it is bit-identical to the
+    /// pre-maker engine while the knob is off.
+    fn resting_usdc(&self) -> f64 {
+        self.maker_rest.values().map(|(_, n)| *n).sum()
+    }
+
+    /// Pull every resting maker bid and say which tokens need cancelling.
+    /// Used by the paths that sweep the book wholesale — quiesce and window
+    /// close — so a resting quote has no way to outlive the arm's own
+    /// lifecycle rules.
+    fn drop_maker_rests(&mut self) -> Vec<String> {
+        let mut tokens: Vec<String> = self.maker_rest.drain().map(|(t, _)| t).collect();
+        tokens.sort(); // HashMap drain order is arbitrary; actions are compared
+        tokens
     }
 
     fn stop_feed(&mut self) {
@@ -716,7 +782,176 @@ impl ArmState {
     }
 }
 
+/// One side's inputs to the maker slice — a struct rather than ten
+/// positional f64s, most of which would be interchangeable at the call site.
+struct MakerSlice<'a> {
+    side: &'a str,
+    token: &'a str,
+    /// The p_cap'd fair for this side, same value the taker gates use.
+    fair: f64,
+    fair_req: f64,
+    edge_req: f64,
+    safety: f64,
+    chop_blocked: bool,
+    top: &'a TopOfBook,
+    model: &'a ModelEval,
+    now: f64,
+}
+
 impl ArmState {
+    /// Maker step 0 (docs/maker-design.md §6 step 0): decide whether ONE
+    /// post-only bid should be resting on a side the book is not offering.
+    ///
+    /// This is deliberately narrow. Early-window maker measured NEGATIVE
+    /// everywhere — a 0.5c half-spread against 3.65c of drift per 5s — so
+    /// this is not a market maker. It reaches exactly one miss class: the
+    /// 9.6% of armed time where our side is bid near 1.00 and NOBODY is
+    /// offering, median 82% through the window
+    /// (analysis/freq_funnel_report.md). No taker parameter touches that
+    /// time; it is supply, not a gate.
+    ///
+    /// Runs whether or not `maker_bid` is armed: with the knob off it only
+    /// stamps `maker_candidate` on the eval so the operator can count the
+    /// opportunity before any capital rides on it.
+    fn maker_slice(
+        &mut self,
+        s: MakerSlice<'_>,
+        room: &mut f64,
+        fleet_room: &mut f64,
+        actions: &mut Vec<Action>,
+        evals: &mut Vec<serde_json::Value>,
+    ) {
+        // A quote already resting here owns notional the pass subtracted
+        // from `room` (and from the fleet pool) before the side loop
+        // started. Refund it up front so the sizing below sees the room
+        // this side actually controls, then re-book whatever we leave
+        // standing — the alternative double-counts a quote against itself.
+        let standing = self.maker_rest.remove(s.token);
+        if let Some((_, n)) = standing {
+            *room += n;
+            if !s.model.banked_decided {
+                *fleet_room += n;
+            }
+        }
+
+        let px = s.top.bid.map(|(bid, _)| {
+            maker_bid_price(s.fair, s.edge_req, bid, self.p.max_price, MAKER_TICK)
+        });
+
+        // The whole condition set, spelled out. Every one must hold for a
+        // bid to rest, and the absence of any one pulls it on this tick.
+        let qualified = px.is_some_and(|px| px > 0.0)
+            // (a) nothing to lift — the miss class this slice exists for.
+            && s.top.ask.is_none()
+            // (b) theta-approved, the same banked-evidence score entry
+            //     uses (docs/LESSONS.md#L13). Entry tests it only on a
+            //     window's FIRST clip; a resting bid re-tests it on every
+            //     quote, because no ask exists to price the thesis against
+            //     and nothing else stands between the model and un-decided
+            //     exposure.
+            && s.safety >= self.p.theta
+            // (c) outside the quiesce sweep. Structurally true here (the
+            //     sweep returns before the side loop) and stated anyway,
+            //     so the condition set reads complete at the one place it
+            //     is enforced.
+            && s.now < self.p.end - self.p.quiesce_secs
+            // (d) the window has not already gone wrong. Flat, unlike the
+            //     taker latch: banked-decided arithmetic earns a clip its
+            //     carve-out because a real ask prices it, and a resting
+            //     bid has no such witness (docs/LESSONS.md#L8).
+            && !self.brake_latched
+            && !s.chop_blocked
+            && s.fair >= s.fair_req
+            // Averaging down is the same brake it always was, measured at
+            // the price we would actually pay.
+            && !avg_down_blocks(
+                px.unwrap_or(0.0),
+                self.last_clip_ask.get(s.token).copied(),
+                self.tunables.avg_down_tol,
+                s.model.banked_decided,
+            )
+            && s.now - self.last_clip.get(s.token).copied().unwrap_or(0.0)
+                >= self.p.clip_cooldown_s
+            && !self.inflight.contains_key(s.token);
+
+        // Budget and the R7 fleet pool bind a resting bid exactly as they
+        // bind a clip — it is un-decided speculative exposure from the
+        // moment it rests, not from the moment it fills.
+        let fleet_bound = if s.model.banked_decided {
+            f64::INFINITY
+        } else {
+            (*fleet_room).max(0.0)
+        };
+        let clip_room = (*room).min(fleet_bound);
+        let size = match px {
+            Some(px) if qualified && clip_room > 5.0 => {
+                (self.p.clip_usdc / px).min(clip_room / px).floor()
+            }
+            _ => 0.0,
+        };
+
+        if size < 5.0 {
+            if standing.is_some() {
+                cancel_once(actions, s.token);
+            }
+            return;
+        }
+        let px = px.expect("a sized quote always has a price");
+
+        let mut eval = serde_json::json!({
+            "side": s.side, "fair": s.fair, "ask": serde_json::Value::Null,
+            "safety": (s.safety * 100.0).round() / 100.0,
+            "maker_px": px, "maker_size": size,
+        });
+
+        if !self.p.maker_bid {
+            // The shadow measurement, and it has to work with the knob
+            // OFF: this is how the operator prices what the slice reaches
+            // before arming it. `ask` stays null so every existing tape
+            // consumer still charges the moment to the same funnel stage.
+            eval["maker_candidate"] = serde_json::json!(true);
+            evals.push(eval);
+            return;
+        }
+
+        // Re-quote only when the price actually moved off the grid point
+        // we are already resting on. A cancel/replace restarts the
+        // order-age clock and spends placement tokens for nothing
+        // (docs/maker-design.md §3).
+        if let Some((resting_px, resting_n)) = standing {
+            if (resting_px - px).abs() < MAKER_TICK / 2.0 {
+                *room -= resting_n;
+                if !s.model.banked_decided {
+                    *fleet_room -= resting_n;
+                }
+                self.maker_rest.insert(s.token.to_string(), (resting_px, resting_n));
+                eval["maker_rest"] = serde_json::json!(resting_px);
+                evals.push(eval);
+                return;
+            }
+        }
+
+        let notional = size * px;
+        *room -= notional;
+        if !s.model.banked_decided {
+            *fleet_room -= notional;
+        }
+        self.maker_rest.insert(s.token.to_string(), (px, notional));
+        eval["maker_rest"] = serde_json::json!(px);
+        evals.push(eval);
+        tracing::info!(
+            side = s.side, px, size, safety = s.safety, slug = %self.p.slug,
+            "updown maker bid resting — nothing offered on this side at any price"
+        );
+        cancel_once(actions, s.token);
+        actions.push(Action::Buy {
+            token: s.token.to_string(),
+            price: px,
+            size,
+            post_only: true,
+        });
+    }
+
     /// Math-forced evacuation: dump a held side whose fair has collapsed,
     /// into a bid that still resembles fair. Runs every armed tick AND
     /// through quiesce (exits are most needed late; only new buys stop).
@@ -904,6 +1139,7 @@ impl ArmState {
         if now >= p.end {
             if !self.cleaned {
                 self.cleaned = true;
+                self.maker_rest.clear(); // the two Cancels below pull them
                 tracing::info!(slug = %p.slug, filled_usdc = self.filled_usdc, "updown window closed — cleaning up");
                 tape_out.push(serde_json::json!({"t": now, "ev": EV_CLEANUP, "slug": p.slug}));
                 actions.push(Action::Cancel(p.token_up.clone()));
@@ -930,6 +1166,14 @@ impl ArmState {
             if !flip_live {
                 actions.push(Action::Cancel(p.token_up.clone()));
                 actions.push(Action::Cancel(p.token_down.clone()));
+            }
+            // The quiesce sweep pulls a resting maker bid like any other
+            // order — including through the flip-proof carve-out, which
+            // exempts CLIPS from the sweep, not standing quotes. A flip
+            // clip needs an ask; a maker bid exists precisely because there
+            // is none, so the two never contend for the same token anyway.
+            for token in self.drop_maker_rests() {
+                cancel_once(&mut actions, &token);
             }
             if let Some(m) = model {
                 if now < p.end - 5.0 {
@@ -971,11 +1215,12 @@ impl ArmState {
                                     let limit = pay_up_limit(
                                         ask, net, p.min_edge, p.pay_up_max, p.max_price,
                                     );
-                                    actions.push(Action::Cancel(token.clone()));
+                                    cancel_once(&mut actions, &token);
                                     actions.push(Action::Buy {
                                         token: token.clone(),
                                         price: limit,
                                         size,
+                                        post_only: false,
                                     });
                                 }
                             }
@@ -1003,6 +1248,13 @@ impl ArmState {
         let m = match model {
             Ok(v) => v,
             Err(gate) => {
+                // A gate means "no trade" (docs/LESSONS.md#L2), and that has
+                // to reach a quote already ON the book, not just the next
+                // one. A stale feed cannot tell us a resting bid is still
+                // priced right, so it comes off.
+                for token in self.drop_maker_rests() {
+                    cancel_once(&mut actions, &token);
+                }
                 // The numbers ride ALONGSIDE the prose, never instead of it:
                 // `reason` reads exactly as it always has for old consumers,
                 // while margin/banked/cushion/guard arrive as fields so
@@ -1040,8 +1292,12 @@ impl ArmState {
         // shares held x entry price. Take the max of every signal we have.
         self.inflight.retain(|_, (_, at)| now - *at < INFLIGHT_TTL_S);
         let inflight_usdc: f64 = self.inflight.values().map(|(n, _)| n).sum();
+        // A resting post-only bid is spend that has not landed yet, exactly
+        // like an inflight clip — it just has no TTL. Zero while maker_bid
+        // is off, so this subtraction is a no-op on today's engine.
+        let resting_usdc = self.resting_usdc();
         let committed = self.filled_usdc.max(view.position_floor);
-        let budget = p.size_usdc - committed - inflight_usdc;
+        let budget = p.size_usdc - committed - inflight_usdc - resting_usdc;
 
         let exits = self.exit_actions(view, p_up, now, &mut tape_out);
         actions.extend(exits);
@@ -1051,7 +1307,7 @@ impl ArmState {
         // the safe bet clip by clip.
         let unlocked = budget_unlocked(now, p.end, p.late_rem_s, m.banked_decided);
         let cap = p.size_usdc * if unlocked { 1.0 } else { p.early_frac };
-        let mut room = (cap - committed - inflight_usdc).min(budget);
+        let mut room = (cap - committed - inflight_usdc - resting_usdc).min(budget);
         let (edge_req, fair_req) = if unlocked {
             (p.min_edge, p.min_fair)
         } else {
@@ -1069,16 +1325,39 @@ impl ArmState {
                     continue;
                 }
             }
-            let Some((ask, ask_size)) = top.ask else {
-                continue;
-            };
-            // R6 cap: fair used for edge and gating, not display honesty —
-            // eval keeps fair_raw when the cap actually bit.
+            // R6 cap and the side's banked-evidence score are both
+            // ask-independent, so they are computed before the book read —
+            // the maker slice below needs them on a side with no ask at all.
             let fair_raw = fair;
             let fair = if m.flip_proof { fair } else { fair.min(p.p_cap) };
+            let safety = side_safety(side == "up", m.banked_margin_bp, m.cushion_bp);
+
+            let Some((ask, ask_size)) = top.ask else {
+                // --- maker step 0: nobody is offering this side ----------
+                // The book is bid up near 1.00 with NO ask at any price.
+                // 9.6% of armed time lives here and no taker knob reaches
+                // it — it is supply (analysis/freq_funnel_report.md). The
+                // one thing that does reach it is a resting bid.
+                self.maker_slice(
+                    MakerSlice {
+                        side, token, fair, fair_req, edge_req, safety,
+                        chop_blocked, top: &top, model: &m, now,
+                    },
+                    &mut room,
+                    fleet_room,
+                    &mut actions,
+                    &mut evals,
+                );
+                continue;
+            };
+            // An ask exists: whatever we were resting on this side no
+            // longer meets the slice's one precondition, so it comes off
+            // the book on this tick.
+            if self.maker_rest.remove(token).is_some() {
+                cancel_once(&mut actions, token);
+            }
             let fee = p.fee_rate * ask.min(1.0 - ask);
             let net = fair - ask - fee;
-            let safety = side_safety(side == "up", m.banked_margin_bp, m.cushion_bp);
             let raw_brake = if distrust_blocks(net, self.tunables.distrust_net, m.banked_decided) {
                 Some("distrust")
             } else if avg_down_blocks(
@@ -1180,8 +1459,13 @@ impl ArmState {
             self.last_clip_ask.insert(token.clone(), ask);
             self.inflight.insert(token.clone(), (size * ask, now));
             let limit = pay_up_limit(ask, net, edge_req, p.pay_up_max, p.max_price);
-            actions.push(Action::Cancel(token.clone()));
-            actions.push(Action::Buy { token: token.clone(), price: limit, size });
+            cancel_once(&mut actions, token);
+            actions.push(Action::Buy {
+                token: token.clone(),
+                price: limit,
+                size,
+                post_only: false,
+            });
         }
 
         // Only carried when a cap is actually set — an uncapped fleet has
@@ -1200,6 +1484,12 @@ impl ArmState {
         if let Some(fr) = fleet_left {
             eval_rec["fleet_room"] = serde_json::json!(fr);
         }
+        // Only when a bid is actually resting — an arm with maker_bid off
+        // never carries the field, so its records are the old shape.
+        let resting_now = self.resting_usdc();
+        if resting_now > 0.0 {
+            eval_rec["resting"] = serde_json::json!(resting_now);
+        }
         self.last_eval = Some(eval_rec);
         if now - self.last_tape_at >= 5.0 {
             self.last_tape_at = now;
@@ -1212,6 +1502,9 @@ impl ArmState {
             });
             if let Some(fr) = fleet_left {
                 rec["fleet_room"] = serde_json::json!(fr);
+            }
+            if resting_now > 0.0 {
+                rec["resting"] = serde_json::json!(resting_now);
             }
             tape_out.push(rec);
         }
@@ -1270,17 +1563,21 @@ fn arm_view(ctx: &StrategyContext, p: &ArmParams) -> ArmView {
 }
 
 /// Action -> engine Signal. The Decimal conversion lives here so the pure
-/// core stays in f64 like the model math. All clip orders are High urgency.
+/// core stays in f64 like the model math.
+///
+/// Urgency is the ONLY channel the engine has for post-only: `Low` means
+/// add liquidity and never take it, everything else is a plain crossing
+/// GTC limit. Taker clips stay High, as they always were.
 fn to_signal(a: Action) -> Signal {
     match a {
         Action::Subscribe(t) => Signal::Subscribe { token_id: t },
         Action::Unsubscribe(t) => Signal::Unsubscribe { token_id: t },
         Action::Cancel(t) => Signal::Cancel { token_id: t },
-        Action::Buy { token, price, size } => Signal::Buy {
+        Action::Buy { token, price, size, post_only } => Signal::Buy {
             token_id: token,
             price: Decimal::from_f64(price).unwrap_or(Decimal::ONE),
             size: Decimal::from_f64(size).unwrap_or(Decimal::ZERO),
-            urgency: Urgency::High,
+            urgency: if post_only { Urgency::Low } else { Urgency::High },
         },
         Action::Sell { token, price, size } => Signal::Sell {
             token_id: token,
@@ -1642,6 +1939,8 @@ impl Strategy for Updown {
                             "filled_usdc": a.filled_usdc,
                             "roll": a.p.roll,
                             "feed": a.p.feed,
+                            "maker_bid": a.p.maker_bid,
+                            "resting_usdc": a.resting_usdc(),
                             "eval": a.last_eval,
                             "oracle": {
                                 "samples": o.samples.len(),
@@ -1805,6 +2104,7 @@ mod tests {
         assert_eq!(p.early_min_edge, 0.08);
         assert_eq!(p.late_rem_s, 120.0);
         assert_eq!(p.rho_block, -0.25);
+        assert!(!p.maker_bid, "maker step 0 ships dark");
     }
 
     // --- decide()-level tests: the pure core makes the full firing policy
@@ -1846,10 +2146,11 @@ mod tests {
         let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.0);
         let b = buys(&out);
         assert_eq!(b.len(), 1);
-        let Action::Buy { token, price, size } = b[0] else { unreachable!() };
+        let Action::Buy { token, price, size, post_only } = b[0] else { unreachable!() };
         assert_eq!(token, "s-u");
         assert_eq!(*price, 0.94);
         assert_eq!(*size, 26.0, "clip_usdc 25 / 0.94 floored");
+        assert!(!*post_only, "a clip crosses the spread — it is never post-only");
         assert!(out.tape.iter().any(|r| r["ev"] == "fire" && r["mode"] == "safe"));
         assert!(arm.inflight.contains_key("s-u"), "one order in flight");
     }
@@ -2196,6 +2497,315 @@ mod tests {
         assert!(arm.last_banked_decided);
         arm.decide(&ArmView::default(), Err(GateReason::plain("feed stale")), 1400.1);
         assert!(arm.last_banked_decided, "a feed hiccup does not un-bank the window");
+    }
+
+    // --- maker step 0: the optimistic resting bid ------------------------
+    //
+    // The miss class: our side is bid near 1.00 and NOBODY is offering, on
+    // 9.6% of armed time, median 82% through the window
+    // (analysis/freq_funnel_report.md). No taker knob reaches it. These
+    // tests pin the four things that keep the slice narrow — it needs the
+    // missing ask, the theta evidence, an un-latched window and room inside
+    // the sweep — plus the shadow record that has to work with the knob OFF.
+
+    /// A book with a fat bid and NO offer on the up side: the exact shape
+    /// the funnel charges to `book_quoted`.
+    fn view_no_ask_up(bid: f64) -> ArmView {
+        ArmView {
+            up: TopOfBook { bid: Some((bid, 500.0)), ask: None },
+            ..ArmView::default()
+        }
+    }
+
+    fn maker_arm(bid: bool) -> ArmState {
+        let mut p = params("s");
+        p.maker_bid = bid;
+        armed(p)
+    }
+
+    fn maker_buys(out: &DecideOut) -> Vec<(&str, f64, f64)> {
+        out.actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Buy { token, price, size, post_only: true } => {
+                    Some((token.as_str(), *price, *size))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn up_side(arm: &ArmState) -> serde_json::Value {
+        arm.last_eval.as_ref().unwrap()["sides"][0].clone()
+    }
+
+    #[test]
+    fn maker_rests_one_post_only_bid_when_nothing_is_offered() {
+        let mut arm = maker_arm(true);
+        // Bid 0.99 with no ask: fair 1.0 - min_edge 0.015 = 0.985, one tick
+        // over the bid is 0.991, max_price is 0.985 — the cap binds.
+        let out = arm.decide(&view_no_ask_up(0.99), Ok(locked_up_model()), 1400.0);
+        let m = maker_buys(&out);
+        assert_eq!(m.len(), 1, "exactly one resting bid, never a ladder");
+        assert_eq!(m[0], ("s-u", 0.985, 25.0), "clip_usdc 25 / 0.985 floored");
+        assert!(
+            out.actions.iter().any(|a| matches!(a, Action::Cancel(t) if t == "s-u")),
+            "re-quoting goes through the delta matcher, so the pass orders the cancel"
+        );
+        assert_eq!(arm.maker_rest.get("s-u").map(|(px, _)| *px), Some(0.985));
+        let side = up_side(&arm);
+        assert!(side["ask"].is_null(), "there was no ask — the record must say so");
+        assert_eq!(side["maker_rest"], 0.985);
+        assert!(
+            side.get("maker_candidate").is_none(),
+            "candidate is the shadow label; an armed slice reports what it DID"
+        );
+    }
+
+    #[test]
+    fn maker_bid_prices_one_tick_over_the_book_when_the_bid_is_thin() {
+        let mut arm = maker_arm(true);
+        let out = arm.decide(&view_no_ask_up(0.50), Ok(locked_up_model()), 1400.0);
+        let m = maker_buys(&out);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].1, 0.501, "join the book +1 tick, never leap the queue");
+        assert_eq!(m[0].2, 49.0, "25 / 0.501 floored");
+    }
+
+    #[test]
+    fn maker_needs_the_missing_ask() {
+        // The precondition IS the miss class. An offer at any price means
+        // the taker path owns this moment.
+        let mut arm = maker_arm(true);
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.0);
+        assert!(maker_buys(&out).is_empty(), "an ask exists — take it, don't quote");
+        assert_eq!(buys(&out).len(), 1, "and the taker clip is untouched");
+        assert!(arm.maker_rest.is_empty());
+    }
+
+    #[test]
+    fn an_ask_appearing_pulls_the_resting_bid() {
+        let mut arm = maker_arm(true);
+        arm.decide(&view_no_ask_up(0.99), Ok(locked_up_model()), 1400.0);
+        assert!(!arm.maker_rest.is_empty());
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.1);
+        assert!(arm.maker_rest.is_empty(), "the slice's one precondition broke");
+        assert_eq!(
+            out.actions.iter().filter(|a| matches!(a, Action::Cancel(t) if t == "s-u")).count(),
+            1,
+            "one cancel, not two — the engine batches per token and would \
+             ask the CLOB to retire the same order id twice"
+        );
+    }
+
+    #[test]
+    fn maker_needs_theta_evidence_on_that_side() {
+        let mut p = params("s");
+        p.maker_bid = true;
+        p.theta = 0.3;
+        let mut arm = armed(p);
+        // safety 0.5/5.0 = 0.1: the clock says go, the evidence does not
+        // (docs/LESSONS.md#L13). Unlike entry's first-clip-only gate, a
+        // resting bid re-tests this on every quote.
+        let weak = ModelEval { banked_margin_bp: 0.5, cushion_bp: 5.0, ..locked_up_model() };
+        let out = arm.decide(&view_no_ask_up(0.99), Ok(weak), 1400.0);
+        assert!(maker_buys(&out).is_empty());
+        assert!(arm.maker_rest.is_empty());
+        assert!(
+            arm.last_eval.as_ref().unwrap()["sides"].as_array().unwrap().is_empty(),
+            "a blocked slice is not even a candidate"
+        );
+        // Evidence arrives: 2.0/5.0 = 0.4 clears theta 0.3.
+        let strong = ModelEval { banked_margin_bp: 2.0, cushion_bp: 5.0, ..locked_up_model() };
+        let out = arm.decide(&view_no_ask_up(0.99), Ok(strong), 1400.1);
+        assert_eq!(maker_buys(&out).len(), 1);
+    }
+
+    #[test]
+    fn maker_is_blocked_by_the_brake_latch() {
+        // Flat, unlike the taker latch: banked-decided arithmetic earns a
+        // clip its carve-out because a real ask prices it, and a resting
+        // bid has no such witness.
+        let mut arm = maker_arm(true);
+        arm.brake_latched = true;
+        let out = arm.decide(&view_no_ask_up(0.99), Ok(locked_up_model()), 1400.0);
+        assert!(maker_buys(&out).is_empty(), "a window that went wrong stays wrong");
+        assert!(arm.maker_rest.is_empty());
+    }
+
+    #[test]
+    fn maker_is_blocked_by_the_avg_down_brake() {
+        let mut arm = maker_arm(true);
+        // Last clip on this token paid 0.60; a 0.501 bid is the market
+        // repricing against the thesis, not a discount.
+        arm.last_clip_ask.insert("s-u".into(), 0.60);
+        let undecided = ModelEval { banked_decided: false, ..locked_up_model() };
+        let out = arm.decide(&view_no_ask_up(0.50), Ok(undecided), 1400.0);
+        assert!(maker_buys(&out).is_empty());
+    }
+
+    #[test]
+    fn the_quiesce_sweep_pulls_a_resting_bid_like_any_other_order() {
+        let mut arm = maker_arm(true);
+        arm.decide(&view_no_ask_up(0.99), Ok(locked_up_model()), 1400.0);
+        assert!(!arm.maker_rest.is_empty());
+        // end 1500, quiesce 20 -> the sweep owns everything past 1480.
+        let out = arm.decide(&view_no_ask_up(0.99), Ok(locked_up_model()), 1490.0);
+        assert!(arm.maker_rest.is_empty(), "quiesce leaves nothing standing");
+        assert!(maker_buys(&out).is_empty());
+        assert!(out.actions.iter().any(|a| matches!(a, Action::Cancel(t) if t == "s-u")));
+    }
+
+    #[test]
+    fn a_gate_pulls_a_resting_bid_off_the_book() {
+        // "No trade" has to reach the quote already standing, not just the
+        // next one — a stale feed cannot say the bid is still priced right.
+        let mut arm = maker_arm(true);
+        arm.decide(&view_no_ask_up(0.99), Ok(locked_up_model()), 1400.0);
+        let out = arm.decide(
+            &view_no_ask_up(0.99),
+            Err(GateReason::plain("feed stale")),
+            1400.1,
+        );
+        assert!(arm.maker_rest.is_empty());
+        assert!(out.actions.iter().any(|a| matches!(a, Action::Cancel(t) if t == "s-u")));
+    }
+
+    #[test]
+    fn a_resting_bid_is_requoted_only_when_its_price_moves() {
+        let mut arm = maker_arm(true);
+        arm.decide(&view_no_ask_up(0.50), Ok(locked_up_model()), 1400.0);
+        // Same book: no cancel, no replace. A re-quote restarts the
+        // order-age clock and spends a placement token for nothing.
+        let held = arm.decide(&view_no_ask_up(0.50), Ok(locked_up_model()), 1400.1);
+        assert!(held.actions.is_empty(), "an unchanged quote is left alone");
+        assert_eq!(arm.maker_rest.get("s-u").map(|(px, _)| *px), Some(0.501));
+        // The book moves: re-quote through the delta matcher.
+        let moved = arm.decide(&view_no_ask_up(0.60), Ok(locked_up_model()), 1400.2);
+        assert_eq!(maker_buys(&moved)[0].1, 0.601);
+        assert!(moved.actions.iter().any(|a| matches!(a, Action::Cancel(t) if t == "s-u")));
+    }
+
+    #[test]
+    fn a_resting_bid_is_committed_notional_like_a_clip() {
+        // The whole point of the accounting: a post-only bid is un-decided
+        // speculative exposure from the moment it RESTS, not from the
+        // moment it fills. R7's pool and the arm's own budget both see it.
+        let mut arm = maker_arm(true);
+        let undecided = ModelEval { banked_decided: false, ..locked_up_model() };
+        arm.decide(&view_no_ask_up(0.50), Ok(undecided.clone()), 1400.0);
+        let notional = 49.0 * 0.501;
+        assert!((arm.resting_usdc() - notional).abs() < 1e-9);
+        assert!(
+            (arm.undecided_committed(0.0, 1400.0) - notional).abs() < 1e-9,
+            "the fleet pre-pass counts it"
+        );
+        // And the arm's own budget shrank by exactly that much.
+        let out = arm.decide(&view_no_ask_up(0.50), Ok(undecided), 1400.1);
+        assert!(out.actions.is_empty());
+        let eval = arm.last_eval.as_ref().unwrap();
+        assert!((eval["budget"].as_f64().unwrap() - (100.0 - notional)).abs() < 1e-9);
+        assert!((eval["resting"].as_f64().unwrap() - notional).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_fleet_cap_rations_resting_bids_and_clips_from_one_pool() {
+        // Arm A rests a bid; arm B in the SAME tick finds the pool spent.
+        let (mut a, mut b) = (maker_arm(true), maker_arm(true));
+        b.p.slug = "b".into();
+        let mut room = 26.0;
+        let undecided = ModelEval { banked_decided: false, ..locked_up_model() };
+        let out_a = a.decide_fleet(&view_no_ask_up(0.99), Ok(undecided.clone()), 1400.0, &mut room);
+        assert_eq!(maker_buys(&out_a).len(), 1);
+        assert!((room - (26.0 - 25.0 * 0.985)).abs() < 1e-9, "the quote drew the pool down in place");
+        let out_b = b.decide_fleet(&view_no_ask_up(0.99), Ok(undecided), 1400.0, &mut room);
+        assert!(maker_buys(&out_b).is_empty(), "a resting bid is rationed like a clip");
+    }
+
+    #[test]
+    fn maker_bid_off_is_inert() {
+        // The R7 wrapper contract: with the knob absent, the pass emits
+        // byte-identical actions and holds no maker state. Only the shadow
+        // label lands, and only on the eval.
+        let mut dark = maker_arm(false);
+        let out = dark.decide(&view_no_ask_up(0.99), Ok(locked_up_model()), 1400.0);
+        assert!(out.actions.is_empty(), "a dark slice never touches the book");
+        assert!(dark.maker_rest.is_empty());
+        assert!(
+            dark.last_eval.as_ref().unwrap().get("resting").is_none(),
+            "no quote, no resting notional in the record"
+        );
+
+        // And the taker path is identical either way.
+        let (mut lit, mut off) = (maker_arm(true), maker_arm(false));
+        let a = lit.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.0);
+        let b = off.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.0);
+        assert_eq!(a.actions, b.actions, "the knob must not perturb a clip");
+    }
+
+    #[test]
+    fn the_shadow_record_prices_the_slice_before_it_is_armed() {
+        // This is the measurement the operator arms on: with maker_bid OFF,
+        // a moment the slice WOULD have quoted still writes a record, so
+        // the opportunity can be counted before any capital rides on it.
+        let mut dark = maker_arm(false);
+        let out = dark.decide(&view_no_ask_up(0.99), Ok(locked_up_model()), 1400.0);
+        assert!(out.actions.is_empty());
+        let side = up_side(&dark);
+        assert_eq!(side["side"], "up");
+        assert_eq!(side["maker_candidate"], true);
+        assert_eq!(side["maker_px"], 0.985);
+        assert_eq!(side["maker_size"], 25.0);
+        assert!(
+            side["ask"].is_null(),
+            "ask stays null so the funnel still charges this to book_quoted"
+        );
+        assert!(side.get("maker_rest").is_none(), "nothing rested");
+    }
+
+    #[test]
+    fn maker_bid_round_trips_through_arm_state_and_an_old_file_reads_as_off() {
+        // Same forward-compat contract as `feed` and the fleet cap: no
+        // version bump, an old file recovers with the slice dark, and an
+        // older binary ignores the field instead of stranding a live window.
+        let (store, path) = tmp_store("makerbid");
+        let mut s = Updown::with_store(store);
+        let (slug, mut cmd) = arm_cmd(-30.0, true);
+        cmd["maker_bid"] = serde_json::json!(true);
+        s.on_command(&cmd).unwrap();
+
+        let mut fresh = Updown::with_store(ArmStore::at(path));
+        fresh.recover(unix_now());
+        assert!(fresh.arms.get(&slug).expect("recovered").p.maker_bid);
+
+        let (_store2, old_path) = tmp_store("makerbid-oldfile");
+        let start = (unix_now() - 30.0) as i64;
+        let old_slug = format!("btc-updown-5m-{}", start);
+        std::fs::write(&old_path, serde_json::json!({
+            "version": 1, "written_at": 0.0, "rolls": [],
+            "arms": [{
+                "slug": old_slug, "kind": "twap", "symbol": "BTCUSDT",
+                "token_up": format!("{}-u", old_slug), "token_down": format!("{}-d", old_slug),
+                "start": start as f64, "end": (start + 300) as f64,
+                "sigma_bp_per_min": 3.0, "fee_rate": 0.07, "size_usdc": 250.0,
+            }],
+        }).to_string()).unwrap();
+        let mut old = Updown::with_store(ArmStore::at(old_path));
+        old.recover(unix_now());
+        assert!(!old.arms.get(&old_slug).expect("still recovers").p.maker_bid);
+    }
+
+    #[test]
+    fn a_resting_bid_becomes_a_low_urgency_signal_and_a_clip_stays_high() {
+        // Urgency is the only channel the engine has for post-only.
+        let rest = to_signal(Action::Buy {
+            token: "t".into(), price: 0.985, size: 25.0, post_only: true,
+        });
+        assert!(matches!(rest, Signal::Buy { urgency: Urgency::Low, .. }));
+        let clip = to_signal(Action::Buy {
+            token: "t".into(), price: 0.94, size: 26.0, post_only: false,
+        });
+        assert!(matches!(clip, Signal::Buy { urgency: Urgency::High, .. }));
     }
 
     fn armed_with_feed(banked_px: f64, spot: f64) -> (ArmState, f64) {

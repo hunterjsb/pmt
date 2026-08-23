@@ -252,7 +252,18 @@ struct FillSim {
 fn apply_fills(arm: &mut ArmState, sim: &mut FillSim, out: &DecideOut, now: f64, fee_rate: f64) {
     for a in &out.actions {
         match a {
-            Action::Buy { token, price, size } => {
+            Action::Buy { token, price, size, post_only } => {
+                // A post-only bid RESTS; it is not a cross. Filling one
+                // here would manufacture liquidity that never existed —
+                // precisely the class of lie replay exists to catch. The
+                // honest conservative queue-ahead model is maker step 2
+                // (docs/maker-design.md §5.3); until it lands, a maker
+                // policy replays as strictly under-filled, which is the
+                // safe direction for a strategy whose whole edge depends
+                // on not overstating how easily a thin book fills.
+                if *post_only {
+                    continue;
+                }
                 let (price, size) = (*price, *size);
                 let fee = size * fee_rate * price.min(1.0 - price);
                 sim.cost += size * price;

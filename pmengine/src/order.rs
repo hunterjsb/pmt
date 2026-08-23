@@ -4,7 +4,7 @@ use crate::client::{PolymarketClient, Side};
 use crate::order_tape::OrderTimings;
 use crate::position::Fill;
 use crate::strategy::{Signal, Urgency};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -50,7 +50,35 @@ pub struct Placement {
     /// reports what hit the wire rather than what the strategy asked for.
     pub price: Decimal,
     pub size: Decimal,
+    /// Whether this went out as a maker (post-only) order. Travels back to
+    /// the caller so the Phase 7 tape can label it: a resting quote and a
+    /// crossing clip are different trades and must not read alike.
+    pub post_only: bool,
     pub timings: OrderTimings,
+}
+
+/// What one signal actually becomes on the wire: `(post_only, tick-rounded
+/// price)`. Split out of the async order path so both halves are testable
+/// without a live CLOB.
+///
+/// `Urgency::Low` is the only urgency the wire can express — it means ADD
+/// liquidity, never take it, and Polymarket REJECTS a post-only order that
+/// would match rather than repricing it (docs/maker-design.md §2). Every
+/// other urgency stays a plain crossing-allowed GTC limit, as it always was.
+///
+/// A post-only order rounds AWAY from the book, never toward it: half-up on
+/// a coarse tick lifts a 0.985 bid to 0.99, past the clamp the strategy
+/// priced it under and straight into a rejection. Same rounding class as
+/// docs/LESSONS.md#L3, opposite direction — there the tick was ignored,
+/// here it must not be allowed to make a quote more aggressive than priced.
+fn wire_shape(urgency: Urgency, is_buy: bool, price: Decimal, dp: u32) -> (bool, Decimal) {
+    let post_only = urgency == Urgency::Low;
+    let price = match (post_only, is_buy) {
+        (true, true) => price.round_dp_with_strategy(dp, RoundingStrategy::ToZero),
+        (true, false) => price.round_dp_with_strategy(dp, RoundingStrategy::AwayFromZero),
+        _ => price.round_dp(dp),
+    };
+    (post_only, price)
 }
 
 /// Order manager wraps the SDK and tracks orders.
@@ -105,7 +133,7 @@ impl OrderManager {
         is_buy: bool,
         price: Decimal,
         size: Decimal,
-        _urgency: Urgency,
+        urgency: Urgency,
     ) -> Result<Option<Placement>, OrderError> {
         // Anchor the Phase 7 record here: the tick resolution below is part
         // of "build", and on a cold token it is the expensive part.
@@ -120,7 +148,7 @@ impl OrderManager {
             .tick_decimals_for(token_id)
             .await
             .unwrap_or(2);
-        let price = price.round_dp(dp);
+        let (post_only, price) = wire_shape(urgency, is_buy, price, dp);
         let size = size.round_dp(2);
 
         // Skip if size rounds to zero
@@ -134,7 +162,7 @@ impl OrderManager {
         // Place order via SDK (handles dry-run internally)
         let order_id = self
             .client
-            .place_limit_order_timed(token_id, side, price, size, &mut timings)
+            .place_limit_order_timed(token_id, side, price, size, post_only, &mut timings)
             .await
             .map_err(|e| OrderError::SdkError(e.to_string()))?;
 
@@ -155,6 +183,7 @@ impl OrderManager {
             order_id,
             price,
             size,
+            post_only,
             timings,
         }))
     }
@@ -348,3 +377,42 @@ impl std::fmt::Display for OrderError {
 }
 
 impl std::error::Error for OrderError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn only_low_urgency_goes_out_post_only() {
+        // Before maker step 0 the urgency was bound as `_urgency` and every
+        // order pmengine ever placed was a plain crossing GTC — updown's
+        // taker clips must keep behaving exactly that way.
+        for u in [Urgency::Medium, Urgency::High, Urgency::Immediate] {
+            let (post_only, _) = wire_shape(u, true, dec!(0.94), 3);
+            assert!(!post_only, "{u:?} must still cross");
+        }
+        let (post_only, _) = wire_shape(Urgency::Low, true, dec!(0.94), 3);
+        assert!(post_only, "Low is the strategy asking to add liquidity");
+    }
+
+    #[test]
+    fn a_post_only_quote_never_rounds_toward_the_book() {
+        // The hazard: 0.987 is a legal price on a 0.001-tick market and
+        // nearest-rounding on a 0.01-tick one lifts it to 0.99 — above the
+        // max_price the strategy clamped it under, and into a postOnly
+        // rejection that costs a placement token and returns nothing.
+        let (_, taker) = wire_shape(Urgency::High, true, dec!(0.987), 2);
+        assert_eq!(taker, dec!(0.99), "the taker path is unchanged");
+
+        let (_, bid) = wire_shape(Urgency::Low, true, dec!(0.987), 2);
+        assert_eq!(bid, dec!(0.98), "a maker bid rounds DOWN onto the tick");
+
+        let (_, ask) = wire_shape(Urgency::Low, false, dec!(0.982), 2);
+        assert_eq!(ask, dec!(0.99), "and a maker ask rounds UP — same rule, mirrored");
+
+        // On a tick the price already sits on, nothing moves.
+        let (_, exact) = wire_shape(Urgency::Low, true, dec!(0.985), 3);
+        assert_eq!(exact, dec!(0.985));
+    }
+}
