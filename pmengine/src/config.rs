@@ -15,6 +15,13 @@ pub struct Config {
     pub max_position_size: f64,
     /// Maximum total exposure (in USDC)
     pub max_total_exposure: f64,
+    /// Session realized-loss circuit breaker (USDC). The engine HALTS all
+    /// trading (evals, fires, rolls) when session P&L breaches this; the
+    /// process and control plane stay up. Size it to "something is
+    /// structurally wrong", not to one bad window: the 2026-08-23
+    /// correlated tail (-$230, five arms same side, one macro impulse)
+    /// tripped the old hardcoded $25 and dark-halted the fleet for 30min.
+    pub max_loss: f64,
     /// Strategy tick interval in milliseconds
     pub tick_interval_ms: u64,
     /// Signature type (0=EOA, 1=PolyProxy, 2=GnosisSafe)
@@ -53,6 +60,11 @@ impl Config {
             .parse()
             .map_err(|_| ConfigError::InvalidValue("PMENGINE_MAX_TOTAL_EXPOSURE"))?;
 
+        let max_loss = env::var("PMENGINE_MAX_LOSS")
+            .unwrap_or_else(|_| "25".to_string())
+            .parse()
+            .map_err(|_| ConfigError::InvalidValue("PMENGINE_MAX_LOSS"))?;
+
         let tick_interval_ms = env::var("PMENGINE_TICK_INTERVAL_MS")
             .unwrap_or_else(|_| "1000".to_string())
             .parse()
@@ -74,6 +86,7 @@ impl Config {
             clob_url,
             max_position_size,
             max_total_exposure,
+            max_loss,
             tick_interval_ms,
             signature_type,
             reconcile_on_startup,

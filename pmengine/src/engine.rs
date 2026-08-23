@@ -165,7 +165,8 @@ impl Engine {
                 .unwrap_or(Decimal::from(50)),
             max_order_size: Decimal::from_f64_retain(config.max_total_exposure / 2.0)
                 .unwrap_or(Decimal::from(25)),
-            ..Default::default()
+            max_loss: Decimal::from_f64_retain(config.max_loss)
+                .unwrap_or(Decimal::from(25)),
         };
 
         tracing::info!(
@@ -883,6 +884,7 @@ impl Engine {
 
         let mut last_tick = Instant::now();
         let mut tick_count: u64 = 0;
+        let mut halt_logged = false;
 
         // Book-health heartbeat: one INFO line carrying the WS state and the
         // book-age distribution. This is the number the operator watches — a
@@ -1049,7 +1051,14 @@ impl Engine {
                     self.risk_manager.check_pnl(&self.positions);
 
                     if self.risk_manager.is_halted() {
-                        tracing::warn!("Engine halted by circuit breaker");
+                        // Once per halt, not per 50ms tick — the 2026-08-23
+                        // halt wrote ~20 lines/s of the same fact.
+                        if !halt_logged {
+                            halt_logged = true;
+                            tracing::error!(
+                                "ENGINE HALTED by circuit breaker — no evals, fires or rolls until restart"
+                            );
+                        }
                         continue;
                     }
 

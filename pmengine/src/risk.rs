@@ -94,6 +94,11 @@ impl RiskManager {
 
     /// Check P&L and trigger circuit breaker if needed.
     pub fn check_pnl(&mut self, positions: &PositionTracker) {
+        // Trigger once, not per 50ms tick — an already-tripped breaker
+        // re-announcing the same fact wrote ~20 log lines/s on 2026-08-23.
+        if self.circuit_breaker_triggered {
+            return;
+        }
         let total_pnl = positions.total_realized_pnl() + positions.total_unrealized_pnl();
         if total_pnl < -self.limits.max_loss {
             self.trigger_circuit_breaker(&format!(
