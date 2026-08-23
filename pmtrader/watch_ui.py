@@ -41,6 +41,8 @@ _BRAKE_COLOR = {  # brake kind -> style name (Rich tag as-is; ANSI parses out "b
 
 _SAFETY_STRONG = 0.3  # display cue only; mirrors the deployed theta (docs/LESSONS.md#L13)
 
+_DASH = "[dim]—[/dim]"  # what a cell with nothing honest to say prints
+
 
 def _side_safety(sides: list[dict]) -> tuple[float | None, float | None]:
     """(up, down) safety values from an eval's `sides` list."""
@@ -235,7 +237,7 @@ def _evidence_markup(e: dict) -> str:
     after an engine restart, or a gated eval that never reached the model)."""
     banked, cushion = e.get("banked_bp"), e.get("cushion_bp")
     if banked is None or cushion is None:
-        return "[dim]—[/dim]"
+        return _DASH
     style = _evidence_style(banked, cushion, bool(e.get("banked_decided")))
     return f"[{style}]{banked:+.1f}/{cushion:.1f}bp[/{style}]"
 
@@ -253,7 +255,7 @@ def _countdown_markup(slug: str, now: float) -> str:
     so it still renders through an engine restart. '—' for an unparseable slug."""
     w = updown_slugs.parse_updown_slug(slug)
     if w is None:
-        return "[dim]—[/dim]"
+        return _DASH
     rem = w["end"] - now
     if rem <= 0:
         return "[dim]0:00[/dim]"
@@ -272,8 +274,7 @@ def _mode_text(e: dict) -> str:
     return e.get("mode") or "—"
 
 
-_TAPE_TAG_WIDTH = 9  # "FIRE DOWN"/"FLIP DOWN"/etc — the widest natural tag, unpadded
-
+_TAPE_TAG_WIDTH = 9   # "FIRE DOWN"/"FLIP DOWN"/etc — the widest natural tag
 _TAPE_AGG_WIDTH = 15  # "→23:43:20 ×9999" — the widest a collapsed line's cell gets
 
 
@@ -725,9 +726,9 @@ class TapeCollapser:
         return None
 
 
-_UNDECIDED_YELLOW_USD = 300.0  # R7 speculative-exposure threshold zone
-
-
+# Speculative-exposure threshold zone: undecided dollars above these turn the
+# header's un-decided figure yellow, then red.
+_UNDECIDED_YELLOW_USD = 300.0
 _UNDECIDED_RED_USD = 500.0
 
 
@@ -958,7 +959,7 @@ def _window_pnl_cell(w: dict) -> str:
     if stage == "riding":
         return "[cyan]riding[/cyan]"
     if stage not in ("won", "lost"):
-        return "[dim]—[/dim]"
+        return _DASH
     v = _zero(float(w.get("pnl") or 0.0))
     return f"[{_pnl_color(v)}]{'~' if w.get('est') else ''}{v:+,.2f}[/{_pnl_color(v)}]"
 
@@ -970,7 +971,7 @@ def _t_cell(w: dict, now: float) -> str:
     the same instant."""
     end_ts = float(w.get("end_ts") or 0.0)
     if not end_ts:
-        return "[dim]—[/dim]"
+        return _DASH
     if end_ts > now:
         return _countdown_markup(w.get("slug", ""), now)
     return _age_label(now - end_ts)
@@ -1008,7 +1009,7 @@ def _state_cell(w: dict, now: float) -> str:
         return _live_state_text(w.get("eval") or {})
     start = float(w.get("entry_ts") or 0.0)
     if not start:
-        return "[dim]—[/dim]"
+        return _DASH
     # Exposure time: what polymarket.effectiveness grades on, and what the
     # dashboard could never show while these were two tables.
     end = now if w.get("won") is None else (float(w.get("exit_ts") or 0.0)
@@ -1031,10 +1032,10 @@ def _read_cell(w: dict) -> str:
             bits.append(f"[dim]ρ{e['rho']:+.2f}[/dim]")
         # A pre-model eval (quiesce, or a half-built one after a restart) has
         # none of these; "— p↑— ρ—" is noise where "—" is the fact.
-        return " ".join(bits) if bits else "[dim]—[/dim]"
+        return " ".join(bits) if bits else _DASH
     shares, ts = w.get("shares"), float(w.get("entry_ts") or 0.0)
     if not shares or not ts:
-        return "[dim]—[/dim]"
+        return _DASH
     return f"{shares:,.0f}sh [dim]in[/dim] {time.strftime('%H:%M', time.localtime(ts))}"
 
 
@@ -1061,30 +1062,30 @@ def _odds_cell(w: dict, odds: dict | None) -> str:
     """
     px = position_odds(odds, w)
     if px is None:
-        return "[dim]—[/dim]"
+        return _DASH
     style = "green" if px >= 0.5 else "red"
     return f"[{style}]{px:.2f}[/{style}]"
 
 
-def _mark_cell(w: dict, odds: dict | None) -> str:
-    """What the held side is worth now — the live mark while it rides, and the
-    binary's own 1.00/0.00 once it has settled. One number, walked all the way
-    to the end of the lifecycle instead of going blank at the verdict."""
-    won = w.get("won")
-    if won is None:
-        return _odds_cell(w, odds)
-    style = "dim" if w.get("est") else ("green" if won else "red")
-    return f"[{style}]{1.0 if won else 0.0:.2f}[/{style}]"
-
-
 def _position_cell(w: dict, odds: dict | None) -> str:
-    """`up 0.97→0.99` — the side we hold, what the average dollar paid for it,
-    and what it is worth now. `—` for a window nothing is held in, which is
-    every live row until its arm fires."""
+    """`up 0.97→0.99` — the side we hold, the average dollar paid for it, and
+    what it is worth now. `—` for a window nothing is held in, which is every
+    live row until its arm fires.
+
+    The right-hand price walks the whole lifecycle rather than going blank at
+    the verdict: the live mark while the window rides, the binary's own
+    1.00/0.00 once it has settled.
+    """
     px = w.get("entry_px")
     if not px:
-        return "[dim]—[/dim]"
-    return f"{w.get('side') or '?'} {px:.2f}[dim]→[/dim]{_mark_cell(w, odds)}"
+        return _DASH
+    won = w.get("won")
+    if won is None:
+        mark = _odds_cell(w, odds)
+    else:
+        style = "dim" if w.get("est") else ("green" if won else "red")
+        mark = f"[{style}]{1.0 if won else 0.0:.2f}[/{style}]"
+    return f"{w.get('side') or '?'} {px:.2f}[dim]→[/dim]{mark}"
 
 
 def _money_cell(w: dict) -> str:
@@ -1111,9 +1112,6 @@ def live_rows(arms: dict | None) -> list[dict]:
     Money here is the engine's own committed figure and is used only where the
     wallet has nothing to say (see window_rows) — the wallet stays ground truth
     everywhere it has an opinion.
-
-    Reads the already-fetched status mapping; never fetches, never calls the
-    engine's control plane.
     """
     out: list[dict] = []
     for slug, a in (arms or {}).items():
@@ -1268,11 +1266,7 @@ def _arm_cell(w: dict) -> str:
     """`◆ btc 5m ⟳≈◇` — the row's whole identity: where the window is in its
     life, which series it belongs to, and (while some arm is actually on it)
     that arm's flags. A rolled-away window is just glyph + series: the markers
-    describe a live arm, and there is no longer one here.
-
-    Glyph and flags ride in this cell rather than columns of their own because
-    both are properties of the row — and because a 1-wide glyph column is the
-    first thing Rich squeezes out of existence on a narrow console.
+    describe a live arm, and there is none here.
     """
     label = _arm_label(w.get("slug", ""))
     flags = w.get("flags") or ""
@@ -1284,11 +1278,10 @@ def engine_row(status: dict | None) -> tuple | None:
     """The red "engine unreachable or no arms" placeholder as a header row, or
     None while something is armed.
 
-    It has to live somewhere: with no arms there are no live rows for the
-    windows table to hang it on, the decided tail below keeps painting exactly
-    as it did an hour ago, and the exposure row would read a confident
-    "committed $0.00" — which is the one reading an unreachable engine and an
-    idle fleet must never share.
+    It has to live somewhere: with no arms the windows table has no live row
+    to hang it on, its decided tail keeps painting as if nothing changed, and
+    the exposure row would read a confident "committed $0.00" — the one
+    reading an unreachable engine and an idle fleet must never share.
     """
     if (status or {}).get("arms"):
         return None
@@ -1297,7 +1290,6 @@ def engine_row(status: dict | None) -> tuple | None:
 
 
 _SB_EMPTY_SLIDING = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "estimated": 0}
-
 
 _SB_EMPTY = {"wins": 0, "losses": 0, "net": 0.0, "rolls": 0, "series": {}, "cal": {},
              "estimated": 0, "riding_n": 0, "riding_usd": 0.0, "windows": [],
@@ -1323,6 +1315,31 @@ _REFRESH_LINE = "tape 1s · engine 2s · stats 10s · odds 30s · balance 60s"
 
 _HELP_MODAL_W = 78  # readable prose width; clamped to the terminal by the caller
 
+# The legend's own copy. Which columns change meaning with the stage is the
+# trick the one table turns, so this is where it is spelled out.
+_MODAL_LEGEND = (
+    ("stage", f"[cyan]{_STAGE_LEGEND}[/cyan] [dim]— it leads every `arm` cell[/dim]"),
+    ("flags", f"[cyan]{_FLAG_LEGEND}[/cyan] [dim]— trailing the arm that is on "
+              "this window right now[/dim]"),
+    ("columns", "[dim]state · read: the engine's posture while a window is live "
+                "(gate reason, evidence, p↑, ρ), what we took once it is settled[/dim]"),
+    ("", "[dim]position: entry→mark, and →1.00/0.00 once the binary settles · "
+         "$ dims while it is the engine's own figure · ~ marks an estimated P&L[/dim]"),
+    ("refresh", f"[dim]{_REFRESH_LINE}[/dim]"),
+    ("--since", "[dim]moves the header's `recent` floor only (default 6h) — "
+                "all-time, riding and the windows table always walk the full "
+                "history[/dim]"),
+)
+
+
+def _modal_grid(label_style: str) -> Table:
+    """The borderless two-column grid both halves of the modal are laid out
+    in, so the key list and the legend line up as one page."""
+    t = Table(box=None, pad_edge=False, padding=(0, 2), show_header=False)
+    t.add_column("label", justify="right", width=7, style=label_style)
+    t.add_column("text", justify="left", overflow="fold")
+    return t
+
 
 def build_help_modal(width: int | None = None):
     """The `h` overlay: every key the watch accepts, the glyph legends, and the
@@ -1341,31 +1358,12 @@ def build_help_modal(width: int | None = None):
     from rich.panel import Panel
     from rich.text import Text
 
-    keys = Table(box=None, pad_edge=False, padding=(0, 2), show_header=False)
-    keys.add_column("key", justify="right", width=7, style="bold")
-    keys.add_column("what", justify="left", overflow="fold")
+    keys = _modal_grid("bold")
     for _press, label, desc in WATCH_KEYS:
         keys.add_row(label, desc)
-
-    legend = Table(box=None, pad_edge=False, padding=(0, 2), show_header=False)
-    legend.add_column("what", justify="right", width=7, style="dim")
-    legend.add_column("meaning", justify="left", overflow="fold")
-    legend.add_row("stage", f"[cyan]{_STAGE_LEGEND}[/cyan] [dim]— it leads "
-                            "every `arm` cell[/dim]")
-    legend.add_row("flags", f"[cyan]{_FLAG_LEGEND}[/cyan] [dim]— trailing the "
-                            "arm that is on this window right now[/dim]")
-    # The columns that change meaning with the stage are the whole trick of the
-    # one-table fold, so the modal is where they are spelled out.
-    legend.add_row("columns", "[dim]state · read: the engine's posture while a "
-                              "window is live (gate reason, evidence, p↑, ρ), "
-                              "what we took once it is settled[/dim]")
-    legend.add_row("", "[dim]position: entry→mark, and →1.00/0.00 once the "
-                       "binary settles · $ dims while it is the engine's own "
-                       "figure · ~ marks an estimated P&L[/dim]")
-    legend.add_row("refresh", f"[dim]{_REFRESH_LINE}[/dim]")
-    legend.add_row("--since", "[dim]moves the header's `recent` floor only "
-                              "(default 6h) — all-time, riding and the windows "
-                              "table always walk the full history[/dim]")
+    legend = _modal_grid("dim")
+    for label, text in _MODAL_LEGEND:
+        legend.add_row(label, text)
     body = Group(keys, Text(""), legend)
     return Panel(body, title="[bold]controls[/bold]", title_align="left",
                  subtitle="[dim]h · esc · q to close[/dim]", subtitle_align="right",
