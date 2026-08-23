@@ -87,6 +87,32 @@ def _brake_rich(sides: list[dict]) -> str:
                      for side, b in _brake_sides(sides))
 
 
+def _rtds_rich(h: dict | None) -> str:
+    """One line for the shared RTDS settlement-stream supervisor, or "" when
+    nothing has ever armed on it.
+
+    Worth its own line rather than a per-arm field: it is ONE socket behind
+    every stream-fed arm, so when it drops they all gate at once and the
+    per-arm reasons all say the same thing. Red the moment it is not
+    connected — a dark stream is a fleet-wide event.
+    """
+    if not h or not (h.get("started") or h.get("events")):
+        return ""
+    age = h.get("last_event_age_s")
+    if h.get("connected"):
+        head = "[green]rtds[/green]"
+    else:
+        head = "[red]rtds DOWN[/red]"
+    bits = [f"{h.get('events_per_s', 0):.1f}/s",
+            f"age {age:.0f}s" if age is not None else "no events yet",
+            f"{h.get('consumers', 0)} arms"]
+    if h.get("reconnects"):
+        bits.append(f"{h['reconnects']} reconnects")
+    if h.get("err") and not h.get("connected"):
+        bits.append(str(h["err"])[:48])
+    return f"{head} [dim]{' · '.join(bits)}[/dim]"
+
+
 def _click_fg_bold(style: str) -> tuple[str | None, bool]:
     parts = style.split()
     return next((p for p in parts if p != "bold"), None), "bold" in parts
@@ -413,8 +439,12 @@ def build_risk_header(status: dict | None, bal: dict | None, sb: dict | None) ->
     undecided_s = f"${undecided:,.2f} un-decided"
     if color:
         undecided_s = f"[{color}]{undecided_s}[/{color}]"
-    return (f"capital {cap} · committed ${committed:,.2f} ({undecided_s}) · "
+    line = (f"capital {cap} · committed ${committed:,.2f} ({undecided_s}) · "
             f"riding {riding_n} windows ${riding_usd:,.2f}")
+    # One socket feeds every stream-fed arm, so its state belongs on the
+    # fleet's risk line, not buried per-arm.
+    rtds = _rtds_rich((status or {}).get("rtds"))
+    return f"{line} · {rtds}" if rtds else line
 
 
 def _window_chip(w: dict) -> str:
@@ -479,9 +509,10 @@ def build_arms_table(arms: dict | None, now: float) -> Table:
         rho = f"{e['rho']:+.2f}" if "rho" in e else "—"
         committed = e.get("committed", a.get("filled_usdc"))
         committed_s = f"${committed:,.2f}" if committed is not None else "—"
+        # "≈" = fed by the settlement stream rather than the Binance proxy.
+        flags = ("⟳" if a.get("roll") else "·") + ("≈" if a.get("feed") == "rtds" else "")
         t.add_row(_tape_slug(slug), _countdown_markup(slug, now), state,
-                  _evidence_markup(e), p_up, _mode_text(e), rho, committed_s,
-                  "⟳" if a.get("roll") else "·")
+                  _evidence_markup(e), p_up, _mode_text(e), rho, committed_s, flags)
     if not arms:
         t.add_row("—", "—", "[red]engine unreachable or no arms[/red]",
                    "—", "—", "—", "—", "—", "—")

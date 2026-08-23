@@ -27,7 +27,7 @@ from cli_common import console, _api, _pnl_color
 from polymarket import effectiveness, tape, updown_slugs, wallet
 from watch_ui import (
     _SB_EMPTY, _brake_rich, _cbreak_stdin, _controls_panel, _eff_table,
-    _restore_stdin, _safety_rich, _tape_render, _tape_slug, _wait_key,
+    _restore_stdin, _rtds_rich, _safety_rich, _tape_render, _tape_slug, _wait_key,
     build_arms_table, build_header_panel, build_risk_header, build_windows_strip,
 )
 import watch_ui
@@ -156,10 +156,19 @@ def _resolve_basis_guard(explicit: float | None, symbol: str) -> tuple[float, st
                    "Gaussian p_up 0.99+ is fiction in the tails (>3-sigma "
                    "jumps ~hourly). With min_edge 1.5c, 0.98 makes ~0.945 the "
                    "max ask a non-flip-proof clip pays. 1.0 disables")
+@click.option("--feed", type=click.Choice(["binance", "rtds"]), default="binance",
+              show_default=True,
+              help="Market data source. 'binance' is the venue proxy every arm "
+                   "has used. 'rtds' reads the Chainlink TWAP stream these "
+                   "markets actually SETTLE on — same series for reference, "
+                   "spot and TWAP marks, so the cross-venue basis the guard "
+                   "was sized for disappears (twap markets only; close_open "
+                   "needs a venue's candle open). This is what makes xrp/doge "
+                   "tradeable at all — see analysis/xrp_fit.md")
 def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
                side: str | None, quiesce: float, min_fair: float, min_elapsed: float,
                roll: bool, clip: float, basis_guard: float | None, theta: float,
-               pay_up: float, p_cap: float) -> None:
+               pay_up: float, p_cap: float, feed: str) -> None:
     """Arm the pmengine updown trigger on a market.
 
     Prices the market (semantics, vol, fee) and hands the parameters to the
@@ -175,6 +184,13 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         raise click.UsageError(str(e))
     if r["rem_s"] <= 0:
         raise click.UsageError("window already over")
+    # The engine refuses this too; catching it here saves a round trip and
+    # says why in the same breath as the flag that caused it.
+    if feed == "rtds" and r["kind"] != "twap":
+        raise click.UsageError(
+            f"--feed rtds does not support {r['kind']} markets — the settlement "
+            "stream has no candle opens. Use --feed binance."
+        )
     guard_bp, guard_warning = _resolve_basis_guard(basis_guard, r["symbol"])
     if guard_warning:
         console.print(f"[yellow]warning:[/yellow] {guard_warning}")
@@ -186,7 +202,7 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         "size_usdc": size, "min_edge": min_edge, "max_price": max_price,
         "quiesce_secs": quiesce, "min_fair": min_fair, "min_elapsed_frac": min_elapsed,
         "roll": roll, "clip_usdc": clip, "basis_guard_bp": guard_bp,
-        "theta": theta, "pay_up_max": pay_up, "p_cap": p_cap,
+        "theta": theta, "pay_up_max": pay_up, "p_cap": p_cap, "feed": feed,
     }
     if side:
         payload["side_filter"] = side
@@ -195,7 +211,7 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
     console.print(f"[green]armed[/green] {reply.get('armed')}  "
                   f"[dim]{r['kind']} · {r['rem_s']:.0f}s left · size ${size:.0f} · "
                   f"min edge {min_edge * 100:.0f}¢ · σ {r['sigma_bp_per_min']:.2f}bp/min · "
-                  f"guard {guard_bp:.1f}bp{rolling}[/dim]")
+                  f"guard {guard_bp:.1f}bp · feed {feed}{rolling}[/dim]")
     console.print(f"[dim]market now: {r['verdict']}[/dim]")
 
 
@@ -257,6 +273,10 @@ def crypto_trigger(as_json: bool) -> None:
         e = a.get("eval") or {}
         state = e.get("state", "?")
         roll = "⟳" if a.get("roll") else " "
+        # Which feed an arm reads is the difference between pricing the
+        # settlement object and pricing a proxy for it — never leave it
+        # implicit on a fleet running both.
+        stream = " [cyan]≈[/cyan]" if a.get("feed") == "rtds" else "  "
         if state == "gated":
             body = f"[yellow]gated[/yellow]   {e.get('reason', '')}"
         elif state == "armed":
@@ -276,7 +296,10 @@ def crypto_trigger(as_json: bool) -> None:
             body += f"  ${committed:,.2f}/${e.get('budget', 0):,.0f}"
         else:
             body = state
-        console.print(f"{roll} {_tape_slug(slug):<14} {body}")
+        console.print(f"{roll}{stream} {_tape_slug(slug):<14} {body}")
+    rtds = _rtds_rich(reply.get("rtds") or {})
+    if rtds:
+        console.print(rtds)
     if reply.get("pending_rolls"):
         console.print(f"[dim]pending rolls: {', '.join(reply['pending_rolls'])}[/dim]")
     # Only when it's on: a line saying "no cap" every tick is noise.

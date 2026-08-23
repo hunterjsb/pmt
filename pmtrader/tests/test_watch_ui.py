@@ -183,6 +183,70 @@ def test_build_risk_header_missing_balance_shows_ellipsis():
     assert "capital …" in line
 
 
+# ---------- RTDS settlement-stream health ----------
+
+def test_rtds_rich_is_silent_until_something_arms_on_the_stream():
+    # A Binance-only fleet must not carry a line about a socket it never
+    # opened — the risk header is one line and every character is spent.
+    assert cc._rtds_rich(None) == ""
+    assert cc._rtds_rich({}) == ""
+    assert cc._rtds_rich({"started": False, "events": 0}) == ""
+
+
+def test_rtds_rich_reads_green_connected_and_red_dark():
+    live = cc._rtds_rich({"started": True, "connected": True, "events": 900,
+                           "events_per_s": 8.0, "last_event_age_s": 0.4,
+                           "consumers": 2, "reconnects": 0})
+    assert "[green]rtds[/green]" in live
+    assert "8.0/s" in live and "2 arms" in live
+
+    # One socket feeds every stream-fed arm, so its death is a fleet event.
+    dark = cc._rtds_rich({"started": True, "connected": False, "events": 900,
+                           "events_per_s": 0.0, "last_event_age_s": 47.0,
+                           "consumers": 2, "reconnects": 3,
+                           "err": "read: connection reset"})
+    assert "[red]rtds DOWN[/red]" in dark
+    assert "age 47s" in dark and "3 reconnects" in dark
+    assert "connection reset" in dark
+
+
+def test_rtds_rich_tolerates_a_stream_that_has_never_printed():
+    # started, connected, zero events: `last_event_age_s` is null and must
+    # not format as a confident "age 0s".
+    line = cc._rtds_rich({"started": True, "connected": True, "events": 0,
+                           "events_per_s": 0.0, "last_event_age_s": None,
+                           "consumers": 1})
+    assert "no events yet" in line
+
+
+def test_risk_header_carries_the_stream_state_when_one_is_running():
+    sb = {"riding_n": 0, "riding_usd": 0.0}
+    status = {"arms": {}, "rtds": {"started": True, "connected": True,
+                                    "events": 10, "events_per_s": 8.0,
+                                    "last_event_age_s": 0.5, "consumers": 1}}
+    assert "rtds" in cc.build_risk_header(status, {"total": 10.0}, sb)
+    # ...and stays out of the way when none is.
+    assert "rtds" not in cc.build_risk_header({"arms": {}}, {"total": 10.0}, sb)
+
+
+def test_arms_table_marks_which_feed_an_arm_reads():
+    from rich.console import Console
+
+    arms = {
+        "xrp-updown-5m-9999999999": {"filled_usdc": 1.0, "roll": True,
+                                      "feed": "rtds", "eval": None},
+        "btc-updown-5m-9999999999": {"filled_usdc": 1.0, "roll": True,
+                                      "feed": "binance", "eval": None},
+    }
+    c = Console(record=True, width=160)
+    c.print(cc.build_arms_table(arms, now=1000.0))
+    out = c.export_text().splitlines()
+    xrp = next(ln for ln in out if "xrp" in ln)
+    btc = next(ln for ln in out if "btc" in ln)
+    assert "≈" in xrp, xrp
+    assert "≈" not in btc, btc
+
+
 # ---------- recent-windows strip ----------
 
 def test_window_chip_formats_win_and_loss():

@@ -342,3 +342,59 @@ def test_arm_basis_guard_unknown_symbol_falls_back_loudly():
     guard, warning = cc._resolve_basis_guard(None, "PEPEUSDT")
     assert guard == 3.0
     assert warning is not None
+
+
+# ---------- `crypto arm --feed` ----------
+
+def _arm(monkeypatch, evaluated, **kwargs):
+    """Run `crypto arm` with the market pricing + engine post stubbed, and
+    return the payload that would have gone to the engine."""
+    from click.testing import CliRunner
+
+    sent = {}
+    monkeypatch.setattr("polymarket.crypto.eval_updown", lambda ref: evaluated)
+
+    def fake_post(path, payload):
+        sent.update(payload)
+        return {"armed": evaluated["slug"]}
+
+    monkeypatch.setattr(cc, "_engine_post", fake_post)
+    args = ["https://polymarket.com/event/x", "--size", "100"]
+    for k, v in kwargs.items():
+        args += [f"--{k}", str(v)]
+    result = CliRunner().invoke(cc.crypto_arm, args)
+    return result, sent
+
+
+_TWAP_MARKET = {
+    "slug": "xrp-updown-5m-1787442000", "kind": "twap", "symbol": "XRPUSDT",
+    "tokens": {"up": "1", "down": "2"}, "start": 1787442000.0, "end": 1787442300.0,
+    "sigma_bp_per_min": 14.0, "fee_rate": 0.07, "rem_s": 250.0, "verdict": "ok",
+}
+
+
+def test_arm_feed_defaults_to_binance_and_plumbs_rtds_through(monkeypatch):
+    result, payload = _arm(monkeypatch, dict(_TWAP_MARKET))
+    assert result.exit_code == 0, result.output
+    assert payload["feed"] == "binance", "the default must stay the old engine"
+
+    result, payload = _arm(monkeypatch, dict(_TWAP_MARKET), feed="rtds")
+    assert result.exit_code == 0, result.output
+    assert payload["feed"] == "rtds"
+    assert "feed rtds" in result.output
+
+
+def test_arm_refuses_rtds_on_a_close_open_market(monkeypatch):
+    # The settlement stream has no candle opens; the engine refuses this
+    # too, but catching it here names the flag that caused it.
+    market = dict(_TWAP_MARKET, kind="close_open")
+    result, payload = _arm(monkeypatch, market, feed="rtds")
+    assert result.exit_code != 0
+    assert "close_open" in result.output and "--feed binance" in result.output
+    assert payload == {}, "nothing reached the engine"
+
+
+def test_arm_rejects_an_unknown_feed(monkeypatch):
+    result, payload = _arm(monkeypatch, dict(_TWAP_MARKET), feed="coinbase")
+    assert result.exit_code != 0
+    assert payload == {}

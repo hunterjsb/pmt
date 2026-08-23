@@ -27,13 +27,14 @@
 use crate::position::Fill;
 use crate::strategies::updown_model::{
     append_jsonl, avg_down_blocks, budget_unlocked, book_sample_due, distrust_blocks, eval_model,
-    lag1_autocorr, pay_up_limit, safety_gate_blocks, shape_klines, side_safety, FeedState,
-    GateReason, ModelEval, Tunables, BINANCE_DATA, EV_BOOK, EV_CLEANUP, EV_EVAL, EV_EXIT,
-    EV_FIRE, EV_GATED, EV_ROLL, KLINE_LOOKBACK_S,
+    lag1_autocorr, pay_up_limit, safety_gate_blocks, settle_tw_secs, shape_klines, side_safety,
+    FeedState, GateReason, ModelEval, Tunables, BINANCE_DATA, EV_BOOK, EV_CLEANUP, EV_EVAL,
+    EV_EXIT, EV_FIRE, EV_GATED, EV_ROLL, KLINE_LOOKBACK_S,
 };
 #[cfg(test)]
 use crate::strategies::updown_model::MAX_SPOT_AGE_S;
 use crate::strategies::updown_oracle;
+use crate::strategies::updown_rtds::{self, RtdsHub, RtdsSub};
 use crate::strategies::updown_state::{
     plan_recovery, spawn_unmanaged_check, ArmStore, ArmsState, RollRecord,
 };
@@ -165,7 +166,22 @@ pub(crate) struct ArmParams {
     /// nobody at the keyboard; `disarm` breaks the chain.
     #[serde(default)]
     pub roll: bool,
+    /// Where this arm's market data comes from: "binance" (the trade
+    /// stream + 1m klines, every arm until now) or "rtds" (the Chainlink
+    /// TWAP stream the market actually settles on — see updown_rtds.rs).
+    ///
+    /// `serde(default)`, no version bump, exactly like the fleet cap: a
+    /// pre-existing arms-state.json reads back as "binance" (today's
+    /// behaviour) and an older binary ignores the field rather than
+    /// refusing the whole state and stranding a live window.
+    #[serde(default = "d_feed")]
+    pub feed: String,
 }
+
+/// The Binance proxy feed — the default, and what every existing arm runs.
+pub(crate) const FEED_BINANCE: &str = "binance";
+/// The settlement stream itself (updown_rtds.rs).
+pub(crate) const FEED_RTDS: &str = "rtds";
 
 // Two-mode tuning. Early: small clips, only on outsized mispricing, capped
 // at early_frac of budget — a wrong "lock" costs a clip, not the stack.
@@ -187,6 +203,7 @@ fn d_rho_block() -> f64 { -0.25 }
 fn d_manip_push() -> f64 { 25.0 }
 fn d_p_cap() -> f64 { 1.0 }
 fn d_settle_rule() -> String { "range_avg".to_string() }
+fn d_feed() -> String { FEED_BINANCE.to_string() }
 /// Flip-proof buys stay live until this close to resolution.
 const FLIP_BUY_CUTOFF_S: f64 = 8.0;
 
@@ -242,6 +259,11 @@ pub(crate) struct ArmState {
     oracle: Arc<Mutex<updown_oracle::OracleState>>,
     feed_stop: Arc<AtomicBool>,
     feed_handles: Vec<std::thread::JoinHandle<()>>,
+    /// feed="rtds" arms hold their registration on the shared RTDS
+    /// supervisor here instead of owning feed threads. Dropping it
+    /// unregisters, so every teardown path is covered by `stop_feed`
+    /// without a second lifecycle to remember.
+    rtds_sub: Option<RtdsSub>,
     pub(crate) subscribed: bool,
     cleaned: bool,
     pub(crate) filled_usdc: f64,
@@ -307,6 +329,11 @@ pub struct Updown {
     /// upgrade. Strategy-level on purpose: an ArmParams knob would be one
     /// budget per arm, which is the thing that already exists.
     fleet_undecided_cap: f64,
+    /// ONE RTDS supervisor for the whole strategy. Lazily connected by the
+    /// first feed="rtds" arm and shared by every one after it — the socket
+    /// carries all symbols and all three topics, so a per-arm connection
+    /// would be N sockets for one stream's worth of data.
+    rtds: RtdsHub,
 }
 
 struct RollTask {
@@ -353,6 +380,38 @@ pub(crate) fn next_window(slug: &str, start: f64, end: f64) -> Option<(String, f
         return None;
     }
     Some((format!("{}-{}", prefix, end as i64), end, end + dur))
+}
+
+/// Arm-time validation of the market-data source. Refusals here are loud on
+/// purpose: an unsupported feed/market pairing that armed anyway would sit
+/// gated on a stale feed for the life of the window and never say why.
+///
+/// close_open is refused on rtds because the model reads `candle_open` — the
+/// exact 1h Binance candle open — and the settlement stream has no candles.
+/// A close_open market is priced against a venue's OHLC, so it belongs on
+/// the venue's feed.
+pub(crate) fn check_feed(p: &ArmParams) -> Result<(), String> {
+    match p.feed.as_str() {
+        FEED_BINANCE => Ok(()),
+        FEED_RTDS => {
+            if p.kind != "twap" {
+                return Err(format!(
+                    "feed 'rtds' does not support kind '{}' — the settlement stream has no \
+                     candle opens; arm close_open markets with --feed binance",
+                    p.kind
+                ));
+            }
+            if updown_rtds::rtds_symbol(&p.symbol).is_none() {
+                return Err(format!(
+                    "feed 'rtds' does not carry {} — the stream serves {}",
+                    p.symbol,
+                    updown_rtds::RTDS_SYMBOLS.join(", ")
+                ));
+            }
+            Ok(())
+        }
+        other => Err(format!("unknown feed '{}' (binance | rtds)", other)),
+    }
 }
 
 /// Gamma encodes outcomes and clobTokenIds as JSON-in-a-string; map the
@@ -422,6 +481,7 @@ impl ArmState {
             oracle: Arc::new(Mutex::new(updown_oracle::OracleState::default())),
             feed_stop: Arc::new(AtomicBool::new(false)),
             feed_handles: Vec::new(),
+            rtds_sub: None,
             subscribed: false,
             cleaned: false,
             filled_usdc: 0.0,
@@ -474,6 +534,11 @@ impl ArmState {
         for h in self.feed_handles.drain(..) {
             let _ = h.join();
         }
+        // Unregisters on drop. The shared RTDS socket itself stays up for
+        // the strategy's lifetime — it is one connection for the whole
+        // fleet, and tearing it down between a window closing and its roll
+        // re-arming would flap it every five minutes.
+        self.rtds_sub = None;
     }
 
     /// Push-based spot off the Binance trade stream (~100ms event age) —
@@ -528,7 +593,41 @@ impl ArmState {
         }));
     }
 
-    fn start_feeds(&mut self) {
+    fn start_feeds(&mut self, rtds: &RtdsHub) {
+        match self.p.feed.as_str() {
+            FEED_BINANCE => {}
+            FEED_RTDS => {
+                // The settlement stream fills the SAME FeedState contract
+                // the Binance threads do, so nothing downstream changes.
+                // No Binance threads at all, and no Chainlink oracle
+                // poller: that poller measures oracle-vs-Binance basis, and
+                // on this feed both sides of that comparison are the same
+                // series. live_guard_bp then floors to the arm's own param,
+                // which is what the operator measured for the stream.
+                let Some(symbol) = updown_rtds::rtds_symbol(&self.p.symbol) else {
+                    return self.refuse_feed(format!(
+                        "rtds does not carry {}", self.p.symbol
+                    ));
+                };
+                tracing::info!(
+                    slug = %self.p.slug, symbol = %symbol,
+                    tw_s = settle_tw_secs(self.p.end - self.p.start),
+                    "updown arm feeding off the RTDS settlement stream"
+                );
+                self.rtds_sub = Some(rtds.register(
+                    &symbol,
+                    settle_tw_secs(self.p.end - self.p.start),
+                    self.p.start,
+                    self.feed.clone(),
+                ));
+                return;
+            }
+            // Fail closed, never fall through to Binance. `on_command`
+            // refuses an unknown feed, so this is the recovery path with a
+            // hand-edited or corrupted state file — and an arm whose guard
+            // was sized for one feed must not quietly trade another.
+            other => return self.refuse_feed(format!("unknown feed '{}'", other)),
+        }
         self.spawn_ws_spot();
         // Ships dark: the dynamic guard's oracle poller runs only when
         // PMENGINE_DYNAMIC_GUARD=1 — a routine engine restart must never
@@ -590,6 +689,17 @@ impl ArmState {
                 std::thread::sleep(std::time::Duration::from_millis(2000));
             }
         }));
+    }
+
+    /// Start no feed at all and say why. spot_ts stays where it is, so the
+    /// arm gates on a stale feed for its whole life — the safe end of the
+    /// failure, and the reason travels into the gate line.
+    fn refuse_feed(&mut self, why: String) {
+        tracing::error!(
+            slug = %self.p.slug, symbol = %self.p.symbol, feed = %self.p.feed,
+            "updown arm has no usable feed — it will gate, never trade: {}", why
+        );
+        self.feed.lock().unwrap().last_err = Some(why);
     }
 
     /// Model fair P(UP) plus regime/decidedness context. Errors = gated.
@@ -1199,6 +1309,7 @@ impl Updown {
             store,
             last_persist_at: 0.0,
             fleet_undecided_cap: 0.0,
+            rtds: RtdsHub::new(),
         }
     }
 
@@ -1279,7 +1390,7 @@ impl Updown {
         // Unit tests get the arm without the sockets: `cfg!` (not `#[cfg]`)
         // so the feed path still compiles and lints under `cargo test`.
         if cfg!(not(test)) {
-            arm.start_feeds();
+            arm.start_feeds(&self.rtds);
         }
         self.arms.insert(slug, arm);
     }
@@ -1449,6 +1560,7 @@ impl Strategy for Updown {
         for arm in self.arms.values_mut() {
             arm.stop_feed();
         }
+        self.rtds.stop();
     }
 
     fn on_command(&mut self, cmd: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -1459,6 +1571,7 @@ impl Strategy for Updown {
                 if p.kind != "twap" && p.kind != "close_open" {
                     return Err(format!("unknown kind '{}'", p.kind));
                 }
+                check_feed(&p)?;
                 if unix_now() >= p.end {
                     return Err("window already over".to_string());
                 }
@@ -1528,6 +1641,7 @@ impl Strategy for Updown {
                         (slug.clone(), serde_json::json!({
                             "filled_usdc": a.filled_usdc,
                             "roll": a.p.roll,
+                            "feed": a.p.feed,
                             "eval": a.last_eval,
                             "oracle": {
                                 "samples": o.samples.len(),
@@ -1544,6 +1658,7 @@ impl Strategy for Updown {
                 Ok(serde_json::json!({
                     "arms": arms, "count": self.arms.len(), "pending_rolls": rolls,
                     "fleet_undecided_cap": self.fleet_undecided_cap,
+                    "rtds": self.rtds.health().json(unix_now()),
                 }))
             }
             _ => Err("unknown action (arm | disarm | fleet | status)".to_string()),
@@ -2483,6 +2598,228 @@ mod tests {
         s.recover(unix_now());
         assert_eq!(s.arms.len(), 1, "a pre-R7 file still recovers its arms");
         assert_eq!(s.fleet_undecided_cap, 0.0);
+    }
+
+    // --- feed selection (updown_rtds.rs): the strategy-level half. The
+    // supervisor, its routing and its reconnect are unit-tested there;
+    // these pin the seam — what an arm accepts, what it persists, and that
+    // a stream-fed FeedState is the same object every gate already knows.
+
+    /// A twap arm on a 5m window (so the settlement width is 30s) fed by
+    /// the stream, wired to a hub the test drives by hand.
+    fn rtds_armed(hub: &RtdsHub) -> (ArmState, f64, f64) {
+        let (start, end) = (600.0, 900.0);
+        let mut p = params("s");
+        p.symbol = "XRPUSDT".into();
+        p.feed = FEED_RTDS.into();
+        p.start = start;
+        p.end = end;
+        let mut arm = ArmState::with_params(p);
+        arm.subscribed = true;
+        arm.rtds_sub = Some(hub.register(
+            "xrp/usd",
+            settle_tw_secs(end - start),
+            start,
+            arm.feed.clone(),
+        ));
+        (arm, start, end)
+    }
+
+    #[test]
+    fn feed_defaults_to_binance_and_only_knows_two_names() {
+        assert_eq!(params("s").feed, FEED_BINANCE, "absent = today's engine");
+        let mut p = params("s");
+        p.feed = FEED_RTDS.into();
+        p.symbol = "XRPUSDT".into();
+        assert!(check_feed(&p).is_ok());
+        p.feed = "coinbase".into();
+        assert!(check_feed(&p).unwrap_err().contains("unknown feed"));
+    }
+
+    #[test]
+    fn rtds_refuses_close_open_and_symbols_the_stream_does_not_carry() {
+        // close_open prices off a venue's 1h candle open; the settlement
+        // stream has no candles, so the model would have nothing to read.
+        let mut p = params("s");
+        p.feed = FEED_RTDS.into();
+        p.symbol = "XRPUSDT".into();
+        p.kind = "close_open".into();
+        let err = check_feed(&p).unwrap_err();
+        assert!(err.contains("close_open"), "{err}");
+        assert!(err.contains("--feed binance"), "the error says what to do instead: {err}");
+        // And a symbol the stream doesn't serve is refused loudly rather
+        // than arming a window that would sit gated forever.
+        p.kind = "twap".into();
+        p.symbol = "PEPEUSDT".into();
+        let err = check_feed(&p).unwrap_err();
+        assert!(err.contains("does not carry PEPEUSDT"), "{err}");
+        assert!(err.contains("xrp/usd"), "and lists what it does carry: {err}");
+    }
+
+    #[test]
+    fn arm_command_rejects_close_open_on_rtds() {
+        let mut s = Updown::new();
+        let start = (unix_now() + 60.0) as i64;
+        let res = s.on_command(&serde_json::json!({
+            "action": "arm", "slug": format!("btc-updown-1h-{}", start),
+            "kind": "close_open", "symbol": "BTCUSDT",
+            "token_up": "1", "token_down": "2",
+            "start": start as f64, "end": (start + 3600) as f64,
+            "sigma_bp_per_min": 3.0, "fee_rate": 0.07, "size_usdc": 100.0,
+            "feed": "rtds",
+        }));
+        assert!(res.is_err(), "close_open on the settlement stream must not arm");
+        assert!(s.arms.is_empty());
+    }
+
+    #[test]
+    fn feed_round_trips_through_arm_state_and_an_old_file_reads_as_binance() {
+        // Forward compat both ways, exactly like the fleet cap: no version
+        // bump, so a file written before this feature recovers its arms and
+        // simply means "binance", and an older binary ignores the new field
+        // instead of refusing the state and stranding a live window.
+        let (store, path) = tmp_store("feedfield");
+        let mut s = Updown::with_store(store);
+        let (slug, mut cmd) = arm_cmd(-30.0, true);
+        cmd["symbol"] = serde_json::json!("XRPUSDT");
+        cmd["feed"] = serde_json::json!("rtds");
+        s.on_command(&cmd).unwrap();
+
+        let mut fresh = Updown::with_store(ArmStore::at(path));
+        fresh.recover(unix_now());
+        assert_eq!(fresh.arms.get(&slug).expect("recovered").p.feed, FEED_RTDS);
+        assert_eq!(
+            fresh.on_command(&serde_json::json!({"action": "status"})).unwrap()["arms"][&slug]
+                ["feed"],
+            "rtds",
+            "and status says which feed an arm is on"
+        );
+
+        // A pre-feature file: no `feed` key at all.
+        let (_store2, old_path) = tmp_store("feedfield-oldfile");
+        let start = (unix_now() - 30.0) as i64;
+        let old_slug = format!("btc-updown-5m-{}", start);
+        std::fs::write(&old_path, serde_json::json!({
+            "version": 1, "written_at": 0.0, "rolls": [],
+            "arms": [{
+                "slug": old_slug, "kind": "twap", "symbol": "BTCUSDT",
+                "token_up": format!("{}-u", old_slug), "token_down": format!("{}-d", old_slug),
+                "start": start as f64, "end": (start + 300) as f64,
+                "sigma_bp_per_min": 3.0, "fee_rate": 0.07, "size_usdc": 250.0,
+            }],
+        }).to_string()).unwrap();
+        let mut old = Updown::with_store(ArmStore::at(old_path));
+        old.recover(unix_now());
+        assert_eq!(old.arms.get(&old_slug).expect("still recovers").p.feed, FEED_BINANCE);
+    }
+
+    #[test]
+    fn an_unusable_feed_starts_nothing_and_gates_forever() {
+        // The recovery path takes no commands, so a hand-edited or
+        // corrupted state file is the one way an unknown feed reaches an
+        // arm. Falling through to Binance would trade a guard sized for
+        // some other feed; starting nothing gates on a stale spot instead.
+        let mut p = params("s");
+        p.feed = "coinbase".into();
+        let mut arm = ArmState::with_params(p);
+        arm.start_feeds(&RtdsHub::new());
+        assert!(arm.feed_handles.is_empty(), "no feed threads on an unknown feed");
+        assert!(arm.rtds_sub.is_none());
+        let err = arm.fair_p_up(1400.0).unwrap_err();
+        assert!(err.reason.contains("stale"), "{}", err.reason);
+        assert!(err.reason.contains("coinbase"), "and names the cause: {}", err.reason);
+
+        // Same for rtds on a symbol the stream doesn't carry.
+        let mut p = params("s");
+        p.feed = FEED_RTDS.into();
+        p.symbol = "PEPEUSDT".into();
+        let mut arm = ArmState::with_params(p);
+        arm.start_feeds(&RtdsHub::new());
+        assert!(arm.rtds_sub.is_none());
+        assert!(arm.fair_p_up(1400.0).unwrap_err().reason.contains("PEPEUSDT"));
+    }
+
+    #[test]
+    fn a_roll_keeps_the_arms_feed() {
+        // Roll chains clone params forward; an rtds arm that silently
+        // rolled onto Binance would trade xrp through the basis this
+        // feature exists to stop reading.
+        let mut p = params("btc-updown-5m-1787442000");
+        p.feed = FEED_RTDS.into();
+        p.start = 1787442000.0;
+        p.end = 1787442300.0;
+        let task = RollTask {
+            params: p.clone(),
+            next_slug: "btc-updown-5m-1787442300".into(),
+            next_start: 1787442300.0,
+            next_end: 1787442600.0,
+            next_try_at: 0.0,
+        };
+        assert_eq!(task.record().params.feed, FEED_RTDS);
+    }
+
+    #[test]
+    fn rtds_fills_the_same_feedstate_contract_the_model_already_reads() {
+        // The point of the whole feature: eval_model needs no knowledge of
+        // where its numbers came from. The stream supplies the range-start
+        // reference (the settlement print AT the window start, not a
+        // Binance proxy for it), spot, and the closes behind sigma/rho.
+        let hub = RtdsHub::new();
+        let (arm, start, _end) = rtds_armed(&hub);
+
+        // The 30s-TWAP print at the window's start instant IS the reference.
+        hub.ingest_price(updown_rtds::TOPIC_TWAP30, "xrp/usd", start as i64, 2.50, start);
+        // 1Hz spot, +20bp above the reference.
+        hub.ingest_price(updown_rtds::TOPIC_SPOT, "xrp/usd", 700, 2.505, 700.0);
+
+        let m = arm.fair_p_up(700.0).expect("prices off the stream");
+        assert!((m.margin_bp - 20.0).abs() < 0.5, "margin {:.1}bp", m.margin_bp);
+        assert!(m.p_up > 0.99, "+20bp with 100s left and 3bp/min vol: {}", m.p_up);
+        assert_eq!(
+            m.guard_bp, arm.p.basis_guard_bp,
+            "no oracle poller on this feed — the operator's param governs"
+        );
+        // The 60s topic belongs to longer windows and must not touch a 5m
+        // arm's reference.
+        hub.ingest_price(updown_rtds::TOPIC_TWAP60, "xrp/usd", start as i64, 9.99, start);
+        assert_eq!(arm.feed.lock().unwrap().per_min.get(&(start as i64 - 60)), Some(&2.50));
+    }
+
+    #[test]
+    fn a_dead_stream_gates_an_rtds_arm_exactly_like_a_dead_binance_feed() {
+        // The basis guard's cross-venue job is gone on this feed; what is
+        // left is staleness, and MAX_SPOT_AGE_S must bind here unchanged.
+        // A dropped socket stops refreshing spot_ts, so the arm gates
+        // within seconds and quiesce still pulls its orders.
+        let hub = RtdsHub::new();
+        let (mut arm, start, end) = rtds_armed(&hub);
+        hub.ingest_price(updown_rtds::TOPIC_TWAP30, "xrp/usd", start as i64, 2.50, start);
+        hub.ingest_price(updown_rtds::TOPIC_SPOT, "xrp/usd", 700, 2.505, 700.0);
+        assert!(arm.fair_p_up(700.0).is_ok());
+
+        // ... and then the socket dies. Nothing arrives; the clock moves.
+        let dead_at = 700.0 + MAX_SPOT_AGE_S + 1.0;
+        let gate = arm.fair_p_up(dead_at).unwrap_err();
+        assert!(gate.reason.contains("stale"), "{}", gate.reason);
+        assert_eq!(gate.margin_bp, None, "a stale feed has no margin to report");
+
+        // The supervisor's error rides along so the gate line names the
+        // feed instead of leaving the operator guessing.
+        arm.feed.lock().unwrap().last_err = Some("rtds read: connection reset".into());
+        let named = arm.fair_p_up(dead_at).unwrap_err();
+        assert!(named.reason.contains("rtds"), "{}", named.reason);
+
+        // No trade on a dead feed, and quiesce still pulls the book.
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Err(named), dead_at);
+        assert!(buys(&out).is_empty());
+        let quiesce = arm.fair_p_up(end - 5.0).unwrap_err();
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Err(quiesce), end - 5.0);
+        assert!(buys(&out).is_empty(), "no buys through quiesce on a dead feed");
+        assert_eq!(
+            out.actions.iter().filter(|a| matches!(a, Action::Cancel(_))).count(),
+            2,
+            "both sides pulled"
+        );
     }
 
     #[test]

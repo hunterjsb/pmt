@@ -437,3 +437,21 @@ that, with a `policy=prer9` mode that reproduces the older engine so the two
 numbers can be put side by side instead of confused for each other. R7 ships
 dark; the operator arms it when the fleet's un-decided exposure is actually
 reaching the cap, which on the measured night it did only before 02:45Z.
+
+### <a id="L38"></a>L38 — Per-symbol RTDS filters silently downgrade the stream to Binance
+
+**2026-08-23.** Polymarket's settlement stream
+(`wss://ws-live-data.polymarket.com/`) accepts a subscription of one entry per
+topic with `filters` omitted, and delivers every symbol. Sending the obvious
+thing instead — one entry per (topic, symbol), 24 of them — made the server
+quietly downgrade the whole subscription to `crypto_prices` snapshots: Binance
+data, on a socket opened specifically to stop reading Binance. No error frame,
+no reconnect, no log line. The same shape of failure sits beside it: without a
+plain-text `PING` every few seconds the socket stays *open* while the flow
+stops (~228s in the scout capture), so "connected" is not evidence of a feed.
+
+**Changed:** both the Python recorder (`polymarket/rtds.py`) and the engine's
+supervisor (`strategies/updown_rtds.rs`) subscribe per TOPIC with no filters,
+ping on a timer, and force a reconnect after `stall_s` of silence. The engine
+side pins it with a test that reads the subscribe frame off every reconnect —
+a socket that reconnects without re-subscribing looks perfectly healthy.

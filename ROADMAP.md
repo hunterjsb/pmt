@@ -92,6 +92,12 @@ R3 → R5/R6/R1 → R7/R8/R9.
     (1 window). ETH 8 / SOL 10 confirmed roughly right, stand. **XRP not tradeable** via
     Binance proxy (p95 alone would need a ~20-25bp guard that guts the edge; got WORSE
     day2). **DOGE not yet, but the closest alt candidate** — recheck after more corpus.
+  - **"via Binance proxy" is now load-bearing** (2026-08-23): arms can read the settlement
+    stream itself (`--feed rtds`, `updown_rtds.rs`), which deletes the cross-venue basis
+    that made XRP untradeable rather than guarding against it. First stream fit
+    (`analysis/xrp_fit.md`): xrp decidedness 97% at ≥10bp with 3× any peer's sample count,
+    12bp guard proposed; doge still deferred at 87-93%. Ships dark — no arm uses rtds until
+    the operator arms one.
   - First measurement kept for the record: point-in-time p95 BTC 8.8 / ETH 13.6 / SOL 26.8 /
     XRP 49.2 / DOGE 37.4bp (upper bounds; outliers cluster in flash-move minutes).
   - **Dynamic guard BUILT, ships dark** (041597e + 6242ceb): per-arm Chainlink poller with

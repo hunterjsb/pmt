@@ -20,6 +20,7 @@ mod sure_bets;
 pub(crate) mod updown;
 pub(crate) mod updown_model;
 pub(crate) mod updown_oracle;
+pub(crate) mod updown_rtds;
 pub(crate) mod updown_state;
 
 use std::collections::HashMap;
