@@ -64,7 +64,7 @@ def test_fetch_wallet_activity_paginates_until_short_page(monkeypatch):
 
     monkeypatch.setattr(wallet, "fetch_activity_page", fake_page)
     rows = wallet.fetch_wallet_activity("0xabc", floor=0.0)
-    assert calls == [0, wallet.PAGE_SIZE, 2 * wallet.PAGE_SIZE]
+    assert calls == [0, wallet.PAGE_STEP, 2 * wallet.PAGE_STEP]
     assert len(rows) == 2 * wallet.PAGE_SIZE + 1
 
 
@@ -99,5 +99,26 @@ def test_fetch_wallet_activity_floor_zero_walks_full_history(monkeypatch):
 
     monkeypatch.setattr(wallet, "fetch_activity_page", fake_page)
     rows = wallet.fetch_wallet_activity("0xabc", floor=0.0)
-    assert calls == [0, wallet.PAGE_SIZE]
+    assert calls == [0, wallet.PAGE_STEP]
+    assert len(rows) == wallet.PAGE_SIZE + 1
+
+
+def test_fetch_wallet_activity_dedupes_seam_rows_from_live_inserts(monkeypatch):
+    # Offset pagination over a live feed: inserts shift rows down, so the
+    # seam rows of page N reappear at the top of page N+1. The overlap +
+    # row_key dedupe must collapse them instead of double-counting.
+    dup = {"timestamp": 2_000_100, "transactionHash": "0xdup", "type": "TRADE",
+           "side": "BUY", "size": 5, "usdcSize": 4.5}
+    page1 = [{"timestamp": 3_000_000 - i} for i in range(wallet.PAGE_SIZE - 1)] + [dup]
+    page2 = [dup] + [{"timestamp": 1_000_000}]
+    pages = [page1, page2]
+    calls = []
+
+    def fake_page(addr, offset, *, limit=wallet.PAGE_SIZE):
+        calls.append(offset)
+        return pages[len(calls) - 1]
+
+    monkeypatch.setattr(wallet, "fetch_activity_page", fake_page)
+    rows = wallet.fetch_wallet_activity("0xabc", floor=0.0)
+    assert sum(1 for a in rows if a.get("transactionHash") == "0xdup") == 1
     assert len(rows) == wallet.PAGE_SIZE + 1
