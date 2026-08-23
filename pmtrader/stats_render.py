@@ -716,7 +716,9 @@ def render_stats(sb: dict, eff: dict, bal: dict | None, status: dict | None,
     series = sb.get("series") or {}
     flags = blocks.get("flags") or {}
     if series:
-        note = "wallet-graded"
+        # Not "wallet-graded" any more: a LOST window posts no wallet row, so
+        # the exchange's settlement grades those. Never our own read.
+        note = "exchange-graded"
         if any(f.get("feed") == "rtds" or f.get("maker_bid") for f in flags.values()):
             note += f" · {_RTDS_MARK} stream-fed · {_MAKER_MARK} maker bid"
         parts += [section("by symbol", note),
