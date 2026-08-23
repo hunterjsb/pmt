@@ -16,7 +16,7 @@
 #
 set -euo pipefail
 
-INSTANCE="${PMT_EU_INSTANCE:-i-0426f1d5e68cdee60}"
+INSTANCE="${PMT_EU_INSTANCE:?set PMT_EU_INSTANCE (see pmt-alpha/infra/ec2-eu-runbook.md)}"
 REGION="${PMT_EU_REGION:-eu-west-1}"
 BUCKET="${PMT_DEPLOY_BUCKET:-xanmc}"
 PREFIX="${PMT_DEPLOY_PREFIX:-pmt-deploy}"

@@ -1,6 +1,6 @@
 # Shipping pmengine to the EU box
 
-The eu-west-1 box (`i-0426f1d5e68cdee60`, t4g.micro, aarch64, SSM-only) runs
+The eu-west-1 box (t4g.micro, aarch64, SSM-only; instance id lives in the private runbook) runs
 the **private** flavor of pmengine against the EU L0 wallet. This directory is
 the whole ship path.
 

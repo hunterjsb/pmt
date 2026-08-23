@@ -1,4 +1,4 @@
-# pmengine on the eu-west-1 box (i-0426f1d5e68cdee60) — SYSTEM unit.
+# pmengine on the eu-west-1 box — SYSTEM unit. Instance id: private runbook.
 #
 # System, not --user, on purpose: the box has no interactive session and we do
 # not want the engine's life to depend on `loginctl enable-linger ec2-user`.
