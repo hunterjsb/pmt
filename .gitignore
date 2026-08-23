@@ -214,3 +214,4 @@ sandbox/
 logs/
 .claude/
 docs/LESSONS.md
+pmengine/target-replay/
