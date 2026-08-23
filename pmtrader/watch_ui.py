@@ -922,11 +922,13 @@ def build_header_panel(snap: dict, floor_label: str, render_err: str | None):
         age_s = time.time() - snap["sb_fetched_at"]
         age_style = "yellow" if age_s > 30 else "dim"
         age = f"[{age_style}]{age_s:.0f}s ago[/{age_style}]"
-    return Panel(
-        f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L [{color}]{net:+,.2f}[/] · "
-        f"{rolls} rolls · capital {cap} · [dim]{floor_label}[/dim] · {age}"
-        f"{all_time}{stale}{est}{err} · "
-        f"[dim]{time.strftime('%H:%M:%S')}[/dim]",
-        title="updown fleet", border_style="cyan")
+    line1 = (f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L [{color}]{net:+,.2f}[/] · "
+             f"{rolls} rolls · capital {cap} · [dim]{floor_label}[/dim] · {age}"
+             f"{all_time}{stale}{est}{err} · "
+             f"[dim]{time.strftime('%H:%M:%S')}[/dim]")
+    # The exposure summary lives here as the box's second line — a bare row
+    # wedged between two panels read as chrome debris, not information.
+    line2 = build_risk_header(snap.get("status"), sb)
+    return Panel(f"{line1}\n{line2}", title="updown fleet", border_style="cyan")
 
 

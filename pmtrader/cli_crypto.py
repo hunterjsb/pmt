@@ -812,8 +812,6 @@ def crypto_watch(since: float | None) -> None:
     def header() -> Panel:
         return build_header_panel(snap, floor_label, render_err)
 
-    def risk_panel() -> Text:
-        return Text.from_markup(build_risk_header(snap["status"], snap["sb"]))
 
     def arms_table() -> Table:
         return build_arms_table(snap["status"].get("arms"), _t.time())
@@ -829,8 +827,7 @@ def crypto_watch(since: float | None) -> None:
 
     layout = Layout()
     layout.split_column(
-        Layout(name="head", size=3),
-        Layout(name="risk", size=1),
+        Layout(name="head", size=4),
         Layout(name="arms", size=10),
         Layout(name="strip", size=3),
         Layout(name="tape", ratio=1),
@@ -876,11 +873,10 @@ def crypto_watch(since: float | None) -> None:
                         pass
                     layout["arms"].size = max(len(snap["status"].get("arms") or {}), 1) + 4
                     layout["head"].update(header())
-                    layout["risk"].update(risk_panel())
                     layout["arms"].update(arms_table())
                     layout["strip"].update(
                         _controls_panel() if show_controls else strip_panel())
-                    h = live.console.size.height - 3 - 1 - 3 - layout["arms"].size
+                    h = live.console.size.height - 4 - 3 - layout["arms"].size
                     layout["tape"].update(tape_panel(h))
                     render_err = None
                 except KeyboardInterrupt:

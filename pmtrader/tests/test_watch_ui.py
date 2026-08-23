@@ -788,11 +788,15 @@ def test_composed_frame_shows_the_capital_figure_exactly_once():
 
 
 def test_composed_frame_puts_each_fact_in_its_own_place():
-    head, risk = _frame_text().splitlines()[1], _frame_text().splitlines()[3]
-    # top panel: the scoreboard's sliding pulse, capital, all-time
-    assert "9W-2L" in head and "capital" in head and "all-time" in head
-    # risk line: exposure only — nothing the panel above already said
-    assert "committed" in risk and "riding" in risk
+    lines = _frame_text().splitlines()
+    # both facts live INSIDE the top panel now (line 1 = pulse, line 2 =
+    # exposure) — the bare wedge row between panels is gone
+    first_close = next(i for i, l in enumerate(lines) if "╰" in l)
+    head_body = "\n".join(lines[:first_close])
+    assert "9W-2L" in head_body and "capital" in head_body and "all-time" in head_body
+    assert "committed" in head_body and "riding" in head_body
+    rest = "\n".join(lines[first_close:])
+    assert "committed" not in rest, "exposure renders exactly once, in the panel"
     assert "capital" not in risk and "all-time" not in risk and "W-" not in risk
 
 class _FakeStdin:
