@@ -1654,9 +1654,14 @@ def crypto_updown(ref: str, as_json: bool) -> None:
                    "noise, no trade. BTC is fine at 3; alts (ETH/SOL) need ~6 — "
                    "both 2026-08-23 losses were thin-margin windows inside the "
                    "real Chainlink-vs-Binance basis")
+@click.option("--theta", type=float, default=0.0, show_default=True,
+              help="R9 safety gate: first clip needs banked-evidence safety "
+                   "(|banked|/cushion, sign-matched to the side) at least this "
+                   "high. 0 disables; ~0.3 blocked both 2026-08-23 post-brake "
+                   "losses in replay; 1.0 = require banked-decided to enter")
 def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
                side: str | None, quiesce: float, min_fair: float, min_elapsed: float,
-               roll: bool, clip: float, basis_guard: float) -> None:
+               roll: bool, clip: float, basis_guard: float, theta: float) -> None:
     """Arm the pmengine updown trigger on a market.
 
     Prices the market (semantics, vol, fee) and hands the parameters to the
@@ -1680,6 +1685,7 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
         "size_usdc": size, "min_edge": min_edge, "max_price": max_price,
         "quiesce_secs": quiesce, "min_fair": min_fair, "min_elapsed_frac": min_elapsed,
         "roll": roll, "clip_usdc": clip, "basis_guard_bp": basis_guard,
+        "theta": theta,
     }
     if side:
         payload["side_filter"] = side

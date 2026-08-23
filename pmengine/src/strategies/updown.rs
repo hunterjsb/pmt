@@ -124,6 +124,14 @@ pub(crate) struct ArmParams {
     /// mean-reverting chop: speculative clips are disabled entirely.
     #[serde(default = "d_rho_block")]
     pub rho_block: f64,
+    /// R9 safety gate: the FIRST clip of a window requires
+    /// safety = signed_banked_bp / cushion_bp >= theta on the fired side.
+    /// 0 disables (clock-gate-only entry, the pre-R9 behavior). θ=1 is
+    /// equivalent to requiring banked_decided for entry. Tonight's first
+    /// light (n=28): both losses entered at safety < 0.25, median winner
+    /// at 0.57 — the clock says "go" long before the evidence does.
+    #[serde(default)]
+    pub theta: f64,
     /// Assumed max adversarial spot push (bp) for the flip-proof test.
     /// Boundary manipulators shove Binance in the final seconds; when the
     /// banked margin exceeds even that push times the remaining weight,
@@ -275,6 +283,12 @@ pub(crate) struct ArmState {
     /// token -> ask price of the last clip, feeding the no-averaging-down
     /// brake. New windows use new token ids so this resets per window.
     last_clip_ask: std::collections::HashMap<String, f64>,
+    /// Latched on the first brake trip and held for the window: the
+    /// 2026-08-23 audit showed brakes flagged all four losses but blocked
+    /// only 10-51% of their exposure — later ticks slid through as the
+    /// ask drifted back inside tolerance. Once the window looks wrong, it
+    /// stays wrong for speculative entries; banked-decided still trades.
+    brake_latched: bool,
     pub(crate) last_eval: Option<serde_json::Value>,
     /// Throttle for eval/gated lines in the durable tape.
     last_tape_at: f64,
@@ -411,6 +425,7 @@ impl ArmState {
             inflight: std::collections::HashMap::new(),
             last_clip: std::collections::HashMap::new(),
             last_clip_ask: std::collections::HashMap::new(),
+            brake_latched: false,
             last_eval: None,
             last_tape_at: 0.0,
             last_book_at: 0.0,
@@ -832,8 +847,13 @@ impl ArmState {
                     Some(serde_json::json!({"state": "gated", "reason": gate, "t": now}));
                 if now - self.last_tape_at >= 5.0 {
                     self.last_tape_at = now;
+                    // Asks recorded even while gated: the 2026-08-23 audit
+                    // couldn't price what the basis guard cost because
+                    // fully-gated windows logged no book data at all.
                     tape_out.push(serde_json::json!({
                         "t": now, "ev": "gated", "slug": p.slug, "reason": gate,
+                        "up_ask": view.up.ask.map(|(px, _)| px),
+                        "dn_ask": view.dn.ask.map(|(px, _)| px),
                     }));
                 }
                 return DecideOut { actions, tape: tape_out, finished: false };
@@ -881,7 +901,8 @@ impl ArmState {
             };
             let fee = p.fee_rate * ask.min(1.0 - ask);
             let net = fair - ask - fee;
-            let brake = if distrust_blocks(net, self.tunables.distrust_net, m.banked_decided) {
+            let safety = side_safety(side == "up", m.banked_margin_bp, m.cushion_bp);
+            let raw_brake = if distrust_blocks(net, self.tunables.distrust_net, m.banked_decided) {
                 Some("distrust")
             } else if avg_down_blocks(
                 ask,
@@ -893,7 +914,27 @@ impl ArmState {
             } else {
                 None
             };
-            let mut eval = serde_json::json!({"side": side, "fair": fair, "ask": ask, "net": net});
+            if raw_brake.is_some() {
+                self.brake_latched = true;
+            }
+            let brake = if safety_gate_blocks(
+                p.theta,
+                &p.kind,
+                self.last_clip.is_empty(),
+                safety,
+            ) {
+                Some("safety")
+            } else if raw_brake.is_some() {
+                raw_brake
+            } else if self.brake_latched && !m.banked_decided {
+                Some("latched")
+            } else {
+                None
+            };
+            let mut eval = serde_json::json!({
+                "side": side, "fair": fair, "ask": ask, "net": net,
+                "safety": (safety * 100.0).round() / 100.0,
+            });
             if let Some(b) = brake {
                 eval["brake"] = serde_json::json!(b);
             }
@@ -1360,6 +1401,23 @@ fn position_floor(ctx: &StrategyContext, p: &ArmParams) -> f64 {
         .sum()
 }
 
+/// Signed safety for one side: banked evidence divided by the residual
+/// noise cushion, positive only when the banked margin points the side's
+/// way. safety >= 1 on the fired side ≈ banked_decided.
+fn side_safety(is_up: bool, banked_margin_bp: f64, cushion_bp: f64) -> f64 {
+    let signed = if is_up { banked_margin_bp } else { -banked_margin_bp };
+    signed / cushion_bp.max(1e-9)
+}
+
+/// R9 entry gate: the FIRST clip of a window needs banked evidence, not a
+/// clock reading — both 2026-08-23 post-brake losses entered at safety
+/// < 0.25 while the 50% clock said go. Applies to twap arms only
+/// (close_open has no banked mass to measure), and only until the first
+/// clip lands; position management after entry belongs to the brakes.
+fn safety_gate_blocks(theta: f64, kind: &str, no_clips_yet: bool, safety: f64) -> bool {
+    theta > 0.0 && kind == "twap" && no_clips_yet && safety < theta
+}
+
 /// Book-distrust brake predicate: a book handing over more than
 /// `threshold` net (BOOK_DISTRUST_NET live) is pricing in something the
 /// model missed, unless the TWAP math itself has already decided the
@@ -1618,6 +1676,72 @@ mod tests {
             2
         );
         assert_eq!(arm.last_eval.as_ref().unwrap()["state"], "quiesce");
+    }
+
+    #[test]
+    fn side_safety_signs_by_side_and_floors_cushion() {
+        assert!((side_safety(true, 6.0, 12.0) - 0.5).abs() < 1e-9);
+        assert!((side_safety(false, 6.0, 12.0) + 0.5).abs() < 1e-9, "banked-up hurts down");
+        assert!((side_safety(false, -6.0, 12.0) - 0.5).abs() < 1e-9);
+        assert!(side_safety(true, 5.0, 0.0) > 1e6, "zero cushion never divides by zero");
+    }
+
+    #[test]
+    fn safety_gate_blocks_only_first_twap_clip_when_armed() {
+        assert!(safety_gate_blocks(0.3, "twap", true, 0.2));
+        assert!(!safety_gate_blocks(0.3, "twap", true, 0.31), "evidence clears it");
+        assert!(!safety_gate_blocks(0.0, "twap", true, 0.0), "theta 0 = disabled");
+        assert!(!safety_gate_blocks(0.3, "twap", false, 0.0), "post-entry belongs to brakes");
+        assert!(!safety_gate_blocks(0.3, "close_open", true, 0.0), "no banked mass to measure");
+    }
+
+    #[test]
+    fn decide_theta_gates_first_clip_until_banked_evidence() {
+        let mut p = params("s");
+        p.theta = 0.3;
+        let mut arm = armed(p);
+        // banked_decided model but banked/cushion say safety 0.1: the -$370
+        // signature (model certain, evidence absent).
+        let weak = ModelEval {
+            banked_margin_bp: 0.5, cushion_bp: 5.0, banked_decided: false,
+            ..locked_up_model()
+        };
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(weak), 1400.0);
+        assert!(buys(&out).is_empty());
+        assert_eq!(arm.last_eval.as_ref().unwrap()["sides"][0]["brake"], "safety");
+        // Evidence arrives: same tick shape now fires.
+        let strong = ModelEval { banked_margin_bp: 2.0, cushion_bp: 5.0, ..locked_up_model() };
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(strong), 1400.1);
+        assert_eq!(buys(&out).len(), 1);
+    }
+
+    #[test]
+    fn decide_theta_ignores_wrong_sign_banked_mass() {
+        let mut p = params("s");
+        p.theta = 0.3;
+        let mut arm = armed(p);
+        // Big banked margin pointing DOWN while the model wants UP.
+        let contra = ModelEval {
+            banked_margin_bp: -10.0, cushion_bp: 5.0, banked_decided: false,
+            ..locked_up_model()
+        };
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(contra), 1400.0);
+        assert!(buys(&out).is_empty(), "|banked| alone is not evidence for this side");
+    }
+
+    #[test]
+    fn decide_brake_latch_holds_for_the_window() {
+        let mut arm = armed(params("s"));
+        let undecided = ModelEval { p_up: 0.99, banked_decided: false, ..locked_up_model() };
+        // Trip distrust (net ~0.45), then present a sane-looking book: the
+        // audit's slide-through. Latch must still block.
+        arm.decide(&view_with_up_ask(0.50, 500.0), Ok(undecided.clone()), 1400.0);
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(undecided), 1400.1);
+        assert!(buys(&out).is_empty());
+        assert_eq!(arm.last_eval.as_ref().unwrap()["sides"][0]["brake"], "latched");
+        // banked_decided math still trades through the latch.
+        let out = arm.decide(&view_with_up_ask(0.94, 500.0), Ok(locked_up_model()), 1400.2);
+        assert_eq!(buys(&out).len(), 1);
     }
 
     #[test]
