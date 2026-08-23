@@ -21,6 +21,7 @@ pub mod config;
 pub mod control;
 pub mod engine;
 pub mod gamma;
+pub(crate) mod jsonl;
 pub mod order;
 pub mod order_tape;
 pub mod orderbook;

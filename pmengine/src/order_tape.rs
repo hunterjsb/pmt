@@ -17,7 +17,7 @@
 //!   * a record is written OUTSIDE every engine lock (nothing here awaits,
 //!     and `record_fill` drops its map guard before touching the disk);
 //!   * a failed write is dropped silently — a lost tape line must never
-//!     impact live trading, same as `updown_model::append_jsonl`.
+//!     impact live trading, same as `jsonl::append_jsonl`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use rust_decimal::Decimal;
 
-use crate::strategies::updown_model::append_jsonl;
+use crate::jsonl::append_jsonl;
 
 /// Sits beside the eval/book tapes in `~/.pmt/engine/`. Its own file: the
 /// order path samples on a completely different clock from the 5s eval
