@@ -19,7 +19,6 @@ import threading
 import time
 
 import click
-from rich.table import Table
 
 import watch_ui
 from cli_common import _api, _parse_since
@@ -27,9 +26,9 @@ from cli_crypto_stats import _tape_scoreboard
 from engine import post as _engine_post
 from polymarket import positions, tape, wallet
 from watch_ui import (
-    _SB_EMPTY, _cbreak_stdin, _restore_stdin, _wait_key, build_arms_table,
-    build_header_panel, build_help_modal, build_windows_table, header_height,
-    window_rows, windows_title,
+    _SB_EMPTY, _cbreak_stdin, _restore_stdin, _wait_key, build_header_panel,
+    build_help_modal, build_windows_table, header_height, window_rows,
+    windows_title,
 )
 
 
@@ -62,17 +61,17 @@ RENDER_EVERY_S = 1.0      # repaint cadence when no key changed anything
 # Windows panel geometry. WINDOWS_MAX_ROWS is a VIEW cap, and the panel title
 # names it ("N of M") — a cap the operator can't see reads as a dropped
 # window, which is the confusion this panel exists to end.
-# 11, not 8: the panel absorbed the recent-windows strip's three rows, and it
-# now also carries the fleet's LIVE windows at the top, so a five-arm fleet
-# spends five rows before the decided tail starts. At 8 the tail a roll cycle
-# left behind was pushed off before the operator saw how any of it resolved.
-WINDOWS_MAX_ROWS = 11
+# 16, not 8: this is now the dashboard's ONLY table. It inherited the
+# recent-windows strip's three rows and the arms table's whole slot, and it
+# carries the fleet's LIVE windows at the top — so a five-arm fleet spends
+# five rows before the decided tail even starts.
+WINDOWS_MAX_ROWS = 16
 WINDOWS_CHROME = 6        # panel border (2) + table border/header/rule (4)
 MIN_TAPE_ROWS = 6         # the tape never gets squeezed below this for a window row
 HEAD_MIN_H = 5            # header border + the four rows it always paints
 
 
-def windows_rows_shown(console_h: int, arms_h: int, n_rows: int,
+def windows_rows_shown(console_h: int, n_rows: int,
                        head_h: int = HEAD_MIN_H) -> int:
     """Window rows this screen can hold: what there is, capped, and never so
     many that the tape stops being readable.
@@ -83,10 +82,11 @@ def windows_rows_shown(console_h: int, arms_h: int, n_rows: int,
     of silently looking like the whole ledger.
 
     `head_h` is the header panel's live height (watch_ui.header_height): it
-    grows a row for the settlement feed and for a render error, and the tape
-    is what pays for that, never the windows panel's floor of one row.
+    grows a row for the settlement feed, for an unreachable engine and for a
+    render error, and the tape is what pays for that, never the windows
+    panel's floor of one row.
     """
-    room = console_h - head_h - arms_h - MIN_TAPE_ROWS - WINDOWS_CHROME
+    room = console_h - head_h - MIN_TAPE_ROWS - WINDOWS_CHROME
     return max(1, min(WINDOWS_MAX_ROWS, n_rows, room))
 
 
@@ -249,7 +249,7 @@ class WatchFetcher:
                    "All-time P&L, and the riding/windows-table figures, "
                    "always walk the full wallet history regardless of this.")
 def crypto_watch(since: float | None) -> None:
-    """Full-screen live dashboard: risk header + arms + windows + streaming tape."""
+    """Full-screen live dashboard: risk header + the windows table + streaming tape."""
     import time as _t
     from collections import deque
     from datetime import datetime, timezone
@@ -290,9 +290,6 @@ def crypto_watch(since: float | None) -> None:
     def header() -> Panel:
         return build_header_panel(snap, floor_label, render_err)
 
-    def arms_table() -> Table:
-        return build_arms_table(snap["status"].get("arms"), _t.time())
-
     def windows_panel(rows: int) -> Panel:
         sb, arms = snap["sb"], snap["status"].get("arms")
         return Panel(build_windows_table(sb, _t.time(), arms=arms, limit=rows,
@@ -317,10 +314,10 @@ def crypto_watch(since: float | None) -> None:
         body.no_wrap, body.overflow = True, "ellipsis"
         return Panel(body, title="tape", border_style="dim")
 
+    # Three slots, one of them a table: header, the windows table, the tape.
     layout = Layout()
     layout.split_column(
         Layout(name="head", size=HEAD_MIN_H),
-        Layout(name="arms", size=10),
         Layout(name="windows", size=WINDOWS_MAX_ROWS + WINDOWS_CHROME),
         Layout(name="tape", ratio=1),
     )
@@ -360,21 +357,20 @@ def crypto_watch(since: float | None) -> None:
                             offset = fh.tell()
                     except OSError:
                         pass
-                    layout["arms"].size = max(len(snap["status"].get("arms") or {}), 1) + 4
-                    # The header grows a row for the settlement feed and one
-                    # for a render error; size the slot to what it will paint
-                    # or Rich clips the row that says what broke.
+                    # The header grows a row for the settlement feed, one for
+                    # an unreachable engine and one for a render error; size
+                    # the slot to what it will paint or Rich clips the row
+                    # that says what broke.
                     layout["head"].size = header_height(snap, render_err)
                     n_win = windows_rows_shown(
-                        live.console.size.height, layout["arms"].size,
+                        live.console.size.height,
                         len(window_rows(snap["sb"], snap["status"].get("arms"))),
                         layout["head"].size)
                     layout["windows"].size = n_win + WINDOWS_CHROME
                     layout["head"].update(header())
-                    layout["arms"].update(arms_table())
                     layout["windows"].update(windows_panel(n_win))
                     h = (live.console.size.height - layout["head"].size
-                         - layout["arms"].size - layout["windows"].size)
+                         - layout["windows"].size)
                     layout["tape"].update(tape_panel(h))
                     render_err = None
                 except KeyboardInterrupt:

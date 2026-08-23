@@ -651,13 +651,20 @@ def test_render_stats_full_restores_everything_demoted():
     assert out.index("order path") < out.index("calibration") < out.index("live arms")
 
 
-def test_render_stats_full_uses_watchs_own_arms_table_not_a_second_one():
-    # A static snapshot that can drift from the live dashboard is worse than
-    # no snapshot: --full renders watch_ui.build_arms_table verbatim.
+def test_render_stats_full_uses_watchs_own_table_not_a_second_one():
+    """A static snapshot that can drift from the live dashboard is worse than
+    no snapshot: --full renders watch_ui.build_windows_table verbatim, handed
+    the arms and no scoreboard so it paints exactly the live head."""
     out = _render(sr.render_stats(_sb(), _eff(), None, {"arms": _arms()}, 0,
-                                  blocks=_blocks(), full=True), width=140)
-    for col in ("evidence", "p_up", "mode", "rho", "flags"):
-        assert col in out
+                                  blocks=_blocks(), full=True), width=200)
+    # the folded table's own headers, not a private copy of the old arms table
+    for col in ("arm", "state", "read", "position"):
+        assert col in out, col
+    # ...and what the arms table carried is still on the row: the model read,
+    # the compact gate reason, the feed/maker flags and committed $.
+    assert "p↑0.96" in out
+    assert "margin -4.9 vs 6.0bp" in out
+    assert "≈◇" in out and "$12.50" in out
     assert not hasattr(sr, "arms_table")
 
 
