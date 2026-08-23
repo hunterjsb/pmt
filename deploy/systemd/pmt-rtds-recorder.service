@@ -1,0 +1,37 @@
+# pmt RTDS recorder — Polymarket real-time data stream capture, as a
+# systemd USER service.
+#
+# PROPOSAL, not installed. See README.md in this directory.
+#
+# Recorded market data is not backfillable: an hour the recorder was down is
+# an hour the replay harness can never judge. That makes this the one unit
+# where restart-on-failure is uncontroversial — it writes tapes, it never
+# places an order.
+
+[Unit]
+Description=pmt RTDS recorder — Polymarket real-time data stream capture
+Documentation=file:///var/home/hunter/Desktop/code/pmt/deploy/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/var/home/hunter/Desktop/code/pmt/pmtrader
+# `uv run` resolves the pmtrader venv from the cwd's pyproject.toml, so the
+# WorkingDirectory above is load-bearing, not cosmetic.
+ExecStart=/var/home/hunter/.local/bin/uv run python -m polymarket.rtds
+
+Restart=on-failure
+RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
+
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+SyslogIdentifier=pmt-rtds
+
+[Install]
+WantedBy=default.target

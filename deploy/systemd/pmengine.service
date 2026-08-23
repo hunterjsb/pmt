@@ -1,0 +1,49 @@
+# pmengine — Polymarket up/down trading engine, as a systemd USER service.
+#
+# PROPOSAL, not installed. See README.md in this directory — auto-restart is
+# only safe to enable together with arm-state recovery, and the operator has
+# to opt in deliberately.
+#
+# ExecStart mirrors what `pmt engine start` launches (pmtrader/cli.py:
+# _engine_bin + --env-file + run updown --skip-warmup), so a unit-started
+# engine and a hand-started one are the same process with the same config.
+
+[Unit]
+Description=pmengine — Polymarket up/down trading engine
+Documentation=file:///var/home/hunter/Desktop/code/pmt/deploy/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+# Give up after 5 failures in 5 minutes rather than crash-loop into the
+# order book. A wedged engine that keeps restarting is worse than a stopped
+# one — the arms are on disk either way and survive a manual start.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/var/home/hunter/Desktop/code/pmt/pmengine
+# cli.py passes this per-launch; the engine's own default is 1000ms, which
+# silently runs updown's 50ms latency model 20x slow (see config.rs).
+Environment=PMENGINE_TICK_INTERVAL_MS=50
+ExecStart=/var/home/hunter/Desktop/code/pmt/pmengine/target/release/pmengine \
+    --env-file /var/home/hunter/Desktop/code/pmt/.env \
+    run updown --skip-warmup
+
+# Crash/wedge -> come back and recover the arms from
+# ~/.pmt/engine/arms-state.json. A clean SIGTERM exits 0, so
+# `systemctl --user stop` and the nightly poweroff do NOT restart.
+Restart=on-failure
+RestartSec=5
+# Exponential-ish backoff: 5s, then stepping up to 120s (systemd >= 254).
+RestartSteps=5
+RestartMaxDelaySec=120
+
+# The engine's graceful shutdown cancels resting orders; give it room to
+# finish before SIGKILL, or a stop leaves live orders on the book.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+SyslogIdentifier=pmengine
+
+[Install]
+WantedBy=default.target
