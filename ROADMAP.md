@@ -41,13 +41,19 @@ don't record is a night the corpus can't judge.
   capped at recorded ask size, fees applied.
 - Outputs: per-window P&L, reliability diagram + ECE per stated-fair bucket, attribution by
   symbol / duration / session hour / ρ-regime, max drawdown.
-- Acceptance test: replaying the params we actually ran over the nights we actually recorded
-  must reproduce the real fills within tolerance. If the simulator can't reproduce last night,
+- Acceptance test (non-negotiable): replaying the params we actually ran over the nights we
+  actually recorded must reproduce the real fills within tolerance — including the −$370
+  15m window AND a clean nothing-fired boundary. If the simulator can't reproduce last night,
   it can't judge next week.
 - A/B protocol: candidate params vs baseline over the same corpus, bootstrap CI on the P&L
   delta. A change ships only on a positive CI, then runs one night at small size before full.
 
-## Phase 2 — Research tracks (run on the harness, roughly by ROI)
+## Phase 2 — Research tracks (run on the harness)
+
+Priority per the 2026-08-23 review: **R4 first** (does the documented 5m manipulation signature
+exist in OUR books, and what does it cost by duration/moneyness), **R2 second** (reliability
+diagrams by p-bucket × ρ-regime × time-to-expiry become the gate on any size increase), then
+R3 → R5/R6/R1 → R7/R8.
 
 - **R1 Oracle basis per symbol** — measured Chainlink-vs-Binance distribution → per-symbol
   guards with confidence, XRP verdict. Needs Phase 0 rounds data.
@@ -70,6 +76,9 @@ don't record is a night the corpus can't judge.
   once-an-hour >3σ jump rate says the Gaussian overpays exactly where we bet.
 - **R7 Correlation-aware fleet cap** — cap total un-decided committed notional across arms;
   at ρ 0.7 the arms lose together.
+- **R8 Near-even late-flow guard** — when the book is still ~50/50 in the final 30–60s and
+  late Binance flow is abnormal, cut or zero the size multiplier: that combination is the
+  manipulation fingerprint the 5m literature documents.
 
 ## Phase 3 — Strategy expansion (each gated by Phase 1)
 
@@ -83,8 +92,17 @@ don't record is a night the corpus can't judge.
 
 ## Operating rules while the roadmap runs
 
+Posture: keep the braked directional fleet live at current (or modestly reduced) size,
+instrument everything, force the harness to reproduce reality, then promote only what
+survives R4 and the calibration gate.
+
 - No size increases anywhere without an R2 calibration pass.
+- Never loosen the three brakes (15¢ distrust, 2¢ no-averaging-down, final-120s unlock)
+  or the basis guards without a replay A/B win — they encode the paid-for lessons.
 - 5m arms stay at current size (experimental class) until R4 settles; XRP stays off until R1.
+- Options-implied gaps and long-horizon mean-reversion findings are research inputs, never
+  direct sizing inputs for the 5/15m fleet.
+- No new strategy ships before the replay reproduces real nights.
 - Every engine change: replay A/B win → one small-size live night → full size.
 - Tape + wallet scoreboard are append-only ground truth; `~/.pmt/` is the durable home
   (scratchpads die nightly).
