@@ -19,28 +19,15 @@ from __future__ import annotations
 
 import bisect
 import json
-import re
 from collections.abc import Iterable
 from pathlib import Path
 
 from .chainlink import twap_over_window
-
-SLUG_RE = re.compile(r"^([a-z]+)-updown-(\d+)m-(\d+)$")
+from .updown_slugs import parse_updown_slug  # re-exported: this module's original home
 
 OUTCOMES_PATH = Path.home() / ".pmt" / "corpus" / "outcomes.jsonl"
 
 STALE_S = 600  # no round within 10min before the query span -> corpus too stale to trust
-
-
-def parse_updown_slug(slug: str) -> dict | None:
-    """{'symbol','dur_s','start','end'} from an updown slug, or None if it doesn't match."""
-    m = SLUG_RE.match(slug)
-    if not m:
-        return None
-    sym, dur_m, start_s = m.groups()
-    start = int(start_s)
-    dur_s = int(dur_m) * 60
-    return {"symbol": sym, "dur_s": dur_s, "start": start, "end": start + dur_s}
 
 
 def extract_updown_slugs(lines: Iterable[str]) -> set[str]:

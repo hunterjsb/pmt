@@ -35,6 +35,9 @@ import re
 import statistics
 from collections.abc import Iterable, Iterator
 
+from .tape import EV_EVAL, EV_FIRE, EV_GATED
+from .updown_slugs import is_updown
+
 FEE_RATE = 0.07  # crypto_fees_v2 exponent-1 — same shape as crypto.taker_fee(),
                   # fixed at the live rate since this module never fetches a
                   # market's actual feeSchedule (pure/no-network by design).
@@ -115,14 +118,14 @@ def iter_ticks(lines: Iterable[str], since: float = 0.0) -> Iterator[dict]:
         if t is None or not slug or t < since:
             continue
         ev = r.get("ev")
-        if ev == "gated":
+        if ev == EV_GATED:
             side = basis_guard_side(r.get("reason") or "")
             if side is None:
                 continue
             ask = r.get("up_ask") if side == "up" else r.get("dn_ask")
             yield {"t": t, "slug": slug, "side": side, "category": "basis_guard",
                    "ask": ask, "fair": None, "net": None}
-        elif ev == "eval":
+        elif ev == EV_EVAL:
             for s in r.get("sides") or []:
                 side = s.get("side")
                 if side not in ("up", "down"):
@@ -137,7 +140,7 @@ def iter_fires(lines: Iterable[str], since: float = 0.0) -> Iterator[dict]:
     """Fire ticks from raw tape lines: {t, slug, side, ask, size}."""
     for raw in lines:
         r = _load(raw)
-        if r is None or r.get("ev") != "fire":
+        if r is None or r.get("ev") != EV_FIRE:
             continue
         t, slug, side = r.get("t"), r.get("slug"), r.get("side")
         ask, size = r.get("ask"), r.get("size")
@@ -255,7 +258,7 @@ def wallet_fill_notional(activity_rows: list[dict]) -> dict[tuple[str, str], flo
         if a.get("type") != "TRADE" or a.get("side") != "BUY":
             continue
         slug = a.get("slug") or ""
-        if "-updown-" not in slug:
+        if not is_updown(slug):
             continue
         side = (a.get("outcome") or "").lower()
         if side not in ("up", "down"):
