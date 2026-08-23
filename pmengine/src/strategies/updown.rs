@@ -38,6 +38,12 @@ const EXIT_FAIR: f64 = 0.40;
 const EXIT_MAX_DISCOUNT: f64 = 0.08;
 /// Live vol floor: minutes of trailing 1m closes for the fast estimate.
 const VOL_FAST_WINDOW: usize = 12;
+/// Slow trailing window (minutes) that supersedes the arm-time sigma param —
+/// roll chains otherwise freeze a floor measured hours ago in a dead regime.
+const SIGMA_SLOW_WINDOW: usize = 45;
+/// Minimum close samples before the live slow estimate is trusted over the
+/// arm-time param.
+const SIGMA_SLOW_MIN: usize = 30;
 /// One order in flight per token; assume dead if no fill inside this window.
 /// Must outlive the engine's ~5s position-reconcile cadence: taker fills
 /// are often MISSED by the realtime fill path and only show up via
@@ -443,23 +449,12 @@ impl ArmState {
             });
         }
         let spot = f.spot;
-        // Vol only ratchets UP: the arm-time trailing sigma is a floor, the
-        // fast window catches the storm the trailing estimate lags.
-        let fast_bp = {
-            let c = &f.closes;
-            let n = c.len().min(VOL_FAST_WINDOW + 1);
-            if n >= 4 {
-                let rets: Vec<f64> =
-                    c[c.len() - n..].windows(2).map(|w| (w[1] / w[0]).ln()).collect();
-                let mu = rets.iter().sum::<f64>() / rets.len() as f64;
-                let var =
-                    rets.iter().map(|r| (r - mu).powi(2)).sum::<f64>() / (rets.len() - 1) as f64;
-                var.sqrt() * 1e4
-            } else {
-                0.0
-            }
-        };
-        let sig_bp = p.sigma_bp_per_min.max(fast_bp);
+        // Floor = live 45m trailing sigma once the feed holds real history
+        // (the arm-time param is only the cold-start fallback); the fast
+        // window still catches the storm either trailing estimate lags.
+        let fast_bp = trailing_sigma_bp(&f.closes, VOL_FAST_WINDOW);
+        let slow_bp = trailing_sigma_bp(&f.closes, SIGMA_SLOW_WINDOW);
+        let sig_bp = vol_floor_bp(slow_bp, f.closes.len(), p.sigma_bp_per_min).max(fast_bp);
         let sig_frac = sig_bp / 1e4;
         let rho = f.rho;
 
@@ -1175,6 +1170,29 @@ fn budget_unlocked(now: f64, end: f64, late_rem_s: f64, banked_decided: bool) ->
     (end - now) <= late_rem_s || banked_decided
 }
 
+/// Realized sigma (bp per 1m bar) over the last `window` returns.
+fn trailing_sigma_bp(closes: &[f64], window: usize) -> f64 {
+    let n = closes.len().min(window + 1);
+    if n < 4 {
+        return 0.0;
+    }
+    let rets: Vec<f64> =
+        closes[closes.len() - n..].windows(2).map(|w| (w[1] / w[0]).ln()).collect();
+    let mu = rets.iter().sum::<f64>() / rets.len() as f64;
+    let var = rets.iter().map(|r| (r - mu).powi(2)).sum::<f64>() / (rets.len() - 1) as f64;
+    var.sqrt() * 1e4
+}
+
+/// Roll chains clone params forever, so the arm-time sigma goes stale within
+/// hours — the live slow estimate supersedes it once enough history printed.
+fn vol_floor_bp(slow_bp: f64, samples: usize, param_bp: f64) -> f64 {
+    if samples >= SIGMA_SLOW_MIN && slow_bp > 0.0 {
+        slow_bp
+    } else {
+        param_bp
+    }
+}
+
 /// Lag-1 autocorrelation of log-returns over the last `n` closes.
 fn lag1_autocorr(closes: &[f64], n: usize) -> f64 {
     let m = closes.len().min(n + 1);
@@ -1297,6 +1315,30 @@ mod tests {
     #[test]
     fn late_rem_s_banked_decided_unlocks_regardless_of_time() {
         assert!(budget_unlocked(0.0, 900.0, 120.0, true));
+    }
+
+    #[test]
+    fn trailing_sigma_needs_history_and_scales_with_moves() {
+        assert_eq!(trailing_sigma_bp(&[100.0, 100.0, 100.0], 45), 0.0);
+        let flat: Vec<f64> = vec![100.0; 40];
+        assert!(trailing_sigma_bp(&flat, 45) < 1e-9);
+        // ~10bp alternating moves → sigma near 10bp/min.
+        let choppy: Vec<f64> =
+            (0..40).map(|i| if i % 2 == 0 { 100.0 } else { 100.1 }).collect();
+        let s = trailing_sigma_bp(&choppy, 45);
+        assert!(s > 8.0 && s < 12.0, "got {s}");
+    }
+
+    #[test]
+    fn live_slow_sigma_supersedes_stale_param_floor() {
+        // Enough history: the live estimate wins in BOTH directions —
+        // that's the point (stale-high floors under-fire, stale-low
+        // floors overtrust).
+        assert_eq!(vol_floor_bp(9.0, 40, 3.0), 9.0);
+        assert_eq!(vol_floor_bp(2.0, 40, 8.0), 2.0);
+        // Thin history or dead feed: fall back to the arm-time param.
+        assert_eq!(vol_floor_bp(9.0, 10, 3.0), 3.0);
+        assert_eq!(vol_floor_bp(0.0, 40, 3.0), 3.0);
     }
 
     fn armed_with_feed(banked_px: f64, spot: f64) -> (ArmState, f64) {
