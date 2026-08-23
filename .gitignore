@@ -221,3 +221,6 @@ analysis/manual_book_audit.md
 docs/ec2-euw-plan.md
 infra/pulumi/README.md
 infra/
+
+# feed A/B scratch (params + replay reports)
+.ab/
