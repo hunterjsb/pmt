@@ -79,15 +79,22 @@ exist in OUR books, and what does it cost by duration/moneyness), **R2 second** 
 diagrams by p-bucket × ρ-regime × time-to-expiry become the gate on any size increase), then
 R3 → R5/R6/R1 → R7/R8/R9.
 
-- **R1 Oracle basis per symbol** — measured Chainlink-vs-Binance distribution → per-symbol
-  guards with confidence, XRP verdict. First measurement (2026-08-23, `pmt crypto basis`,
-  point-in-time rounds vs 1m closes, 24h): p95 |basis| ≈ BTC 8.8 / ETH 13.6 / SOL 26.8 /
-  XRP 49.2 / DOGE 37.4 bp. CAVEAT: this method bakes in up to a minute of pure timing noise
-  (all symbols' worst outliers cluster in one flash-move minute), so it over-states true
-  settlement basis — treat as an upper bound. Refinement: TWAP-vs-TWAP join (average Chainlink
-  rounds over the settlement window vs Binance TWAP of the same span). Even as upper bounds:
-  alt guards were raised (ETH 6→8, SOL 6→10), XRP/DOGE look structurally untradeable with a
-  Binance proxy, BTC 3bp stands on its live record pending the aligned measurement.
+- **R1 Oracle basis per symbol — ALIGNED MEASUREMENT DONE 2026-08-23**
+  (`analysis/r1_aligned_basis.py`, 48h corpus, step-interpolated Chainlink TWAP vs Binance
+  minute marks, plus the settlement-shaped 30s/60s variant). Settlement-shaped p95 |basis|:
+  BTC 8.0/7.6bp (5m/15m), ETH 10.0/8.0, SOL 11.1/8.7, XRP 22.5/16.8, DOGE 17.9/13.2.
+  The first point-in-time method was right for BTC and over-stated alts 2-3x (SOL 26.8→11.5,
+  XRP 49→18.6, DOGE 37→15 per-minute p95). Signed bias ≈ −2.5bp on all symbols (oracle lags
+  drift). BTC/ETH distribution HALVED day1→day2 — non-stationary; re-run after 1-2 weeks
+  before trusting any p99.
+  - Verdicts: **BTC 3bp was too loose** → raised to 6bp 2026-08-23 04:15Z, backed by the
+    first replay full-mode A/B over 23 recorded windows with Chainlink-truth settlement:
+    guard 3 = 61 fires, 9-3, −$300; guard 6 = 21 fires, 6-0, +$71; guard 8 over-gates
+    (1 window). ETH 8 / SOL 10 confirmed roughly right, stand. **XRP not tradeable** via
+    Binance proxy (p95 alone would need a ~20-25bp guard that guts the edge; got WORSE
+    day2). **DOGE not yet, but the closest alt candidate** — recheck after more corpus.
+  - First measurement kept for the record: point-in-time p95 BTC 8.8 / ETH 13.6 / SOL 26.8 /
+    XRP 49.2 / DOGE 37.4bp (upper bounds; outliers cluster in flash-move minutes).
 - **R2 Calibration gate + fractional Kelly** — clip size from quarter-Kelly on post-fee,
   post-haircut edge; hard per-window %-of-bankroll cap; no size increases until each p-bucket
   shows calibration over ≥30 decided windows. (Current reality check: stated fair ≥0.95 hits 92%.)
