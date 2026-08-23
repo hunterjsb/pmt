@@ -1,0 +1,49 @@
+# pmengine on the eu-west-1 box (i-0426f1d5e68cdee60) — SYSTEM unit.
+#
+# System, not --user, on purpose: the box has no interactive session and we do
+# not want the engine's life to depend on `loginctl enable-linger ec2-user`.
+#
+# Installed by deploy/eu/ship-eu.sh, but NEVER enabled or started by it.
+# Arming the engine is an operator ceremony — see deploy/eu/README.md.
+
+[Unit]
+Description=pmengine — Polymarket up/down trading engine (EU L0)
+After=network-online.target
+Wants=network-online.target
+# A wedged engine that crash-loops into the order book is worse than a
+# stopped one. The arms live on disk and survive a manual start.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user
+
+# The EOA key lives in l0.env and ONLY there. engine.env carries the
+# non-secret knobs. Both are `-` optional so a missing file is a clean
+# start failure rather than a systemd load error.
+EnvironmentFile=-/home/ec2-user/.pmt/l0.env
+EnvironmentFile=-/home/ec2-user/.pmt/engine.env
+
+# --env-file is also passed explicitly: the engine's own dotenv load is what
+# populates config.rs, and it must see the same file systemd sourced.
+ExecStart=/home/ec2-user/pmt/bin/pmengine \
+    --env-file /home/ec2-user/.pmt/engine.env \
+    run updown --skip-warmup
+
+Restart=on-failure
+RestartSec=5
+
+# Graceful shutdown cancels resting orders. Cut it short and a stop leaves
+# live orders on the book with nobody managing them.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+StandardOutput=append:/home/ec2-user/.pmt/engine/engine-systemd.log
+StandardError=append:/home/ec2-user/.pmt/engine/engine-systemd.log
+SyslogIdentifier=pmengine
+
+[Install]
+WantedBy=multi-user.target
