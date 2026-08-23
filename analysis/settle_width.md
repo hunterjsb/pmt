@@ -110,6 +110,22 @@ width recovers its own true winner only ~95% of the time, an error rate larger
 than the entire effect being measured. Whichever direction that corpus leans,
 it leans on noise. Only the recorded stream settles this.
 
+## Independent corroboration
+
+`analysis/correlation_study.md` Result 0 reached the same place from the other
+direction, grading settlement *rules* rather than widths over its own (shorter,
+17:39Z-truncated) slice of the same stream:
+
+| rule | book (unselected) |
+|---|---|
+| `terminal` (30s at 5m) | 282/289 — 97.6% |
+| `terminal_t60` | 288/289 — **99.7%** |
+
+97.6% vs 99.7% there; 97.5% vs 99.6% here. Two studies, different window sets,
+same gap. That study did not name the width as the finding — it was chasing the
+range_avg-vs-terminal error — so this is a genuinely separate confirmation
+rather than a restatement.
+
 ## Consequence
 
 `settle_tw_secs` should return `60.0` for every window, not just windows wider
