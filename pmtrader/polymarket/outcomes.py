@@ -144,6 +144,74 @@ def chainlink_outcome(window: dict, rounds: list[dict]) -> tuple[str | None, str
     return ("up" if settlement > reference else "down"), None
 
 
+# ---------- (c) gamma resolution — live tie-break when redemption is silent ----------
+
+def gamma_resolution(markets: list[dict]) -> dict:
+    """{'resolved': bool, 'winner': 'up'|'down'|None} from a gamma
+    `/markets?slug=...` response (a list; empty when the slug is unknown).
+
+    outcomePrices only pins to "1"/"0" once UMA has actually settled —
+    `closed` alone isn't enough, a market can close for trading well before
+    resolution proposes/finalizes. Tolerant of the malformed-JSON shapes
+    gamma has emitted elsewhere (see scanner._parse_prices).
+    """
+    if not markets:
+        return {"resolved": False, "winner": None}
+    m = markets[0]
+    try:
+        outcomes = json.loads(m.get("outcomes") or "[]")
+        prices = [float(p) for p in json.loads(m.get("outcomePrices") or "[]")]
+    except (TypeError, ValueError):
+        return {"resolved": False, "winner": None}
+    if len(outcomes) != 2 or len(prices) != 2:
+        return {"resolved": False, "winner": None}
+    by_outcome = {str(o).lower(): p for o, p in zip(outcomes, prices)}
+    up, down = by_outcome.get("up"), by_outcome.get("down")
+    if up is None or down is None:
+        return {"resolved": False, "winner": None}
+    if up >= 0.99:
+        return {"resolved": True, "winner": "up"}
+    if down >= 0.99:
+        return {"resolved": True, "winner": "down"}
+    return {"resolved": False, "winner": None}
+
+
+def grade_window(redeemed_usd: float, redeem_seen: bool, fired_side: str | None,
+                  gamma: dict | None, now: float, end: float,
+                  grace_s: float = 300) -> tuple[bool | None, bool]:
+    """(won, estimated) for one window's wallet totals — worst case first.
+
+    1. A paying redeem (>$0.5): WIN, ground truth from the wallet itself.
+    2. A $0 redeem happened with no paying one: LOSS — still ground truth,
+       Polymarket only lets you redeem the outcome token you actually hold
+       (so a lone $0 redeem can't be dust beside a paying row elsewhere).
+    3. No redeem event at all, still inside the settlement grace window:
+       riding (None) — too soon to know either way.
+    4. Past grace with no redeem: Polymarket doesn't reliably auto-redeem a
+       slow-paying WIN (2026-08-23 audit), so a silent wallet no longer
+       means LOSS. `gamma` — already fetched by the caller, or None on a
+       skipped/failed lookup — breaks the tie: resolved -> WIN/LOSS by
+       whether our side matches the winner; not yet resolved -> riding
+       (None); unreachable -> fall back to the old assume-LOSS heuristic,
+       flagged `estimated` so the UI can mark it as such instead of
+       presenting it as confirmed.
+    """
+    if redeemed_usd > 0.5:
+        return True, False
+    if redeem_seen:
+        return False, False
+    if now < end + grace_s:
+        return None, False
+    if gamma is not None:
+        if not gamma.get("resolved"):
+            return None, False
+        winner = gamma.get("winner")
+        if winner and fired_side:
+            return winner == fired_side, False
+        return None, False  # resolved, but we can't tell which side we held
+    return False, True
+
+
 # ---------- priority merge ----------
 
 def build_outcomes(windows: list[dict], wallet: dict[str, str],
