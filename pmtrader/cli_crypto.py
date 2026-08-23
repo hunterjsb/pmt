@@ -25,7 +25,7 @@ from rich.table import Table
 from engine import post as _engine_post
 
 from cli_common import console, _api, _pnl_color
-from polymarket import tape, updown_slugs, wallet
+from polymarket import effectiveness, tape, updown_slugs, wallet
 
 
 @click.group("crypto")
@@ -605,15 +605,21 @@ def score_activity(rows: list[dict], floor: float,
             continue
         w = win_by_slug.setdefault(slug, {"buy": 0.0, "sell": 0.0, "redeem": 0.0,
                                           "redeem_seen": False, "won": None,
-                                          "buy_shares": 0.0})
+                                          "buy_shares": 0.0,
+                                          "buy_ts_usd": 0.0, "exit_ts": 0.0})
         usd = a.get("usdcSize") or 0.0
+        ts = float(a.get("timestamp") or 0.0)
         if a["type"] == "TRADE":
             w["buy" if a.get("side") == "BUY" else "sell"] += usd
             if a.get("side") == "BUY":
                 w["buy_shares"] += a.get("size") or 0.0
+                # Exposure-time accumulators (polymarket.effectiveness): the
+                # average dollar's entry, and when the capital came back.
+                w["buy_ts_usd"] += usd * ts
         elif a["type"] == "REDEEM":
             w["redeem"] += usd
             w["redeem_seen"] = True
+            w["exit_ts"] = max(w["exit_ts"], ts)
             if usd > 0.5:
                 w["won"] = (a.get("outcome") or "").lower()
 
@@ -681,7 +687,10 @@ def score_activity(rows: list[dict], floor: float,
             wins_s, losses_s, net_s = wins_s + won, losses_s + (not won), net_s + pnl
             estimated_s += pnl_est
         window_list.append({"slug": slug, "won": won, "pnl": pnl,
-                             "est": bool(pnl_est), "end_ts": end})
+                             "est": bool(pnl_est), "end_ts": end,
+                             "notional": w["buy"],
+                             "entry_ts": effectiveness.weighted_ts(w["buy_ts_usd"], w["buy"]),
+                             "exit_ts": w["exit_ts"]})
         # Winning outcome for calibration: the paying redeem row names it
         # directly; else gamma's own read if we cross-checked one; else
         # infer from our fired side (right if we won, flipped if we lost).
@@ -703,11 +712,80 @@ def score_activity(rows: list[dict], floor: float,
     windows = sorted(window_list, key=lambda r: r["end_ts"], reverse=True)[:12]
     result = {"wins": wins, "losses": losses, "net": net, "rolls": rolls,
               "series": series, "cal": cal, "estimated": estimated,
-              "riding_n": riding_n, "riding_usd": riding_usd, "windows": windows}
+              "riding_n": riding_n, "riding_usd": riding_usd, "windows": windows,
+              # Every graded window (uncapped, unsorted) with its notional and
+              # exposure timing — the input to polymarket.effectiveness. Kept
+              # separate from `windows`, which is a 12-row display strip.
+              "eff_windows": window_list}
     if sliding_floor is not None:
         result["sliding"] = {"wins": wins_s, "losses": losses_s, "net": net_s,
                               "rolls": rolls_sliding, "estimated": estimated_s}
     return result
+
+
+def effectiveness_summary(sb: dict, bal: dict | None) -> dict:
+    """polymarket.effectiveness.summary() over a scoreboard's graded windows.
+
+    The bankroll denominator is cash PLUS notional still riding: the CLOB's
+    balance only reports free USDC, so mid-flight capital would otherwise
+    vanish from the book's size and flatter every per-bankroll rate. Falls
+    back to None (metrics that need a bankroll come back None) when the
+    balance call failed — never to a guess.
+
+    The watch header can call this on its own snapshot and render
+    effectiveness.header_line() from the result.
+    """
+    cash = float((bal or {}).get("total") or 0.0)
+    bankroll = cash + float(sb.get("riding_usd") or 0.0)
+    return effectiveness.summary(sb.get("eff_windows") or [],
+                                  bankroll=bankroll or None, now=time.time())
+
+
+def _eff_table(s: dict) -> Table:
+    """The effectiveness block: each corrected number beside what it means."""
+    def signed(v: float | None, unit: str = "", pct: bool = True, digits: int = 2) -> str:
+        if v is None:
+            return "[dim]—[/dim]"
+        x = v * 100 if pct else v
+        return f"[{'green' if x >= 0 else 'red'}]{x:+,.{digits}f}{unit}[/]"
+
+    def rate(v: float | None, digits: int = 0) -> str:
+        return "[dim]—[/dim]" if v is None else f"{v * 100:.{digits}f}%"
+
+    rorc, bgr = s.get("rorc") or {}, s.get("bgr") or {}
+    wr, be = s.get("win_rate"), s.get("breakeven_win_rate")
+    # Show the growth denominator in the unit it actually has: "over 0.1d"
+    # hides that a %/day figure is extrapolated from three hours.
+    span = (f"{s['span_h'] / 24:.1f}d" if s["span_h"] >= 24 else f"{s['span_h']:.1f}h")
+    hold_m = (rorc.get("avg_hold_h") or 0) * 60
+    t = Table(title="Effectiveness — the win rate, corrected for size and time")
+    t.add_column("metric"); t.add_column("value", justify="right"); t.add_column("means")
+    t.add_row("$-weighted win rate", rate(s["mww_rate"]),
+              "share of DOLLARS at risk that won"
+              + (f" [dim](count: {wr * 100:.0f}%)[/dim]" if wr is not None else ""))
+    # The bar the headline has to clear: with -100% losses against +2-8%
+    # wins it sits in the nineties, which is the whole reason 92% flatters.
+    t.add_row("break-even win rate",
+              "[dim]—[/dim]" if be is None else
+              f"[{'red' if wr is not None and wr < be else 'green'}]{be * 100:.1f}%[/]",
+              "what THIS payoff shape needs just to stay flat")
+    t.add_row("profit factor",
+              "[dim]—[/dim]" if s["profit_factor"] is None else
+              f"[{'green' if s['profit_factor'] >= 1 else 'red'}]{s['profit_factor']:.2f}[/]",
+              f"gross wins ${s['gross_win']:,.0f} / gross losses ${s['gross_loss']:,.0f}"
+              " — under 1.00 the book loses")
+    t.add_row("return on notional", signed(s["return_on_notional"], "%"),
+              f"P&L per dollar put at risk (${s['notional']:,.0f} traded), time ignored")
+    t.add_row("RoRC", signed(rorc.get("per_hour"), "%/h"),
+              "return per dollar-HOUR at risk — [bold]trade quality[/bold]"
+              + (f" [dim](avg hold {hold_m:.1f}m)[/dim]" if hold_m else ""))
+    t.add_row("bankroll growth", signed(bgr.get("per_day_pct"), "%/d", pct=False),
+              "log growth of the whole book per calendar day — "
+              f"[bold]capital effectiveness[/bold] [dim](over {span})[/dim]")
+    t.add_row("utilization", rate(s["utilization"], 2),
+              "share of bankroll-hours actually at risk (the bridge: "
+              "growth ≈ RoRC × utilization)")
+    return t
 
 
 @crypto_group.command("stats")
@@ -740,13 +818,15 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
     except Exception:
         pass
 
+    eff_s = effectiveness_summary(sb, bal)
+
     if as_json:
         click.echo(json.dumps({
             "wins": wins, "losses": losses, "net_est": net, "rolls": rolls,
             "estimated": estimated, "series": series,
             "calibration": {str(k): v for k, v in cal.items()},
             "arms": status.get("arms", {}), "balance": bal,
-            "windows": sb["windows"],
+            "windows": sb["windows"], "effectiveness": eff_s,
         }, indent=2))
         return
 
@@ -765,6 +845,9 @@ def crypto_stats(since: float | None, as_json: bool) -> None:
     console.print(f"[bold]{wins}W-{losses}L[/bold] ({wr}) · P&L "
                   f"[{_pnl_color(net)}]{net:+,.2f}[/] · "
                   f"{rolls} rolls · capital {cap} · [dim]{floor_label}[/dim]{est}")
+
+    if eff_s["n"]:
+        console.print(_eff_table(eff_s))
 
     t = Table(title="By series (wallet-graded)")
     for col in ("series", "record", "P&L", "notional"):
