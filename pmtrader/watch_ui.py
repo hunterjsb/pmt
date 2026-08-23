@@ -913,6 +913,13 @@ def feed_row(status: dict | None) -> tuple | None:
 # table's live rows ARE the arms table's rows, it repeats none of the model
 # read, and it carries only the two facts a lifecycle needs from an arm —
 # whether it is gated, and how much is in.
+#
+# The one figure that appears in both is the money: the arms table's
+# `committed` is what the ENGINE says it has spent on its current window, this
+# table's `size` is what the WALLET says the position cost. They answer the
+# same question from the two sides of a fill and can legitimately disagree for
+# a few seconds; which one is authoritative is never in doubt (the wallet), and
+# an engine figure the wallet has not confirmed renders dim to say so.
 
 _WINDOWS_COLUMNS = (
     ("·", "left", 1),        # stage glyph — _STAGE_LEGEND
@@ -964,9 +971,10 @@ def _stage_cell(w: dict) -> str:
 
 
 def _age_label(sec: float) -> str:
-    """Compact time-since for a trades row — `live` while the window is still
-    open, then s / m / h:mm. Age, not a wall clock: "how long ago" is the
-    question a trade row on a live dashboard is actually asked."""
+    """Compact time-since for a window row — `live` while the window is still
+    open (which is every row of the live head), then s / m / h:mm. Age, not a
+    wall clock: "how long ago" is the question a live dashboard is asked. The
+    countdown to a live window's close is the arms table's T-, not this."""
     if sec < 0:
         return "live"
     if sec < 60:
@@ -988,8 +996,8 @@ def _window_pnl_cell(w: dict) -> str:
 
     One column, one question: "what has this window come to so far". A live
     row saying `gated` here is the stage, never the reason — the arms table one
-    panel up owns the diagnostic ("gated  margin -4.9 vs 6.0bp"), and repeating
-    it in a 9-column cell would only ellipsize it.
+    panel up owns the diagnostic ("gated  margin -4.9 vs 6.0bp"), and a
+    ten-column cell could only ellipsize it.
     """
     stage = _stage(w)
     if stage not in ("won", "lost"):
