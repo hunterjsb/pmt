@@ -359,7 +359,7 @@ def test_build_outcomes_resolution_beats_chainlink_but_loses_to_wallet():
     w = {"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300,
          "start": 1000, "end": 1300}
     # chainlink would read "up" here; the market settled "down".
-    rounds = {"btc": _rounds({960: 100.0, 1250: 110.0, 1300: 999.0})}
+    rounds = {"btc": _rounds({900: 100.0, 1250: 110.0, 1300: 999.0})}
     res = {"btc-updown-5m-1000": "down"}
     rows, dropped = build_outcomes([w], {}, rounds, None, res)
     assert rows == [{"slug": "btc-updown-5m-1000", "winner": "down", "source": "resolution"}]
@@ -372,7 +372,7 @@ def test_build_outcomes_resolution_beats_chainlink_but_loses_to_wallet():
 def test_build_outcomes_without_resolutions_is_unchanged():
     w = {"slug": "btc-updown-5m-1000", "symbol": "btc", "dur_s": 300,
          "start": 1000, "end": 1300}
-    rounds = {"btc": _rounds({960: 100.0, 1250: 110.0, 1300: 999.0})}
+    rounds = {"btc": _rounds({900: 100.0, 1250: 110.0, 1300: 999.0})}
     rows, _ = build_outcomes([w], {}, rounds, None, {})
     assert rows == [{"slug": "btc-updown-5m-1000", "winner": "up", "source": "chainlink"}]
 
