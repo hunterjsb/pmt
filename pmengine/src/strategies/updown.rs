@@ -19,6 +19,11 @@
 //!   - the full budget unlocks only late or banked-beyond-reversion
 //!   - quiesce pulls everything before resolution; exits stay live longer
 
+// The replay harness (src/replay.rs) drives this module's decision core
+// directly, so it must be visible crate-wide. The line below tells the
+// registry generator to emit `pub(crate) mod updown;` in mod.rs.
+// pmstrat: pub(crate)
+
 use crate::position::Fill;
 use crate::strategies::updown_model::{
     append_jsonl, avg_down_blocks, budget_unlocked, book_sample_due, distrust_blocks, eval_model,

@@ -1975,22 +1975,48 @@ class StrategyFileInfo:
     module_name: str
     struct_name: str
     requires_market_discovery: bool
+    # True when the file asks for `pub(crate) mod` instead of a private `mod`.
+    pub_crate: bool = False
+
+
+@dataclass
+class HelperFileInfo:
+    """A .rs file in the strategies dir that is not itself a strategy.
+
+    These still need a `mod` line or they never get compiled, and they are
+    reached from elsewhere in the crate (the replay harness, sibling
+    strategies), so they are declared `pub(crate)`.
+    """
+    module_name: str
+
+
+# A strategy file can ask for crate-wide module visibility by carrying this
+# marker line. updown needs it: the replay harness drives its decision core
+# directly, which a private `mod updown;` would hide.
+PUB_CRATE_MARKER = re.compile(r"^[ \t]*//[ \t]*pmstrat:[ \t]*pub\(crate\)[ \t]*$", re.MULTILINE)
 
 
 def scan_strategy_file(path: Path) -> StrategyFileInfo | None:
     """Extract strategy info from a Rust strategy file.
 
-    Returns None if the file doesn't look like a valid strategy.
+    Returns None if the file doesn't look like a valid strategy — i.e. it has
+    no `pub struct X` that also carries an `impl Strategy for X`. Requiring the
+    trait impl (not just "the first pub struct in the file") is what keeps a
+    helper module from being registered as a bogus strategy.
     """
     content = path.read_text()
     module_name = path.stem
 
-    # Look for struct definition pattern: pub struct StructName {
-    struct_match = re.search(r'pub struct (\w+)\s*\{', content)
-    if not struct_match:
+    # Find the pub struct that actually implements Strategy — a file may
+    # declare several structs, and the strategy is rarely the first.
+    struct_name = None
+    for m in re.finditer(r'\bpub struct (\w+)', content):
+        candidate = m.group(1)
+        if re.search(rf'impl\s+Strategy\s+for\s+{candidate}\b', content):
+            struct_name = candidate
+            break
+    if struct_name is None:
         return None
-
-    struct_name = struct_match.group(1)
 
     # Detect if market discovery is needed.
     # The OLD path: `tokens: vec![]` + no market_filter — strategy relies
@@ -2008,7 +2034,33 @@ def scan_strategy_file(path: Path) -> StrategyFileInfo | None:
         module_name=module_name,
         struct_name=struct_name,
         requires_market_discovery=requires_market_discovery,
+        pub_crate=bool(PUB_CRATE_MARKER.search(content)),
     )
+
+
+def scan_strategies_dir(
+    strategies_dir: Path,
+) -> tuple[list[StrategyFileInfo], list[HelperFileInfo]]:
+    """Classify every .rs file in the strategies dir.
+
+    Returns (strategies, helpers), both sorted by module name. A file is a
+    strategy if it has a `pub struct X` with an `impl Strategy for X`;
+    everything else is a helper module that still needs declaring.
+    """
+    files = [f for f in sorted(strategies_dir.glob("*.rs")) if f.name != "mod.rs"]
+
+    strategies: list[StrategyFileInfo] = []
+    helpers: list[HelperFileInfo] = []
+    for f in files:
+        info = scan_strategy_file(f)
+        if info:
+            strategies.append(info)
+        else:
+            helpers.append(HelperFileInfo(module_name=f.stem))
+
+    strategies.sort(key=lambda s: s.module_name)
+    helpers.sort(key=lambda h: h.module_name)
+    return strategies, helpers
 
 
 def generate_mod_rs(strategies_dir: Path) -> str:
@@ -2020,22 +2072,17 @@ def generate_mod_rs(strategies_dir: Path) -> str:
     Returns:
         Generated Rust code for mod.rs
     """
-    # Scan for all .rs files (except mod.rs)
-    strategy_files = sorted(strategies_dir.glob("*.rs"))
-    strategy_files = [f for f in strategy_files if f.name != "mod.rs"]
+    strategies, helpers = scan_strategies_dir(strategies_dir)
 
-    # Extract info from each file
-    strategies: list[StrategyFileInfo] = []
-    for f in strategy_files:
-        info = scan_strategy_file(f)
-        if info:
-            strategies.append(info)
-
-    # Sort by module name
-    strategies.sort(key=lambda s: s.module_name)
-
-    # Generate mod declarations
-    mod_decls = "\n".join(f"mod {s.module_name};" for s in strategies)
+    # Generate mod declarations — strategies and helper modules interleaved
+    # in one alphabetical block, each with the visibility its file asks for.
+    mod_lines: dict[str, str] = {
+        s.module_name: f"{'pub(crate) ' if s.pub_crate else ''}mod {s.module_name};"
+        for s in strategies
+    }
+    for h in helpers:
+        mod_lines[h.module_name] = f"pub(crate) mod {h.module_name};"
+    mod_decls = "\n".join(mod_lines[name] for name in sorted(mod_lines))
 
     # Generate pub use statements
     pub_uses = "\n".join(f"pub use {s.module_name}::{s.struct_name};" for s in strategies)
@@ -2052,6 +2099,14 @@ def generate_mod_rs(strategies_dir: Path) -> str:
 
     return f'''//! Auto-generated strategy registry - DO NOT EDIT MANUALLY
 //! Regenerate with: pmstrat transpile --all
+//!
+//! Every .rs file in this directory gets a `mod` line here. A file with a
+//! `pub struct X` that carries `impl Strategy for X` is a strategy: declared
+//! `mod x;`, re-exported, and registered below. Anything else is a helper
+//! module, declared `pub(crate) mod x;` so the rest of the crate can reach it.
+//! A strategy file that needs crate-wide visibility of its own module says so
+//! in the file with a `// pmstrat: pub(crate)` marker line — nothing here is
+//! hand-maintained.
 
 {mod_decls}
 
