@@ -255,14 +255,6 @@ impl GammaClient {
         }
     }
 
-    /// Create a new Gamma client with custom base URL.
-    pub fn with_base_url(base_url: &str) -> Self {
-        Self {
-            client: Client::new(),
-            base_url: base_url.to_string(),
-        }
-    }
-
     /// Fetch the active gamma markets that match `filter`.
     ///
     /// Server-side, this issues a paged `/markets?active=true&closed=false&limit=N`
@@ -673,54 +665,6 @@ impl GammaClient {
         );
 
         Ok(candidates)
-    }
-
-    /// Fetch markets for a specific event by slug.
-    #[allow(dead_code)]
-    async fn fetch_event_markets(&self, event_slug: &str) -> Result<Vec<GammaMarket>, GammaError> {
-        let url = format!("{}/events?slug={}", self.base_url, event_slug);
-
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| GammaError::RequestError(e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(GammaError::RequestError(format!(
-                "HTTP {}: {}",
-                response.status(),
-                response.status().canonical_reason().unwrap_or("Unknown")
-            )));
-        }
-
-        let events: Vec<RawGammaEvent> = response
-            .json()
-            .await
-            .map_err(|e| GammaError::ParseError(e.to_string()))?;
-
-        let mut markets = Vec::new();
-
-        for event in events {
-            let event_end_date = event.end_date.as_ref();
-
-            if let Some(raw_markets) = event.markets {
-                for raw_market in raw_markets {
-                    if !raw_market.active.unwrap_or(false) || raw_market.closed.unwrap_or(true) {
-                        continue;
-                    }
-
-                    let end_date_str = raw_market.end_date.clone().or_else(|| event_end_date.cloned());
-
-                    if let Ok(market) = self.parse_market_with_end_date(raw_market, end_date_str.as_ref()) {
-                        markets.push(market);
-                    }
-                }
-            }
-        }
-
-        Ok(markets)
     }
 
     /// Parse a raw market response into structured data.

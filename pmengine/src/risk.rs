@@ -21,8 +21,10 @@ pub struct RiskLimits {
     pub max_total_exposure: Decimal,
     /// Maximum loss before circuit breaker triggers (in USDC)
     pub max_loss: Decimal,
-    /// Maximum number of open orders
-    pub max_open_orders: usize,
+    // NOTE: there is deliberately no max_open_orders here. One existed,
+    // defaulted to 10, and was never read by check_signal or reserve_exposure
+    // — an unenforced limit that read as a guarantee. Order count is bounded
+    // indirectly by max_total_exposure; add a real one only with enforcement.
     /// Maximum order size (in USDC notional)
     pub max_order_size: Decimal,
 }
@@ -33,7 +35,6 @@ impl Default for RiskLimits {
             max_position_size: Decimal::from(50),
             max_total_exposure: Decimal::from(50),
             max_loss: Decimal::from(25),
-            max_open_orders: 10,
             max_order_size: Decimal::from(25),
         }
     }
@@ -89,12 +90,6 @@ impl RiskManager {
     pub fn trigger_circuit_breaker(&mut self, reason: &str) {
         tracing::error!(reason, "CIRCUIT BREAKER TRIGGERED");
         self.circuit_breaker_triggered = true;
-    }
-
-    /// Reset circuit breaker (manual intervention).
-    pub fn reset_circuit_breaker(&mut self) {
-        tracing::warn!("Circuit breaker reset");
-        self.circuit_breaker_triggered = false;
     }
 
     /// Check P&L and trigger circuit breaker if needed.
@@ -262,22 +257,6 @@ impl RiskManager {
         })
     }
 
-    /// Track an open order with its notional value.
-    pub fn order_placed(&mut self, order_id: &str, token_id: &str, notional: Decimal) {
-        tracing::debug!(
-            order_id = order_id,
-            token_id = token_id,
-            notional = %notional,
-            "Tracking order"
-        );
-        self.open_orders.insert(
-            order_id.to_string(),
-            TrackedOrder {
-                token_id: token_id.to_string(),
-                notional,
-            },
-        );
-    }
 
     /// Remove order tracking on fill/cancel.
     pub fn order_closed(&mut self, order_id: &str) {

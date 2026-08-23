@@ -80,12 +80,6 @@ impl Config {
         })
     }
 
-    /// Normalize private key (strip 0x prefix if present)
-    pub fn private_key_bytes(&self) -> Result<[u8; 32], ConfigError> {
-        let key = self.private_key.strip_prefix("0x").unwrap_or(&self.private_key);
-        let bytes = hex::decode(key).map_err(|_| ConfigError::InvalidValue("PRIVATE_KEY format"))?;
-        bytes.try_into().map_err(|_| ConfigError::InvalidValue("PRIVATE_KEY length"))
-    }
 }
 
 /// Above this, an engine loop interval is too coarse for a strategy whose own

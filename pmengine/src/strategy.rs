@@ -123,16 +123,6 @@ pub struct MarketInfo {
 }
 
 impl MarketInfo {
-    /// Create a new MarketInfo.
-    pub fn new(
-        question: String,
-        outcome: String,
-        slug: String,
-        end_date: Option<DateTime<Utc>>,
-    ) -> Self {
-        Self::with_liquidity(question, outcome, slug, end_date, None)
-    }
-
     /// Create a new MarketInfo with liquidity data.
     pub fn with_liquidity(
         question: String,
@@ -323,10 +313,6 @@ impl StrategyRuntime {
         Some(tokens)
     }
 
-    pub fn is_paused(&self, id: &str) -> bool {
-        self.paused.contains(id)
-    }
-
     /// Route a control-plane command to a strategy by id.
     pub fn command(&mut self, id: &str, cmd: &serde_json::Value) -> Result<serde_json::Value, String> {
         let strategy = self
@@ -384,18 +370,6 @@ impl StrategyRuntime {
                 paused: self.paused.contains(s.id()),
             })
             .collect()
-    }
-
-    /// Get all token subscriptions from all strategies.
-    pub fn all_subscriptions(&self) -> Vec<String> {
-        let mut subs: Vec<String> = self
-            .strategies
-            .iter()
-            .flat_map(|s| s.subscriptions())
-            .collect();
-        subs.sort();
-        subs.dedup();
-        subs
     }
 
     /// Run all strategies that are due for a tick and collect signals.
@@ -476,45 +450,3 @@ impl Default for StrategyRuntime {
     }
 }
 
-/// Example: Simple market maker strategy (for testing).
-pub struct DummyStrategy {
-    id: String,
-    tokens: Vec<String>,
-}
-
-impl DummyStrategy {
-    pub fn new(id: &str, tokens: Vec<String>) -> Self {
-        Self {
-            id: id.to_string(),
-            tokens,
-        }
-    }
-}
-
-impl Strategy for DummyStrategy {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn subscriptions(&self) -> Vec<String> {
-        self.tokens.clone()
-    }
-
-    fn on_tick(&mut self, ctx: &StrategyContext) -> Vec<Signal> {
-        // Just log market state, don't trade
-        for token_id in &self.tokens {
-            if let Some(book) = ctx.order_books.get(token_id) {
-                tracing::debug!(
-                    token_id,
-                    best_bid = ?book.best_bid().map(|l| l.price),
-                    best_ask = ?book.best_ask().map(|l| l.price),
-                    mid = ?book.mid_price(),
-                    bid_levels = book.bids.len(),
-                    ask_levels = book.asks.len(),
-                    "Market state"
-                );
-            }
-        }
-        vec![Signal::Hold]
-    }
-}

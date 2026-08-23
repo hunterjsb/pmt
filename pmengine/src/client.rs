@@ -66,11 +66,10 @@ impl PolymarketClient {
         Self::new_internal(config, dry_run).await
     }
 
-    /// Create and authenticate a new client with optional SigV4 signing.
-    #[cfg(feature = "sigv4")]
-    pub async fn new(config: &Config, dry_run: bool) -> Result<Self, ClientError> {
-        Self::new_with_sigv4(config, dry_run, None).await
-    }
+    // NOTE: no `new()` under `sigv4`. It existed, forwarded to
+    // new_with_sigv4(.., None), and had zero callers in the only configuration
+    // that ships a binary — while reading as the obvious constructor that
+    // silently hands back an UNSIGNED client. Pick new_with_sigv4 explicitly.
 
     /// Create and authenticate a new client with SigV4 signing for pmproxy.
     #[cfg(feature = "sigv4")]
@@ -782,7 +781,6 @@ pub enum ClientError {
     AuthError(String),
     SdkError(String),
     OrderError(String),
-    WebSocketError(String),
 }
 
 impl std::fmt::Display for ClientError {
@@ -792,7 +790,6 @@ impl std::fmt::Display for ClientError {
             ClientError::AuthError(e) => write!(f, "Authentication error: {}", e),
             ClientError::SdkError(e) => write!(f, "SDK error: {}", e),
             ClientError::OrderError(e) => write!(f, "Order error: {}", e),
-            ClientError::WebSocketError(e) => write!(f, "WebSocket error: {}", e),
         }
     }
 }

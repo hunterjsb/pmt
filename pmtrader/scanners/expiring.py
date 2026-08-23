@@ -211,9 +211,8 @@ def find_expiring_opportunities(
                                     )
                                 )
 
-                    except (ValueError, IndexError, AttributeError) as e:
-                        # Skip markets with parsing issues
-                        continue
+                    except (ValueError, IndexError, AttributeError):
+                        continue  # skip markets with parsing issues
 
             offset += batch_size
 
