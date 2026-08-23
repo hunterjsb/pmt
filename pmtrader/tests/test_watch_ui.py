@@ -1,7 +1,8 @@
 """Pure-seam tests for the crypto watch dashboard's render layer: margin-regex
 parsing, evidence/countdown color thresholds, the tape log's fixed-width
 alignment, the risk header's committed/undecided math, the recent-windows
-strip, the arms table's column geometry, and the terminal-mode helpers.
+strip, the trades table, the arms table's column geometry, and the
+terminal-mode helpers.
 
 Every dashboard render function must tolerate a missing/partial eval (an
 engine restart mid-watch leaves last_eval None or half-built) — several tests
@@ -356,7 +357,7 @@ def test_controls_panel_legend_names_every_arms_table_marker():
     con = Console(file=io.StringIO(), width=160)
     con.print(cc._controls_panel())
     out = con.file.getvalue()
-    for glyph in ("⟳", "≈", "◇"):
+    for glyph in ("⟳", "≈", "◇", "◆"):
         assert glyph in out, glyph
     # ONE content line: the strip slot is 3 rows and a second would be clipped.
     body = [ln for ln in out.splitlines() if ln.startswith("│")]
@@ -381,8 +382,148 @@ def test_window_chip_estimated_is_dim_not_win_loss_colored():
 
 
 def test_build_windows_strip_empty():
-    assert cc.build_windows_strip([]) == "[dim]no resolved windows yet[/dim]"
-    assert cc.build_windows_strip(None) == "[dim]no resolved windows yet[/dim]"
+    assert cc.build_windows_strip([]) == "[dim]no windows traded yet[/dim]"
+    assert cc.build_windows_strip(None) == "[dim]no windows traded yet[/dim]"
+
+
+def test_a_fresh_fill_chips_the_strip_before_its_redeem_posts():
+    """A FILLED window with no verdict yet is the newest thing that happened —
+    it must chip the strip immediately, not stay absent until its redeem row
+    posts (or, on a loss, until the 300s gamma grace expires)."""
+    strip = cc.build_windows_strip(
+        [{"slug": "eth-updown-5m-1787509500", "won": True, "pnl": 4.0, "est": False,
+          "end_ts": 1787509800}],
+        [{"slug": "bnb-updown-5m-1787510100", "notional": 19.44, "won": None,
+          "end_ts": 1787510400}],
+    )
+    assert strip.startswith("[cyan]◆ bnb5 $19[/cyan]")
+    assert "✓ eth5 +4" in strip
+
+
+# ---------- trades table ----------
+#
+# The panel that exists because a real BNB fill (2026-08-23 14:38, window
+# 14:35-14:40) was invisible on the dashboard for nearly four minutes: the arm
+# had rolled, the fire had scrolled off the tape, and the only per-trade view
+# carried decided windows only.
+
+def _trades_text(sb, now=1787510500.0, width=90, limit=None):
+    from rich.console import Console
+
+    c = Console(record=True, width=width)
+    c.print(cc.build_trades_table(sb, now, limit=limit))
+    return c.export_text()
+
+
+def _decided(slug, pnl, end_ts, **kw):
+    row = {"slug": slug, "won": pnl >= 0, "pnl": pnl, "est": False, "end_ts": end_ts,
+           "notional": 10.0, "shares": 10.0, "entry_px": 0.96, "side": "up"}
+    row.update(kw)
+    return row
+
+
+def test_every_decided_window_in_the_scoreboard_renders_a_trades_row():
+    """The guarantee the chip strip could not make: hand the table a
+    scoreboard and every window in it is on screen. A trade that graded is a
+    trade the operator can see."""
+    sb = {"windows": [_decided(f"btc-updown-5m-{1787500000 + i * 300}", i - 3.0,
+                                1787500300 + i * 300) for i in range(6)],
+          "riding_windows": []}
+    out = _trades_text(sb)
+    assert out.count("btc 5m") == 6
+
+
+def test_a_filled_window_renders_before_its_redeem_posts():
+    """THE regression. A win waits on Polymarket's redeem row and a loss posts
+    no row at all until the 300s gamma grace expires; for that whole stretch
+    the window is undecided, and it used to exist on this dashboard only as
+    the header's "riding N windows $W" count."""
+    sb = {"windows": [], "riding_windows": [
+        {"slug": "bnb-updown-5m-1787510100", "won": None, "pnl": None, "est": False,
+         "end_ts": 1787510400, "notional": 19.44, "shares": 20.0,
+         "entry_px": 0.972, "side": "up"}]}
+    out = _trades_text(sb)
+    assert "bnb 5m" in out
+    assert "19.44" in out and "up" in out
+    assert "riding" in out          # no verdict yet — never a fake $0.00 P&L
+    assert "+0.00" not in out
+
+
+def test_trades_title_states_the_retention_cap():
+    sb = {"windows": [_decided("btc-updown-5m-1787500000", 1.0, 1787500300)] * 12,
+          "riding_windows": [{"slug": "bnb-updown-5m-1787510100", "notional": 19.0}] * 2}
+    assert cc.trades_title(sb) == "trades · last 12 decided · 2 riding"
+    assert cc.trades_title({}) == "trades · last 0 decided · 0 riding"
+    assert cc.trades_title(None) == "trades · last 0 decided · 0 riding"
+    # A short panel says how much of the held set it is actually painting.
+    assert cc.trades_title(sb, 6) == "trades · 6 of 14 · 12 decided · 2 riding"
+    assert cc.trades_title(sb, 14) == "trades · last 12 decided · 2 riding"
+
+
+def _riding(slug, end_ts, notional=19.44):
+    return {"slug": slug, "won": None, "pnl": None, "end_ts": end_ts,
+            "notional": notional, "entry_px": 0.97, "side": "up"}
+
+
+def test_a_fresh_fill_tops_the_panel_and_a_short_panel_keeps_it():
+    sb = {"windows": [_decided(f"btc-updown-5m-{1787500000 + i * 300}", 1.0,
+                                1787500300 + i * 300) for i in range(6)],
+          "riding_windows": [_riding("bnb-updown-5m-1787510100", 1787510400)]}
+    rows = cc.trade_rows(sb, limit=2)
+    assert rows[0]["slug"] == "bnb-updown-5m-1787510100"
+    assert len(rows) == 2
+    assert len(cc.trade_rows(sb)) == 7  # no limit: everything
+
+
+def test_a_window_stuck_riding_since_yesterday_does_not_squat_on_the_panel():
+    """Four windows had been undecided for 13-25h on 2026-08-23 ($317 of
+    them). Riding-always-first would have handed them 4 of the panel's 6 rows
+    in perpetuity; the risk header's "riding N windows $W" is where a stuck
+    total belongs, not this panel, which answers "what just happened"."""
+    sb = {"windows": [_decided(f"btc-updown-5m-{1787509500 + i * 300}", 1.0,
+                                1787509800 + i * 300) for i in range(4)],
+          "riding_windows": [_riding(f"eth-updown-5m-{1787420000 + i}", 1787420300 + i)
+                              for i in range(4)]}
+    rows = cc.trade_rows(sb, limit=4)
+    assert all(r["won"] is not None for r in rows), "stale riding crowded out today"
+    # ...and they are still all there, in age order, when nothing is capping.
+    assert len(cc.trade_rows(sb)) == 8
+
+
+def test_age_label_reads_as_time_since_not_a_clock():
+    assert cc._age_label(-30) == "live"      # window still open
+    assert cc._age_label(0) == "0s"
+    assert cc._age_label(45) == "45s"
+    assert cc._age_label(150) == "2m"
+    assert cc._age_label(3600 * 2 + 240) == "2h04"
+
+
+def test_trades_table_tolerates_a_half_built_row():
+    # An engine/data-api seam can leave side or entry unknown; the panel must
+    # still paint, the same rule the arms table lives by.
+    sb = {"windows": [{"slug": "xrp-updown-5m-1787500000", "won": False,
+                       "pnl": -23.19, "end_ts": 1787500300}],
+          "riding_windows": [{"slug": "not-a-slug"}]}
+    out = _trades_text(sb)
+    assert "xrp 5m" in out and "-23.19" in out
+    assert "riding" in out          # the unparseable row still paints a row
+
+
+def test_trades_table_empty_scoreboard_says_so():
+    # The placeholder must FIT its cell — an ellipsized "no trade…" is exactly
+    # the ambiguity this panel exists to remove.
+    assert "no trades" in _trades_text({"windows": [], "riding_windows": []})
+    assert "no trades" in _trades_text(None)
+    assert "…" not in _trades_text(None)
+
+
+def test_trades_table_marks_an_estimated_pnl_and_never_shows_negative_zero():
+    sb = {"windows": [_decided("sol-updown-5m-1787500000", 3.0, 1787500300, est=True),
+                      _decided("eth-updown-5m-1787500000", -0.001, 1787500300)],
+          "riding_windows": []}
+    out = _trades_text(sb)
+    assert "~+3.00" in out
+    assert "-0.00" not in out and "+0.00" in out  # _zero() snaps the residual
 
 
 # ---------- arms table: missing/partial eval tolerance (4d) ----------
