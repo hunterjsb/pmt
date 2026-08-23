@@ -706,10 +706,18 @@ def build_windows_strip(windows: list[dict] | None) -> str:
 # slack in evidence/p_up/mode/rho, each of which is now its longest value
 # ("-100.0/100.0bp", "0.87", "quiesce", "+0.40") rather than a round number.
 # T- keeps 6: an arm placed on a not-yet-open window counts down past "59:59".
+def _arm_label(slug: str) -> str:
+    """`btc 5m` — symbol + duration only. The start clock the tape lines
+    carry would be redundant here: T- counts down to the same instant, and
+    an arms row is always the CURRENT window."""
+    parts = slug.split("-")
+    return f"{parts[0]} {parts[2]}" if len(parts) >= 3 else slug
+
+
 _ARMS_COLUMNS = (
-    ("window", "left", 14),
+    ("arm", "left", 8),
     ("T-", "right", 6),
-    ("state", "left", 34),
+    ("state", "left", 40),
     ("evidence", "right", 14),
     ("p_up", "right", 5),
     ("mode", "left", 7),
@@ -758,7 +766,7 @@ def build_arms_table(arms: dict | None, now: float) -> Table:
         flags = (("⟳" if a.get("roll") else "·")
                  + ("≈" if a.get("feed") == "rtds" else "")
                  + ("◇" if a.get("maker_bid") else ""))
-        t.add_row(_tape_slug(slug), _countdown_markup(slug, now), state,
+        t.add_row(_arm_label(slug), _countdown_markup(slug, now), state,
                   _evidence_markup(e), p_up, _mode_text(e), rho, committed_s, flags)
     if not arms:
         t.add_row("—", "—", "[red]engine unreachable or no arms[/red]",
