@@ -141,7 +141,7 @@ def crypto_window(slug: str) -> None:
     if parsed is None:
         raise click.UsageError(f"not an updown slug: {slug!r} (want e.g. btc-updown-15m-1787449500)")
     start, end = parsed["start"], parsed["end"]
-    dur = f"{parsed['dur_s'] // 60}m"
+    dur = updown_slugs.dur_label(parsed["dur_s"])
 
     addr = _funder_or_usage_error()
 

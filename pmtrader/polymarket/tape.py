@@ -105,6 +105,27 @@ def record_t(raw: str | bytes) -> float | None:
     return None
 
 
+def record_key(raw: str | bytes) -> str | None:
+    """A raw tape line's IDENTITY — canonical JSON, or None if it isn't a
+    record at all.
+
+    `t` alone is not an identity: the engine writes one record per armed token
+    per fleet tick and they all carry that tick's `t` (up to 14 of them). A
+    consumer deduping on `t` keeps the lexically-first slug and throws the rest
+    of the fleet away. Canonical because the same record reaches the watch
+    panel two ways — Rust's compact `serde_json` off the file, Python's
+    spaced `json.dumps` off the control plane — and byte compare would call
+    those two different records.
+    """
+    try:
+        r = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(r, dict):
+        return None
+    return json.dumps(r, sort_keys=True, separators=(",", ":"))
+
+
 def newest_t(path: str, tail_bytes: int = _TAIL_BYTES) -> float | None:
     """The `t` of the newest parseable record in a tape, or None if there
     isn't one (no file, empty file, nothing parseable in the tail).

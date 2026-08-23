@@ -148,6 +148,10 @@ WINDOWS_MAX_ROWS = 16
 WINDOWS_CHROME = 6        # panel border (2) + table border/header/rule (4)
 MIN_TAPE_ROWS = 6         # the tape never gets squeezed below this for a window row
 HEAD_MIN_H = 5            # header border + the four rows it always paints
+# What a Panel costs the renderable inside it: two border columns plus its one
+# space of padding either side. The windows table picks its column set from the
+# room it will actually get, not from the console width.
+PANEL_CHROME_W = 4
 
 
 def windows_rows_shown(console_h: int, n_rows: int,
@@ -259,6 +263,10 @@ class TapeFeed:
         self._stale_after = stale_after
         self._limit = limit
         self._cursor = 0.0
+        # Identities (tape.record_key) of the records already accepted AT
+        # _cursor — see accept(). Bounded by the fleet's arm count, and reset
+        # to empty the moment the cursor moves on.
+        self._seen: set[str] = set()
         self._pending: list[str] = []
         self._remote = False
         self._gap = False
@@ -268,6 +276,16 @@ class TapeFeed:
     def accept(self, raw: str, collapser, lines) -> bool:
         """Gate one raw tape line on the cursor, then render it.
 
+        The gate is `(t, identity)`, NOT `t` alone. The engine writes one
+        record per armed token per fleet tick and every one of them carries
+        that tick's `t` — up to 14. A strictly-increasing `t` cursor keeps the
+        first of each tick and silently throws the rest of the fleet away:
+        measured on the live tape that is 79% of all records, 100% of ROLLs,
+        and four of seven armed symbols that never reach the panel at all.
+        So a record older than the cursor is still refused (a re-read from a
+        stale offset), and a record AT the cursor is refused only when this
+        exact record is already on the panel.
+
         A line with no readable `t` is passed through ungated rather than
         dropped — the collapser has its own opinion about records it can't
         parse, and silently swallowing one here would hide a record the panel
@@ -275,10 +293,16 @@ class TapeFeed:
         """
         t = tape.record_t(raw)
         if t is not None:
+            key = tape.record_key(raw)
             with self._lock:
-                if t <= self._cursor:
+                if t < self._cursor:
                     return False
-                self._cursor = t
+                if t > self._cursor:
+                    self._cursor, self._seen = t, set()
+                elif key is not None and key in self._seen:
+                    return False
+                if key is not None:
+                    self._seen.add(key)
         collapser.add(raw, lines)
         return True
 
@@ -517,10 +541,11 @@ def crypto_watch(since: float | None) -> None:
     def header() -> Panel:
         return build_header_panel(snap, floor_label, render_err)
 
-    def windows_panel(rows: int) -> Panel:
+    def windows_panel(rows: int, width: int) -> Panel:
         sb, arms = snap["sb"], snap["status"].get("arms")
         return Panel(build_windows_table(sb, _t.time(), arms=arms, limit=rows,
-                                         odds=snap.get("odds")),
+                                         odds=snap.get("odds"),
+                                         width=width - PANEL_CHROME_W),
                      title=windows_title(sb, arms, rows),
                      # The "h" hint rides the panel whose glyphs the modal
                      # explains.
@@ -592,14 +617,16 @@ def crypto_watch(since: float | None) -> None:
                     # an unreachable engine and one for a render error; size
                     # the slot to what it will paint or Rich clips the row
                     # that says what broke.
-                    layout["head"].size = header_height(snap, render_err)
+                    layout["head"].size = header_height(
+                        snap, render_err, live.console.size.width)
                     n_win = windows_rows_shown(
                         live.console.size.height,
                         len(window_rows(snap["sb"], snap["status"].get("arms"))),
                         layout["head"].size)
                     layout["windows"].size = n_win + WINDOWS_CHROME
                     layout["head"].update(header())
-                    layout["windows"].update(windows_panel(n_win))
+                    layout["windows"].update(
+                        windows_panel(n_win, live.console.size.width))
                     h = (live.console.size.height - layout["head"].size
                          - layout["windows"].size)
                     layout["tape"].update(tape_panel(h))
@@ -609,7 +636,8 @@ def crypto_watch(since: float | None) -> None:
                 except (Exception, SystemExit) as e:
                     render_err = f"{type(e).__name__}: {e}"[:100]
                     try:
-                        layout["head"].size = header_height(snap, render_err)
+                        layout["head"].size = header_height(
+                            snap, render_err, live.console.size.width)
                         layout["head"].update(header())
                     except Exception:
                         pass
