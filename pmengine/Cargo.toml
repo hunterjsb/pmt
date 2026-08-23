@@ -2,6 +2,7 @@
 name = "pmengine"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.92"
 description = "Rust HFT engine for Polymarket trading"
 
 [package.metadata.cargo-machete]
@@ -11,7 +12,7 @@ ignored = ["openssl"]
 
 [dependencies]
 # Polymarket official SDK
-polymarket_client_sdk_v2 = { version = "0.6.0-canary.1", features = ["clob", "data", "gamma", "ws"] }
+polymarket_client_sdk_v2 = { version = "0.7.0", features = ["clob", "data", "gamma", "ws"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -39,16 +40,16 @@ chrono = { version = "0.4", features = ["serde"] }
 # Crypto
 alloy = { version = "1.4", features = ["signers", "signer-local"] }
 hex = "0.4"
-hmac = "0.12"
-sha2 = "0.10"
-base64 = "0.22"
+hmac = "0.13"
+sha2 = "0.11"
+base64 = "0.23"
 secrecy = "0.10"
 
 # HTTP client (for L2 auth requests; blocking for strategy feed threads)
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.13", features = ["json", "blocking"] }
 
 # Sync WS client for strategy feed threads (Binance trade stream)
-tungstenite = { version = "0.24", features = ["native-tls"] }
+tungstenite = { version = "0.30", features = ["native-tls"] }
 
 # OpenSSL with vendored feature for static linking (avoids version mismatches)
 openssl = { version = "0.10", features = ["vendored"] }
@@ -57,7 +58,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 async-broadcast = "0.7"
 
 # Control plane HTTP server (local introspection + future alert approval)
-axum = "0.7"
+axum = "0.8"
 
 # AWS SigV4 signing (optional, for pmproxy behind an AWS_IAM Function URL)
 aws-config = { version = "1", optional = true }
