@@ -1,6 +1,7 @@
 //! Order management wrapping the Polymarket SDK.
 
 use crate::client::{PolymarketClient, Side};
+use crate::order_tape::OrderTimings;
 use crate::position::Fill;
 use crate::strategy::{Signal, Urgency};
 use rust_decimal::Decimal;
@@ -37,6 +38,21 @@ impl Order {
     }
 }
 
+/// A placed order and the stage stamps its path collected.
+///
+/// The stamps travel back to the caller rather than being written here so
+/// the tape line lands outside every lock the engine holds — and so the
+/// engine can attach the decision id that ties the record to the fire.
+#[derive(Debug, Clone)]
+pub struct Placement {
+    pub order_id: String,
+    /// Price and size as SENT — after the tick rounding, so a tape line
+    /// reports what hit the wire rather than what the strategy asked for.
+    pub price: Decimal,
+    pub size: Decimal,
+    pub timings: OrderTimings,
+}
+
 /// Order manager wraps the SDK and tracks orders.
 pub struct OrderManager {
     client: Arc<PolymarketClient>,
@@ -54,7 +70,7 @@ impl OrderManager {
     }
 
     /// Execute a signal by placing/canceling orders.
-    pub async fn execute(&mut self, signal: Signal) -> Result<Option<String>, OrderError> {
+    pub async fn execute(&mut self, signal: Signal) -> Result<Option<Placement>, OrderError> {
         match signal {
             Signal::Hold => Ok(None),
 
@@ -90,7 +106,11 @@ impl OrderManager {
         price: Decimal,
         size: Decimal,
         _urgency: Urgency,
-    ) -> Result<Option<String>, OrderError> {
+    ) -> Result<Option<Placement>, OrderError> {
+        // Anchor the Phase 7 record here: the tick resolution below is part
+        // of "build", and on a cold token it is the expensive part.
+        let mut timings = OrderTimings::start();
+
         // Round price to the market's actual tick size (Polymarket rejects
         // orders that don't sit on a tick). Default to 2 dp if the tick
         // lookup fails — better to attempt at coarser precision than to
@@ -114,7 +134,7 @@ impl OrderManager {
         // Place order via SDK (handles dry-run internally)
         let order_id = self
             .client
-            .place_limit_order(token_id, side, price, size)
+            .place_limit_order_timed(token_id, side, price, size, &mut timings)
             .await
             .map_err(|e| OrderError::SdkError(e.to_string()))?;
 
@@ -131,7 +151,12 @@ impl OrderManager {
         };
 
         self.orders.insert(order_id.clone(), order);
-        Ok(Some(order_id))
+        Ok(Some(Placement {
+            order_id,
+            price,
+            size,
+            timings,
+        }))
     }
 
     /// Cancel all orders for a token.
@@ -179,6 +204,20 @@ impl OrderManager {
         Ok(())
     }
 
+    /// Mark a tracked order cancelled without issuing the network call.
+    ///
+    /// For callers that drive the CLOB themselves — the delta matcher runs
+    /// its batch of cancels concurrently through the shared client, then
+    /// applies local state here for each one that actually succeeded.
+    /// Never call this for a cancel that failed: a locally-cancelled order
+    /// still live on the book is the ghost `cancel_all` was fixed to avoid
+    /// (docs/LESSONS.md#L6).
+    pub fn mark_cancelled(&mut self, order_id: &str) {
+        if let Some(order) = self.orders.get_mut(order_id) {
+            order.status = OrderStatus::Cancelled;
+        }
+    }
+
     /// Cancel all active orders (for shutdown).
     pub async fn cancel_all_orders(&mut self) -> Result<usize, OrderError> {
         let active: Vec<String> = self
@@ -188,24 +227,38 @@ impl OrderManager {
             .map(|(id, _)| id.clone())
             .collect();
 
-        let count = active.len();
-        if count > 0 {
-            // Batch cancel via SDK
+        let requested = active.len();
+        let mut count = 0usize;
+        if requested > 0 {
+            // Batch cancel via SDK — one request for the whole book.
             let order_refs: Vec<&str> = active.iter().map(|s| s.as_str()).collect();
-            self.client
+            let report = self
+                .client
                 .cancel_orders(&order_refs)
                 .await
                 .map_err(|e| OrderError::SdkError(e.to_string()))?;
 
-            // Update local state
-            for order_id in &active {
-                if let Some(order) = self.orders.get_mut(order_id) {
-                    order.status = OrderStatus::Cancelled;
-                }
+            // Only what the CLOB confirmed is off the book gets marked
+            // cancelled locally; anything it refused is still live and must
+            // keep saying so (docs/LESSONS.md#L6). Refusals are logged loud
+            // rather than returned — an `Err` here would abort the rest of
+            // shutdown (strategy cleanup, final P&L) over orders the
+            // operator now needs the log to go find.
+            count = report.cancelled.len();
+            for order_id in &report.cancelled {
+                self.mark_cancelled(order_id);
+            }
+            if !report.failed.is_empty() {
+                tracing::error!(
+                    requested,
+                    cancelled = count,
+                    still_live = ?report.failed,
+                    "Shutdown cancel left orders ON THE BOOK"
+                );
             }
         }
 
-        tracing::info!(count = count, "Cancelled all orders on shutdown");
+        tracing::info!(requested, count, "Cancelled all orders on shutdown");
         Ok(count)
     }
 

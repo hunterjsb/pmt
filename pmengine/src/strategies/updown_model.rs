@@ -264,7 +264,7 @@ pub(crate) fn eval_model(
                 .per_min
                 .get(&(p.start as i64 - 60))
                 .ok_or("range-start reference not printed yet")?;
-            return eval_terminal(p, now, spot, ref_px, sig_frac, sig_bp, rho, effective_guard_bp);
+            eval_terminal(p, now, spot, ref_px, sig_frac, sig_bp, rho, effective_guard_bp)
         } else {
             let ref_px = *f
                 .per_min

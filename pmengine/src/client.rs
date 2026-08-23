@@ -27,6 +27,7 @@ use secrecy::ExposeSecret;
 use sha2::Sha256;
 
 use crate::config::Config;
+use crate::order_tape::OrderTimings;
 
 use std::sync::Arc;
 #[cfg(feature = "sigv4")]
@@ -54,9 +55,86 @@ pub struct PolymarketClient {
     /// Optional SigV4 signer for pmproxy behind an AWS_IAM Function URL
     #[cfg(feature = "sigv4")]
     sigv4: Option<Arc<SigV4Signer>>,
-    /// Cached tick-size decimal places per token — every price rounds to its
-    /// own market's tick (0.0001/0.001/0.01), never a fixed 2 (docs/LESSONS.md#L3).
-    tick_decimals: Arc<tokio::sync::RwLock<std::collections::HashMap<String, u32>>>,
+    /// Static per-token market metadata, resolved once and kept forever.
+    meta: Arc<TokenMetaCache>,
+}
+
+/// The market facts an order needs that never change for a given token.
+///
+/// Both were being fetched from `clob.polymarket.com` on the order path —
+/// the tick size twice over (once by us to round the price, again inside
+/// the SDK's `build()`), the neg-risk flag inside `sign()`. Three serial
+/// round trips at ~119ms each, which is most of the ~334ms local residual
+/// in `analysis/latency_report.txt` section 7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenMeta {
+    /// Decimal places this market's tick size allows — prices round to
+    /// their own market's tick, never a fixed 2 (docs/LESSONS.md#L3).
+    pub tick_decimals: u32,
+    /// Whether the token settles through the NegRisk adapter. Decides which
+    /// exchange contract the EIP-712 domain signs against, so `sign()`
+    /// cannot proceed without it.
+    pub neg_risk: bool,
+}
+
+/// Outcome of a batch cancel, one entry per requested order.
+#[derive(Debug, Default, Clone)]
+pub struct CancelReport {
+    /// Orders the CLOB confirmed are off the book.
+    pub cancelled: Vec<String>,
+    /// order id -> the reason the CLOB refused. These are still LIVE.
+    pub failed: std::collections::HashMap<String, String>,
+}
+
+/// Per-token metadata cache. No TTL and no invalidation on purpose: a
+/// token's tick size and neg-risk flag are fixed for the token's whole
+/// life, so a refresh could only ever return the same answer. Memory is a
+/// non-issue — a 5-15min window's churn leaves a few hundred entries a day.
+#[derive(Default)]
+pub struct TokenMetaCache {
+    map: tokio::sync::RwLock<std::collections::HashMap<String, TokenMeta>>,
+}
+
+impl TokenMetaCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cached value, or `None` on a cold token. Never touches the network.
+    pub async fn get(&self, token_id: &str) -> Option<TokenMeta> {
+        self.map.read().await.get(token_id).copied()
+    }
+
+    /// Cache-first resolution: a hit never calls `fetch`, and a value once
+    /// stored is never fetched again.
+    ///
+    /// Two simultaneous misses on the same token both fetch — the lookups
+    /// are idempotent GETs and `prewarm_token` makes the race rare, so a
+    /// per-key lock would buy nothing but a way to deadlock the order path.
+    ///
+    /// Generic over the fetch so the never-refetch contract is unit-testable
+    /// without a live CLOB.
+    pub async fn resolve<F, Fut, E>(&self, token_id: &str, fetch: F) -> Result<TokenMeta, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<TokenMeta, E>>,
+    {
+        if let Some(meta) = self.get(token_id).await {
+            return Ok(meta);
+        }
+        let meta = fetch().await?;
+        self.map.write().await.insert(token_id.to_string(), meta);
+        Ok(meta)
+    }
+
+    /// Number of tokens resolved so far.
+    pub async fn len(&self) -> usize {
+        self.map.read().await.len()
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
 }
 
 impl PolymarketClient {
@@ -143,6 +221,13 @@ impl PolymarketClient {
             .build()
             .map_err(|e| ClientError::SdkError(e.to_string()))?;
 
+        // Resolve the CLOB protocol version once, here. The SDK caches it
+        // process-wide but resolves it lazily inside the FIRST order's
+        // `build()`, where it costs that order a full round trip.
+        if let Err(e) = client.version().await {
+            tracing::warn!(error = %e, "CLOB version probe failed — the first order will resolve it");
+        }
+
         tracing::info!(
             signer = %signer.address(),
             funder = ?funder,
@@ -163,37 +248,82 @@ impl PolymarketClient {
             dry_run,
             #[cfg(feature = "sigv4")]
             sigv4: None,
-            tick_decimals: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            meta: Arc::new(TokenMetaCache::new()),
         })
     }
 
-    /// Look up (and cache) how many decimal places this market's tick size
-    /// allows. Used by `place_limit_order` to round each price to the right
-    /// precision instead of the hard-coded 2-decimal default.
-    pub async fn tick_decimals_for(&self, token_id: &str) -> Result<u32, ClientError> {
-        if let Some(d) = self.tick_decimals.read().await.get(token_id).copied() {
-            return Ok(d);
-        }
+    /// Resolve a token's static market metadata, from cache when possible.
+    ///
+    /// The two lookups the order path needs are independent GETs to the same
+    /// host, so a miss fetches them CONCURRENTLY — one round trip of wall
+    /// time, not two. Both calls also prime the SDK's own internal caches,
+    /// which is what stops `build()` refetching the tick size and `sign()`
+    /// refetching the neg-risk flag a few microseconds later.
+    pub async fn token_meta(&self, token_id: &str) -> Result<TokenMeta, ClientError> {
         let token_u256 = U256::from_str(token_id)
             .map_err(|e| ClientError::OrderError(format!("Invalid token_id: {}", e)))?;
-        let resp = self
-            .inner
-            .tick_size(token_u256)
+        self.meta
+            .resolve(token_id, || self.fetch_token_meta(token_u256))
             .await
-            .map_err(|e| ClientError::OrderError(format!("tick_size lookup failed: {}", e)))?;
+    }
+
+    async fn fetch_token_meta(&self, token_u256: U256) -> Result<TokenMeta, ClientError> {
+        let (tick, neg) = tokio::try_join!(
+            self.inner.tick_size(token_u256),
+            self.inner.neg_risk(token_u256),
+        )
+        .map_err(|e| ClientError::OrderError(format!("market meta lookup failed: {}", e)))?;
+
         use polymarket_client_sdk_v2::clob::types::TickSize;
-        let decimals = match resp.minimum_tick_size {
+        let tick_decimals = match tick.minimum_tick_size {
             TickSize::Tenth => 1,
             TickSize::Hundredth => 2,
             TickSize::Thousandth => 3,
             TickSize::TenThousandth => 4,
             _ => 2, // unknown variant — default to coarsest commonly safe value
         };
-        self.tick_decimals
-            .write()
-            .await
-            .insert(token_id.to_string(), decimals);
-        Ok(decimals)
+        Ok(TokenMeta {
+            tick_decimals,
+            neg_risk: neg.neg_risk,
+        })
+    }
+
+    /// Resolve a token's metadata BEFORE any order needs it.
+    ///
+    /// Called when the engine subscribes a token, which happens minutes
+    /// ahead of the first clip (report section 4: window open -> first fire
+    /// is p10 150s). Cost lands there instead of inside decision->ack.
+    /// Best-effort: a failure just leaves the order path to fetch it cold,
+    /// exactly as it did before.
+    pub async fn prewarm_token(&self, token_id: &str) {
+        match self.token_meta(token_id).await {
+            Ok(meta) => {
+                // A V1 CLOB also resolves a per-token fee rate inside
+                // `build()`; V2 carries fees in the market info instead.
+                if self.inner.version().await.unwrap_or(2) == 1 {
+                    if let Ok(t) = U256::from_str(token_id) {
+                        if let Err(e) = self.inner.fee_rate_bps(t).await {
+                            tracing::debug!(error = %e, token_id, "fee-rate prewarm failed");
+                        }
+                    }
+                }
+                tracing::debug!(
+                    token_id,
+                    tick_decimals = meta.tick_decimals,
+                    neg_risk = meta.neg_risk,
+                    "Prewarmed token metadata"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, token_id, "Token metadata prewarm failed");
+            }
+        }
+    }
+
+    /// How many decimal places this market's tick size allows. Cache read
+    /// after the token's first touch — see `token_meta`.
+    pub async fn tick_decimals_for(&self, token_id: &str) -> Result<u32, ClientError> {
+        Ok(self.token_meta(token_id).await?.tick_decimals)
     }
 
     /// Compute L2 HMAC signature for a request.
@@ -233,8 +363,16 @@ impl PolymarketClient {
     }
 
     /// Make an L2-authenticated POST request.
+    ///
+    /// `send_at` is stamped the instant the request is handed to the socket,
+    /// so the Phase 7 tape can separate header/signing work from wire time.
     #[allow(unused_mut)] // mut needed only when sigv4 feature is enabled
-    async fn l2_post<T: serde::de::DeserializeOwned>(&self, path: &str, body: &impl serde::Serialize) -> Result<T, ClientError> {
+    async fn l2_post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl serde::Serialize,
+        send_at: &mut Option<std::time::Instant>,
+    ) -> Result<T, ClientError> {
         let body_str = serde_json::to_string(body)
             .map_err(|e| ClientError::OrderError(format!("JSON serialization failed: {}", e)))?;
 
@@ -263,6 +401,7 @@ impl PolymarketClient {
 
         tracing::debug!(url = %url, path = %path, body_len = body_str.len(), "L2 POST request");
 
+        *send_at = Some(std::time::Instant::now());
         let response = self.http
             .post(&url)
             .headers(headers)
@@ -292,8 +431,29 @@ impl PolymarketClient {
         price: Decimal,
         size: Decimal,
     ) -> Result<String, ClientError> {
+        self.place_limit_order_timed(token_id, side, price, size, &mut OrderTimings::start())
+            .await
+    }
+
+    /// `place_limit_order`, stamping each stage into `t` for the Phase 7
+    /// tape. The stamps are bare `Instant` reads — no allocation, no
+    /// syscall past the clock — so measuring the hot path costs it nothing.
+    pub async fn place_limit_order_timed(
+        &self,
+        token_id: &str,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+        t: &mut OrderTimings,
+    ) -> Result<String, ClientError> {
         if self.dry_run {
             let fake_id = format!("dry_run_{}", chrono::Utc::now().timestamp_millis());
+            // Stamp every stage so a dry-run line is shaped like a real one
+            // and honestly reports the ~0ms path it actually took.
+            let now = std::time::Instant::now();
+            t.sign_done = Some(now);
+            t.send = Some(now);
+            t.ack = Some(now);
             tracing::info!(
                 order_id = %fake_id,
                 token_id = token_id,
@@ -325,13 +485,17 @@ impl PolymarketClient {
             .await
             .map_err(|e| ClientError::OrderError(e.to_string()))?;
 
+        // `sign` resolves the token's neg-risk flag to pick the EIP-712
+        // verifying contract — a cache read once `token_meta` has run.
         let signed = self.inner
             .sign(&self.signer, order)
             .await
             .map_err(|e| ClientError::OrderError(e.to_string()))?;
+        t.sign_done = Some(std::time::Instant::now());
 
         // POST using our own L2 auth (with correct path for HMAC)
-        let response: PostOrderResponse = self.l2_post("/order", &signed).await?;
+        let response: PostOrderResponse = self.l2_post("/order", &signed, &mut t.send).await?;
+        t.ack = Some(std::time::Instant::now());
 
         tracing::info!(
             order_id = %response.order_id,
@@ -395,20 +559,38 @@ impl PolymarketClient {
         Ok(all)
     }
 
-    /// Cancel multiple orders.
-    pub async fn cancel_orders(&self, order_ids: &[&str]) -> Result<(), ClientError> {
+    /// Cancel multiple orders in ONE request.
+    ///
+    /// Polymarket answers per order, and the caller needs that granularity:
+    /// marking a still-live order cancelled is the ghost `cancel_all` was
+    /// fixed to avoid (docs/LESSONS.md#L6). A transport failure is still an
+    /// `Err` — nothing was cancelled; a partial refusal comes back inside
+    /// the report.
+    pub async fn cancel_orders(&self, order_ids: &[&str]) -> Result<CancelReport, ClientError> {
         if self.dry_run {
             tracing::info!(count = order_ids.len(), "[DRY RUN] Would cancel orders");
-            return Ok(());
+            return Ok(CancelReport {
+                cancelled: order_ids.iter().map(|s| s.to_string()).collect(),
+                failed: std::collections::HashMap::new(),
+            });
         }
 
-        self.inner
+        let resp = self
+            .inner
             .cancel_orders(order_ids)
             .await
             .map_err(|e| ClientError::OrderError(e.to_string()))?;
 
-        tracing::info!(count = order_ids.len(), "Orders cancelled");
-        Ok(())
+        tracing::info!(
+            requested = order_ids.len(),
+            cancelled = resp.canceled.len(),
+            refused = resp.not_canceled.len(),
+            "Orders cancelled"
+        );
+        Ok(CancelReport {
+            cancelled: resp.canceled,
+            failed: resp.not_canceled,
+        })
     }
 
     /// Check if in dry run mode.
@@ -795,3 +977,82 @@ impl std::fmt::Display for ClientError {
 }
 
 impl std::error::Error for ClientError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn meta(dp: u32) -> TokenMeta {
+        TokenMeta {
+            tick_decimals: dp,
+            neg_risk: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_token_fetches_once_then_never_again() {
+        let cache = TokenMetaCache::new();
+        let fetches = AtomicUsize::new(0);
+        let fetch = || async {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ()>(meta(3))
+        };
+
+        assert_eq!(cache.resolve("tok", fetch).await, Ok(meta(3)));
+        assert_eq!(fetches.load(Ordering::SeqCst), 1, "the cold miss must fetch");
+
+        for _ in 0..50 {
+            assert_eq!(cache.resolve("tok", fetch).await, Ok(meta(3)));
+        }
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "a cached token must never be refetched — tick size and neg-risk are fixed for its life"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_tokens_do_not_share_an_entry() {
+        let cache = TokenMetaCache::new();
+        cache
+            .resolve("a", || async { Ok::<_, ()>(meta(2)) })
+            .await
+            .unwrap();
+        cache
+            .resolve("b", || async { Ok::<_, ()>(meta(4)) })
+            .await
+            .unwrap();
+        assert_eq!(cache.get("a").await, Some(meta(2)));
+        assert_eq!(cache.get("b").await, Some(meta(4)));
+        assert_eq!(cache.len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_is_not_cached() {
+        let cache = TokenMetaCache::new();
+        assert!(cache.is_empty().await);
+        let err: Result<TokenMeta, &str> =
+            cache.resolve("tok", || async { Err("clob down") }).await;
+        assert_eq!(err, Err("clob down"));
+        assert_eq!(
+            cache.get("tok").await,
+            None,
+            "a failed lookup must leave the token cold, not poison it"
+        );
+        // The next attempt still resolves normally.
+        assert_eq!(
+            cache
+                .resolve("tok", || async { Ok::<_, &str>(meta(2)) })
+                .await,
+            Ok(meta(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_never_fetches() {
+        let cache = TokenMetaCache::new();
+        assert_eq!(cache.get("never-seen").await, None);
+        assert!(cache.is_empty().await);
+    }
+}

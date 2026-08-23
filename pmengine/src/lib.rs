@@ -22,6 +22,7 @@ pub mod control;
 pub mod engine;
 pub mod gamma;
 pub mod order;
+pub mod order_tape;
 pub mod orderbook;
 pub mod position;
 pub mod replay;
@@ -32,7 +33,7 @@ pub mod strategies;
 #[cfg(feature = "sigv4")]
 pub mod sigv4;
 
-pub use client::{ClientError, PolymarketClient, Side};
+pub use client::{ClientError, PolymarketClient, Side, TokenMeta, TokenMetaCache};
 pub use config::Config;
 pub use engine::Engine;
 pub use gamma::{GammaClient, GammaError, GammaMarket};
