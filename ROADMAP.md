@@ -208,6 +208,28 @@ R3 → R5/R6/R1 → R7/R8/R9.
 4. **Two-sided inventory rotator with directional tilt** — the pattern profitable wallets
    actually run at scale; biggest build, needs maker infra first.
 
+## Phase 4 — Market-data leadership & latency telemetry (issue #4, added 2026-08-23)
+
+The full 14-phase spec lives in the issue: common event timestamping (exchange→receive→process),
+multi-venue realtime feeds (Binance/Coinbase/OKX/Bybit WS), the Chainlink reference stream as a
+first-class source, WS-authoritative Polymarket books with measured book-age, an internal
+market-data bus, decision→sign→send→ack→fill latency telemetry, offline lead/lag + predictive-
+leader analysis, post-fill markout (the adverse-selection test), book-age/queue research, an
+execution-location experiment, and event-level replay. Measurement first — no strategy changes.
+
+Sequencing judgment (2026-08-23, post settlement-rule discovery):
+1. **Phase 3 FIRST and urgently** — the Chainlink 60s-TWAP stream is not telemetry, it is THE
+   settlement quantity (terminal rule). The eval_model re-spec should consume it (or its
+   on-chain shadow) directly; every hour without it we price settlement through a Binance
+   proxy plus basis guess.
+2. Phase 1 (event timestamping) + Phase 7 (order-path latency) next — cheap, and the R2/audit
+   fill-ratio findings (72% crossed, re-quote chasing) need exactly this to be diagnosed.
+3. Phase 10 (post-fill markout) — the first-half research already found taker sells are the
+   informed flow; markout tells us if OUR fills are the sucker side.
+4. Multi-venue feeds + bus + the rest follow measurement demand, not upfront.
+Issue constraints adopted: no sizing/policy changes from this work; nothing becomes a live
+signal without the usual replay A/B.
+
 ## Operating rules while the roadmap runs
 
 Posture: keep the braked directional fleet live at current size, instrument everything,
