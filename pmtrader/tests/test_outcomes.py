@@ -2,8 +2,6 @@
 here is inline fixtures (activity rows, synthetic Chainlink rounds, tape lines).
 """
 
-import pytest
-
 from polymarket.outcomes import (
     build_outcomes,
     chainlink_outcome,
