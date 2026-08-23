@@ -89,6 +89,26 @@ pub struct Engine {
     pending_cancellations: Vec<(chrono::DateTime<chrono::Utc>, String)>,
 }
 
+/// One quote the strategies want live this tick, carrying its Phase 7
+/// decision id from the moment it is bucketed — so a fire the delta matcher
+/// suppresses and a fire that reaches the wire are both identifiable on the
+/// same tape.
+struct Desired {
+    signal: Signal,
+    token_id: String,
+    price: Decimal,
+    size: Decimal,
+    decision_id: String,
+}
+
+/// Tape label for a signal's side.
+fn signal_side(signal: &Signal) -> &'static str {
+    match signal {
+        Signal::Sell { .. } => "sell",
+        _ => "buy",
+    }
+}
+
 /// Internal event emitted by the trades poller for the main loop to process.
 #[derive(Debug, Clone)]
 pub struct FillEvent {
@@ -403,6 +423,12 @@ impl Engine {
         self.subscribed_tokens.push(token_id.to_string());
         self.ws_needs_reconnect = true;
         self.ensure_condition_id(token_id).await;
+        // Pull the token's tick size and neg-risk flag now, off the tick —
+        // the order path would otherwise pay for them inside decision->ack.
+        // Spawned, not awaited: nothing this tick needs the answer.
+        let client = self.client.clone();
+        let token = token_id.to_string();
+        tokio::spawn(async move { client.prewarm_token(&token).await });
         tracing::info!(token_id = %token_id, "Subscribed to token");
     }
 
@@ -1213,7 +1239,7 @@ impl Engine {
                         // (`are_orders_scoring` returns false on orders <60s old, roughly).
                         let mut shutdown_requested = false;
                         let mut cancel_tokens: Vec<String> = Vec::new();
-                        let mut desired: Vec<(Signal, String, Decimal, Decimal)> = Vec::new(); // (signal, token, price, size)
+                        let mut desired: Vec<Desired> = Vec::new();
 
                         for signal in signals {
                             match signal {
@@ -1297,23 +1323,35 @@ impl Engine {
                                     // sub-tick wobble in the strategy's target still matches
                                     // an existing aged order.
                                     let size = size.round_dp(2);
-                                    let sig = Signal::Buy {
+                                    let signal = Signal::Buy {
                                         token_id: token_id.clone(),
                                         price,
                                         size,
                                         urgency,
                                     };
-                                    desired.push((sig, token_id, price, size));
+                                    desired.push(Desired {
+                                        signal,
+                                        token_id,
+                                        price,
+                                        size,
+                                        decision_id: crate::order_tape::next_decision_id(),
+                                    });
                                 }
                                 Signal::Sell { token_id, price, size, urgency } => {
                                     let size = size.round_dp(2);
-                                    let sig = Signal::Sell {
+                                    let signal = Signal::Sell {
                                         token_id: token_id.clone(),
                                         price,
                                         size,
                                         urgency,
                                     };
-                                    desired.push((sig, token_id, price, size));
+                                    desired.push(Desired {
+                                        signal,
+                                        token_id,
+                                        price,
+                                        size,
+                                        decision_id: crate::order_tape::next_decision_id(),
+                                    });
                                 }
                             }
                         }
@@ -1323,6 +1361,7 @@ impl Engine {
                         // that token (same side + price + size), keep it alive and remove
                         // it from the "to place" list — that order stays aged. Otherwise
                         // cancel it.
+                        let mut stale: Vec<String> = Vec::new();
                         for token_id in &cancel_tokens {
                             let active: Vec<(String, bool, Decimal, Decimal)> = self
                                 .order_manager
@@ -1339,18 +1378,18 @@ impl Engine {
                                 // re-quote restarts the order-age timer from zero,
                                 // costing far more than the precision gained.
                                 let price_tol = rust_decimal::Decimal::new(5, 4); // 0.0005
-                                let matched_idx = desired.iter().position(|(s, t, p, sz)| {
-                                    t == token_id
-                                        && (*p - price).abs() <= price_tol
-                                        && *sz == size
+                                let matched_idx = desired.iter().position(|d| {
+                                    d.token_id == *token_id
+                                        && (d.price - price).abs() <= price_tol
+                                        && d.size == size
                                         && matches!(
-                                            (s, is_buy),
+                                            (&d.signal, is_buy),
                                             (Signal::Buy { .. }, true) | (Signal::Sell { .. }, false)
                                         )
                                 });
                                 if let Some(i) = matched_idx {
                                     // Already have this order — keep it, drop from desired.
-                                    desired.remove(i);
+                                    let kept = desired.remove(i);
                                     tracing::debug!(
                                         order_id = %id,
                                         token_id = %token_id,
@@ -1358,22 +1397,64 @@ impl Engine {
                                         size = %size,
                                         "Keeping aged order (matches desired quote)"
                                     );
+                                    // Phase 7: a fire that never reaches the wire is
+                                    // still a decision. Section 7 could only count
+                                    // these (8.7% of firings) by their ABSENCE from
+                                    // the log; the tape names them.
+                                    crate::order_tape::record_suppressed(
+                                        &kept.decision_id,
+                                        &kept.token_id,
+                                        signal_side(&kept.signal),
+                                        kept.price,
+                                        kept.size,
+                                        &id,
+                                    );
                                 } else {
-                                    // No matching desired — cancel it.
-                                    if let Err(e) = self.order_manager.cancel_order(&id).await {
-                                        tracing::warn!(error = %e, "Cancel failed for stale order");
-                                    } else {
-                                        self.risk_manager.release_order(&id);
+                                    stale.push(id);
+                                }
+                            }
+                        }
+
+                        // Retire the whole stale set in ONE request. This used to
+                        // be a cancel per order, awaited in turn — a full round
+                        // trip each (~119ms to clob) inside the decision->ack
+                        // window, on every re-quote tick, multiplied by however
+                        // many tokens re-quoted together.
+                        //
+                        // The batch still completes BEFORE any replacement is sent,
+                        // and that ordering is not an accident. The exit path emits
+                        // Cancel(token) + Sell(token @ bid) in the same tick, so a
+                        // sell let loose while our own resting BUY is still live
+                        // would cross it. Same-side replaces cannot self-trade, but
+                        // they do double-count against the server's collateral
+                        // reservation until the cancel lands, which turns a near-cap
+                        // account's re-quote into an HTTP 400. Neither is worth the
+                        // ~119ms: report section 6 prices this whole leg at $41 over
+                        // 11.7h, one to two orders of magnitude under (b) and (c).
+                        if !stale.is_empty() {
+                            let refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
+                            match self.client.cancel_orders(&refs).await {
+                                Ok(report) => {
+                                    for id in &report.cancelled {
+                                        self.order_manager.mark_cancelled(id);
+                                        self.risk_manager.release_order(id);
                                     }
+                                    // Refusals stay active locally on purpose — a
+                                    // locally-cancelled order still on the book is
+                                    // the ghost of docs/LESSONS.md#L6.
+                                    for (id, why) in &report.failed {
+                                        tracing::warn!(order_id = %id, reason = %why, "Stale order refused cancellation");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, count = stale.len(), "Batch cancel of stale orders failed");
                                 }
                             }
                         }
 
                         // Drop the original `signals` iteration and place remaining desired.
-                        let signals_to_place: Vec<Signal> =
-                            desired.into_iter().map(|(s, _, _, _)| s).collect();
-
-                        for signal in signals_to_place {
+                        for d in desired {
+                            let Desired { signal, decision_id, .. } = d;
                             match self.risk_manager.check_signal(&signal, &self.positions) {
                                 RiskCheckResult::Approved(ref s) | RiskCheckResult::Reduced(ref s, _) => {
                                     if let RiskCheckResult::Reduced(_, ref reason) = self.risk_manager.check_signal(&signal, &self.positions) {
@@ -1408,10 +1489,22 @@ impl Engine {
                                         }
                                     };
 
+                                    let side = signal_side(s);
                                     match self.order_manager.execute(s.clone()).await {
-                                        Ok(Some(order_id)) => {
+                                        Ok(Some(placed)) => {
                                             // Confirm the reservation as an open order
-                                            self.risk_manager.confirm_reservation(&reservation_id, &order_id);
+                                            self.risk_manager.confirm_reservation(&reservation_id, &placed.order_id);
+                                            // Phase 7 tape line. Nothing is held here
+                                            // — the write must stay outside every lock.
+                                            crate::order_tape::record_placed(
+                                                &decision_id,
+                                                &token_id,
+                                                side,
+                                                placed.price,
+                                                placed.size,
+                                                &placed.order_id,
+                                                &placed.timings,
+                                            );
                                         }
                                         Ok(None) => {
                                             // Order was not placed (e.g., dry-run mode)
@@ -1447,6 +1540,11 @@ impl Engine {
                             size = %fill.size,
                             "Processing fill"
                         );
+
+                        // Phase 7: close the decision->fill leg locally. Section 1
+                        // could only bound this with a Polygon block; here it is a
+                        // monotonic delta against the same anchor the ack used.
+                        crate::order_tape::record_fill(&fill.order_id, fill.price, fill.size);
 
                         // Update positions
                         self.positions.apply_fill(&fill);
@@ -1846,9 +1944,18 @@ impl Engine {
             .reserve_exposure(&token_id, price * size, &self.positions)
             .ok_or_else(|| "exposure reservation rejected".to_string())?;
         match self.order_manager.execute(signal).await {
-            Ok(Some(order_id)) => {
-                self.risk_manager.confirm_reservation(&reservation_id, &order_id);
-                Ok(order_id)
+            Ok(Some(placed)) => {
+                self.risk_manager.confirm_reservation(&reservation_id, &placed.order_id);
+                crate::order_tape::record_placed(
+                    &crate::order_tape::next_decision_id(),
+                    &token_id,
+                    signal_side(&sig),
+                    placed.price,
+                    placed.size,
+                    &placed.order_id,
+                    &placed.timings,
+                );
+                Ok(placed.order_id)
             }
             Ok(None) => {
                 self.risk_manager.release_reservation(&reservation_id);
