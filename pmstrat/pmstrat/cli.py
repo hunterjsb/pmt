@@ -41,22 +41,25 @@ def print_usage():
   transpile <name> [--all] [--force]     Transpile strategy to Rust
   lint <name> [--all]                    Validate strategy without transpiling
   backtest <strategy.py> [--data FILE]   Run backtest on strategy
-  scan                                   Scan for sure_bets opportunities (live)
+  scan                                   Scan for high-certainty expiring markets (live)
   simulate [--ticks N]                   Run strategy on synthetic data
 
 [bold]Transpile Examples:[/bold]
-  pmstrat transpile sure_bets            Transpile single strategy
+  pmstrat transpile my_strategy          Transpile single strategy
   pmstrat transpile --all                Transpile all & regenerate registry
   pmstrat transpile --all --force        Force transpile even with errors
 
 [bold]Lint Examples:[/bold]
-  pmstrat lint sure_bets                 Check single strategy for issues
+  pmstrat lint my_strategy               Check single strategy for issues
   pmstrat lint --all                     Check all strategies
 
 [bold]Other Examples:[/bold]
-  pmstrat backtest strategies/sure_bets.py
+  pmstrat backtest strategies/my_strategy.py
   pmstrat scan
   pmstrat simulate --ticks 1000
+
+[dim]pmstrat/strategies/ ships empty — the built-in DSL strategies were
+deleted in the 2026-08 engine cleanup. Drop your own module in there.[/dim]
 """)
 
 
@@ -104,10 +107,11 @@ def run_backtest(args: list[str]):
             console.print("[red]No @strategy decorated function found![/red]")
             return
     else:
-        # Default to sure_bets
-        console.print("[dim]Using default sure_bets strategy...[/dim]")
-        from .strategies.sure_bets import on_tick
-        strategy_fn = on_tick
+        # No built-in default any more — the shipped DSL strategies were all
+        # deleted in the 2026-08 engine cleanup, so backtest needs a path.
+        console.print("[red]backtest needs a strategy file path[/red]")
+        console.print("  pmstrat backtest path/to/my_strategy.py")
+        return
 
     # Load or generate data
     if data_path:
@@ -156,7 +160,7 @@ def run_scan(args: list[str]):
 
     import httpx
 
-    console.print("[bold]Scanning for sure_bets opportunities...[/bold]\n")
+    console.print("[bold]Scanning for high-certainty expiring markets...[/bold]\n")
 
     # Parse args
     min_price = 95.0

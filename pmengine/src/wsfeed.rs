@@ -3,10 +3,10 @@
 //! ## Why this exists
 //!
 //! The engine used to open the market WS inline in the main `select!`, inside
-//! a `'reconnect` loop that only re-ran when *market discovery* found new
-//! tokens. Everything that subscribes at RUNTIME — the updown arm/roll, the
-//! market scanner, `pmt engine subscribe` — set a `ws_needs_reconnect` flag
-//! that nothing outside that discovery branch ever read. With no tokens at
+//! a `'reconnect` loop that only re-ran when the engine's blanket market
+//! discovery (since deleted) found new tokens. Everything that subscribes at
+//! RUNTIME — the updown arm/roll, the market scanner, `pmt engine subscribe`
+//! — set a `ws_needs_reconnect` flag that nothing else ever read. With no tokens at
 //! startup the engine logged "No subscriptions, running without WebSocket"
 //! and stayed there for the whole session, so every book the strategies read
 //! came from the 2s REST poller. That is the entire reason the measured book

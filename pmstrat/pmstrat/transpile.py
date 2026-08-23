@@ -1974,7 +1974,6 @@ class StrategyFileInfo:
     """Information extracted from a strategy .rs file."""
     module_name: str
     struct_name: str
-    requires_market_discovery: bool
     # True when the file asks for `pub(crate) mod` instead of a private `mod`.
     pub_crate: bool = False
 
@@ -2018,22 +2017,15 @@ def scan_strategy_file(path: Path) -> StrategyFileInfo | None:
     if struct_name is None:
         return None
 
-    # Detect if market discovery is needed.
-    # The OLD path: `tokens: vec![]` + no market_filter — strategy relies
-    # on the engine's legacy market_discovery_enabled flag to subscribe
-    # to every gamma-discovered market.
-    # The NEW path: strategy declares `fn market_filter()` → the engine's
-    # per-strategy scanner is responsible. Don't turn on the legacy
-    # flag too, or the engine will subscribe to all 400+ markets AND
-    # the scanner's 20 — they fight on every refresh cycle.
-    has_empty_tokens = bool(re.search(r'tokens:\s*vec!\[\s*\]', content))
-    has_market_filter = bool(re.search(r'fn market_filter\(', content))
-    requires_market_discovery = has_empty_tokens and not has_market_filter
-
+    # A strategy that wants the engine to find its markets declares
+    # `fn market_filter()` and the engine's scanner reconciles its token set
+    # every scan interval. The legacy alternative — `tokens: vec![]` plus a
+    # `requires_market_discovery` registry flag that made the engine subscribe
+    # to every gamma-discovered market — was removed with the strategies that
+    # used it; the two paths fought on every refresh cycle when both were on.
     return StrategyFileInfo(
         module_name=module_name,
         struct_name=struct_name,
-        requires_market_discovery=requires_market_discovery,
         pub_crate=bool(PUB_CRATE_MARKER.search(content)),
     )
 
@@ -2092,7 +2084,6 @@ def generate_mod_rs(strategies_dir: Path) -> str:
     for s in strategies:
         registry_entries.append(f'''    m.insert("{s.module_name}", StrategyInfo {{
         factory: || Box::new({s.module_name}::{s.struct_name}::new()),
-        requires_market_discovery: {str(s.requires_market_discovery).lower()},
     }});''')
 
     registry_body = "\n\n".join(registry_entries)
@@ -2119,8 +2110,6 @@ use crate::strategy::Strategy;
 pub struct StrategyInfo {{
     /// Factory function to create a new instance of the strategy.
     pub factory: fn() -> Box<dyn Strategy>,
-    /// Whether this strategy requires market discovery (empty tokens list).
-    pub requires_market_discovery: bool,
 }}
 
 /// Returns the strategy registry - a map of strategy names to their info.

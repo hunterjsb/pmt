@@ -10,7 +10,7 @@ from pmstrat.transpile import (
     scan_strategy_file,
 )
 from pmstrat.dsl import strategy
-from pmstrat import Hold
+from pmstrat import Buy, Hold
 
 
 @strategy(name="test_strategy", tokens=["abc123"])
@@ -92,27 +92,46 @@ def test_transpile_on_fill_on_shutdown():
     assert "fn on_shutdown(&mut self)" in result.rust_code
 
 
-def test_transpile_sure_bets():
-    """Test transpiling the actual sure_bets strategy.
+def test_transpile_full_strategy():
+    """A whole strategy body — market scan, threshold, Buy — end to end.
 
-    This is an integration test that verifies:
-    1. The sure_bets strategy can be transpiled without errors
-    2. Key constructs are correctly converted
+    Used to run against the shipped `sure_bets` module; that and every other
+    built-in DSL strategy was deleted in the 2026-08 engine cleanup, so the
+    same constructs are asserted against an inline strategy instead.
     """
-    from pmstrat.strategies.sure_bets import on_tick
+    from decimal import Decimal
 
-    result = transpile(on_tick)
+    @strategy(
+        name="certainty_taker",
+        tokens=[],
+        params={"MIN_CERTAINTY": Decimal("0.95"), "SIZE": Decimal("10")},
+    )
+    def certainty_taker(ctx):
+        signals = []
+        for token_id, market in ctx.markets.items():
+            book = ctx.book(token_id)
+            if book is None:
+                continue
+            if book.best_ask is None:
+                continue
+            ask = book.best_ask
+            if ask >= MIN_CERTAINTY:  # noqa: F821 — transpiler const
+                signals.append(Buy(token_id, ask, SIZE, "low"))  # noqa: F821
+        return signals
+
+    result = transpile(certainty_taker)
 
     # Basic structure
-    assert result.strategy_name == "sure_bets"
-    assert result.struct_name == "SureBets"
-    assert "pub struct SureBets" in result.rust_code
-    assert "impl Strategy for SureBets" in result.rust_code
+    assert result.strategy_name == "certainty_taker"
+    assert result.struct_name == "CertaintyTaker"
+    assert "pub struct CertaintyTaker" in result.rust_code
+    assert "impl Strategy for CertaintyTaker" in result.rust_code
 
-    # Key patterns from sure_bets are transpiled
+    # The constructs the deleted strategy exercised
     assert "ctx.markets.iter()" in result.rust_code  # markets iteration
     assert "Signal::Buy" in result.rust_code  # Buy signals
     assert "Urgency::" in result.rust_code  # Urgency enum
+    assert "const MIN_CERTAINTY: Decimal = dec!(0.95);" in result.rust_code
 
     # Verify the code compiles (syntax check via string patterns)
     assert "fn on_tick(&mut self, ctx: &StrategyContext)" in result.rust_code

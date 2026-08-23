@@ -6,12 +6,12 @@ use crate::config::Config;
 use crate::control::{
     self, EngineCommand, OrderInfo, StatusReport, StrategyInfo, TradeInfo,
 };
-use crate::gamma::{GammaClient, GammaMarket};
+use crate::gamma::GammaClient;
 use crate::order::OrderManager;
 use crate::orderbook::MarketDataHub;
 use crate::position::{Fill, PositionTracker};
 use crate::risk::{RiskCheckResult, RiskLimits, RiskManager};
-use crate::strategy::{MarketInfo, Signal, StrategyContext, StrategyRuntime};
+use crate::strategy::{Signal, StrategyContext, StrategyRuntime};
 use crate::wsfeed::{WsFeed, WsHealth};
 
 #[cfg(feature = "sigv4")]
@@ -38,16 +38,10 @@ pub struct Engine {
     subscribed_tokens: Vec<String>,
     fill_receiver: mpsc::Receiver<Fill>,
     shutdown: bool,
-    /// Gamma API client for market discovery
-    gamma_client: Option<GammaClient>,
-    /// Market metadata by token ID
-    market_info: HashMap<String, MarketInfo>,
-    /// Whether market discovery is enabled
-    market_discovery_enabled: bool,
     /// The authoritative market-data feed. Subscriptions are incremental, so
     /// a runtime arm/roll adds and drops tokens without touching the socket —
     /// the old `ws_needs_reconnect` flag existed because the WS was rebuilt
-    /// wholesale, and nothing outside market discovery ever acted on it.
+    /// wholesale, and only the since-deleted market-discovery branch acted on it.
     ws_feed: WsFeed,
     /// Shared health of `ws_feed`, read by the REST poller and `/status`.
     ws_health: Arc<WsHealth>,
@@ -71,9 +65,7 @@ pub struct Engine {
     /// the data API. Shared via Arc so the spawned poller can read it
     /// without holding a borrow on the engine.
     token_to_condition: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
-    /// Always-on gamma client used to resolve token_id → condition_id on
-    /// subscription. Independent from the optional `gamma_client` above,
-    /// which is gated by market-discovery mode.
+    /// Gamma client used to resolve token_id → condition_id on subscription.
     gamma_resolver: GammaClient,
     /// Queue of `PendingAlert` awaiting human approval.
     alert_queue: AlertQueue,
@@ -209,9 +201,6 @@ impl Engine {
             subscribed_tokens: Vec::new(),
             fill_receiver,
             shutdown: false,
-            gamma_client: None,
-            market_info: HashMap::new(),
-            market_discovery_enabled: false,
             ws_feed,
             ws_health,
             skip_warmup: false,
@@ -227,164 +216,12 @@ impl Engine {
         })
     }
 
-    /// Enable market discovery with Gamma API.
-    ///
-    /// This allows the engine to dynamically discover markets and subscribe
-    /// to tokens that meet certain criteria (e.g., high-certainty expiring markets).
-    pub fn enable_market_discovery(&mut self) {
-        self.gamma_client = Some(GammaClient::new());
-        self.market_discovery_enabled = true;
-        tracing::info!("Market discovery enabled");
-    }
-
     /// Set whether to skip warmup period.
     ///
     /// When true, the engine will start trading immediately without waiting
     /// for WebSocket order book data. Useful when WS connection is unavailable.
     pub fn set_skip_warmup(&mut self, skip: bool) {
         self.skip_warmup = skip;
-    }
-
-    /// Build market info map from Gamma markets.
-    ///
-    /// IMPORTANT: Only adds the HIGH-CERTAINTY token from each market.
-    /// This prevents the strategy from accidentally buying the wrong outcome
-    /// (e.g., buying "No" at 0.05 instead of "Yes" at 0.95).
-    fn build_market_info(&self, markets: &[GammaMarket]) -> HashMap<String, MarketInfo> {
-        let mut info_map = HashMap::new();
-
-        for market in markets {
-            // Only add the highest-certainty outcome token
-            // This prevents buying the wrong side of a market
-            if let Some(high_cert_idx) = market.highest_certainty_index() {
-                if let (Some(token_id), Some(outcome)) = (
-                    market.clob_token_ids.get(high_cert_idx),
-                    market.outcomes.get(high_cert_idx),
-                ) {
-                    let info = MarketInfo::with_liquidity(
-                        market.question.clone(),
-                        outcome.clone(),
-                        market.slug.clone(),
-                        market.end_date,
-                        market.liquidity,
-                    );
-
-                    tracing::debug!(
-                        question = market.question.as_str(),
-                        outcome = outcome.as_str(),
-                        token_id = token_id.as_str(),
-                        price = ?market.outcome_prices.get(high_cert_idx),
-                        "Adding high-certainty token to market info"
-                    );
-
-                    info_map.insert(token_id.clone(), info);
-                }
-            }
-        }
-
-        info_map
-    }
-
-    /// Maximum hours to expiry for market discovery.
-    /// This is a broader window - strategies will do their own time filtering.
-    const MAX_HOURS_TO_EXPIRY: f64 = 72.0;
-
-    /// Minimum certainty threshold for fetching markets (broad filter).
-    /// Strategies will apply their own stricter filters.
-    const MIN_CERTAINTY: rust_decimal::Decimal = rust_decimal_macros::dec!(0.90);
-
-    /// Refresh markets from Gamma API.
-    ///
-    /// This fetches markets from two sources:
-    /// 1. Events endpoint - for general high-certainty expiring markets
-    /// 2. Series endpoint - for recurring markets (BTC 4h, SPX daily, etc.)
-    ///
-    /// NOTE: The engine provides ALL markets to strategies. Strategies do their
-    /// own filtering based on keywords, liquidity, certainty thresholds, etc.
-    async fn refresh_markets(&mut self) -> Result<(), EngineError> {
-        let gamma = match &self.gamma_client {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-
-        // Fetch from events endpoint (general markets)
-        let event_markets = gamma
-            .fetch_sure_bet_candidates(Self::MAX_HOURS_TO_EXPIRY, Self::MIN_CERTAINTY)
-            .await
-            .map_err(|e| EngineError::SdkError(format!("Gamma API error (events): {}", e)))?;
-
-        tracing::info!(
-            count = event_markets.len(),
-            "Discovered markets from events endpoint"
-        );
-
-        // Fetch from series endpoint (recurring markets like BTC 4h, SPX daily)
-        let recurring_markets = gamma
-            .fetch_recurring_markets(Self::MAX_HOURS_TO_EXPIRY, Self::MIN_CERTAINTY)
-            .await
-            .map_err(|e| EngineError::SdkError(format!("Gamma API error (series): {}", e)))?;
-
-        tracing::info!(
-            count = recurring_markets.len(),
-            "Discovered markets from recurring series"
-        );
-
-        // Merge both sources, deduplicating by slug
-        let mut seen_slugs = std::collections::HashSet::new();
-        let mut markets = Vec::new();
-
-        for market in event_markets.into_iter().chain(recurring_markets) {
-            if seen_slugs.insert(market.slug.clone()) {
-                markets.push(market);
-            }
-        }
-
-        tracing::info!(
-            count = markets.len(),
-            "Total unique markets discovered"
-        );
-
-        // Subscribe ONLY to high-certainty tokens (matching build_market_info logic)
-        let mut new_tokens_found = false;
-
-        for market in &markets {
-            // Only subscribe to the highest-certainty outcome token
-            // This matches build_market_info() and prevents wrong-side subscriptions
-            if let Some(high_cert_idx) = market.highest_certainty_index() {
-                if let Some(token_id) = market.clob_token_ids.get(high_cert_idx) {
-                    if !self.subscribed_tokens.contains(token_id) {
-                        self.market_data.init_book(token_id).await;
-                        self.subscribed_tokens.push(token_id.clone());
-                        self.ws_feed.subscribe(token_id);
-                        new_tokens_found = true;
-                        tracing::debug!(
-                            token_id = token_id.as_str(),
-                            outcome = ?market.outcomes.get(high_cert_idx),
-                            price = ?market.outcome_prices.get(high_cert_idx),
-                            "New high-certainty token discovered"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Update market info with ALL markets (strategies filter themselves)
-        self.market_info = self.build_market_info(&markets);
-
-        tracing::info!(
-            token_count = self.subscribed_tokens.len(),
-            market_count = self.market_info.len(),
-            "Market info updated"
-        );
-
-        if new_tokens_found {
-            tracing::info!(
-                token_count = self.subscribed_tokens.len(),
-                "New tokens discovered, streaming them"
-            );
-        }
-
-        Ok(())
     }
 
     /// Check if running in dry-run mode.
@@ -433,7 +270,7 @@ impl Engine {
     ///
     /// This is the path the updown arm/roll takes every five minutes, and it
     /// is where the WS used to lose: the old code set a reconnect flag that
-    /// only market discovery read.
+    /// only the since-deleted market-discovery branch read.
     pub async fn subscribe_token(&mut self, token_id: &str) {
         if self.subscribed_tokens.iter().any(|t| t == token_id) {
             return;
@@ -527,11 +364,6 @@ impl Engine {
                 EngineError::UnknownStrategy(name.clone())
             })?;
 
-            // Enable market discovery if required
-            if info.requires_market_discovery {
-                self.enable_market_discovery();
-            }
-
             // Create and register the strategy
             let strategy = (info.factory)();
 
@@ -562,11 +394,7 @@ impl Engine {
             }
             self.strategy_runtime.register(strategy);
 
-            tracing::info!(
-                strategy = name.as_str(),
-                requires_market_discovery = info.requires_market_discovery,
-                "Loaded strategy"
-            );
+            tracing::info!(strategy = name.as_str(), "Loaded strategy");
         }
 
         Ok(())
@@ -856,9 +684,8 @@ impl Engine {
                 loop {
                     timer.tick().await;
                     // Build the desired token set by unioning each
-                    // strategy's matched markets. Choose the
-                    // highest-certainty token per market — that's what
-                    // existing discovery does and what strategies expect.
+                    // strategy's matched markets, one highest-certainty
+                    // token per market — never the cheap losing side.
                     let mut desired: std::collections::HashSet<String> = std::collections::HashSet::new();
                     for filter in &scanner_filters {
                         let markets = match gamma.fetch_markets_matching(filter).await {
@@ -888,8 +715,8 @@ impl Engine {
                     let to_add: Vec<String> = desired.difference(&current).cloned().collect();
                     // Skip Unsubscribe for any token a sibling strategy
                     // statically declared. Otherwise the scanner would
-                    // happily drop hanta_maker's Hantavirus token the
-                    // moment it doesn't match momentum_fade's filter.
+                    // happily drop a statically-armed token the moment it
+                    // doesn't match some other strategy's filter.
                     let to_drop: Vec<String> = current
                         .difference(&desired)
                         .filter(|t| !static_subscriptions.contains(*t))
@@ -1057,18 +884,6 @@ impl Engine {
         let mut last_tick = Instant::now();
         let mut tick_count: u64 = 0;
 
-        // Market discovery timer (60 seconds)
-        let mut market_refresh_timer = interval(Duration::from_secs(60));
-        // Skip the first immediate tick
-        market_refresh_timer.tick().await;
-
-        // Do initial market discovery if enabled
-        if self.market_discovery_enabled {
-            if let Err(e) = self.refresh_markets().await {
-                tracing::warn!(error = %e, "Initial market discovery failed");
-            }
-        }
-
         // Book-health heartbeat: one INFO line carrying the WS state and the
         // book-age distribution. This is the number the operator watches — a
         // p50 in the hundreds of ms means the WS is carrying the book, a p50
@@ -1095,15 +910,6 @@ impl Engine {
 
         loop {
             tokio::select! {
-
-                // Market discovery refresh (if enabled). Newly discovered
-                // tokens are streamed the moment they're added — there is
-                // no socket to rebuild any more.
-                _ = market_refresh_timer.tick(), if self.market_discovery_enabled => {
-                    if let Err(e) = self.refresh_markets().await {
-                        tracing::warn!(error = %e, "Market discovery refresh failed");
-                    }
-                }
 
                 // Periodic book-health line.
                 _ = book_health_timer.tick() => {
@@ -1261,7 +1067,13 @@ impl Engine {
                         order_books: books,
                         trade_history: self.market_data.get_all_trade_history().await,
                         positions: self.positions.clone(),
-                        markets: self.market_info.clone(),
+                        // Empty since the legacy gamma-discovery refresh was
+                        // removed — it was the only thing that ever filled
+                        // this map, and only the deleted `sure_bets` /
+                        // `dynamic_market_maker` ever read it. A strategy
+                        // that wants market metadata declares `market_filter()`
+                        // and works off `order_books`.
+                        markets: HashMap::new(),
                         unrealized_pnl: self.positions.total_unrealized_pnl(),
                         realized_pnl: self.positions.total_realized_pnl(),
                         usdc_balance: *self.usdc_balance.read().await,

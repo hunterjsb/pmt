@@ -118,8 +118,12 @@ High-performance Rust trading daemon that manages WebSocket orderbooks, enforces
 
 ```bash
 cd pmengine && cargo build --release --features ec2
-./target/release/pmengine run sure_bets dynamic_market_maker
+./target/release/pmengine run updown
 ```
+
+`updown` (the crypto up/down trigger) is the only registered strategy — the eight dormant
+example strategies that shipped alongside it were deleted in the 2026-08 cleanup. `pmengine
+list` is the live answer.
 
 ### Key Capabilities
 - **Local Control Plane**: `pmt engine status`, `pmt engine strategies`, and `pmt engine subscriptions`.
@@ -147,9 +151,13 @@ Define trading strategies in a clean Python subset, validate with local backtest
 
 ```bash
 cd pmstrat && uv sync
-uv run pmstrat transpile --all    # Transpile Python strategies to Rust
-uv run pmstrat lint sure_bets     # Validate strategy DSL
+uv run pmstrat transpile --all      # Transpile Python strategies to Rust
+uv run pmstrat lint my_strategy     # Validate strategy DSL
 ```
+
+`pmstrat/strategies/` ships empty: every built-in DSL strategy was deleted in the 2026-08
+cleanup, alongside the Rust it transpiled to. Leaving the sources would have let the next
+`transpile --all` put the dead Rust back.
 
 ---
 

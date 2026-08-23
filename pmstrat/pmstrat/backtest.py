@@ -343,9 +343,8 @@ class Backtester:
 
         This is a rough estimate - real rewards depend on competition.
         """
-        # For sure_bets strategy, we're not providing liquidity (we're taking)
-        # So rewards would come from any resting orders we place
-        # For simplicity, estimate based on position value
+        # Assumes a taking strategy: rewards come only from whatever resting
+        # orders it leaves behind, estimated off position value.
         total_position_value = sum(
             (pos.size * pos.avg_entry_price for pos in self.positions.values()),
             Decimal(0),
@@ -359,8 +358,7 @@ class Backtester:
 
     def _is_winning_fill(self, fill: Fill) -> bool:
         """Determine if a fill was profitable (simplified)."""
-        # For sure_bets, a winning buy is one where we bought at < 1.00
-        # and the market resolved to 1.00
+        # Assumes resolution at 1.00, so any buy under par counts as a win.
         if fill.side == "BUY":
             return fill.price < Decimal("1.00")
         return True  # Sells lock in profit
