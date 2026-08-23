@@ -29,7 +29,9 @@ use crate::strategies::updown_model::{
 #[cfg(test)]
 use crate::strategies::updown_model::MAX_SPOT_AGE_S;
 use crate::strategies::updown_oracle;
-use crate::strategies::updown_state::{plan_recovery, ArmStore, ArmsState, RollRecord};
+use crate::strategies::updown_state::{
+    plan_recovery, spawn_unmanaged_check, ArmStore, ArmsState, RollRecord,
+};
 use crate::strategy::{Signal, Strategy, StrategyContext, Urgency};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -1092,6 +1094,9 @@ impl Updown {
                 "updown recovery — window closed while the engine was down, dropping the arm"
             );
         }
+        // Detection only: anything still held on those tokens rode to
+        // resolution with no exit rule running. Fires off-thread.
+        spawn_unmanaged_check(plan.ended);
         self.persist(now);
     }
 

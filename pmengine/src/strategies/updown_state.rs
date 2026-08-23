@@ -8,13 +8,17 @@
 //! could recreate the arm — recovery depended entirely on a human noticing
 //! in time. Nothing logged, nothing alerted.
 //!
-//! `ArmStore` is the durable snapshot; `plan_recovery` is the pure decision
-//! of what to do with each entry on the way back up.
+//! Two halves live here:
+//!   - `ArmStore` + `plan_recovery` — the durable snapshot and the pure
+//!     decision of what to do with each entry on the way back up.
+//!   - `unmanaged_from_positions` + `spawn_unmanaged_check` — the startup
+//!     reconcile that shouts about inventory nobody was managing.
 //!
 //! No plain `pub struct` in this file on purpose (same reason as
 //! updown_model.rs): `pmstrat transpile --all` registers the first one it
 //! finds in strategies/ as a strategy.
 
+use crate::alerts::Notifier;
 use crate::strategies::updown::{next_window, ArmParams};
 use crate::strategies::updown_model::engine_dir;
 use serde::{Deserialize, Serialize};
@@ -23,6 +27,9 @@ use std::path::PathBuf;
 /// Bumped only if the on-disk shape changes incompatibly; a mismatch is
 /// treated as "no state" rather than guessed at.
 const STATE_VERSION: u32 = 1;
+
+/// Sub-share remainders aren't worth paging a human over — clips are 5+.
+const MIN_UNMANAGED_SHARES: f64 = 1.0;
 
 /// One pending roll, flattened for disk. `next_try_at` is deliberately not
 /// persisted: on recovery every task is due immediately.
@@ -210,6 +217,133 @@ pub(crate) fn slug_epoch(slug: &str) -> Option<f64> {
     (t > 1_000_000_000).then_some(t as f64)
 }
 
+/// One position left holding a bag on a window that already resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UnmanagedPosition {
+    pub(crate) slug: String,
+    pub(crate) side: String,
+    pub(crate) token_id: String,
+    pub(crate) size: f64,
+    pub(crate) avg_price: f64,
+}
+
+impl UnmanagedPosition {
+    /// The one line the operator gets, verbatim, in the log and the push.
+    pub(crate) fn message(&self) -> String {
+        format!(
+            "unmanaged position rode to resolution while engine was down: {} {} {}",
+            self.slug, self.side, self.size
+        )
+    }
+}
+
+/// Match ended windows' tokens against a data-api positions payload.
+/// Pure so the matching is testable without a wallet or a network.
+pub(crate) fn unmanaged_from_positions(
+    ended: &[ArmParams],
+    positions: &[serde_json::Value],
+) -> Vec<UnmanagedPosition> {
+    let mut out = Vec::new();
+    for p in ended {
+        for (side, token) in [("up", &p.token_up), ("down", &p.token_down)] {
+            let Some(pos) = positions
+                .iter()
+                .find(|v| v.get("asset").and_then(|a| a.as_str()) == Some(token.as_str()))
+            else {
+                continue;
+            };
+            let size = pos.get("size").and_then(|s| s.as_f64()).unwrap_or(0.0);
+            if size.abs() < MIN_UNMANAGED_SHARES {
+                continue;
+            }
+            out.push(UnmanagedPosition {
+                slug: p.slug.clone(),
+                side: side.to_string(),
+                token_id: token.clone(),
+                size,
+                avg_price: pos.get("avgPrice").and_then(|s| s.as_f64()).unwrap_or(0.0),
+            });
+        }
+    }
+    out
+}
+
+/// Startup reconcile for ended windows: ask the data-api what we still hold
+/// on their tokens and shout about anything non-zero. Detection only — this
+/// never sells; a resolved window can't be traded out of anyway, and one
+/// that resolved against us wants a human, not a reflex.
+///
+/// Runs on its own OS thread: the caller is the engine's async startup path,
+/// and reqwest::blocking must not be driven from a tokio worker (same rule
+/// the replay entry point follows in main.rs).
+pub(crate) fn spawn_unmanaged_check(ended: Vec<ArmParams>) {
+    // Same house rule as ArmStore::live() and install_arm's feeds: a unit
+    // test never reaches the network or the operator's phone. The matching
+    // itself is pure and tested directly.
+    if ended.is_empty() || cfg!(test) {
+        return;
+    }
+    let Ok(funder) = std::env::var("PMENGINE_FUNDER_ADDRESS")
+        .or_else(|_| std::env::var("PM_FUNDER_ADDRESS"))
+    else {
+        tracing::warn!(
+            windows = ended.len(),
+            "windows closed while the engine was down but no funder address is set — \
+             cannot check for unmanaged positions; run `pmt crypto activity` by hand"
+        );
+        return;
+    };
+    std::thread::spawn(move || {
+        let positions = match fetch_positions(&funder) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    err = %e, windows = ended.len(),
+                    "unmanaged-position check FAILED — windows closed while the engine was \
+                     down and their inventory is unverified; run `pmt crypto activity`"
+                );
+                return;
+            }
+        };
+        let hits = unmanaged_from_positions(&ended, &positions);
+        if hits.is_empty() {
+            tracing::info!(
+                windows = ended.len(),
+                "recovery: windows closed while down, no inventory left on them"
+            );
+            return;
+        }
+        let notifier = Notifier::from_env();
+        for u in &hits {
+            tracing::error!(
+                slug = %u.slug, side = %u.side, size = u.size, avg_price = u.avg_price,
+                notional = u.size * u.avg_price, token = %u.token_id,
+                "{}", u.message()
+            );
+            notifier.notify_text_blocking("pmengine: unmanaged position", &u.message());
+        }
+    });
+}
+
+/// Every position the funder holds, straight off the unauthenticated
+/// data-api (same endpoint the engine's own reconcile uses).
+fn fetch_positions(funder: &str) -> Result<Vec<serde_json::Value>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("client: {}", e))?;
+    client
+        .get(format!(
+            "https://data-api.polymarket.com/positions?user={}&sizeThreshold=0",
+            funder
+        ))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("positions: {}", e))?
+        .json()
+        .map_err(|e| format!("positions json: {}", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,4 +507,44 @@ mod tests {
         assert_eq!(slug_epoch("nodashes"), None);
     }
 
+    #[test]
+    fn unmanaged_matches_ended_windows_only() {
+        let ended = vec![params("btc-updown-5m-1787442000", 1787442000.0, 1787442300.0, true)];
+        let positions = vec![
+            serde_json::json!({"asset": "btc-updown-5m-1787442000-u", "size": 42.0, "avgPrice": 0.94}),
+            // A live window's token — not in `ended`, so not reported.
+            serde_json::json!({"asset": "btc-updown-5m-1787442300-u", "size": 30.0, "avgPrice": 0.9}),
+        ];
+        let hits = unmanaged_from_positions(&ended, &positions);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].side, "up");
+        assert_eq!(hits[0].size, 42.0);
+        assert_eq!(
+            hits[0].message(),
+            "unmanaged position rode to resolution while engine was down: \
+             btc-updown-5m-1787442000 up 42"
+        );
+    }
+
+    #[test]
+    fn unmanaged_ignores_dust_and_redeemed_positions() {
+        let ended = vec![params("btc-updown-5m-1787442000", 1787442000.0, 1787442300.0, false)];
+        let positions = vec![
+            serde_json::json!({"asset": "btc-updown-5m-1787442000-u", "size": 0.0, "avgPrice": 0.94}),
+            serde_json::json!({"asset": "btc-updown-5m-1787442000-d", "size": 0.0004, "avgPrice": 0.1}),
+        ];
+        assert!(unmanaged_from_positions(&ended, &positions).is_empty());
+    }
+
+    #[test]
+    fn unmanaged_reports_both_sides_of_a_window() {
+        let ended = vec![params("btc-updown-5m-1787442000", 1787442000.0, 1787442300.0, false)];
+        let positions = vec![
+            serde_json::json!({"asset": "btc-updown-5m-1787442000-u", "size": 20.0, "avgPrice": 0.6}),
+            serde_json::json!({"asset": "btc-updown-5m-1787442000-d", "size": 15.0, "avgPrice": 0.4}),
+        ];
+        let hits = unmanaged_from_positions(&ended, &positions);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[1].side, "down");
+    }
 }
