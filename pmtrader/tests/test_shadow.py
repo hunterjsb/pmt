@@ -443,3 +443,134 @@ def test_build_report_since_filters_old_ticks():
     lines = [_gated(50.0, "s", "basis guard: projected margin +1.0bp", up_ask=0.6, dn_ask=0.4)]
     report = build_report(lines, winners={"s": "up"}, activity_rows=[], since=100.0)
     assert report["totals"]["episodes"] == 0
+
+
+# ---------- the ask a counterfactual clip pays (bughunt 2026-08-24) ----------
+#
+# The ledger used to price every episode at its LOWEST recorded ask. A win pays
+# clip/ask shares and a loss is -clip flat, so that choice inflates missed_wins
+# and cannot move avoided_losses at all — a one-directional thumb on the scale
+# that made every gate read "over-tight". These pin the entry-ask convention
+# and the asymmetry that motivates it.
+
+def test_episode_carries_entry_ask_and_best_ask_separately():
+    ticks = [
+        {"t": 100.0, "slug": "s", "side": "up", "category": "safety", "ask": 0.60, "fair": None, "net": None},
+        {"t": 105.0, "slug": "s", "side": "up", "category": "safety", "ask": 0.10, "fair": None, "net": None},
+        {"t": 110.0, "slug": "s", "side": "up", "category": "safety", "ask": 0.40, "fair": None, "net": None},
+    ]
+    ep = collapse_episodes(ticks)[0]
+    assert ep["entry_ask"] == 0.60, "entry ask is the book at the moment of refusal"
+    assert ep["best_ask"] == 0.10, "best ask is still carried, for diagnostics only"
+
+
+def test_episode_entry_ask_is_chronological_not_list_order():
+    # ticks handed in newest-first still report the OLDEST ask as entry
+    ticks = [
+        {"t": 110.0, "slug": "s", "side": "up", "category": "safety", "ask": 0.40, "fair": None, "net": None},
+        {"t": 100.0, "slug": "s", "side": "up", "category": "safety", "ask": 0.60, "fair": None, "net": None},
+    ]
+    assert collapse_episodes(ticks)[0]["entry_ask"] == 0.60
+
+
+def test_price_episode_prices_at_entry_ask_not_the_episode_minimum():
+    ep = {"slug": "s", "side": "up", "category": "safety",
+          "entry_ask": 0.50, "best_ask": 0.05}
+    out = price_episode(ep, winner="up", clip_notional=25.0)
+    # $25 at 0.50 buys 50 shares; at the 0.05 minimum it would buy 500 and book
+    # roughly ten times the "missed win".
+    assert out["pnl"] == shadow_value(0.50, 25.0, True)
+    assert out["pnl"] < shadow_value(0.05, 25.0, True) / 5.0
+
+
+def test_the_ask_convention_moves_missed_wins_but_never_avoided_losses():
+    """The asymmetry the fix exists for, stated as an invariant."""
+    win_at_entry = shadow_value(0.50, 25.0, True)
+    win_at_min = shadow_value(0.05, 25.0, True)
+    loss_at_entry = shadow_value(0.50, 25.0, False)
+    loss_at_min = shadow_value(0.05, 25.0, False)
+    assert win_at_min > win_at_entry, "a lower ask inflates a missed win"
+    assert loss_at_min == loss_at_entry == -25.0, "a loss is -clip at any ask"
+
+
+def test_unfilled_episode_entry_and_best_ask_are_the_same_volume_weighted_ask():
+    fires = [{"t": 1.0, "slug": "s", "side": "up", "ask": 0.9, "size": 50.0}]
+    ep = unfilled_episodes(fires, fills={("s", "up"): 9.0}, winners={"s": "up"})[0]
+    assert ep["entry_ask"] == ep["best_ask"] == 0.9
+
+
+def test_price_episode_still_prices_an_episode_built_without_an_entry_ask():
+    # older callers hand in best_ask alone; they must not become "unpriced"
+    ep = {"slug": "s", "side": "up", "category": "basis_guard", "best_ask": 0.7}
+    out = price_episode(ep, winner="up", clip_notional=25.0)
+    assert out["status"] == "priced" and out["pnl"] == shadow_value(0.7, 25.0, True)
+
+
+def test_build_report_verdict_follows_the_entry_ask_through_a_falling_book():
+    """End-to-end: a refused side whose ask collapses mid-episode. Priced at
+    the minimum this reads 'over-tight'; priced at entry it reads as a gate
+    paying for itself, on identical input."""
+    lines = [
+        _eval(100.0, "btc-updown-5m-1000",
+              [{"side": "up", "brake": "safety", "ask": 0.50, "fair": 0.6, "net": -0.1}]),
+        _eval(105.0, "btc-updown-5m-1000",
+              [{"side": "up", "brake": "safety", "ask": 0.02, "fair": 0.6, "net": -0.1}]),
+        # a losing refused side, so the category has both halves
+        _eval(100.0, "btc-updown-5m-1000",
+              [{"side": "down", "brake": "safety", "ask": 0.50, "fair": 0.4, "net": -0.2}]),
+    ]
+    report = build_report(lines, winners={"btc-updown-5m-1000": "up"},
+                          activity_rows=[], since=0.0)
+    safety = report["categories"]["safety"]
+    assert safety["priced"] == 2
+    # entry ask 0.50 on a $25 clip -> ~$25 missed, against the $25 avoided:
+    # net stays at or below zero instead of the ~$1,200 the 0.02 minimum books.
+    assert safety["missed_wins"] == shadow_value(0.50, 25.0, True)
+    assert safety["avoided_losses"] == 25.0
+    assert safety["net"] <= 0.0
+    assert verdict(safety) == "paying for itself"
+
+
+# ---------- the right-hand range bound (bughunt 2026-08-24) ----------
+#
+# `--era` scoped the scoreboard and every tape block except this one, so an
+# era's gates table priced the whole tape from its start to now.
+
+def test_iter_ticks_until_is_half_open_on_the_right():
+    lines = [
+        _gated(100.0, "s", "basis guard: projected margin +1.0bp", up_ask=0.6, dn_ask=0.4),
+        _gated(200.0, "s", "basis guard: projected margin +1.0bp", up_ask=0.6, dn_ask=0.4),
+        _gated(300.0, "s", "basis guard: projected margin +1.0bp", up_ask=0.6, dn_ask=0.4),
+    ]
+    assert [tk["t"] for tk in iter_ticks(lines, since=100.0, until=300.0)] == [100.0, 200.0]
+    assert [tk["t"] for tk in iter_ticks(lines, since=100.0)] == [100.0, 200.0, 300.0]
+
+
+def test_iter_fires_shares_the_same_half_open_range():
+    lines = [_fire(100.0, "s", "up", 0.9, 10.0), _fire(300.0, "s", "up", 0.9, 10.0)]
+    assert [f["t"] for f in iter_fires(lines, since=0.0, until=300.0)] == [100.0]
+
+
+def test_build_report_until_confines_a_scoped_report_to_its_own_range():
+    """Two refusals, one inside the scope and one after it. The scoped report
+    must not price the later one."""
+    lines = [
+        _eval(100.0, "btc-updown-5m-1000",
+              [{"side": "up", "brake": "safety", "ask": 0.5, "fair": 0.6, "net": -0.1}]),
+        _eval(900.0, "btc-updown-5m-2000",
+              [{"side": "up", "brake": "safety", "ask": 0.5, "fair": 0.6, "net": -0.1}]),
+    ]
+    winners = {"btc-updown-5m-1000": "up", "btc-updown-5m-2000": "up"}
+    scoped = build_report(lines, winners, activity_rows=[], since=0.0, until=500.0)
+    whole = build_report(lines, winners, activity_rows=[], since=0.0)
+    assert scoped["totals"]["episodes"] == 1
+    assert scoped["coverage"]["windows"] == 1
+    assert whole["totals"]["episodes"] == 2
+    assert scoped["totals"]["missed_wins"] < whole["totals"]["missed_wins"]
+
+
+def test_build_report_until_none_still_reaches_the_end_of_the_tape():
+    lines = [_eval(900.0, "btc-updown-5m-2000",
+                   [{"side": "up", "brake": "safety", "ask": 0.5, "fair": 0.6, "net": -0.1}])]
+    report = build_report(lines, {"btc-updown-5m-2000": "up"}, [], since=0.0, until=None)
+    assert report["totals"]["episodes"] == 1

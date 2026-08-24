@@ -389,7 +389,8 @@ def score_activity(rows: list[dict], floor: float,
     return result
 
 
-def effectiveness_summary(sb: dict, bal: dict | None) -> dict:
+def effectiveness_summary(sb: dict, bal: dict | None,
+                           now: float | None = None) -> dict:
     """polymarket.effectiveness.summary() over a scoreboard's graded windows.
 
     The bankroll denominator is cash PLUS notional still riding: the CLOB's
@@ -400,11 +401,20 @@ def effectiveness_summary(sb: dict, bal: dict | None) -> dict:
 
     The watch header calls this on its own snapshot too, so the dashboard and
     the report grade the same windows against the same bankroll.
+
+    `now` is the CLOCK the calendar-time metrics (bankroll growth,
+    utilization) end at, and defaults to the real one. A CLOSED era passes
+    its own boundary instead: those two metrics divide by wall-clock span, so
+    running the clock past the era's end stretches the denominator and
+    flatters the rate. Live 2026-08-24, `--era brakes` — a 2.8h era — billed
+    itself 34.2h of calendar time (12.2x), reporting -6.1%/day where its own
+    clock says -53.9%/day.
     """
     cash = float((bal or {}).get("total") or 0.0)
     bankroll = cash + float(sb.get("riding_usd") or 0.0)
     return effectiveness.summary(sb.get("eff_windows") or [],
-                                  bankroll=bankroll or None, now=time.time())
+                                  bankroll=bankroll or None,
+                                  now=time.time() if now is None else now)
 
 
 def era_scoreboards(rows: list[dict], tape_records: list[dict] | None = None,
@@ -546,13 +556,18 @@ def crypto_stats(since: float | None, full: bool, gates: bool,
     except Exception:
         pass
 
-    eff_s = effectiveness_summary(sb, bal)
+    # A scope that has CLOSED is measured on its own clock, not on the wall
+    # clock — see effectiveness_summary. The running era's ceiling is +inf,
+    # which is the live clock and stays it.
+    scope_end = None if ceiling is None or ceiling == float("inf") else ceiling
+    eff_s = effectiveness_summary(sb, bal, now=scope_end)
     blocks = _stats_blocks(sb, status, floor, ceiling=ceiling)
     # Same rows, same tape: the era table is the third consumer of the one
     # walk, not a second walk of its own.
     era_rows = (era_scoreboards(sb.get("activity") or [], tape_records=tape_records)
                 if show_eras else None)
-    gates_report = _gates_report(sb.pop("activity", []), floor) if gates else None
+    gates_report = (_gates_report(sb.pop("activity", []), floor, scope_end)
+                    if gates else None)
 
     # The chip beside all-time names the era the report is LOOKING THROUGH:
     # the scoped one under --era, otherwise the era the clock is in.
@@ -587,7 +602,8 @@ def crypto_stats(since: float | None, full: bool, gates: bool,
                                              eras_omitted=not show_eras))
 
 
-def _gates_report(activity: list[dict], since_epoch: float) -> dict:
+def _gates_report(activity: list[dict], since_epoch: float,
+                   until_epoch: float | None = None) -> dict:
     """The shadow ledger behind `pmt crypto stats --gates`.
 
     Every refused side on the decision tape — basis-guard gates, the
@@ -606,6 +622,13 @@ def _gates_report(activity: list[dict], since_epoch: float) -> dict:
 
     `activity` is the caller's already-walked wallet history, not a fresh
     fetch: this runs as one section of a report that has already paid for it.
+
+    `until_epoch` closes the range on the right — the era ceiling every OTHER
+    block on this report is already folded under (`_stats_blocks._under`).
+    Without it `--era` scoped the report but not this block, so a 2.8h era's
+    gates table priced 11,051 episodes against its own 381: the whole tape
+    from the era's start to now, reading net +$39,280 where the era itself
+    was -$541 (2026-08-24).
     """
     from polymarket import chainlink as ck
     from polymarket import outcomes, shadow
@@ -637,4 +660,8 @@ def _gates_report(activity: list[dict], since_epoch: float) -> dict:
     outcomes.write_outcomes(merged)
     winners = {slug: row["winner"] for slug, row in merged.items()}
 
-    return shadow.build_report(lines, winners, activity, since=since_epoch)
+    # The corpus refresh above stays UNSCOPED on purpose — it is a service to
+    # the whole box and resolving more windows can only help every consumer.
+    # `until` scopes what gets PRICED, which is the only era-specific part.
+    return shadow.build_report(lines, winners, activity, since=since_epoch,
+                                until=until_epoch)

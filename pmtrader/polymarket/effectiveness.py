@@ -135,6 +135,33 @@ def win_rate(windows: Sequence[dict]) -> float | None:
     return sum(1 for w in windows if w.get("won")) / len(windows)
 
 
+def by_settlement(windows: Sequence[dict]) -> list[dict]:
+    """Windows in settlement order — THE order, so every consumer counting a
+    run counts the same one.
+
+    Sorted by `end_ts` and then by `slug`, and the slug is load-bearing rather
+    than cosmetic. Whole series settle on the same :00/:05 boundary, so the
+    key is massively tied: 170 tied groups covering 460 of 590 windows live on
+    2026-08-24. Python's sort is stable, so a tie fell through to the caller's
+    order — which for the scoreboard is `win_by_slug` insertion order, i.e.
+    the order data-api's pages happened to return the rows in. wallet.py's own
+    docstring is that those pages seam-shift and mutate between walks.
+
+    The number that came out was therefore not reproducible: shuffling only
+    within ties, `streak(...)["longest"]` flipped 107 <-> 108 on roughly half
+    of 400 draws, and `pmt crypto stats` printed "best 107" as a coin flip.
+    The journal is worse off still — it stamps `streak:{n}:{slug}` into a
+    permanent file, so a re-ordered walk names a different window for the same
+    crossing and writes the milestone a second time.
+
+    Within one settlement second the true order is genuinely unknown, so no
+    tiebreak is more correct than another; what matters is that one is FIXED,
+    and the slug is the only stable identity a window has.
+    """
+    return sorted(windows, key=lambda w: (float(w.get("end_ts") or 0.0),
+                                           str(w.get("slug") or "")))
+
+
 def streak(windows: Sequence[dict]) -> dict:
     """{"current", "longest"} consecutive wins, ordered by settlement.
 
@@ -144,11 +171,12 @@ def streak(windows: Sequence[dict]) -> dict:
     from the newest settled window, so a loss most recently makes it 0 —
     which is the honest answer, not a hidden number.
 
-    Ordered by `end_ts` here rather than trusting caller order: the
+    Ordered by `by_settlement` rather than trusting caller order: the
     scoreboard builds its window list from a dict, so arrival order is
-    insertion order, not time.
+    insertion order, not time — and see that function for why the tiebreak
+    inside a settlement second decides the printed number.
     """
-    ordered = sorted(windows, key=lambda w: float(w.get("end_ts") or 0.0))
+    ordered = by_settlement(windows)
     longest = run = 0
     for w in ordered:
         run = run + 1 if w.get("won") else 0

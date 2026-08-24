@@ -165,3 +165,33 @@ def test_fleet_sums_what_the_cap_actually_refused():
                            {"side": "down", "brake": "safety", "fleet_blocked": 99.0}]),
              _eval(sides=[{"side": "up", "brake": "fleet", "fleet_blocked": 40.88}])]
     assert abs(us.fleet_summary(evals, 350.0)["blocked_usd"] - 100.88) < 1e-9
+
+
+# ---------- the fleet cap must not be restated as a peak (bughunt 2026-08-24) ----------
+
+def _room(t, room):
+    return {"ev": "eval", "t": t, "slug": "btc-updown-5m-1000", "fleet_room": room,
+            "sides": []}
+
+
+def test_fleet_peak_is_measured_when_the_cap_held_all_range():
+    evals = [_room(1.0, 100.0), _room(2.0, 40.0), _room(3.0, 90.0)]
+    out = us.fleet_summary(evals, cap=110.0)
+    assert out["cap_moved"] is False
+    assert out["peak_undecided"] == 70.0
+
+
+def test_fleet_peak_is_refused_when_a_tick_had_more_room_than_the_whole_cap():
+    """Headroom above the ration is proof the range spans a bigger, earlier
+    cap. Live: the cap walked 350->500->...->110 while min(room) was 0, so
+    `cap - min(room)` printed the cap back ($110) as if it were a measurement,
+    against a true worst of $500."""
+    evals = [_room(1.0, 500.0), _room(2.0, 0.0)]
+    out = us.fleet_summary(evals, cap=110.0)
+    assert out["cap_moved"] is True
+    assert out["peak_undecided"] is None, "a dash, not the cap restated"
+
+
+def test_fleet_peak_none_distinguishes_no_ticks_from_a_moved_cap():
+    empty = us.fleet_summary([], cap=110.0)
+    assert empty["peak_undecided"] is None and empty["cap_moved"] is False

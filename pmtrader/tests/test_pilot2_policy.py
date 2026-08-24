@@ -155,3 +155,32 @@ def test_realized_pnl_is_the_replays_accounting():
     assert policy.realized_pnl(shares, ask, True) == shares * (1.0 - ask - fee)
     assert policy.realized_pnl(shares, ask, False) == shares * (0.0 - ask - fee)
     assert policy.realized_pnl(shares, ask, False) < -shares * ask, "fees on top of the wipeout"
+
+
+# ---------- the graded ledger is one fee schedule (bughunt 2026-08-24) ----------
+#
+# graded.jsonl is append-only and idempotent by (slug, side): a row is priced
+# once, at whatever taker_fee said that day, and never revisited. When 1ff4b59
+# replaced `rate*min(p,1-p)` with the measured `rate*p*(1-p)`, the live file was
+# left holding both — 102 of 423 rows on the retired shape — and the cumulative
+# summed two schedules together.
+
+def test_reprice_ignores_the_stored_pnl_and_re_derives_from_the_row():
+    row = {"shares": 10.0, "ask": 0.5, "won": True, "pnl": -999.0}
+    assert policy.reprice(row) == policy.realized_pnl(10.0, 0.5, True)
+
+
+def test_reprice_restates_a_row_priced_on_the_retired_min_fee_shape():
+    """The retired shape over-charged by 1/max(p, 1-p) — exactly 2x at p=0.50."""
+    shares, ask = 10.0, 0.5
+    retired_fee = 0.07 * min(ask, 1.0 - ask)          # rate * min(p, 1-p)
+    stale = shares * (1.0 - ask - retired_fee)
+    row = {"shares": shares, "ask": ask, "won": True, "pnl": stale}
+    assert policy.reprice(row) > stale, "the retired shape over-charged"
+    # the whole gap is the doubled fee on those shares
+    assert policy.reprice(row) - stale == pytest.approx(shares * retired_fee / 2.0)
+
+
+def test_reprice_handles_a_loss_and_a_row_missing_its_inputs():
+    assert policy.reprice({"shares": 10.0, "ask": 0.5, "won": False}) < 0
+    assert policy.reprice({}) == 0.0

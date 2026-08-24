@@ -18,10 +18,23 @@ Method, per ROADMAP's shadow-ledger spec:
   2. Ticks sharing (window, side, category) collapse into EPISODES — the
      tape re-records every ~5s, so a >20s gap means the refusal cleared and
      came back, not one continuous stretch.
-  3. Each episode prices as ONE hypothetical clip at its best (lowest)
-     recorded ask, sized at that window's real clip notional (inferred from
-     its actual fires) or the arm default. WIN pays $1/share net of fee;
-     LOSS forfeits the whole clip.
+  3. Each episode prices as ONE hypothetical clip at its ENTRY ask — the
+     first ask recorded in the episode, i.e. the price on the book at the
+     moment the gate said no — sized at that window's real clip notional
+     (inferred from its actual fires) or the arm default. WIN pays $1/share
+     net of fee; LOSS forfeits the whole clip.
+
+     NOT the episode's lowest ask, which is what this priced on until
+     2026-08-24 and which biases the ledger in ONE direction only. A win
+     pays `clip/ask` shares, so it grows without bound as the ask falls; a
+     loss is `-clip` flat, untouched by the ask. Taking the minimum over an
+     episode therefore inflates `missed_wins` and cannot move
+     `avoided_losses` by a cent. Measured on the live tape (10,385 priced
+     episodes): min-ask reported net +$40,514 ("every gate over-tight"),
+     while the entry ask on the SAME episodes reports -$16,238, the median
+     ask -$22,854 and the last ask -$29,052. The convention, not the gates,
+     was producing the verdict. `best_ask` is still carried for diagnostics
+     and is never what prices a clip.
   4. `unfilled_fires` is a separate, simpler category: the gap between a
      window's intended fire notional and what the wallet shows actually
      filled — no gap-collapsing needed, a window's fires already are the
@@ -113,7 +126,8 @@ def _load(line: str) -> dict | None:
     return r if isinstance(r, dict) else None
 
 
-def iter_ticks(lines: Iterable[str], since: float = 0.0) -> Iterator[dict]:
+def iter_ticks(lines: Iterable[str], since: float = 0.0,
+                until: float | None = None) -> Iterator[dict]:
     """Refusal ticks from raw `updown-tape.jsonl` lines: {t, slug, side,
     category, ask, fair, net}.
 
@@ -124,13 +138,16 @@ def iter_ticks(lines: Iterable[str], since: float = 0.0) -> Iterator[dict]:
     line pre-dating up_ask/dn_ask, or an eval side with no live book —
     callers roll those into the 'unpriced' coverage bucket rather than
     dropping them silently.
+
+    `until` closes the range on the right (half-open [since, until)), which is
+    what an era-scoped report needs — see build_report.
     """
     for raw in lines:
         r = _load(raw)
         if r is None:
             continue
         t, slug = r.get("t"), r.get("slug")
-        if t is None or not slug or t < since:
+        if t is None or not slug or t < since or (until is not None and t >= until):
             continue
         ev = r.get("ev")
         if ev == EV_GATED:
@@ -151,15 +168,20 @@ def iter_ticks(lines: Iterable[str], since: float = 0.0) -> Iterator[dict]:
                        "ask": s.get("ask"), "fair": s.get("fair"), "net": s.get("net")}
 
 
-def iter_fires(lines: Iterable[str], since: float = 0.0) -> Iterator[dict]:
-    """Fire ticks from raw tape lines: {t, slug, side, ask, size}."""
+def iter_fires(lines: Iterable[str], since: float = 0.0,
+                until: float | None = None) -> Iterator[dict]:
+    """Fire ticks from raw tape lines: {t, slug, side, ask, size}.
+
+    Same half-open [since, until) range as iter_ticks — the two must agree or
+    an era's clip sizing would be inferred from fires outside it.
+    """
     for raw in lines:
         r = _load(raw)
         if r is None or r.get("ev") != EV_FIRE:
             continue
         t, slug, side = r.get("t"), r.get("slug"), r.get("side")
         ask, size = r.get("ask"), r.get("size")
-        if t is None or not slug or t < since:
+        if t is None or not slug or t < since or (until is not None and t >= until):
             continue
         if side not in ("up", "down") or ask is None or size is None:
             continue
@@ -197,9 +219,12 @@ def collapse_episodes(ticks: list[dict], gap_s: float = EPISODE_GAP_S) -> list[d
     """Group ticks sharing (slug, side, category) into episodes: consecutive
     in time, split whenever the gap to the previous tick exceeds gap_s.
 
-    Each episode: {slug, side, category, start, end, n_ticks, best_ask,
-    last_fair, last_net}. best_ask is the lowest recorded ask seen in the
-    episode (None if every tick in it lacked one).
+    Each episode: {slug, side, category, start, end, n_ticks, entry_ask,
+    best_ask, last_fair, last_net}. `entry_ask` is the FIRST recorded ask —
+    what the clip would have paid at the moment of refusal, and the only one
+    that prices it. `best_ask` is the lowest ask seen, carried for
+    diagnostics only (module docstring §3: it is one-directional). Both are
+    None if every tick in the episode lacked an ask.
     """
     by_key: dict[tuple[str, str, str], list[dict]] = {}
     for tk in ticks:
@@ -220,13 +245,28 @@ def collapse_episodes(ticks: list[dict], gap_s: float = EPISODE_GAP_S) -> list[d
 
 
 def _finish_episode(slug: str, side: str, category: str, tks: list[dict]) -> dict:
+    # tks arrives sorted by t (collapse_episodes sorts before running), so the
+    # first ask here is the ask at the moment the gate refused.
     asks = [t["ask"] for t in tks if t.get("ask") is not None]
     return {
         "slug": slug, "side": side, "category": category,
         "start": tks[0]["t"], "end": tks[-1]["t"], "n_ticks": len(tks),
+        "entry_ask": asks[0] if asks else None,
         "best_ask": min(asks) if asks else None,
         "last_fair": tks[-1].get("fair"), "last_net": tks[-1].get("net"),
     }
+
+
+def priced_ask(ep: dict) -> float | None:
+    """The ask one episode's hypothetical clip pays.
+
+    `entry_ask` — the book at the moment of refusal. Falls back to
+    `best_ask` only for an episode dict built without one (older callers,
+    and `unfilled_episodes`, which has a single volume-weighted ask and sets
+    both to it).
+    """
+    ask = ep.get("entry_ask")
+    return ep.get("best_ask") if ask is None else ask
 
 
 # ---------- clip sizing ----------
@@ -251,15 +291,19 @@ def price_episode(ep: dict, winner: str | None, clip_notional: float) -> dict:
     status: "unpriced" (no recorded ask — can't price regardless of outcome),
     "unresolved" (priceable but the window's winner isn't known — never
     guessed), or "priced" (both known; `won`/`pnl` are set).
+
+    Prices at `priced_ask(ep)` — the entry ask, never the episode's minimum.
+    See the module docstring §3 for the measured size of that difference.
     """
-    if ep["best_ask"] is None:
+    ask = priced_ask(ep)
+    if ask is None:
         return {**ep, "status": "unpriced", "clip_notional": clip_notional,
                 "won": None, "pnl": None}
     if winner is None:
         return {**ep, "status": "unresolved", "clip_notional": clip_notional,
                 "won": None, "pnl": None}
     won = ep["side"] == winner
-    pnl = shadow_value(ep["best_ask"], clip_notional, won)
+    pnl = shadow_value(ask, clip_notional, won)
     return {**ep, "status": "priced", "clip_notional": clip_notional, "won": won, "pnl": pnl}
 
 
@@ -311,7 +355,10 @@ def unfilled_episodes(fires: list[dict], fills: dict[tuple[str, str], float],
         ep = {
             "slug": slug, "side": side, "category": "unfilled_fires",
             "start": min(f["t"] for f in fs), "end": max(f["t"] for f in fs),
-            "n_ticks": len(fs), "best_ask": avg_ask,
+            "n_ticks": len(fs),
+            # One volume-weighted ask across the window's fires — already the
+            # price actually asked for, so entry and best are the same number.
+            "entry_ask": avg_ask, "best_ask": avg_ask,
             "last_fair": None, "last_net": None,
         }
         clip_notional = unfilled_shares * avg_ask
@@ -360,18 +407,24 @@ def verdict(cat_stats: dict) -> str:
 def build_report(tape_lines: Iterable[str], winners: dict[str, str], activity_rows: list[dict],
                   since: float = 0.0, min_fair: float = DEFAULT_MIN_FAIR,
                   min_edge: float = DEFAULT_MIN_EDGE, default_clip: float = DEFAULT_CLIP_USDC,
-                  gap_s: float = EPISODE_GAP_S) -> dict:
+                  gap_s: float = EPISODE_GAP_S, until: float | None = None) -> dict:
     """Full shadow ledger: categorized episodes -> per-category summary,
     grand totals, and a coverage note. Pure given the tape lines already
     read and `winners` already resolved — all I/O lives in cli.py.
+
+    The range is half-open [since, until) on the tape's own record time, the
+    same convention `_stats_blocks` folds its blocks under. `until=None` runs
+    to the end of the tape, which is every caller but `--era`: without it a
+    2.8-hour era's gates table priced 11,051 episodes instead of its own 381
+    — the whole tape from the era's start to now, 29x over (2026-08-24).
     """
     lines = list(tape_lines)
 
-    raw_ticks = list(iter_ticks(lines, since))
+    raw_ticks = list(iter_ticks(lines, since, until))
     ticks = categorize_ticks(raw_ticks, min_fair, min_edge)
     episodes = collapse_episodes(ticks, gap_s)
 
-    fires = list(iter_fires(lines, since))
+    fires = list(iter_fires(lines, since, until))
     fires_by_slug: dict[str, list[dict]] = {}
     for f in fires:
         fires_by_slug.setdefault(f["slug"], []).append(f)
