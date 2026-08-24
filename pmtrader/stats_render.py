@@ -272,8 +272,11 @@ def _fleet_cells(fleet: dict | None) -> tuple | None:
         return None
     peak, cap = fleet.get("peak_undecided"), fleet["cap"]
     if peak is None:
-        return ("fleet cap", f"[dim]${cap:,.0f}[/dim]", "",
-                "[dim]no capped ticks in range[/dim]")
+        # Two different Nones: nothing to measure, vs a range this tape cannot
+        # price because the cap moved inside it (updown_stats.fleet_summary).
+        why = ("cap moved in range — peak unmeasurable"
+               if fleet.get("cap_moved") else "no capped ticks in range")
+        return ("fleet cap", f"[dim]${cap:,.0f}[/dim]", "", f"[dim]{why}[/dim]")
     style = "yellow" if peak >= cap * 0.9 else "dim"
     tail = f"[dim]over {fleet['ticks']:,} ticks[/dim]"
     if fleet.get("blocked_usd", 0.0) > 0.5:

@@ -185,9 +185,22 @@ def fleet_summary(evals: Sequence[dict], cap: float | None) -> dict:
     was off for the whole range, not that exposure was zero.
 
     Peak un-decided is `cap - min(fleet_room)`, measured against the cap in
-    force NOW. A cap changed mid-range would misprice the older ticks; that
-    is why `ticks` is reported beside it rather than the number standing
-    alone.
+    force NOW — which is only meaningful if that cap was in force for the
+    whole range.
+
+    IT OFTEN IS NOT, AND THEN THE NUMBER IS REFUSED. The engine records the
+    remaining headroom, not the cap that produced it, so a range spanning a
+    cap change cannot be priced from this tape. `max(fleet_room) > cap` is
+    PROOF of that — no tick can have more headroom than the whole ration —
+    and the answer is a dash, not an arithmetic result (`cap_moved` says
+    which of the two None cases it is).
+
+    Reporting it anyway was live-wrong on 2026-08-24. The cap walked
+    350 -> 500 -> 333 -> 150 -> 200 -> 365 -> 200 -> 110 across one tape;
+    `min(fleet_room)` was 0.0 (last touched under a $200 cap, and earlier
+    under $500), so the report printed "cap $110 · peak un-decided $110" —
+    which is just the cap restated, while the fleet's true worst simultaneous
+    un-decided exposure was $500. A risk line understating the worst by 4.5x.
     """
     rooms = [float(r["fleet_room"]) for r in evals if r.get("fleet_room") is not None]
     blocked = 0.0
@@ -196,5 +209,7 @@ def fleet_summary(evals: Sequence[dict], cap: float | None) -> dict:
             if isinstance(s, dict) and s.get("brake") == "fleet":
                 blocked += float(s.get("fleet_blocked") or 0.0)
     cap = float(cap or 0.0)
+    cap_moved = bool(rooms) and cap > 0 and max(rooms) > cap
+    peak = (cap - min(rooms)) if (rooms and cap > 0 and not cap_moved) else None
     return {"cap": cap, "ticks": len(rooms), "blocked_usd": blocked,
-            "peak_undecided": (cap - min(rooms)) if (rooms and cap > 0) else None}
+            "cap_moved": cap_moved, "peak_undecided": peak}
