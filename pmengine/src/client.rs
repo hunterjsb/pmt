@@ -203,6 +203,41 @@ impl TokenMetaCache {
     }
 }
 
+/// How long an idle pooled connection survives before hyper reaps it.
+///
+/// reqwest's default is 90s. The order path is only ever fast because it
+/// finds a WARM connection: `analysis/order_latency_eu.md` measures a cold
+/// TCP+TLS handshake to the CLOB at ~18ms (1.7ms connect + 16ms TLS), which
+/// an order would pay in full. Today nothing drops out of the pool only
+/// because the REST book poller happens to run every 10s — an accident of
+/// `PMENGINE_BOOK_POLL_SLOW_MS`, not a property of the order path. Five
+/// minutes spans a whole quiet window between arms, so the first fire of a
+/// new window meets an open connection whatever the poller is doing.
+const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The order path's HTTP client.
+///
+/// Its settings are money-path invariants, pinned here rather than inherited
+/// from reqwest's defaults: a default that changes under a version bump would
+/// change order latency silently, and this is the one client whose round trip
+/// is the trade. Built ONCE per engine (see `new_internal`) — a client built
+/// per order would pool nothing and hand every fire a fresh handshake.
+fn build_order_http_client() -> reqwest::Result<reqwest::Client> {
+    order_http_builder().build()
+}
+
+/// The settings themselves, split from `build` so a test can read them back —
+/// a built `reqwest::Client` does not expose its own transport config.
+fn order_http_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        // Nagle would hold a small order POST waiting for more bytes that
+        // never come. reqwest already defaults this on; the money path
+        // states it rather than depending on that staying true.
+        .tcp_nodelay(true)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+}
+
 impl PolymarketClient {
     /// Create and authenticate a new client.
     #[cfg(not(feature = "sigv4"))]
@@ -293,9 +328,7 @@ impl PolymarketClient {
         let address = signer.address();
 
         // Create HTTP client for L2 requests
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
+        let http = build_order_http_client()
             .map_err(|e| ClientError::SdkError(e.to_string()))?;
 
         // Resolve the CLOB protocol version once, here. The SDK caches it
@@ -1211,6 +1244,93 @@ mod tests {
                 "{reason:?}",
             );
         }
+    }
+
+    /// HTTP/1.1 stub that counts ACCEPTED CONNECTIONS, not requests.
+    /// Connections are the only honest measure of pooling: the order path's
+    /// cost is the handshake, and a handshake is exactly one accept.
+    async fn counting_stub() -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let conns = Arc::new(AtomicUsize::new(0));
+        let counter = conns.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {
+                                let resp = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+                                if sock.write_all(resp).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/order"), conns)
+    }
+
+    #[tokio::test]
+    async fn the_order_client_reuses_one_connection_across_sequential_orders() {
+        let (url, conns) = counting_stub().await;
+        let http = build_order_http_client().expect("build order client");
+        for _ in 0..12 {
+            let resp = http.get(&url).send().await.expect("stub request");
+            assert!(resp.status().is_success());
+            // The body must be drained or the connection never returns to
+            // the pool — a half-read response is a leaked connection.
+            resp.text().await.expect("stub body");
+        }
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            1,
+            "every order after the first must ride the pooled connection; a \
+             second accept is a TCP+TLS handshake charged to a live fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_built_per_order_would_handshake_every_time() {
+        // The regression the test above guards, demonstrated: pooling lives in
+        // the CLIENT, so moving construction onto the order path defeats it
+        // completely. This is what the old `reqwest::Client::new()`-per-call
+        // shape costs, and why `new_internal` builds exactly one.
+        let (url, conns) = counting_stub().await;
+        for _ in 0..5 {
+            let http = build_order_http_client().expect("build order client");
+            let resp = http.get(&url).send().await.expect("stub request");
+            resp.text().await.expect("stub body");
+        }
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            5,
+            "a per-order client cannot pool — if this ever passes at 1 the \
+             pooling assertion above has stopped proving anything"
+        );
+    }
+
+    #[test]
+    fn the_order_client_pins_tcp_nodelay() {
+        // Nagle on a small order POST is pure added latency. reqwest defaults
+        // this on today; the assertion is what makes it a pinned property of
+        // the money path rather than a default we happen to inherit.
+        let cfg = format!("{:?}", order_http_builder());
+        assert!(
+            cfg.contains("tcp_nodelay: true"),
+            "order client lost TCP_NODELAY: {cfg}"
+        );
     }
 
     fn meta(dp: u32) -> TokenMeta {
