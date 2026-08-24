@@ -33,6 +33,27 @@ entire behavioural difference. It also means this recorder harvests exactly the
 windows the engine actually watched, and cannot run away scanning all of
 Polymarket.
 
+READERS MUST CLIP TO THE WINDOW. A market accepts orders long before its window
+opens — gamma's `acceptingOrdersTimestamp` for `sol-updown-15m-1787519700` is
+2026-08-22T21:26:00Z against a 2026-08-23T21:15:00Z start, ~24h early — so the
+corpus legitimately contains prints OUTSIDE `[start, end)`. Measured over
+724,134 rows (analysis/flow_forensics.md §0): **4.16% land before the window
+opens** (median only 29s early, tail to 23.8h) and **0.42% after it closes**
+(median 15s late). Those rows are correctly attributed — every one is
+re-checked against `conditionId` in `fetch_window` — they simply describe a
+market that was not running yet. The pre-open ones cluster at $0.50 because
+they are makers seeding a fresh book, so any per-window flow statistic that
+forgets to clip will average real trading against book-seeding and quietly
+skew. The median being 29s is what makes this dangerous: a spot check looks
+fine and the tail is what bites.
+
+NO MAKER/TAKER ATTRIBUTION EXISTS HERE. data-api `/trades` answers with exactly
+one row per transaction hash (724,134 rows, 724,134 distinct hashes) carrying a
+single `proxyWallet` and no maker/taker field: it is the TAKER view. The maker
+on the other side of every fill is invisible, which also means OUR OWN resting
+fills never appear in this corpus — only our aggressive clips do (594 of 1,328
+fires over the same span). Do not build a maker-share statistic on this source.
+
 ROTATION AND BOUNDS. `prints-YYYYMMDD.jsonl`, UTC-daily, same shape as the RTDS
 corpus — but rotated by PRINT time, not harvest time, so "the prints for day X"
 is one file and joins to `rtds-X.jsonl` without a filter. Unlike the RTDS
