@@ -10,6 +10,7 @@ win rate sitting next to a sub-1.00 profit factor and a negative growth rate.
 from __future__ import annotations
 
 import math
+import time
 
 import pytest
 
@@ -395,3 +396,36 @@ def test_streak_orders_by_settlement_not_by_arrival():
 def test_summary_carries_the_streak_so_both_reports_read_one_number():
     s = eff.summary([_sw(True, 100), _sw(False, 200), _sw(True, 300)])
     assert s["streak"] == {"current": 1, "longest": 1}
+
+
+# ---------- a closed scope is measured on its own clock (bughunt 2026-08-24) ----------
+
+def test_effectiveness_summary_ends_a_closed_scope_at_its_own_boundary():
+    """`--era` scopes the WINDOWS but the calendar-time metrics used to run to
+    the wall clock, so a 2.8h era billed itself 34h of calendar time and its
+    bankroll growth read ~9x flatter than its own clock gives."""
+    era_start, era_end = 1_000_000.0, 1_000_000.0 + 3600.0   # a one-hour era
+    sb = {"eff_windows": [
+        {"notional": 100.0, "pnl": -10.0, "won": False,
+         "entry_ts": era_start, "exit_ts": era_start + 300.0, "end_ts": era_start + 300.0},
+    ], "riding_usd": 0.0}
+
+    on_its_own_clock = cc.effectiveness_summary(sb, {"total": 1000.0}, now=era_end)
+    on_the_wall_clock = cc.effectiveness_summary(sb, {"total": 1000.0},
+                                                  now=era_end + 86400.0)
+
+    assert on_its_own_clock["span_h"] == pytest.approx(1.0)
+    assert on_the_wall_clock["span_h"] == pytest.approx(25.0)
+    # same P&L, same windows: only the denominator moved, and the wall clock
+    # makes the loss look 25x gentler per day and the book 25x less utilized
+    assert on_its_own_clock["bgr"]["per_day"] == pytest.approx(
+        on_the_wall_clock["bgr"]["per_day"] * 25.0)
+    assert on_its_own_clock["utilization"] == pytest.approx(
+        on_the_wall_clock["utilization"] * 25.0)
+
+
+def test_effectiveness_summary_defaults_to_the_wall_clock():
+    sb = {"eff_windows": [{"notional": 100.0, "pnl": 1.0, "won": True,
+                            "entry_ts": time.time() - 3600.0, "exit_ts": 0.0,
+                            "end_ts": time.time() - 3000.0}], "riding_usd": 0.0}
+    assert cc.effectiveness_summary(sb, {"total": 1000.0})["span_h"] == pytest.approx(1.0, abs=0.05)

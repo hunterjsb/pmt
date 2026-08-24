@@ -126,7 +126,8 @@ def _load(line: str) -> dict | None:
     return r if isinstance(r, dict) else None
 
 
-def iter_ticks(lines: Iterable[str], since: float = 0.0) -> Iterator[dict]:
+def iter_ticks(lines: Iterable[str], since: float = 0.0,
+                until: float | None = None) -> Iterator[dict]:
     """Refusal ticks from raw `updown-tape.jsonl` lines: {t, slug, side,
     category, ask, fair, net}.
 
@@ -137,13 +138,16 @@ def iter_ticks(lines: Iterable[str], since: float = 0.0) -> Iterator[dict]:
     line pre-dating up_ask/dn_ask, or an eval side with no live book —
     callers roll those into the 'unpriced' coverage bucket rather than
     dropping them silently.
+
+    `until` closes the range on the right (half-open [since, until)), which is
+    what an era-scoped report needs — see build_report.
     """
     for raw in lines:
         r = _load(raw)
         if r is None:
             continue
         t, slug = r.get("t"), r.get("slug")
-        if t is None or not slug or t < since:
+        if t is None or not slug or t < since or (until is not None and t >= until):
             continue
         ev = r.get("ev")
         if ev == EV_GATED:
@@ -164,15 +168,20 @@ def iter_ticks(lines: Iterable[str], since: float = 0.0) -> Iterator[dict]:
                        "ask": s.get("ask"), "fair": s.get("fair"), "net": s.get("net")}
 
 
-def iter_fires(lines: Iterable[str], since: float = 0.0) -> Iterator[dict]:
-    """Fire ticks from raw tape lines: {t, slug, side, ask, size}."""
+def iter_fires(lines: Iterable[str], since: float = 0.0,
+                until: float | None = None) -> Iterator[dict]:
+    """Fire ticks from raw tape lines: {t, slug, side, ask, size}.
+
+    Same half-open [since, until) range as iter_ticks — the two must agree or
+    an era's clip sizing would be inferred from fires outside it.
+    """
     for raw in lines:
         r = _load(raw)
         if r is None or r.get("ev") != EV_FIRE:
             continue
         t, slug, side = r.get("t"), r.get("slug"), r.get("side")
         ask, size = r.get("ask"), r.get("size")
-        if t is None or not slug or t < since:
+        if t is None or not slug or t < since or (until is not None and t >= until):
             continue
         if side not in ("up", "down") or ask is None or size is None:
             continue
@@ -398,18 +407,24 @@ def verdict(cat_stats: dict) -> str:
 def build_report(tape_lines: Iterable[str], winners: dict[str, str], activity_rows: list[dict],
                   since: float = 0.0, min_fair: float = DEFAULT_MIN_FAIR,
                   min_edge: float = DEFAULT_MIN_EDGE, default_clip: float = DEFAULT_CLIP_USDC,
-                  gap_s: float = EPISODE_GAP_S) -> dict:
+                  gap_s: float = EPISODE_GAP_S, until: float | None = None) -> dict:
     """Full shadow ledger: categorized episodes -> per-category summary,
     grand totals, and a coverage note. Pure given the tape lines already
     read and `winners` already resolved — all I/O lives in cli.py.
+
+    The range is half-open [since, until) on the tape's own record time, the
+    same convention `_stats_blocks` folds its blocks under. `until=None` runs
+    to the end of the tape, which is every caller but `--era`: without it a
+    2.8-hour era's gates table priced 11,051 episodes instead of its own 381
+    — the whole tape from the era's start to now, 29x over (2026-08-24).
     """
     lines = list(tape_lines)
 
-    raw_ticks = list(iter_ticks(lines, since))
+    raw_ticks = list(iter_ticks(lines, since, until))
     ticks = categorize_ticks(raw_ticks, min_fair, min_edge)
     episodes = collapse_episodes(ticks, gap_s)
 
-    fires = list(iter_fires(lines, since))
+    fires = list(iter_fires(lines, since, until))
     fires_by_slug: dict[str, list[dict]] = {}
     for f in fires:
         fires_by_slug.setdefault(f["slug"], []).append(f)

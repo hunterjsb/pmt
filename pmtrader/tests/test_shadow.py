@@ -529,3 +529,48 @@ def test_build_report_verdict_follows_the_entry_ask_through_a_falling_book():
     assert safety["avoided_losses"] == 25.0
     assert safety["net"] <= 0.0
     assert verdict(safety) == "paying for itself"
+
+
+# ---------- the right-hand range bound (bughunt 2026-08-24) ----------
+#
+# `--era` scoped the scoreboard and every tape block except this one, so an
+# era's gates table priced the whole tape from its start to now.
+
+def test_iter_ticks_until_is_half_open_on_the_right():
+    lines = [
+        _gated(100.0, "s", "basis guard: projected margin +1.0bp", up_ask=0.6, dn_ask=0.4),
+        _gated(200.0, "s", "basis guard: projected margin +1.0bp", up_ask=0.6, dn_ask=0.4),
+        _gated(300.0, "s", "basis guard: projected margin +1.0bp", up_ask=0.6, dn_ask=0.4),
+    ]
+    assert [tk["t"] for tk in iter_ticks(lines, since=100.0, until=300.0)] == [100.0, 200.0]
+    assert [tk["t"] for tk in iter_ticks(lines, since=100.0)] == [100.0, 200.0, 300.0]
+
+
+def test_iter_fires_shares_the_same_half_open_range():
+    lines = [_fire(100.0, "s", "up", 0.9, 10.0), _fire(300.0, "s", "up", 0.9, 10.0)]
+    assert [f["t"] for f in iter_fires(lines, since=0.0, until=300.0)] == [100.0]
+
+
+def test_build_report_until_confines_a_scoped_report_to_its_own_range():
+    """Two refusals, one inside the scope and one after it. The scoped report
+    must not price the later one."""
+    lines = [
+        _eval(100.0, "btc-updown-5m-1000",
+              [{"side": "up", "brake": "safety", "ask": 0.5, "fair": 0.6, "net": -0.1}]),
+        _eval(900.0, "btc-updown-5m-2000",
+              [{"side": "up", "brake": "safety", "ask": 0.5, "fair": 0.6, "net": -0.1}]),
+    ]
+    winners = {"btc-updown-5m-1000": "up", "btc-updown-5m-2000": "up"}
+    scoped = build_report(lines, winners, activity_rows=[], since=0.0, until=500.0)
+    whole = build_report(lines, winners, activity_rows=[], since=0.0)
+    assert scoped["totals"]["episodes"] == 1
+    assert scoped["coverage"]["windows"] == 1
+    assert whole["totals"]["episodes"] == 2
+    assert scoped["totals"]["missed_wins"] < whole["totals"]["missed_wins"]
+
+
+def test_build_report_until_none_still_reaches_the_end_of_the_tape():
+    lines = [_eval(900.0, "btc-updown-5m-2000",
+                   [{"side": "up", "brake": "safety", "ask": 0.5, "fair": 0.6, "net": -0.1}])]
+    report = build_report(lines, {"btc-updown-5m-2000": "up"}, [], since=0.0, until=None)
+    assert report["totals"]["episodes"] == 1
