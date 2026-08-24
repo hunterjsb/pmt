@@ -28,17 +28,27 @@ from pathlib import Path
 from polymarket import errlog, rtds, rtds_read, spot
 
 # Seeds: enough tail to fill the charts' own axes on the first frame, and no
-# more. rtds appends ~6KB/s and the per-symbol rows plot 120s; the spot tape
-# runs ~3x that and only the 30s lead block reads it.
-RTDS_SEED_BYTES = 2 << 20
+# more. rtds appends ~6KB/s and the candle rows look back up to 45min
+# (KEEP_S), so the seed covers that once instead of waiting 45min of live
+# tailing to fill the first chart; the spot tape runs ~3x the rate and only
+# the 30s lead block reads it.
+RTDS_SEED_BYTES = 18 << 20
 SPOT_SEED_BYTES = 1 << 20
 # Per-poll ceiling. A dashboard whose worker stalled (a slow wallet walk, a
 # suspended laptop) must not answer by parsing the whole backlog on one tick —
 # it skips forward to the recent end, which is the only part any chart plots.
-MAX_CHUNK_BYTES = 4 << 20
+# Sized ABOVE the seed or the first poll would skip most of it; the worst
+# case, a ~20MB parse, is a 1-2s worker tick the 60s wallet walk dwarfs.
+MAX_CHUNK_BYTES = 20 << 20
 
-# How much history the ring buffers hold. The widest axis any panel draws.
-KEEP_S = 150.0
+# How much history the ring buffers hold — per stream, because the widest
+# axis each feeds differs by an order of magnitude: the candle charts look
+# back 3 window durations (45min for a 15m window; watch_charts
+# CANDLE_LOOKBACK_WINDOWS), while the spot venues only ever feed the 30s lead
+# block and their tapes are ~17 prints/s/symbol — holding 45 minutes of THAT
+# would put ~50k tuples per symbol under the render thread's snapshot copy.
+KEEP_S = 2700.0
+SPOT_KEEP_S = 150.0
 # Spot trade tapes run ~17 prints/s/symbol; a chart cell is worth far less
 # resolution than that, and the deques are read on the render thread.
 SPOT_MIN_GAP_S = 0.2
@@ -289,8 +299,12 @@ class FeedTail:
 
     def _trim(self, now: float) -> None:
         floor = now - self._keep_s
-        for d in list(self._chain.values()) + list(self._spot.values()):
+        for d in self._chain.values():
             while d and d[0][0] < floor:
+                d.popleft()
+        spot_floor = now - min(self._keep_s, SPOT_KEEP_S)
+        for d in self._spot.values():
+            while d and d[0][0] < spot_floor:
                 d.popleft()
 
     def _venue_for(self, sym: str, now: float) -> str | None:

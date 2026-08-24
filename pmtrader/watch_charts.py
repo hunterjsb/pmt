@@ -109,6 +109,112 @@ def sparkline(cols: list[float | None], width: int,
     return braille_rows(cols, width, 1, lo, hi)[0]
 
 
+# ---------- candle canvas ----------
+#
+# Half-block resolution: `height` terminal rows give 2*height vertical levels,
+# one candle per character cell. Bodies are blocks, wicks are the thin bar,
+# and each candle carries its own up/down colour — which is the point of a
+# candle over a line: one cell says open, close, range and direction at once.
+
+def candle_cols(points: list[tuple[float, float]], n: int,
+                floor: float, ceiling: float
+                ) -> list[tuple[float, float, float, float] | None]:
+    """`n` (open, high, low, close) tuples from (t, v) samples on the
+    half-open [floor, ceiling) axis — None where no sample landed, and
+    deliberately NOT carried forward: an empty candle is a gap in the corpus,
+    and painting yesterday's close there would invent a print."""
+    n = max(int(n), 1)
+    out: list[list[float] | None] = [None] * n
+    span = ceiling - floor
+    if span <= 0:
+        return out
+    for t, v in points:
+        if t < floor or t >= ceiling:
+            continue
+        i = min(n - 1, max(0, int((t - floor) / span * n)))
+        v = float(v)
+        c = out[i]
+        if c is None:
+            out[i] = [v, v, v, v]
+        else:
+            c[1] = max(c[1], v)
+            c[2] = min(c[2], v)
+            c[3] = v
+    return [tuple(c) if c else None for c in out]
+
+
+def _candle_bounds(candles, lo: float | None, hi: float | None
+                   ) -> tuple[float, float]:
+    flat: list[float | None] = []
+    for c in candles:
+        if c:
+            flat.extend((c[1], c[2]))
+    return series_bounds(flat, lo, hi)
+
+
+def candle_rows(candles, width: int, height: int,
+                lo: float | None = None, hi: float | None = None) -> list[str]:
+    """`height` Rich-markup strings of `width` cells, one candle per cell.
+
+    Each terminal row is two half-cells: a body covering both paints █, one
+    half ▀/▄, and a row the wick alone passes through paints │. Green when the
+    candle closed at or above its open, red below — adjacent same-colour cells
+    share one markup span so a row is a handful of tags, not one per cell.
+    """
+    width = max(int(width), 1)
+    height = max(int(height), 1)
+    halves = 2 * height
+    lo, hi = _candle_bounds(candles, lo, hi)
+    span = hi - lo
+
+    def hrow(v: float) -> int:
+        return max(0, min(halves - 1, int(round((hi - v) / span * (halves - 1)))))
+
+    cells = [[(None, " ")] * width for _ in range(height)]
+    for i in range(width):
+        c = candles[i] if i < len(candles) else None
+        if c is None:
+            continue
+        o, h, l, close = c
+        style = "green" if close >= o else "red"
+        b_top, b_bot = hrow(max(o, close)), hrow(min(o, close))
+        w_top, w_bot = hrow(h), hrow(l)
+        for r in range(height):
+            top, bot = 2 * r, 2 * r + 1
+            t_body = b_top <= top <= b_bot
+            b_body = b_top <= bot <= b_bot
+            if t_body and b_body:
+                glyph = "█"
+            elif t_body:
+                glyph = "▀"
+            elif b_body:
+                glyph = "▄"
+            elif w_top <= top <= w_bot or w_top <= bot <= w_bot:
+                glyph = "│"
+            else:
+                continue
+            cells[r][i] = (style, glyph)
+
+    rows = []
+    for r in range(height):
+        parts, run_style, run = [], None, []
+
+        def flush():
+            if run:
+                text = "".join(run)
+                parts.append(f"[{run_style}]{text}[/{run_style}]"
+                             if run_style else text)
+
+        for style, glyph in cells[r]:
+            if style != run_style:
+                flush()
+                run_style, run = style, []
+            run.append(glyph)
+        flush()
+        rows.append("".join(parts))
+    return rows
+
+
 # ---------- turning samples into columns ----------
 
 def downsample(points: list[tuple[float, float]], n: int,
@@ -223,10 +329,17 @@ def span_with_zero(cols: list[float | None], floor_span: float = 2.0
 
 # ---------- panel geometry ----------
 
-FEED_WINDOW_S = 120.0         # per-symbol path against the strike
+FEED_WINDOW_S = 120.0         # the compact line's axis (h=1 fallback)
+CANDLE_LOOKBACK_WINDOWS = 3.0  # a tall chart's axis, in window durations —
+#                                15min of candles behind a 5m window, so the
+#                                interval scales with what the arm trades and
+#                                every candle aggregates real OHLC instead of
+#                                the line's carried-forward last sample
 FOCUS_WINDOW_S = 30.0         # the rtds-vs-spot lead block: seconds, not minutes
 CHARTS_MAX_INNER = 6          # inner rows, compact: every chart one terminal row
-CHARTS_MAX_INNER_TALL = 12    # inner rows, tall: every chart two terminal rows
+CHARTS_MAX_INNER_TALL = 14    # inner rows, tall: every chart two terminal
+#                               rows — sized so four 5m lanes + the "+N" note
+#                               + the lead block all seat (4*2 + 1 + 4 = 13)
 CHARTS_CHROME = 2             # panel border, top and bottom
 _FEED_IDENT_W = 10            # "hype 15m ▲" — the side rides the identity cell
 _FEED_TAIL_W = 16             # "  -4.7bp   2:41"
@@ -272,6 +385,36 @@ def armed_windows(snap: dict) -> list[dict]:
                     "entry_ts": pos.get("entry_ts")})
     out.sort(key=lambda r: float(r.get("end_ts") or 0.0))
     return out
+
+
+def _has_stake(w: dict) -> bool:
+    """Money is in this window: the wallet knows a side, or the engine's own
+    committed figure is nonzero."""
+    return bool(w.get("side")) or float(w.get("notional") or 0.0) > 0.0
+
+
+def _dur_of(w: dict) -> float:
+    p = updown_slugs.parse_updown_slug(w.get("slug") or "")
+    return float(p["end"]) - float(p["start"]) if p else float("inf")
+
+
+def cared_windows(windows: list[dict]) -> list[dict]:
+    """The windows worth a chart: every window with a stake, then the unfilled
+    arms of the SHORTEST armed duration tier only.
+
+    The long-duration arms are measurement canaries today — tiny, basis-guard
+    gated, no money at risk — and a chart of one displaces a chart of a lane
+    that fires. Duration is the discriminator rather than a series list or a
+    dollar floor because it self-corrects: a 15m window that actually fills
+    charts like anything else, and a fleet armed ONLY on 15m gets its charts
+    back. The rest stay counted in the "+N more armed" note.
+    """
+    staked = [w for w in windows if _has_stake(w)]
+    idle = [w for w in windows if not _has_stake(w)]
+    if idle:
+        min_dur = min(_dur_of(w) for w in idle)
+        idle = [w for w in idle if _dur_of(w) == min_dur]
+    return staked + idle
 
 
 def _side_style(side: str | None, d_bp: float | None) -> str:
@@ -328,21 +471,40 @@ def feed_row(w: dict, feeds: dict, panel_w: int, now: float,
     d_bp = delta_bp(samples[-1][1], target)
     style = _side_style(side, d_bp)
     delta = f"{d_bp:+.1f}bp" if d_bp is not None else "tgt —"
-    chart = (braille_rows(cols, chart_w, h, lo, hi) if chart_w
-             else [""] * max(h, 1))
     ident = _feed_ident(w, side)
-    head = (f"{watch_ui._stage_cell(w)} [dim]{ident:<{_FEED_IDENT_W}}[/dim] "
-            f"[{style}]{chart[0]}[/{style}] [{style}]{delta:>9}[/{style}]")
+    prefix = f"{watch_ui._stage_cell(w)} [dim]{ident:<{_FEED_IDENT_W}}[/dim] "
     if h <= 1:
-        return [f"{head} {watch_ui._countdown_markup(slug, now)}"]
+        # Compact fallback: the 2-minute carried-forward line.
+        line = (f"[{style}]{sparkline(cols, chart_w, lo, hi)}[/{style}]"
+                if chart_w else "")
+        return [f"{prefix}{line} [{style}]{delta:>9}[/{style}] "
+                f"{watch_ui._countdown_markup(slug, now)}"]
+    # Tall form: real OHLC candles over a lookback that scales with the
+    # window, one candle per cell — each cell aggregates every print in its
+    # interval instead of the line's one carried sample.
+    dur = max(float(parsed["end"]) - float(parsed["start"]), 60.0)
+    c_floor = now - CANDLE_LOOKBACK_WINDOWS * dur
+    if target:
+        candles = candle_cols([(t, delta_bp(px, target)) for t, px in samples],
+                              max(chart_w, 1), c_floor, now)
+        c_lo, c_hi = span_with_zero(
+            [v for c in candles if c for v in (c[1], c[2])])
+    else:
+        candles = candle_cols(samples, max(chart_w, 1), c_floor, now)
+        c_lo = c_hi = None
+    chart = (candle_rows(candles, chart_w, h, c_lo, c_hi) if chart_w
+             else [""] * h)
+    candle_s = CANDLE_LOOKBACK_WINDOWS * dur / max(chart_w, 1)
+    per = (f"{candle_s:.0f}s/c" if candle_s < 60
+           else f"{candle_s / 60:.0f}m/c")
+    rows = [f"{prefix}{chart[0]} [{style}]{delta:>9}[/{style}] [dim]{per}[/dim]"]
     # Continuation rows: the chart keeps its columns (the pad mirrors the
     # stage-glyph + identity prefix exactly), the countdown lands on the last
     # row where the eye ends the stroke.
     pad = " " * (_FEED_IDENT_W + 3)
-    rows = [head]
     for line in chart[1:-1]:
-        rows.append(f"{pad}[{style}]{line}[/{style}]")
-    rows.append(f"{pad}[{style}]{chart[-1]}[/{style}] "
+        rows.append(f"{pad}{line}")
+    rows.append(f"{pad}{chart[-1]} "
                 f"{'':>9} {watch_ui._countdown_markup(slug, now)}")
     return rows
 
@@ -407,9 +569,11 @@ def feeds_rows(snap: dict, panel_w: int, now: float | None = None,
     The lead block is budgeted FIRST and drawn whole or not at all — a
     comparison missing its second line is not a comparison, and truncating the
     panel from the bottom is exactly how that used to happen. Whatever rows
-    remain go to armed windows, soonest to settle first, and any window that
-    does not get one is counted in a "+N more armed" note: a cap the operator
-    cannot see is indistinguishable from an arm that has gone missing.
+    remain go to the cared windows (cared_windows: stakes first, then the
+    shortest-duration idle arms, soonest to settle first within each), and
+    every armed window that does not get a chart — cared or not — is counted
+    in a "+N more armed" note: a cap the operator cannot see is
+    indistinguishable from an arm that has gone missing.
 
     Degrades a row at a time. No arms, no rtds corpus, no spot recorder, an
     armed symbol the stream does not carry — each removes what it removes and
@@ -420,7 +584,8 @@ def feeds_rows(snap: dict, panel_w: int, now: float | None = None,
     cap = CHARTS_MAX_INNER_TALL if tall else CHARTS_MAX_INNER
     feeds = snap.get("feeds") or {}
     windows = armed_windows(snap)
-    built = [(w, lines) for w in windows
+    cared = cared_windows(windows)
+    built = [(w, lines) for w in cared
              if (lines := feed_row(w, feeds, panel_w, now, h)) is not None]
     # The focus is the window closest to settling that has both feeds: the one
     # where three seconds of lead is still worth something.

@@ -1593,6 +1593,59 @@ def test_armed_windows_take_the_side_and_entry_from_the_wallet_not_the_arm():
     assert w["live"] is True and w["side"] == "down" and w["entry_px"] == 0.44
 
 
+def test_candles_aggregate_real_ohlc_and_a_gap_stays_empty():
+    """Each cell aggregates every print in its interval — the "more data per
+    point" the carried-forward line never had — and an empty interval stays
+    None rather than repeating yesterday's close as if it printed."""
+    floor = 0.0
+    pts = [(1.0, 10.0), (2.0, 14.0), (3.0, 8.0), (4.0, 12.0),  # candle 0
+           (14.0, 5.0)]                                        # candle 2
+    cols = wc.candle_cols(pts, 3, floor, 15.0)
+    assert cols[0] == (10.0, 14.0, 8.0, 12.0)                  # o, h, l, c
+    assert cols[1] is None
+    assert cols[2] == (5.0, 5.0, 5.0, 5.0)
+
+
+def test_candle_rows_paint_body_wick_and_direction():
+    """An up candle is green, a down candle red, the body is blocks and a row
+    only the wick crosses is the thin bar (body wins a cell they share)."""
+    up = (4.0, 10.0, 0.0, 5.0)      # small mid body, wick to both rails
+    down = (5.0, 10.0, 0.0, 4.0)    # same shape, closed below its open
+    rows = wc.candle_rows([up, down], 2, 3, 0.0, 10.0)
+    assert len(rows) == 3
+    flat = "".join(rows)
+    assert "[green]" in flat and "[red]" in flat
+    assert "█" in rows[1]                                       # the body row
+    assert "│" in rows[0] and "│" in rows[2]                    # wick-only rows
+
+
+def test_a_tall_feed_row_charts_candles_at_a_window_scaled_interval():
+    """The tall chart's axis is CANDLE_LOOKBACK_WINDOWS window durations, so
+    a 5m arm charts 15 minutes and says what one candle costs."""
+    now = 1_787_500_100.0
+    start = int(now - 60)
+    feeds = {"chain": {"btc": [(now - 600, 77_000.0), (now - 599, 77_020.0),
+                               (now - 30, 77_010.0), (now - 1, 77_077.0)]},
+             "marks": {"btc": {start - 60: 77_000.0}}, "spot": {}, "venue": {}}
+    snap = _armed_snap(now, feeds=feeds, start=start, side="up", entry_px=0.62)
+    rows = wc.feed_row(wc.armed_windows(snap)[0], feeds, 60, now, h=2)
+    assert "/c" in rows[0]                       # the interval label
+    assert "[green]" in "".join(rows) or "[red]" in "".join(rows)
+
+
+def test_cared_windows_drop_idle_long_durations_but_never_a_stake():
+    """Hunter's rule: don't chart the 15m measurement arms we don't trade —
+    unless money is actually in one, and a fleet armed only on 15m keeps its
+    charts."""
+    fivem = {"slug": "btc-updown-5m-1000", "side": None, "notional": 0.0}
+    idle15 = {"slug": "eth-updown-15m-1000", "side": None, "notional": 0.0}
+    filled15 = {"slug": "sol-updown-15m-1000", "side": "up", "notional": 9.0}
+    out = wc.cared_windows([idle15, filled15, fivem])
+    assert [w["slug"] for w in out] == [filled15["slug"], fivem["slug"]]
+    # Only long durations armed: they are the fleet, so they chart.
+    assert wc.cared_windows([idle15]) == [idle15]
+
+
 def test_armed_windows_lead_with_whatever_settles_first():
     now = 1_787_500_100.0
     arms = {"btc-updown-15m-1787500000": {"eval": {}},
