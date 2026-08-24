@@ -1,0 +1,76 @@
+# pmt fleet doctor — cross-node health heartbeat, as a systemd USER service.
+#
+# PROPOSAL, not installed. See README.md in this directory and
+# orchestrator/DESIGN.md.
+#
+# THIS UNIT PLACES NO ORDERS, TAKES NO LEASE, AND TOUCHES NO ARM. `pmt-fleet
+# beat` writes one row to the pmt-fleet DynamoDB table every 30 seconds saying
+# what this node can see about itself — engine up, feed age, balance, which
+# series are armed — and does nothing else. Phase 1 of the orchestrator is
+# observation only; the lease protocol it will eventually run is built and
+# tested but nothing calls its mutating path.
+#
+# Of all the units in this directory this is the one whose caveat section is
+# empty. It cannot bring a position back, cannot re-enter the market, and
+# cannot stop the engine. Enabling it is not a risk decision.
+#
+# THE ONE THING TO KNOW: the clean-shutdown stamp.
+#
+# On SIGTERM the daemon writes one last heartbeat carrying `shutdown`, which is
+# how the checker tells "Hunter turned the box off" from "the box wedged". That
+# marker is the whole reason a nightly poweroff does not page. Two consequences:
+#
+#   1. TimeoutStopSec must leave room for that final write. 20s is generous for
+#      one PutItem; do not cut it to nothing.
+#   2. `systemctl --user kill -s SIGKILL` skips it, and the node then looks
+#      wedged for as long as the checker's staleness window. Use `stop`.
+#
+# The stamp self-clears: put_heartbeat replaces the row whole, so the first
+# live beat after the next boot removes it with nobody having to remember.
+
+[Unit]
+Description=pmt fleet doctor — cross-node health heartbeat (observation only, places no orders)
+Documentation=file:///var/home/hunter/Desktop/code/pmt/orchestrator/DESIGN.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/var/home/hunter/Desktop/code/pmt/pmtrader
+# `uv run` resolves the pmtrader venv from the cwd's pyproject.toml, so the
+# WorkingDirectory above is load-bearing, not cosmetic.
+ExecStart=/var/home/hunter/.local/bin/uv run python -m orchestrator beat
+
+# This node's fleet id. It must match a key in orchestrator/assignments.json,
+# and the daemon exits 2 if it does not. Set explicitly rather than falling
+# back to the hostname: the hostname fallback is a convenience on the desktop
+# and a hazard anywhere a box gets renamed.
+Environment=PMT_FLEET_NODE=desktop
+
+# Credentials come from the operator's standard AWS chain (~/.aws). The daemon
+# reads no secrets of its own — it never opens .env, never touches a private
+# key, and reads arms-state.json by path for slug names only.
+Environment=AWS_REGION=eu-west-1
+
+Restart=on-failure
+RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
+
+# A clean exit is a SIGTERM, which is the nightly poweroff and is expected.
+SuccessExitStatus=0
+# Exit 2 is a REFUSED assignment map — this node is not in it, or the map does
+# not validate. A restart cannot fix a config error and a unit that bounces on
+# one hides it. Same contract as pmt-pilot2.service.
+RestartPreventExitStatus=2
+
+KillSignal=SIGTERM
+# Room for the final clean-shutdown heartbeat. See the header.
+TimeoutStopSec=20
+
+SyslogIdentifier=pmt-fleet-doctor
+
+[Install]
+WantedBy=default.target
