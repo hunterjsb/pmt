@@ -2016,6 +2016,228 @@ mod tests {
         assert!(synth_params("not-a-recognized-slug").is_err());
     }
 
+    // --- mixed-cadence book tapes ---------------------------------------
+    //
+    // The recorder's coarse leg moved 5s -> 2s (book_sample_due), so every
+    // live tape from the change onward is one file with 5s rows followed by
+    // 2s rows, and every committed fixture still carries a pure-5s slice.
+    // Nothing here may notice: the readers are row-driven, and the ONLY
+    // clock they have is each row's own `t`.
+
+    /// A book slice at an explicit list of offsets from `start` — the caller
+    /// supplies the cadence, which is the whole point.
+    fn book_rows_at(slug: &str, start: f64, offsets: &[f64], ask: f64) -> Vec<Value> {
+        offsets
+            .iter()
+            .map(|off| {
+                let t = start + off;
+                serde_json::json!({
+                    "t": t, "ev": "book", "slug": slug,
+                    "up_bid": ask - 0.02, "up_bid_sz": 500.0,
+                    "up_ask": ask, "up_ask_sz": 500.0,
+                    "dn_bid": 1.0 - ask - 0.02, "dn_bid_sz": 500.0,
+                    "dn_ask": 1.0 - ask + 0.02, "dn_ask_sz": 500.0,
+                    "spot": 101.0, "spot_age_s": 0.1,
+                })
+            })
+            .collect()
+    }
+
+    /// 5s for the first `switch` seconds, 2s after it — a tape that spans
+    /// the recorder change.
+    fn mixed_offsets(span: f64, switch: f64) -> Vec<f64> {
+        let mut v = Vec::new();
+        let mut t = 0.0;
+        while t < switch {
+            v.push(t);
+            t += 5.0;
+        }
+        while t <= span {
+            v.push(t);
+            t += 2.0;
+        }
+        v
+    }
+
+    #[test]
+    fn mixed_cadence_book_tape_loads_row_for_row_in_time_order() {
+        let dir = scratch("mixed-cadence");
+        let slug = "btc-updown-15m-600";
+        let offsets = mixed_offsets(600.0, 300.0);
+        let rows = book_rows_at(slug, 600.0, &offsets, 0.94);
+
+        // The realistic file shape is append-only: the old 5s rows, then the
+        // new 2s rows. The pathological one is a concatenation that got them
+        // backwards (two archives glued together). Both must group the same.
+        let (old_rows, new_rows) = rows.split_at(offsets.iter().filter(|o| **o < 300.0).count());
+        let appended = dir.join("appended.jsonl");
+        let backwards = dir.join("backwards.jsonl");
+        write_jsonl(&appended, &rows).unwrap();
+        let mut swapped = new_rows.to_vec();
+        swapped.extend_from_slice(old_rows);
+        write_jsonl(&backwards, &swapped).unwrap();
+
+        let group = |p: &Path| {
+            let recs = load_jsonl(p).unwrap();
+            let mut g = group_by_slug(&recs, slug);
+            assert_eq!(g.len(), 1);
+            g.pop().unwrap().1
+        };
+        let a = group(&appended);
+        let b = group(&backwards);
+
+        assert_eq!(a.len(), rows.len(), "every row survives — no dedup, no gap-filling");
+        assert_eq!(a, b, "file order is not information; `t` is");
+
+        // The mixed gap structure comes back intact. A reader that had
+        // baked in a fixed step would have to normalize this away.
+        let gaps: Vec<f64> = a
+            .windows(2)
+            .map(|w| w[1]["t"].as_f64().unwrap() - w[0]["t"].as_f64().unwrap())
+            .collect();
+        assert!(gaps.iter().take(59).all(|g| (*g - 5.0).abs() < 1e-9), "5s prefix preserved");
+        assert!(gaps.iter().skip(60).all(|g| (*g - 2.0).abs() < 1e-9), "2s suffix preserved");
+        assert!(gaps.windows(2).any(|w| w[0] != w[1]), "the tape really does change cadence");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Permissive params: the gate family is exercised everywhere else, and
+    /// this test is about the tape grid, so let the arm actually trade.
+    fn open_arm(slug: &str, start: f64, end: f64) -> ArmParams {
+        serde_json::from_value(serde_json::json!({
+            "slug": slug, "kind": "twap", "symbol": "BTCUSDT",
+            "token_up": format!("{}-up", slug), "token_down": format!("{}-down", slug),
+            "start": start, "end": end,
+            "sigma_bp_per_min": 3.0, "fee_rate": 0.0, "size_usdc": 10_000.0,
+            "min_edge": 0.0, "early_min_edge": 0.0, "min_fair": 0.0,
+            "min_elapsed_frac": 0.0, "basis_guard_bp": 0.0, "theta": 0.0,
+            "clip_usdc": 20.0, "early_frac": 1.0, "p_cap": 1.0, "rho_block": -1.0,
+        }))
+        .unwrap()
+    }
+
+    /// A decisively-up kline series, so the model prices `up` and the arm
+    /// has a reason to keep buying it.
+    fn rising_klines(start: i64, end: i64) -> Arc<BTreeMap<i64, Kline>> {
+        let mut rows = BTreeMap::new();
+        let mut px = 100.0;
+        let mut t = start - 60;
+        while t <= end + 60 {
+            rows.insert(t, Kline { t, o: px, c: px + 0.5 });
+            px += 0.5;
+            t += 60;
+        }
+        Arc::new(rows)
+    }
+
+    #[test]
+    fn a_mixed_cadence_tape_replays_and_only_ever_acts_on_recorded_instants() {
+        let (slug, start, end) = ("btc-updown-15m-600", 600.0, 1500.0);
+        let p = open_arm(slug, start, end);
+        let offsets = mixed_offsets(880.0, 300.0);
+        let rows = book_rows_at(slug, start, &offsets, 0.60);
+        let stamps: Vec<f64> = rows.iter().map(|r| r["t"].as_f64().unwrap()).collect();
+
+        let mut feed = FullFeed::Klines(rising_klines(start as i64, end as i64));
+        let (report, trace) = replay_full_window_with(
+            &mut feed,
+            &p,
+            None,
+            &rows,
+            Some("up".to_string()),
+            &RealTally::default(),
+        );
+
+        // Guard against the test rotting into a vacuous one: it only proves
+        // something if the arm actually did something across BOTH cadences.
+        assert!(!trace.is_empty(), "the arm emitted no tape at all — nothing is being proved");
+        let fires = report["sim"]["fires"].as_i64().unwrap();
+        assert!(fires > 0, "expected the permissive arm to trade; got {fires} fires");
+
+        // The cadence-agnosticism claim, stated so it can fail: replay has
+        // no clock of its own, so every instant it acts at must be a row it
+        // was handed. A reader that stepped a fixed interval, interpolated
+        // between samples, or resampled a mixed file onto one grid would
+        // land between these stamps.
+        for rec in &trace {
+            let t = rec["t"].as_f64().unwrap();
+            assert!(
+                stamps.iter().any(|s| (s - t).abs() < 1e-9),
+                "record at t={t} is not a recorded book instant — replay invented a tick"
+            );
+        }
+
+        // And it really did work across the seam, not just in the 5s half.
+        let seam = start + 300.0;
+        assert!(trace.iter().any(|r| r["t"].as_f64().unwrap() < seam), "acted in the 5s prefix");
+        assert!(trace.iter().any(|r| r["t"].as_f64().unwrap() > seam), "acted in the 2s suffix");
+    }
+
+    #[test]
+    fn the_tape_grid_bounds_replay_and_2s_is_the_first_that_can_express_a_clip_cooldown() {
+        // L46's residue, end to end. Replay can only act on a recorded row,
+        // so the tape grid is a FLOOR under every timing gate the arm has —
+        // and a 5s grid sits above the finest one, `clip_cooldown_s` (2.0):
+        // an arm free to re-fire at +2s replays as re-firing at +5s, and
+        // there is no replay-side change that can recover the difference.
+        // A 2s grid is the coarsest that can express it.
+        //
+        // The gate this ultimately has to resolve is the 12s INFLIGHT_TTL_S
+        // lock — live's real firing metronome, same-side p50 12.07s. It is
+        // not the binding gate HERE, because `apply_fills` still deletes
+        // the lock on fill (the branch-`sim-fidelity` repair L46 describes
+        // is not on master yet), which is why this test measures the
+        // cooldown instead. The 2s grid answers both for the same reason:
+        // 2 divides both 12 and 2, where 5 divides neither. The sampler-side
+        // arithmetic for the 12s case is pinned in updown_model.rs's
+        // `book_grid_resolves_the_12s_inflight_lock_without_rounding_up`.
+        let (slug, start, end) = ("btc-updown-15m-600", 600.0, 1500.0);
+        let p = open_arm(slug, start, end);
+        let span = 600.0;
+
+        let same_side_gaps = |step: f64| -> Vec<f64> {
+            let offsets: Vec<f64> =
+                std::iter::successors(Some(0.0), |t| Some(t + step)).take_while(|t| *t <= span).collect();
+            let rows = book_rows_at(slug, start, &offsets, 0.60);
+            let mut feed = FullFeed::Klines(rising_klines(start as i64, end as i64));
+            let (_, trace) = replay_full_window_with(
+                &mut feed,
+                &p,
+                None,
+                &rows,
+                Some("up".to_string()),
+                &RealTally::default(),
+            );
+            let fires: Vec<f64> = trace
+                .iter()
+                .filter(|r| r["ev"] == "fire" && r["side"] == "up")
+                .filter_map(|r| r["t"].as_f64())
+                .collect();
+            fires.windows(2).map(|w| w[1] - w[0]).collect()
+        };
+
+        let five = same_side_gaps(5.0);
+        let two = same_side_gaps(2.0);
+        assert!(five.len() >= 3 && two.len() >= 3, "need several re-fires to compare");
+
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let (m5, m2) = (median(five), median(two));
+        assert!(
+            (m5 - 5.0).abs() < 1e-6,
+            "on a 5s grid the re-fire gap should be the GRID, not the arm's 2s cooldown; got {m5}s"
+        );
+        assert!(
+            (m2 - p.clip_cooldown_s).abs() < 1e-6,
+            "a 2s grid should resolve clip_cooldown_s ({}s) exactly; got {m2}s",
+            p.clip_cooldown_s
+        );
+        assert!(m5 > m2, "the coarse grid can only ever under-fire relative to the fine one");
+    }
+
     // --- R7 fleet mode ------------------------------------------------
 
     /// Scratch dir for the file-driven fleet tests. Named per test so two
