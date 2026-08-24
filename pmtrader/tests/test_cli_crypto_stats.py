@@ -410,3 +410,46 @@ def test_stats_exposes_full_and_gates_without_changing_the_default():
     assert {"since", "full", "gates", "as_json"} <= opts
     defaults = {p.name: p.default for p in cs.crypto_stats.params}
     assert defaults["full"] is False and defaults["gates"] is False
+
+
+def test_gates_report_reads_each_chainlink_corpus_once_per_symbol(monkeypatch, tmp_path):
+    """The Chainlink corpus is per SYMBOL. The window universe is per WINDOW.
+
+    Keying the load off `windows` re-read and re-parsed each symbol's whole
+    ~6k-round corpus file once per window — over a 1422-window universe that
+    is ~240 reads of every file to build a 6-entry dict, measured at 31.7s of
+    a 43s `--gates` run, and it grows every day the fleet trades. `pmt crypto
+    outcomes` has always keyed off the symbol set; this was the copy that lost
+    the dedupe.
+
+    Pins the CALL COUNT, because the shape is the bug: a wall-time assertion
+    would pass on a fast box with the quadratic still in place.
+    """
+    import json as _json
+
+    from polymarket import chainlink as ck
+    from polymarket import outcomes as oc
+
+    # 18 closed windows over 2 symbols: the old shape asks for 18 corpus reads.
+    starts = [1787000000 + 300 * i for i in range(9)]
+    tape_file = tmp_path / "updown-tape.jsonl"
+    with tape_file.open("w") as fh:
+        for s in starts:
+            for sym in ("btc", "eth"):
+                fh.write(_json.dumps({"ev": "eval", "t": s + 10, "sides": [],
+                                      "slug": f"{sym}-updown-5m-{s}"}) + "\n")
+    monkeypatch.setattr(cs.tape, "UPDOWN_TAPE", str(tape_file))
+
+    loads: list[str] = []
+    monkeypatch.setattr(ck, "load_corpus",
+                        lambda sym, since=None: (loads.append(sym), [])[1])
+    # The corpus on disk is the operator's; a test never touches it.
+    monkeypatch.setattr(oc, "load_outcomes", lambda *a, **k: {})
+    monkeypatch.setattr(oc, "write_outcomes", lambda *a, **k: None)
+
+    cs._gates_report([], 0.0)
+
+    assert sorted(loads) == ["btc", "eth"], (
+        f"expected one corpus read per symbol over {len(starts) * 2} windows, "
+        f"got {len(loads)}: "
+        f"{ {s: loads.count(s) for s in sorted(set(loads))} }")

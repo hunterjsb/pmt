@@ -620,7 +620,14 @@ def _gates_report(activity: list[dict], since_epoch: float) -> dict:
     windows = outcomes.window_universe(slugs, since_epoch, time.time())
 
     wallet_wins = outcomes.wallet_outcomes(activity)
-    rounds_by_symbol = {w["symbol"]: ck.load_corpus(w["symbol"]) for w in windows}
+    # ONE corpus read per SYMBOL. Keyed off `windows` this comprehension re-read
+    # and re-parsed each ~6k-round chainlink file once per WINDOW — 1422 windows
+    # over 6 symbols is ~240 reads of every file to build a 6-entry dict, and it
+    # measured 31.7s of the 43s this command took. `pmt crypto outcomes` has
+    # always done it per-symbol (cli_crypto_data.py); this was the copy that
+    # lost the dedupe. Cost grows with the window universe, so it gets worse
+    # every day the fleet trades.
+    rounds_by_symbol = {sym: ck.load_corpus(sym) for sym in {w["symbol"] for w in windows}}
     # No resolution lookups here on purpose: that is one gamma round-trip per
     # ungraded window, and `pmt crypto outcomes` already banks them into the
     # corpus — which load_outcomes below picks up for free.

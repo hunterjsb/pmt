@@ -41,7 +41,7 @@ import json
 from collections.abc import Iterable
 from pathlib import Path
 
-from .chainlink import twap_over_window
+from .chainlink import sorted_rounds, twap_over_window
 from .updown_slugs import parse_updown_slug  # re-exported: this module's original home
 
 OUTCOMES_PATH = Path.home() / ".pmt" / "corpus" / "outcomes.jsonl"
@@ -161,7 +161,8 @@ def wallet_outcomes(activity_rows: list[dict]) -> dict[str, str]:
 
 # ---------- (b) Chainlink corpus inference, with the staleness guard ----------
 
-def chainlink_outcome(window: dict, rounds: list[dict]) -> tuple[str | None, str | None]:
+def chainlink_outcome(window: dict, rounds: list[dict],
+                       ts_list: list[int] | None = None) -> tuple[str | None, str | None]:
     """(winner, drop_reason) for one window from the Chainlink corpus.
 
     winner is 'up'/'down' from the settlement-shaped TWAP (width per
@@ -169,11 +170,16 @@ def chainlink_outcome(window: dict, rounds: list[dict]) -> tuple[str | None, str
     start. winner is None (with a reason) when the corpus can't be trusted
     for this window: no round within STALE_S before the query span, or the
     corpus's last known round predates the window end outright.
+
+    `ts_list` is chainlink.sorted_rounds()'s second half, for a caller grading
+    many windows off one symbol's corpus: passing it says `rounds` is ALREADY
+    oldest-first and skips re-sorting it per window. Omit it and this sorts
+    its own copy, which is what every one-window caller wants.
     """
     if not rounds:
         return None, "no corpus data"
-    rounds = sorted(rounds, key=lambda r: r["updated_at"])
-    ts_list = [r["updated_at"] for r in rounds]
+    if ts_list is None:
+        rounds, ts_list = sorted_rounds(rounds)
     w = ck_settlement_width_s(window["dur_s"])
     span_start = window["start"] - w
 
@@ -355,6 +361,11 @@ def build_outcomes(windows: list[dict], wallet: dict[str, str],
     windows no source could validate.
     """
     rows, dropped = [], []
+    # Sorted ONCE per symbol. Every window of a symbol grades off that symbol's
+    # whole corpus, so sorting inside the per-window call re-sorted the same
+    # ~6k rounds once per window (0.9s over 1422 windows, and rising with both
+    # the window count and the corpus).
+    prepared = {sym: sorted_rounds(rs) for sym, rs in rounds_by_symbol.items()}
     for w in windows:
         slug = w["slug"]
         if slug in wallet:
@@ -364,7 +375,8 @@ def build_outcomes(windows: list[dict], wallet: dict[str, str],
         if res:
             rows.append({"slug": slug, "winner": res, "source": "resolution"})
             continue
-        winner, reason = chainlink_outcome(w, rounds_by_symbol.get(w["symbol"]) or [])
+        ck_rounds, ck_ts = prepared.get(w["symbol"]) or ([], [])
+        winner, reason = chainlink_outcome(w, ck_rounds, ck_ts)
         if winner is not None:
             rows.append({"slug": slug, "winner": winner, "source": "chainlink"})
             continue
