@@ -18,6 +18,10 @@ dependencies = [
 
 [project.scripts]
 pmt = "cli:cli"
+# The pilot is a STANDALONE service with its own state, its own unit and its
+# own risk law — not a `pmt crypto` subcommand. Wiring it into the engine's CLI
+# would put it one typo away from the fleet's arms.
+pilot2 = "pilot2.cli:main"
 
 [dependency-groups]
 dev = [
@@ -30,7 +34,13 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["polymarket*", "scanners*"]
+include = ["polymarket*", "scanners*", "pilot2*"]
+
+[tool.setuptools.package-data]
+# The frozen predictor vectors ship WITH the code. A build that drops them
+# leaves the exactness test with nothing to assert against, which is worse
+# than a build that fails.
+pilot2 = ["vectors/*.json"]
 
 [tool.setuptools]
 # Every top-level module ships explicitly — a cli_crypto_* module missing from

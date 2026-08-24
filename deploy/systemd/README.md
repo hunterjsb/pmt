@@ -1,6 +1,6 @@
 # systemd user units (proposal)
 
-Four units, none installed. They are checked in as a proposal so adopting
+Five units, none installed. They are checked in as a proposal so adopting
 them is a decision with a diff behind it, not a thing that happened.
 
 | unit | what it runs | restarts? |
@@ -8,7 +8,38 @@ them is a decision with a diff behind it, not a thing that happened.
 | `pmengine.service` | `pmengine ... run updown --skip-warmup`, same as `pmt engine start` | on failure, 5s→120s backoff, 5 tries / 5min |
 | `pmt-rtds-recorder.service` | `uv run python -m polymarket.rtds` in `pmtrader/` | on failure, 10s→300s backoff, 10 tries / 10min |
 | `pmt-print-recorder.service` | `uv run python -m polymarket.prints` in `pmtrader/` | on failure, 10s→300s backoff, 10 tries / 10min |
+| `pmt-pilot2.service` | `uv run python -m pilot2 run` in `pmtrader/` — **SHADOW, places no orders** | on failure, 10s→300s backoff; **never** on exit 2 |
 | `pmt-backup.service` + `.timer` | `scripts/pmt-backup.sh` — ~/.pmt corpus + tapes → `s3://xanmc/pmt-backups/YYYY-MM-DD.tar.zst` | no. oneshot, daily 03:30, `Persistent=true` |
+
+## The pilot unit, and the two switches it deliberately does not throw
+
+`pmt-pilot2.service` runs the Strategy 2.0 interim pilot
+(`pmtrader/pilot2/README.md`) in SHADOW mode. It prices the majors, writes down
+what it WOULD have traded, and places nothing.
+
+Live requires **both** `PILOT2_LIVE=1` and `--live` on the ExecStart line, and
+the unit ships with `Environment=PILOT2_LIVE=0` and no flag. One of them alone
+is a mistake somebody could make — a flag survives a copied command line, an
+env var survives a unit file — so it takes two edits in two different places.
+
+Three things about this unit that differ from the recorders:
+
+- **`RestartPreventExitStatus=2`.** Exit 2 is a REFUSED series partition: the
+  pilot was configured onto a series a running engine already trades, which is
+  wash-trade shaped. A restart cannot fix a config error and a unit that keeps
+  bouncing on one hides it. It stays visibly stopped.
+- **The kill file beats systemctl.** `touch ~/.pmt/pilot2/HALT` stops the pilot
+  at the top of its next poll (≤2s) and it exits 0, so `Restart=on-failure`
+  leaves it down. Remove the file before restarting. Filled positions ride to
+  resolution either way — that is the strategy, not a degraded mode.
+- **A gap here is not a corpus gap.** The recorders write data nobody can
+  re-observe; the pilot writes a decision log. Restart-on-failure is still
+  right (a pilot running half the day produces a record nobody can conclude
+  from), but this is the unit to stop first when something is wrong.
+
+It shares nothing mutable with `pmengine.service`: separate process, separate
+state directory (`~/.pmt/pilot2`), separate wallet when live, and a series
+partition checked at startup.
 
 ## The print recorder, and why it is a second unit
 
@@ -138,6 +169,7 @@ mkdir -p ~/.config/systemd/user
 cp deploy/systemd/pmengine.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-rtds-recorder.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-print-recorder.service ~/.config/systemd/user/
+cp deploy/systemd/pmt-pilot2.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-backup.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-backup.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
@@ -160,6 +192,16 @@ Start one without enabling it at boot (the way to try it):
 systemctl --user start pmt-rtds-recorder.service
 systemctl --user status pmt-rtds-recorder.service
 journalctl --user -u pmt-rtds-recorder.service -f
+```
+
+The pilot, before enabling it — the partition check exits 2 if it is pointed
+at a series an engine already trades, and that is the whole safety story:
+
+```sh
+(cd pmtrader && uv run python -m pilot2 series); echo "exit $?"
+systemctl --user start pmt-pilot2.service
+(cd pmtrader && uv run python -m pilot2 status)
+touch ~/.pmt/pilot2/HALT      # stops it within one poll; rm before restarting
 ```
 
 Enable at login once you trust it:

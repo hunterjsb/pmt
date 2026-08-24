@@ -1,0 +1,62 @@
+# pmt pilot2 — the Strategy 2.0 interim pilot, as a systemd USER service.
+#
+# PROPOSAL, not installed. SHADOW MODE. See README.md in this directory and
+# pmtrader/pilot2/README.md.
+#
+# This unit places NO ORDERS. `pilot2 run` is shadow unless BOTH `--live` and
+# `PILOT2_LIVE=1` are present, and neither is here. Arming it is a deliberate
+# edit to two lines plus a series partition check — see the pilot's README for
+# the ceremony, which is not optional and is not something to do from a diff.
+#
+# Unlike the two recorders this unit does not write anything irreplaceable: the
+# shadow tape it produces is a decision log, and a gap in it costs graded
+# windows, not corpus. Restart-on-failure is still right — a pilot that is only
+# running half the day produces a record nobody can draw a conclusion from.
+#
+# It is a SIBLING of pmengine.service and shares nothing mutable with it:
+# separate process, separate state directory (~/.pmt/pilot2), separate wallet
+# when live, and a series partition that is checked at startup and fatal.
+
+[Unit]
+Description=pmt pilot2 — Strategy 2.0 interim pilot (SHADOW MODE, places no orders)
+Documentation=file:///var/home/hunter/Desktop/code/pmt/pmtrader/pilot2/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/var/home/hunter/Desktop/code/pmt/pmtrader
+# `uv run` resolves the pmtrader venv from the cwd's pyproject.toml, so the
+# WorkingDirectory above is load-bearing, not cosmetic.
+ExecStart=/var/home/hunter/.local/bin/uv run python -m pilot2 run
+
+# SHADOW. Setting PILOT2_LIVE=1 here arms real capital and is HALF of what that
+# takes — the other half is `--live` on the ExecStart line. Two switches, two
+# edits, on purpose.
+Environment=PILOT2_LIVE=0
+
+# The kill file. `touch ~/.pmt/pilot2/HALT` stops the pilot at the top of its
+# next poll (<=2s) without a systemctl call, and filled positions ride to
+# resolution as they would anyway. Remove the file before restarting.
+Environment=PILOT2_HOME=%h/.pmt/pilot2
+
+Restart=on-failure
+RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
+
+# A clean exit is a HALT file or a SIGTERM, and neither should be restarted.
+SuccessExitStatus=0
+# Exit 2 is a REFUSED series partition — a config error that a restart cannot
+# fix and that must stay visibly stopped.
+RestartPreventExitStatus=2
+
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+SyslogIdentifier=pmt-pilot2
+
+[Install]
+WantedBy=default.target
