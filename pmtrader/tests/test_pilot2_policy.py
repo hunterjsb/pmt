@@ -24,13 +24,27 @@ def test_min_edge_is_the_reports_value():
 
 
 def test_fee_is_the_live_schedule_not_a_local_copy():
-    """0.07 * min(p, 1-p) — imported from polymarket.constants so the pilot
-    and pmengine cannot charge different fees for the same fill."""
-    assert taker_fee(0.70) == 0.07 * min(0.70, 1.0 - 0.70)
-    assert taker_fee(0.30) == 0.07 * 0.30
-    assert taker_fee(0.50) == 0.07 * 0.50
+    """0.07 * p * (1-p) — the MEASURED schedule, imported from
+    polymarket.constants so the pilot and pmengine cannot charge different
+    fees for the same fill."""
+    assert taker_fee(0.05) == pytest.approx(0.07 * 0.05 * 0.95)
+    assert taker_fee(0.50) == pytest.approx(0.0175)
+    assert taker_fee(0.95) == pytest.approx(0.07 * 0.95 * 0.05)
     assert taker_fee(0.95) == pytest.approx(taker_fee(0.05)), \
-        "the cheaper side of the pair, either way"
+        "symmetric: both legs of a pair pay the same"
+    assert taker_fee(0.5, 0.0) == 0.0, "a fee-free series has no term at all"
+
+
+def test_a_mid_price_entry_the_old_shape_priced_out_now_clears_min_edge():
+    """At a coin flip the realized fee is 1.75c, not the 3.5c the old
+    min(p, 1-p) shape charged. A 4c gross edge at 0.50 clears MIN_EDGE on
+    the real schedule and did not on the old one — and mid price is exactly
+    where thesis B says the edge lives."""
+    ask = 0.50
+    d = policy.side_decision("up", 0.54, ask, 100.0)
+    assert d.fee == pytest.approx(0.0175)
+    assert d.fire, f"edge {d.edge} clears MIN_EDGE at the real fee"
+    assert 0.54 - ask - 0.07 * min(ask, 1 - ask) < policy.MIN_EDGE
 
 
 def test_edge_is_probability_minus_ask_minus_fee():
@@ -50,13 +64,17 @@ def test_gate_fires_exactly_at_min_edge_and_not_below():
 
 def test_the_fee_alone_can_close_the_gate():
     """A raw 2c edge that ignores the fee fires; the real cost model does not.
-    At ask 0.50 the fee is 3.5c, which is bigger than min_edge on its own."""
+    At ask 0.50 the realized fee is 1.75c — it eats 7/8 of a 2c gross edge
+    and the gate refuses. (The old min(p, 1-p) shape charged 3.5c and drove
+    the edge NEGATIVE; the refusal survives the correction, its margin does
+    not, which is the whole point of measuring the constant.)"""
     ask = 0.50
     p = ask + 0.02
     naive_edge = p - ask
     assert naive_edge >= policy.MIN_EDGE
     d = policy.side_decision("up", p, ask, 100.0)
-    assert d.edge < 0, "the fee at 0.50 is 3.5c and swamps a 2c gross edge"
+    assert d.fee == pytest.approx(0.0175)
+    assert 0.0 < d.edge < policy.MIN_EDGE, "1.75c of a 2c edge is still a refusal"
     assert not d.fire
 
 

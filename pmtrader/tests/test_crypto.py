@@ -53,10 +53,27 @@ def test_parse_semantics_rejects_unknown():
         parse_semantics(_event("resolves YES if the president says bitcoin"))
 
 
-def test_taker_fee_cheaper_side():
-    assert taker_fee(0.91, 0.07) == pytest.approx(0.07 * 0.09)
-    assert taker_fee(0.09, 0.07) == pytest.approx(0.07 * 0.09)
-    assert taker_fee(0.5, 0.0) == 0.0
+def test_taker_fee_is_the_measured_curve():
+    """`rate * p * (1-p)` — the schedule the wallet actually charged on 1017
+    of 1017 fee-bearing updown fills. Pinned at three prices."""
+    assert taker_fee(0.05, 0.07) == pytest.approx(0.07 * 0.05 * 0.95)
+    assert taker_fee(0.50, 0.07) == pytest.approx(0.0175)
+    assert taker_fee(0.95, 0.07) == pytest.approx(0.07 * 0.95 * 0.05)
+
+
+def test_taker_fee_is_symmetric_and_zero_at_a_zero_rate():
+    assert taker_fee(0.91, 0.07) == pytest.approx(taker_fee(0.09, 0.07))
+    for p in (0.0, 0.05, 0.5, 0.95, 1.0):
+        assert taker_fee(p, 0.0) == 0.0
+
+
+def test_taker_fee_at_mid_is_half_the_old_min_shape():
+    """The correction's whole point: `min(p, 1-p)` doubled the charge at a
+    coin flip, which is the lane peer_intel says earns. A regression fails
+    here rather than silently pricing us out again."""
+    assert taker_fee(0.50, 0.07) == pytest.approx(0.07 * min(0.5, 0.5) / 2)
+    # and is only ~5% cheaper at 0.95, where the two shapes nearly agree
+    assert taker_fee(0.95, 0.07) == pytest.approx(0.07 * 0.05 * 0.95)
 
 
 # ---------- one source for the shared constants ----------
@@ -78,7 +95,7 @@ def test_shadow_prices_fees_at_the_shared_rate():
 def test_taker_fee_defaults_to_the_live_rate():
     from polymarket.constants import FEE_RATE, taker_fee
 
-    assert taker_fee(0.91) == pytest.approx(FEE_RATE * 0.09)
+    assert taker_fee(0.91) == pytest.approx(FEE_RATE * 0.91 * 0.09)
 
 
 # ---------- market data: symbols Binance does not list ----------

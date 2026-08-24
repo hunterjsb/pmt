@@ -56,7 +56,12 @@ _MARGIN_RE = re.compile(r"projected margin ([+-]?\d+(?:\.\d+)?)bp")
 def fee(ask: float) -> float:
     """Per-share taker fee at the live rate. This module never fetches a
     market's actual feeSchedule (pure/no-network by design), so it prices
-    at the constant."""
+    at the constant.
+
+    Only ever used to price a HYPOTHETICAL clip. Where a wallet row exists
+    the ledger reads the fee the wallet actually recorded — a formula never
+    overrides a receipt.
+    """
     return taker_fee(ask, FEE_RATE)
 
 

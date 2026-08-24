@@ -13,9 +13,12 @@ Cost model, verbatim from `calfit/ev_policy.py`:
 
 `ask` is the quoted ask, so paying the spread is already inside the arithmetic
 — we are the taker and never assume a mid fill. `taker_fee` is the live
-`crypto_fees_v2` schedule, `0.07 * min(p, 1-p)`, the same function pmengine
-charges; it is imported from `polymarket.constants` rather than re-typed, so
-the two can never drift.
+`crypto_fees_v2` schedule, `0.07 * p * (1-p)` as MEASURED off the wallet (see
+`polymarket.constants`), the same function pmengine charges; it is imported
+from `polymarket.constants` rather than re-typed, so the two can never drift.
+The gate is at its most sensitive to this at mid price, which is exactly where
+thesis B says the edge lives — the old `min(p, 1-p)` shape charged double
+there and priced the lane out.
 """
 
 from __future__ import annotations

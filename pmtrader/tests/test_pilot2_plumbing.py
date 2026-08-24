@@ -162,7 +162,9 @@ def test_grade_pays_a_winner_a_dollar_a_share_and_wipes_a_loser(tmp_path):
                     log=lambda *_: None)
     assert out["graded"] == 1 and out["wins"] == 1
     row = next(iter(state.iter_records(state.GRADED, tmp_path)))
-    assert row["pnl"] == pytest.approx(policy.realized_pnl(9.0, 0.55, True))
+    # the graded row rounds to 4dp, so compare at that grain, not at approx's
+    # relative default
+    assert row["pnl"] == pytest.approx(policy.realized_pnl(9.0, 0.55, True), abs=1e-4)
     assert row["pnl"] > 0
 
 

@@ -80,8 +80,10 @@ def test_fee_symmetric_around_50c():
 
 
 def test_fee_matches_taker_fee_shape():
-    # 0.07 * min(ask, 1-ask), same formula as crypto.taker_fee()
-    assert abs(fee(0.85) - 0.07 * 0.15) < 1e-12
+    # 0.07 * ask * (1-ask), same formula as crypto.taker_fee() — the shape
+    # the wallet actually charged, not the old min(ask, 1-ask).
+    assert abs(fee(0.85) - 0.07 * 0.85 * 0.15) < 1e-12
+    assert abs(fee(0.50) - 0.0175) < 1e-12
 
 
 def test_shadow_value_win_is_positive_and_net_of_fee():

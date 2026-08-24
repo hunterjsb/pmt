@@ -131,13 +131,26 @@ def test_the_paired_check_never_blocks_a_first_clip(tmp_path):
 
 
 def test_the_paired_check_counts_fees_on_both_legs(tmp_path):
-    """0.48 + 0.48 = 0.96 looks like a 4c lock-in. The two fees are 0.07*0.48
-    each = 6.7c, so the pair really costs 1.027."""
+    """0.53 + 0.53 = 1.06 is already a 6c lock-in before fees, and the two
+    realized fees (0.07*0.53*0.47 = 1.74c each) only deepen it.
+
+    The break-even moved with the fee correction: `2a + 2*0.07*a*(1-a) >= 1`
+    turns over at a = 0.4825, so a 0.48/0.48 pair now locks a half-cent
+    PROFIT and is allowed. The old min(p, 1-p) shape charged 3.36c a leg and
+    refused it — that pair was never a loss, and refusing it was the
+    over-charge showing up as a risk rule."""
     b = risk.RiskBook(home=tmp_path)
     end = 1_000_000.0
-    b.record_fill("btc-updown-5m-1", "down", shares=10.0, notional=4.8, ask=0.48, end=end)
-    assert b.locks_a_paired_loss("btc-updown-5m-1", "up", 0.48)
+    b.record_fill("btc-updown-5m-1", "down", shares=10.0, notional=5.3, ask=0.53, end=end)
+    assert b.locks_a_paired_loss("btc-updown-5m-1", "up", 0.53)
     assert not b.locks_a_paired_loss("btc-updown-5m-1", "up", 0.40)
+
+    b2 = risk.RiskBook(home=tmp_path)
+    b2.record_fill("btc-updown-5m-2", "down", shares=10.0, notional=4.8, ask=0.48, end=end)
+    assert not b2.locks_a_paired_loss("btc-updown-5m-2", "up", 0.48), \
+        "0.9949 to collect 1.00 is a locked profit, not a loss"
+    assert b2.locks_a_paired_loss("btc-updown-5m-2", "up", 0.49), \
+        "one tick the other side of the 0.4825 break-even and it is a loss"
 
 
 def test_total_exposure_stops_new_windows(tmp_path):

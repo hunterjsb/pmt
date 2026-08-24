@@ -17,6 +17,12 @@ edge = p_side - ask - taker_fee(ask)       ->  fire iff edge >= 0.02
 risk law                                   ->  a NAMED refusal, or one clip
 ```
 
+`taker_fee` is `rate * p * (1-p)` per share — the schedule MEASURED off the
+wallet (`polymarket/constants.py`), not the `rate * min(p, 1-p)` every path
+used to subtract. It matters most here: the correction halves the charge at a
+coin flip, and thesis B's whole claim is that the edge lives at mid price.
+A resting fill pays zero, but nothing in pilot2 rests.
+
 ## What it does per decision
 
 Shadow mode writes ONE line to `~/.pmt/pilot2/shadow-tape.jsonl` for each
