@@ -1,0 +1,45 @@
+# EU auto-redeem sweeper — SYSTEM unit, driven by pmt-redeem-sweeper.timer.
+#
+# Turns the box's settled winners back into spendable collateral. Without it
+# a winning night walks the wallet's cash under the clip size and freezes the
+# engine while the wins sit as unredeemed CTF tokens — the L43 incident.
+#
+# Installed by the orchestrator via SSM. NOT enabled by the ship script:
+# whether an unattended process may sign a wallet batch is a human decision,
+# and the adapter path's one-time approval is a second one.
+
+[Unit]
+Description=pmt EU auto-redeem sweeper — settled winners back to collateral
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user
+
+# No EnvironmentFile for l0.env: the sweeper reads the key file itself, at the
+# moment it signs and not before, so a --dry-run run never has it in its
+# environment and neither does anything systemd logs about this unit.
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/home/ec2-user/redeem-venv/bin/python \
+    /home/ec2-user/pmt/bin/redeem-sweeper.py
+
+# A oneshot that fails is the ALARM, so it must not retry itself into a
+# quieter failure. Exit 3 is "the batch landed and paid nothing" (L43) and
+# wants a human, not another attempt in five seconds; the timer's next tick
+# is the only retry, ten minutes out, by which time the chain has moved.
+Restart=no
+
+# Submit, wait for the receipt, assert the payout. Generous enough to cover a
+# slow relayer; short enough that two ticks never overlap.
+TimeoutStartSec=420
+
+StandardOutput=append:/home/ec2-user/.pmt/engine/redeem-sweeper.log
+StandardError=append:/home/ec2-user/.pmt/engine/redeem-sweeper.log
+SyslogIdentifier=pmt-redeem-sweeper
+
+[Install]
+WantedBy=multi-user.target
