@@ -12,11 +12,12 @@
 # trade than a URL that dies in 15 minutes.
 #
 #   ./deploy/eu/ship-eu.sh              # build + upload + install + smoke
-#   ./deploy/eu/ship-eu.sh --skip-build # reuse the existing target/ binary
+#   ./deploy/eu/ship-eu.sh --skip-build # reuse the existing target-eu/ binary
+#   ./deploy/eu/ship-eu.sh --restart    # ...then restart at the next 5m boundary
 #
 set -euo pipefail
 
-INSTANCE="${PMT_EU_INSTANCE:?set PMT_EU_INSTANCE (see pmt-alpha/infra/ec2-eu-runbook.md)}"
+INSTANCE="${PMT_EU_INSTANCE:-i-0426f1d5e68cdee60}"   # pmt-alpha/infra/ec2-eu-runbook.md
 REGION="${PMT_EU_REGION:-eu-west-1}"
 BUCKET="${PMT_DEPLOY_BUCKET:-xanmc}"
 PREFIX="${PMT_DEPLOY_PREFIX:-pmt-deploy}"
@@ -35,7 +36,14 @@ BOX_GLIBC="${BOX_GLIBC:-2.34}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENGINE="$REPO_ROOT/pmengine"
 SKIP_BUILD=0
-[ "${1:-}" = "--skip-build" ] && SKIP_BUILD=1
+RESTART=0
+for a in "$@"; do
+  case "$a" in
+    --skip-build) SKIP_BUILD=1 ;;
+    --restart)    RESTART=1 ;;
+    *) echo "unknown arg: $a" >&2; exit 1 ;;
+  esac
+done
 
 say() { printf '\n=== %s\n' "$*"; }
 die() { printf '\nFATAL: %s\n' "$*" >&2; exit 1; }
@@ -129,8 +137,12 @@ say "built $(file "$BIN" | cut -d, -f1-3)"
 say "upload s3://$BUCKET/$KEY"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
-tar -czf "$STAGE/$ARTIFACT" -C "$ENGINE/target/$TARGET/release" pmengine
-sha256sum "$STAGE/$ARTIFACT" | tee "$STAGE/sha256"
+# Tar from $BIN's own directory. The 2026-08-24 incident: this line still read
+# the pre-isolation target/ path, so a stale binary shipped under a fresh SHA's
+# artifact name and smoke-tested green (smoke proves flavor, not version).
+tar -czf "$STAGE/$ARTIFACT" -C "$(dirname "$BIN")" pmengine
+LOCAL_SHA="$(sha256sum "$BIN" | cut -d' ' -f1)"
+echo "local binary sha256: $LOCAL_SHA"
 aws s3 cp "$STAGE/$ARTIFACT" "s3://$BUCKET/$KEY" --region "$BUCKET_REGION"
 
 URL="$(aws s3 presign "s3://$BUCKET/$KEY" --region "$BUCKET_REGION" --expires-in 900)"
@@ -156,7 +168,9 @@ PY
   cmd_id="$(aws ssm send-command --region "$REGION" --instance-ids "$INSTANCE" \
     --document-name AWS-RunShellScript --parameters "file://$work/params.json" \
     --timeout-seconds "$timeout" --query "Command.CommandId" --output text)"
-  for _ in $(seq 1 60); do
+  # Poll for the payload's whole timeout, not a fixed 5 minutes — the boundary
+  # restart legitimately sleeps up to ~5.5 minutes before it even starts.
+  for _ in $(seq 1 $((timeout / 5 + 12))); do
     sleep 5
     status="$(aws ssm get-command-invocation --region "$REGION" --command-id "$cmd_id" \
       --instance-id "$INSTANCE" --query Status --output text 2>/dev/null || echo Pending)"
@@ -180,7 +194,9 @@ cd "\$(mktemp -d)"
 curl -fsSL -o pmengine.tar.gz '$URL'
 tar -xzf pmengine.tar.gz
 install -o ec2-user -g ec2-user -m 0755 pmengine '$REMOTE_BIN'
-echo "installed:"; ls -l '$REMOTE_BIN'; sha256sum '$REMOTE_BIN'
+echo "installed:"; ls -l '$REMOTE_BIN'
+# The version proof: what landed is bit-for-bit what was built.
+echo '$LOCAL_SHA  $REMOTE_BIN' | sha256sum -c -
 EOSH
 ssm_run "$INSTALL" 300 || die "install failed"
 
@@ -199,8 +215,27 @@ echo "$OUT"
 echo "$OUT" | grep -qw updown || die "PUBLIC FLAVOR ON BOX — 'list' has no updown. Do not proceed."
 say "OK — updown present. Private flavor confirmed on aarch64."
 
-cat <<'EOF'
+# --- 6. optional boundary restart -------------------------------------------
+# A restart mid-window would yank management out from under a live position;
+# every 5m rollover leaves the box flat, so activation waits for one.
+if [ "$RESTART" -eq 1 ]; then
+  say "boundary restart: next 5m rollover +15s"
+  RESTART_SH="$STAGE/restart.sh"
+  cat > "$RESTART_SH" <<'EOSH'
+set -euo pipefail
+now=$(date +%s); wait=$(( (300 - now % 300) % 300 + 15 ))
+echo "restarting in ${wait}s (boundary +15s)"; sleep "$wait"
+systemctl restart pmengine
+sleep 6
+systemctl is-active pmengine
+tail -5 /home/ec2-user/.pmt/engine/engine-systemd.log
+EOSH
+  ssm_run "$RESTART_SH" 600 || die "boundary restart failed"
+  say "OK — engine restarted on the shipped binary at a window boundary"
+else
+  cat <<'EOF'
 
-Installed and smoke-tested. NOT enabled, NOT started — on purpose.
-Remaining ceremony is in deploy/eu/README.md.
+Installed and smoke-tested. NOT restarted — the running engine still execs the
+old binary. Re-run with --restart, or follow deploy/eu/README.md.
 EOF
+fi
