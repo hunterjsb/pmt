@@ -271,8 +271,14 @@ def streak_milestones(windows: list[dict]) -> list[dict]:
     Asks effectiveness.streak() for the run at each settled window in turn
     rather than re-deriving it here, so the milestone and the number
     `pmt crypto stats` prints can never mean two different things.
+
+    The prefix walk uses effectiveness.by_settlement — the SAME order streak()
+    counts in. Sorting on `end_ts` alone left the tie inside a settlement
+    second to wallet-page arrival order, which decided both which window got
+    named and (because the key is `streak:{n}:{slug}`) whether a re-ordered
+    walk wrote the same crossing a second time into a permanent file.
     """
-    ordered = sorted(windows, key=lambda w: float(w.get("end_ts") or 0.0))
+    ordered = effectiveness.by_settlement(windows)
     out = []
     for i, w in enumerate(ordered, start=1):
         n = effectiveness.streak(ordered[:i])["current"]
@@ -316,7 +322,21 @@ def scale_changes(arms: list[dict], state: dict, now: float) -> list[dict]:
             bits.append(f"{verb} ${prev.get('size', 0):,.0f}→${cur['size']:,.0f}")
         if cur["clip"] != prev.get("clip"):
             bits.append(f"clip ${prev.get('clip', 0):,.0f}→${cur['clip']:,.0f}")
-        out.append(_ev(now, f"scale:{series}:{cur['size']:.0f}:{cur['clip']:.0f}",
+        # The key names the TRANSITION, not the destination. Keyed on the new
+        # values alone, a restore collided with the key the original change
+        # already burned and the line was silently dropped — proven live on
+        # 2026-08-24: `seen` held `scale:btc 5m:300:50`, btc 5m had since gone
+        # to 34/8, and replaying a move back to 300/50 wrote nothing while
+        # note_scale moved the baseline anyway, so the journal never said it.
+        # A restore is an ordinary operator action, not an edge case.
+        #
+        # Residual, deliberately left: the SAME transition twice (A->B, B->A,
+        # A->B) still collides on the third leg. Fixing that needs an event
+        # time these records do not carry — they are stamped with the run
+        # time, not the moment the arm changed.
+        out.append(_ev(now,
+                        f"scale:{series}:{prev.get('size', 0):.0f}:{prev.get('clip', 0):.0f}"
+                        f"->{cur['size']:.0f}:{cur['clip']:.0f}",
                         f"{series} {', '.join(bits)}"))
     return out
 

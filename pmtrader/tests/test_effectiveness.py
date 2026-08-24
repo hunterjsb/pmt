@@ -9,6 +9,7 @@ win rate sitting next to a sub-1.00 profit factor and a negative growth rate.
 
 from __future__ import annotations
 
+import itertools
 import math
 import time
 
@@ -429,3 +430,36 @@ def test_effectiveness_summary_defaults_to_the_wall_clock():
                             "entry_ts": time.time() - 3600.0, "exit_ts": 0.0,
                             "end_ts": time.time() - 3000.0}], "riding_usd": 0.0}
     assert cc.effectiveness_summary(sb, {"total": 1000.0})["span_h"] == pytest.approx(1.0, abs=0.05)
+
+
+# ---------- settlement order is deterministic (bughunt 2026-08-24) ----------
+
+def test_by_settlement_breaks_ties_on_slug_not_arrival_order():
+    """Whole series settle on the same boundary — 460 of 590 live windows share
+    an end_ts with another. A stable sort on end_ts alone let wallet-page
+    arrival order decide the run, and `longest` flipped 107<->108 between
+    walks of identical data."""
+    a = {"slug": "btc-updown-5m-1000", "end_ts": 1000.0, "won": True}
+    b = {"slug": "eth-updown-5m-1000", "end_ts": 1000.0, "won": False}
+    c = {"slug": "sol-updown-5m-1000", "end_ts": 1000.0, "won": True}
+    forward = [w["slug"] for w in eff.by_settlement([a, b, c])]
+    shuffled = [w["slug"] for w in eff.by_settlement([c, a, b])]
+    reversed_ = [w["slug"] for w in eff.by_settlement([b, c, a])]
+    assert forward == shuffled == reversed_ == [a["slug"], b["slug"], c["slug"]]
+
+
+def test_streak_is_invariant_to_the_order_rows_arrived_in():
+    wins = [{"slug": f"{s}-updown-5m-1000", "end_ts": 1000.0, "won": True}
+            for s in ("btc", "eth", "sol")]
+    loss = {"slug": "xrp-updown-5m-1000", "end_ts": 1000.0, "won": False}
+    windows = [*wins, loss]
+    answers = {eff.streak(list(p))["longest"]
+               for p in itertools.permutations(windows)}
+    assert answers == {3}, "one answer, whatever order the walk returned"
+
+
+def test_streak_still_orders_across_different_settlement_times():
+    early = {"slug": "btc-updown-5m-1000", "end_ts": 1000.0, "won": True}
+    late = {"slug": "aaa-updown-5m-2000", "end_ts": 2000.0, "won": False}
+    # `late` sorts first by slug but LAST by time: time must dominate
+    assert eff.streak([late, early]) == {"current": 0, "longest": 1}

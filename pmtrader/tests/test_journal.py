@@ -424,3 +424,32 @@ def test_styled_escapes_a_line_that_looks_like_markup():
                                           (0.0, "+$0.00")])
 def test_money_always_carries_its_sign(pnl, expected):
     assert j._money(pnl) == expected
+
+
+# ---------- a restore is a change too (bughunt 2026-08-24) ----------
+
+def test_scale_key_names_the_transition_so_a_restore_is_not_swallowed():
+    """Keyed on the destination alone, going back to a size held before
+    collided with the key the original move burned. Proven live: `seen` held
+    `scale:btc 5m:300:50`, btc 5m had gone to 34/8, and a restore to 300/50
+    wrote nothing while note_scale moved the baseline anyway."""
+    state = {"scale": {"btc 5m": {"size": 1000.0, "clip": 150.0}}}
+    (down,) = j.scale_changes([_arm("btc-updown-5m-1", 300.0, 50.0)], state, T0)
+    seen = {down["key"]}
+
+    state = {"scale": {"btc 5m": {"size": 300.0, "clip": 50.0}}}
+    (further,) = j.scale_changes([_arm("btc-updown-5m-1", 34.0, 8.0)], state, T0)
+    assert further["key"] not in seen
+    seen.add(further["key"])
+
+    state = {"scale": {"btc 5m": {"size": 34.0, "clip": 8.0}}}
+    (restore,) = j.scale_changes([_arm("btc-updown-5m-1", 300.0, 50.0)], state, T0)
+    assert restore["key"] not in seen, "the restore must not collide with the move away"
+    assert "$34→$300" in restore["line"]
+
+
+def test_scale_key_is_stable_for_the_same_transition_on_a_rerun():
+    state = {"scale": {"btc 5m": {"size": 1000.0, "clip": 150.0}}}
+    (first,) = j.scale_changes([_arm("btc-updown-5m-1", 300.0, 50.0)], state, T0)
+    (again,) = j.scale_changes([_arm("btc-updown-5m-1", 300.0, 50.0)], state, T0 + 99)
+    assert first["key"] == again["key"], "idempotency across re-runs must survive"
