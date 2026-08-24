@@ -762,5 +762,6 @@ def render_stats(sb: dict, eff: dict, bal: dict | None, status: dict | None,
         parts += [section("live arms", "a snapshot — `pmt crypto watch` for live"),
                   build_windows_table({}, _t.time(), arms=arms)]
         if status.get("pending_rolls"):
-            parts.append(f"[dim]pending rolls: {', '.join(status['pending_rolls'])}[/dim]")
+            rolls = ", ".join(str(x) for x in (status.get("pending_rolls") or []))
+            parts.append(f"[dim]pending rolls: {rolls}[/dim]")
     return Group(*parts)

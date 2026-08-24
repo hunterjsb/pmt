@@ -41,6 +41,7 @@ import json
 from collections.abc import Iterable
 from pathlib import Path
 
+from . import errlog
 from .chainlink import sorted_rounds, twap_over_window
 from .updown_slugs import parse_updown_slug  # re-exported: this module's original home
 
@@ -402,10 +403,22 @@ def load_outcomes(path: Path = OUTCOMES_PATH) -> dict[str, dict]:
                 continue
             try:
                 r = json.loads(line)
-            except ValueError:
+            except ValueError as e:
+                # The corpus is the graded-winner record `stats --gates`,
+                # `journal` and the regime gauge all resolve against. A line
+                # lost here is a window that silently stops having an outcome,
+                # so it gets a mark rather than a shrug.
+                errlog.note("outcomes.load_outcomes.corrupt_line", e,
+                            path=str(path), line=line[:200])
                 continue
-            if r.get("slug"):
+            # isinstance, not a bare .get: a line that parses to a LIST used to
+            # raise AttributeError straight out of the corpus reader.
+            if isinstance(r, dict) and r.get("slug"):
                 out[r["slug"]] = r
+            elif not isinstance(r, dict):
+                errlog.note("outcomes.load_outcomes.bad_row",
+                            TypeError(f"corpus row is {type(r).__name__}, not an object"),
+                            path=str(path), line=line[:200])
     return out
 
 

@@ -65,7 +65,7 @@ import os
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
-from . import tape
+from . import errlog, tape
 from .outcomes import OUTCOMES_PATH, is_terminal_source
 from .updown_slugs import dur_label, parse_updown_slug, series_key
 
@@ -403,7 +403,9 @@ def resolved_windows(outcomes_path: Path | None = None) -> dict[str, dict]:
                 continue
             try:
                 r = json.loads(line)
-            except ValueError:
+            except ValueError as e:
+                errlog.note("regime.load_winners.corrupt_line", e,
+                            path=str(path), line=line[:200])
                 continue
             if not isinstance(r, dict):
                 continue
@@ -486,7 +488,12 @@ def load_rows(path: Path | None = None) -> list[dict]:
                 continue
             try:
                 r = json.loads(line)
-            except ValueError:
+            except ValueError as e:
+                # regime.jsonl is idempotent BY SLUG: a row lost to a bad line
+                # is a window the next run will happily re-append, which is a
+                # duplicate in a file whose whole contract is one row per slug.
+                errlog.note("regime.load_rows.corrupt_line", e,
+                            path=str(p), line=line[:200])
                 continue
             if isinstance(r, dict) and r.get("slug"):
                 out.append(r)

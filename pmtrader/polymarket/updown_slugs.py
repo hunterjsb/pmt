@@ -64,7 +64,15 @@ def window_start(slug: str) -> float:
     Deliberately looser than parse_updown_slug: it only needs the trailing
     token, so it works on any slug whose caller already knows (by other
     means, e.g. `is_updown`) is an updown window.
+
+    A non-string (a record with `"slug": null`, which `.get("slug", "")` hands
+    straight through) is 0 like any other unparseable slug. It used to be
+    `AttributeError: 'NoneType' object has no attribute 'rsplit'` raised from
+    the middle of the fleet scoreboard — the handler named IndexError and
+    ValueError, and rsplit on None is neither.
     """
+    if not isinstance(slug, str):
+        return 0.0
     try:
         return float(slug.rsplit("-", 1)[1])
     except (IndexError, ValueError):

@@ -35,6 +35,7 @@ import re
 import statistics
 from collections.abc import Iterable, Iterator
 
+from . import errlog
 from .constants import FEE_RATE, taker_fee
 from .tape import EV_EVAL, EV_FIRE, EV_GATED
 from .updown_slugs import is_updown
@@ -108,7 +109,12 @@ def _load(line: str) -> dict | None:
         return None
     try:
         r = json.loads(line)
-    except ValueError:
+    except ValueError as e:
+        # A refusal tick lost here is a counterfactual clip missing from the
+        # gates ledger — a number that quietly gets smaller rather than wrong,
+        # which is the harder kind to notice. The mark's COUNT is the tell: one
+        # is the torn tail of a live tape, thousands is a dead file.
+        errlog.note("shadow._load.corrupt_line", e, line=line[:200])
         return None
     return r if isinstance(r, dict) else None
 

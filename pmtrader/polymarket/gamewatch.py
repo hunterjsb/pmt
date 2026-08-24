@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from . import espn, hosts
+from . import errlog, espn, hosts
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 WP_EVENT_THRESH = 0.015   # ESPN wp jump that counts as a game event
@@ -825,8 +825,12 @@ def run_watch(
     else:
         try:
             state.positions = fetch_positions(resolved)
-        except Exception:
-            pass  # no funder configured / data-api hiccup: watch still works
+        except Exception as e:
+            # No funder configured / data-api hiccup: the watch still works,
+            # but with NO position in it — and "flat" and "we couldn't ask" are
+            # opposite facts to have on screen during a game.
+            errlog.note("gamewatch.start.fetch_positions", e,
+                        slug=resolved.get("slug"))
     state.log({"type": "start", "slug": resolved["slug"],
                "home": resolved["home"]["abbrev"], "away": resolved["away"]["abbrev"]})
     stop = threading.Event()

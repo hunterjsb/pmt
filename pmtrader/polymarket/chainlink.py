@@ -25,7 +25,7 @@ from pathlib import Path
 
 import requests
 
-from . import hosts
+from . import errlog, hosts
 from .fit import fetch_klines
 
 REQUEST_TIMEOUT = 10
@@ -269,7 +269,9 @@ def load_corpus(symbol: str, since: float | None = None) -> list[dict]:
                 continue
             try:
                 r = json.loads(line)
-            except ValueError:
+            except ValueError as e:
+                errlog.note("chainlink.load_corpus.corrupt_line", e,
+                            path=str(path), line=line[:200])
                 continue
             if since is None or r.get("updated_at", 0) >= since:
                 rows.append(r)

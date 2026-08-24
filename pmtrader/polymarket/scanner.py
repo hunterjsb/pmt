@@ -131,6 +131,10 @@ def fetch_wallet_stats(wallet: str) -> dict:
     """Lifetime pnl/volume/markets-traded for one wallet. Any leg failing -> 0 for that leg, never raises."""
     pnl = volume = 0.0
     markets = 0
+    # LEGITIMATELY SILENT (errlog census, 2026-08-24) x3: these are the
+    # leaderboard/volume chrome on a holder row in an exploratory scan. Zero is
+    # a fine answer, nothing downstream sizes or grades off them, and a scan
+    # over 200 holders would otherwise mark three times per holder.
     try:
         r = requests.get(f"{hosts.LB_API}/profit", params={"window": "all", "limit": 1, "address": wallet},
                           headers=hosts.UA, timeout=REQUEST_TIMEOUT)

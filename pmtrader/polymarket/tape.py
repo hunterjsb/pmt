@@ -19,6 +19,8 @@ import os
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
+from . import errlog
+
 # Where the engine appends (updown_model.rs::append_jsonl writes under
 # $HOME/.pmt/engine). Derived, not hardcoded — same shape as
 # outcomes.OUTCOMES_PATH. str, not Path: every consumer passes these
@@ -48,6 +50,20 @@ STAGE_SUPPRESSED = "suppressed"
 STAGE_FILL = "fill"
 
 
+def record_floor_t(r: dict) -> float:
+    """A record's `t` for range comparisons — 0.0 when it hasn't got a usable
+    one, which is what a missing `t` has always meant here.
+
+    Exists so `r.get("t", 0) < floor` can never be `float < None`: the default
+    only covers a MISSING key, and the engine writing `"t": null` once turned
+    an every-record comparison into a TypeError out of `pmt crypto stats`.
+    """
+    t = r.get("t")
+    if isinstance(t, bool) or not isinstance(t, (int, float)):
+        return 0.0
+    return float(t)
+
+
 def iter_records(path: str, floor: float | None = None,
                   evs: Iterable[str] | None = None) -> Iterator[dict]:
     """Yield parsed dict records from a tape file, oldest to newest.
@@ -56,24 +72,41 @@ def iter_records(path: str, floor: float | None = None,
     records whose "t" is below it (missing "t" treated as 0). `evs`, if
     given, restricts to records whose "ev" is in it. Yields nothing (no
     error) when the file doesn't exist yet.
+
+    A corrupt line is SURFACED unless it is the last line in the file. The
+    trailing one is the documented race this module exists to tolerate — the
+    engine appending while we read — and marking it would put a benign entry
+    in `pmt crypto errors` on every other run. A corrupt line with records
+    after it is a different animal: that write finished, badly, and whatever
+    it said is permanently missing from every grade this tape feeds.
     """
     evs_set = set(evs) if evs is not None else None
     try:
         fh = open(path)
     except FileNotFoundError:
         return
+    # One line of hindsight: a corrupt line only becomes a finding once
+    # something follows it.
+    torn: str | None = None
     with fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
+            if torn is not None:
+                errlog.note("tape.iter_records.corrupt_line",
+                            ValueError("unparseable mid-file tape line"),
+                            path=path, line=torn[:200])
+                torn = None
             try:
                 r = json.loads(line)
             except ValueError:
+                torn = line
                 continue
             if not isinstance(r, dict):
+                torn = line
                 continue
-            if floor is not None and r.get("t", 0) < floor:
+            if floor is not None and record_floor_t(r) < floor:
                 continue
             if evs_set is not None and r.get("ev") not in evs_set:
                 continue
@@ -94,6 +127,10 @@ def record_t(raw: str | bytes) -> float | None:
     ONE parse rule for "does this line carry a timestamp", so the freshness
     check below and the watch dashboard's dedupe cursor can't disagree about
     which lines count.
+
+    LEGITIMATELY SILENT (errlog census, 2026-08-24): newest_t() feeds this the
+    fragments of a byte-offset seek, so unparseable input is the NORMAL case
+    and None is the answer, not a failure. Nothing to surface.
     """
     try:
         r = json.loads(raw)
@@ -116,6 +153,9 @@ def record_key(raw: str | bytes) -> str | None:
     panel two ways — Rust's compact `serde_json` off the file, Python's
     spaced `json.dumps` off the control plane — and byte compare would call
     those two different records.
+
+    LEGITIMATELY SILENT, same reason as record_t: a partial line has no
+    identity, and that is an answer rather than an error.
     """
     try:
         r = json.loads(raw)

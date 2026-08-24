@@ -32,6 +32,7 @@ import math
 import re
 from collections.abc import Iterable
 
+from . import errlog
 from .updown_slugs import parse_updown_slug
 
 FIXTURE_VERSION = 1
@@ -240,8 +241,13 @@ def wallet_accounting(activity_rows: Iterable[dict], slug: str,
     for a in activity_rows:
         try:
             newest = max(newest, float(a.get("timestamp") or 0))
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as e:
+            # `newest` is the dump-coverage check that decides whether this
+            # fixture may be frozen at all. A row whose timestamp won't parse
+            # silently lowers it, and a too-low coverage number is what stamps
+            # $0 buy/redeem/pnl onto a window that really traded.
+            errlog.note("fixtures.wallet_accounting.timestamp", e,
+                        slug=slug, ts=a.get("timestamp"))
         if a.get("slug") != slug:
             continue
         matched += 1

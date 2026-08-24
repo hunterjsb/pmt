@@ -17,6 +17,8 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
+from polymarket import errlog
+
 HOME_ENV = "PILOT2_HOME"
 
 SHADOW_TAPE = "shadow-tape.jsonl"      # would-be trades + refusals + window summaries
@@ -92,7 +94,12 @@ def iter_records(name: str, home: str | Path | None = None,
                 continue
             try:
                 r = json.loads(line)
-            except ValueError:
+            except ValueError as e:
+                # pilot2's shadow tape IS its ledger — `pilot2 grade` refits the
+                # blend weight off these lines, so one lost silently moves a
+                # live parameter.
+                errlog.note("pilot2.state.iter_records.corrupt_line", e,
+                            name=name, line=line[:200])
                 continue
             if not isinstance(r, dict):
                 continue
