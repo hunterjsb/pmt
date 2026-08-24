@@ -92,10 +92,19 @@ async fn warm_loop_is_unchanged_by_the_new_settings() {
 /// 300s one, then times ONE request — the shape of a real first fire after a
 /// quiet stretch between windows. The legacy arm has to rebuild TCP+TLS; the
 /// current arm should still be holding the connection open.
+/// `PMT_LATENCY_IDLE_S` raises the idle gap. Worth turning up before trusting
+/// the keep-alive on the money path: pings are only free if the CLOB's edge
+/// tolerates them, and a server that answers a 100s soak with a GOAWAY at
+/// 10 minutes would be a worse bug than the handshake this removes.
 #[tokio::test]
 #[ignore = "hits the live CLOB and sleeps ~2x100s; run explicitly"]
 async fn an_idle_gap_costs_the_legacy_client_a_handshake() {
-    const IDLE: Duration = Duration::from_secs(100);
+    let idle: Duration = Duration::from_secs(
+        std::env::var("PMT_LATENCY_IDLE_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100),
+    );
     let mut results = Vec::new();
     for (label, http) in [
         ("legacy (90s pool idle)", legacy_client()),
@@ -108,11 +117,11 @@ async fn an_idle_gap_costs_the_legacy_client_a_handshake() {
         // A second request proves the connection is pooled before the sleep,
         // so what the sleep changes is unambiguous.
         let pooled = ms(probe(&http).await);
-        tokio::time::sleep(IDLE).await;
+        tokio::time::sleep(idle).await;
         let after_idle = ms(probe(&http).await);
         println!(
             "{label:32} cold={warm:7.2}ms pooled={pooled:7.2}ms after-{}s-idle={after_idle:7.2}ms",
-            IDLE.as_secs()
+            idle.as_secs()
         );
         results.push((label, pooled, after_idle));
     }

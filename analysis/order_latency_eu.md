@@ -69,6 +69,38 @@ p50 held nothing. Both findings are tails:
    `prewarm_token` that failed or lost the race, and pay the tick-size /
    neg-risk round trip on the order path. Prewarm now retries.
 
+## What the fix measured (desktop, 2026-08-24)
+
+`pmengine/tests/order_transport_live.rs`, legacy client (what shipped) vs
+current, both against `clob.polymarket.com/ok`.
+
+Warm loop, N=50 — deliberately unchanged, this is the control:
+
+| client  | p50       | p90       |
+|---------|----------:|----------:|
+| legacy  | 114.45ms  | 117.00ms  |
+| current | 114.74ms  | 115.80ms  |
+
+Idle gap, one request after the pool has gone quiet — the shape of a window's
+first fire. Three runs:
+
+| idle  | legacy   | current  |
+|-------|---------:|---------:|
+| 100s  | +28.55ms | −0.29ms  |
+| 100s  | +45.39ms | −1.56ms  |
+| 280s  | +48.29ms | +2.20ms  |
+
+The legacy client pays 28–48ms to rebuild TCP+TLS; the current one pays
+nothing because it still holds the connection. The 280s run is also the
+keep-alive safety check: ~9 pings at 30s drew no `GOAWAY` and no
+`ENHANCE_YOUR_CALM` from Cloudflare's edge, and the connection was still
+reused at the end.
+
+The desktop handshake is dearer than the EU box's (~18ms there, measured by
+`curl`), so the EU saving is the smaller number — but it lands on the first
+fire of every window that follows a quiet stretch, which is the fire that
+matters most.
+
 ## Verdict
 
 166ms is near the floor. About 125ms of it is Polymarket's matching engine,
