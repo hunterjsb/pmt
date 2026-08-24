@@ -537,3 +537,68 @@ def test_chainlink_outcome_refuses_margin_inside_noise_floor():
     rounds = _rounds({900: 100.0, 1240: 100.02, 1300: 100.02})
     winner, reason = chainlink_outcome(w, rounds)
     assert winner is None and "noise floor" in reason
+
+
+# ---------- the corpus is per SYMBOL, the window universe is per WINDOW ----------
+#
+# Every window of a symbol grades off that symbol's whole corpus. Deriving the
+# sorted view inside the per-window call re-sorted the same ~6k rounds once per
+# window; the same shape one level up (re-READING the file per window) cost 32s
+# of a 43s `pmt crypto stats --gates`. These pin the shape, not a wall time.
+
+def test_chainlink_outcome_sorts_unsorted_rounds_when_given_no_index():
+    # The contract the default path owes a caller that just hands over a list.
+    rounds = _rounds({900: 100.0, 1250: 110.0, 1300: 999.0})
+    window = {"slug": "s", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
+    assert chainlink_outcome(window, list(reversed(rounds))) == \
+        chainlink_outcome(window, rounds) == ("up", None)
+
+
+def test_chainlink_outcome_precomputed_index_matches_the_sorting_path():
+    # sorted_rounds() is the hoist: prepare once per symbol, grade many windows.
+    # Its output must reach the identical verdict the self-sorting call does.
+    from polymarket.chainlink import sorted_rounds
+
+    window = {"slug": "s", "symbol": "btc", "dur_s": 300, "start": 1000, "end": 1300}
+    for prices in ({900: 100.0, 1250: 110.0, 1300: 999.0},
+                   {900: 100.0, 1250: 90.0, 1300: 999.0},
+                   {500: 100.0, 600: 101.0},
+                   {0: 100.0, 1300: 110.0}):
+        rounds = _rounds(prices)
+        rs, ts = sorted_rounds(list(reversed(rounds)))
+        assert chainlink_outcome(window, rs, ts) == chainlink_outcome(window, rounds)
+
+
+def test_build_outcomes_prepares_each_symbol_corpus_once_not_once_per_window():
+    from polymarket import outcomes as oc
+
+    calls: list[int] = []
+    real = oc.sorted_rounds
+
+    def counting(rounds):
+        calls.append(len(rounds))
+        return real(rounds)
+
+    rounds = _rounds({t: 100.0 + t / 100.0 for t in range(0, 6000, 30)})
+    windows = [{"slug": f"{sym}-updown-5m-{1000 + 300 * i}", "symbol": sym,
+                "dur_s": 300, "start": 1000 + 300 * i, "end": 1300 + 300 * i}
+               for sym in ("btc", "eth") for i in range(9)]
+    oc.sorted_rounds = counting
+    try:
+        oc.build_outcomes(windows, {}, {"btc": rounds, "eth": rounds})
+    finally:
+        oc.sorted_rounds = real
+    assert calls == [len(rounds), len(rounds)], (
+        f"expected one prepare per symbol over {len(windows)} windows, got {len(calls)}")
+
+
+def test_build_outcomes_grades_the_same_from_an_unsorted_corpus():
+    # The hoisted sort must still HAPPEN. If build_outcomes ever passed a raw
+    # list through as though it were ordered, this flips verdicts silently.
+    rounds = _rounds({900: 100.0, 1250: 110.0, 1300: 999.0})
+    windows = [{"slug": "btc-updown-5m-1000", "symbol": "btc",
+                "dur_s": 300, "start": 1000, "end": 1300}]
+    asc, _ = build_outcomes(windows, {}, {"btc": rounds})
+    desc, _ = build_outcomes(windows, {}, {"btc": list(reversed(rounds))})
+    assert asc == desc == [{"slug": "btc-updown-5m-1000", "winner": "up",
+                            "source": "chainlink"}]

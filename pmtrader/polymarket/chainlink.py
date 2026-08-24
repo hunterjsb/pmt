@@ -463,6 +463,19 @@ def extend_all(target_hours: float, symbols: list[str]) -> dict[str, dict]:
     return out
 
 
+def sorted_rounds(rounds: list[dict]) -> tuple[list[dict], list[int]]:
+    """Rounds oldest-first, plus the parallel updated_at list twap_over_window
+    bisects — the pair every windowed read below needs.
+
+    Its own function so a caller grading N windows off ONE symbol's corpus
+    prepares it once. Doing it inside the per-window call re-sorts the same
+    ~6k rounds N times, which is the same per-window-instead-of-per-symbol
+    cost as re-reading the file.
+    """
+    rs = sorted(rounds, key=lambda r: r["updated_at"])
+    return rs, [r["updated_at"] for r in rs]
+
+
 def twap_over_window(rounds: list[dict], ts_list: list[int], start: int, end: int) -> float | None:
     """Time-weighted average of the step function (answer holds until the next round).
 
