@@ -155,11 +155,13 @@ def _resolve_basis_guard(explicit: float | None, symbol: str) -> tuple[float, st
                    "warning. Both 2026-08-23 losses were thin-margin windows "
                    "inside the real Chainlink-vs-Binance basis, and a flat 3 "
                    "under-guards the alts by 2-3x")
-@click.option("--theta", type=float, default=0.0, show_default=True,
+@click.option("--theta", type=float, default=0.3, show_default=True,
               help="R9 safety gate: first clip needs banked-evidence safety "
                    "(|banked|/cushion, sign-matched to the side) at least this "
-                   "high. 0 disables; ~0.3 blocked both 2026-08-23 post-brake "
-                   "losses in replay; 1.0 = require banked-decided to enter")
+                   "high. 0.3 is the SETTLED value (theta sweep; blocked both "
+                   "2026-08-23 post-brake losses) — defaulting to 0 made every "
+                   "re-arm silently drop the brake. 0 disables; 1.0 = require "
+                   "banked-decided to enter")
 @click.option("--settle-tw", type=float, default=0.0, show_default=True,
               help="Settlement TWAP width (seconds) the model prices against. "
                    "0 keeps the engine's duration default (30s at 5m — wrong: "
