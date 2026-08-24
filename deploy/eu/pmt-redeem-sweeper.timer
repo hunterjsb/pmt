@@ -1,0 +1,30 @@
+# Ten-minute trigger for pmt-redeem-sweeper.service.
+#
+# Ten minutes is set by what it is racing: a 5-minute updown window that
+# resolves into tokens, against a wallet whose cash has to stay above the
+# $10 clip. Two windows' worth of winnings is the most collateral the engine
+# should ever be blind to.
+#
+# Faster buys nothing — UMA's report to the CTF is the gate, and the sweeper
+# skips a condition the CTF has no payout for rather than reverting the batch.
+
+[Unit]
+Description=redeem the EU box's settled winners every 10 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+
+# The box's night is not guaranteed continuous. A missed window's winners are
+# still redeemable on the next boot, and being one tick late is free.
+Persistent=true
+AccuracySec=30s
+
+# Nothing here is time-critical to the second, and a spread-out tick keeps the
+# sweeper off the same instant as the engine's own window boundaries.
+RandomizedDelaySec=60
+
+Unit=pmt-redeem-sweeper.service
+
+[Install]
+WantedBy=timers.target
