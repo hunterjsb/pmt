@@ -238,6 +238,14 @@ def score_activity(rows: list[dict], floor: float,
                 # is still held at settlement (outcomes.exited_flat).
                 w["sell_shares"] += a.get("size") or 0.0
         elif a["type"] == "REDEEM":
+            # A zero-share, zero-dollar REDEEM is a stub, not a redemption
+            # (data-api posted them beside two resolution-confirmed wins,
+            # 2026-08-23 23:01Z): it burned nothing and proves nothing, but
+            # setting redeem_seen on it locks grade_window's rule 2 into LOSS
+            # and skips the gamma cross-check + win imputation — two wins
+            # graded as -$38.69. Real loss evidence burns shares (size > 0).
+            if usd <= 0 and (a.get("size") or 0.0) <= 0:
+                continue
             w["redeem"] += usd
             w["redeem_seen"] = True
             w["exit_ts"] = max(w["exit_ts"], ts)

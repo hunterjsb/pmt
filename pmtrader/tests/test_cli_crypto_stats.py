@@ -47,7 +47,10 @@ def test_tape_scoreboard_collects_windows_riding_and_sliding(monkeypatch):
          "slug": f"btc-updown-5m-{a_start}", "timestamp": a_end + 30},
         {"type": "TRADE", "side": "BUY", "usdcSize": 8.0, "size": 9.0,
          "slug": f"eth-updown-5m-{b_start}", "timestamp": b_start + 10},
-        {"type": "REDEEM", "usdcSize": 0.0,
+        # size > 0: a real worthless redemption (shares burned for $0), the
+        # one shape rule 2 may still grade as an exact LOSS — a size-0 row is
+        # a stub and says nothing (see the stub-redeem test below).
+        {"type": "REDEEM", "usdcSize": 0.0, "size": 9.0,
          "slug": f"eth-updown-5m-{b_start}", "timestamp": b_end + 30},
         {"type": "TRADE", "side": "BUY", "usdcSize": 9.0, "size": 10.0,
          "slug": c_slug, "timestamp": c_start + 10},
@@ -76,6 +79,31 @@ def test_tape_scoreboard_collects_windows_riding_and_sliding(monkeypatch):
     assert c_row["pnl"] == pytest.approx(1.0)  # 10 shares*$1 - $9 buy
     b_row = next(w for w in windows if w["slug"].startswith("eth"))
     assert b_row["won"] is False and b_row["est"] is False  # exact, included not open
+
+
+def test_zero_share_stub_redeem_does_not_grade_a_loss(monkeypatch):
+    """A 0-share/$0 REDEEM row is a stub, not a redemption — the data-api
+    posted them beside two resolution-confirmed WINS (2026-08-23 23:01Z,
+    -$38.69 of phantom loss). It must be ignored so the window falls through
+    to the gamma cross-check and the imputed-win payout, instead of locking
+    grade_window's $0-redeem rule into an exact LOSS."""
+    now = int(time.time())
+    start = now - 4000
+    slug = f"bnb-updown-5m-{start}"
+    rows = [
+        {"type": "TRADE", "side": "BUY", "usdcSize": 28.88, "size": 30.0,
+         "outcome": "Up", "slug": slug, "timestamp": start + 10},
+        {"type": "REDEEM", "usdcSize": 0.0, "size": 0.0, "outcome": "Up",
+         "slug": slug, "timestamp": start + 3400},
+    ]
+    _install_fake_pipeline(monkeypatch, rows, {}, {slug: {"resolved": True,
+                                                           "winner": "up"}})
+
+    sb = cs._tape_scoreboard(0.0)
+    assert sb["wins"] == 1 and sb["losses"] == 0
+    row = next(w for w in sb["windows"] if w["slug"] == slug)
+    assert row["won"] is True and row["est"] is True  # payout imputed until the real redeem posts
+    assert row["pnl"] == pytest.approx(30.0 - 28.88)
 
 
 def test_tape_scoreboard_windows_capped_at_twelve(monkeypatch):

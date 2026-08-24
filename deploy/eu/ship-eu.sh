@@ -141,7 +141,9 @@ URL="$(aws s3 presign "s3://$BUCKET/$KEY" --region "$BUCKET_REGION" --expires-in
 ssm_run() {
   local script="$1" timeout="${2:-300}" work cmd_id status
   work="$(mktemp -d)"
-  python3 - "$(base64 -w0 "$script")" "$work/params.json" <<'PY'
+  # base64 portably: BSD (macOS) takes no -w/positional file, GNU wraps at 76
+  # cols by default — stdin + tr covers both.
+  python3 - "$(base64 < "$script" | tr -d '\n')" "$work/params.json" <<'PY'
 import json, sys
 b64, out = sys.argv[1], sys.argv[2]
 json.dump({"commands": [
