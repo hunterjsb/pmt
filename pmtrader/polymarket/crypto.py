@@ -7,6 +7,13 @@ burned us twice — always parsed from the description, never assumed):
            projected margins inside ~3bp are Chainlink-basis coin flips.
   - close_open: hourly "<h>PM ET" series — Binance 1h candle close >= open.
            Binance IS the resolution source, so no basis risk.
+
+**Two market-data sources, one model.** Binance is the venue proxy every arm
+was built on. The `rtds` source reads the Chainlink settlement stream itself
+(`rtds_read`), which is the only way to price a symbol Binance does not list
+at all — `hype` resolves off HYPE/USD Chainlink data and there is no
+`HYPEUSDT` pair to 400 on. The model functions below take their spot, vol and
+per-minute marks as arguments precisely so neither source is baked into them.
 """
 
 from __future__ import annotations
@@ -21,11 +28,23 @@ import requests
 from . import hosts
 from .constants import BASIS_NOISE_BP, taker_fee  # re-exported: this module's original home
 from .fit import BINANCE_DATA, fetch_klines, realized_sigma, _norm_cdf
+from .fixtures import rtds_symbol
 from .scanner import fetch_event
 
 REQUEST_TIMEOUT = 10
 
-__all__ = ["BASIS_NOISE_BP", "eval_updown", "parse_semantics", "slug_of", "spot_price", "taker_fee"]
+__all__ = ["BASIS_NOISE_BP", "SymbolNotOnBinance", "eval_updown", "parse_semantics",
+           "slug_of", "spot_price", "taker_fee"]
+
+
+class SymbolNotOnBinance(requests.HTTPError):
+    """Binance has no such spot pair — not an outage, a listing fact.
+
+    Subclasses HTTPError so every existing `except requests.HTTPError` still
+    catches it: today this case is an unhandled 400 traceback naming a
+    binance.vision URL, which tells an operator nothing about why their hype
+    arm died.
+    """
 
 _PAIR_RE = re.compile(r"([A-Z0-9]{2,10})/(?:USDT?|USD)")
 _TITLE_SYMBOLS = {"bitcoin": "BTCUSDT", "btc": "BTCUSDT", "ethereum": "ETHUSDT",
@@ -40,9 +59,23 @@ def slug_of(ref: str) -> str:
     return ref.split("?")[0].strip("/")
 
 
+def _unlisted(r: requests.Response) -> bool:
+    """Binance's `-1121 Invalid symbol` — the pair does not exist."""
+    if r.status_code != 400:
+        return False
+    try:
+        body = r.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and (body.get("code") == -1121
+                                       or "invalid symbol" in str(body.get("msg", "")).lower())
+
+
 def spot_price(symbol: str = "BTCUSDT") -> float:
     r = requests.get(f"{BINANCE_DATA}/api/v3/ticker/price",
                      params={"symbol": symbol}, timeout=REQUEST_TIMEOUT)
+    if _unlisted(r):
+        raise SymbolNotOnBinance(f"Binance does not list {symbol}", response=r)
     r.raise_for_status()
     return float(r.json()["price"])
 
@@ -117,6 +150,126 @@ def _sigma_1m(symbol: str, now: float, lookback_min: int = 120) -> float:
     return realized_sigma(closes, min(lookback_min, len(closes) - 1))
 
 
+def _binance_per_min(symbol: str, start: float) -> dict[float, float]:
+    """`{minute_open: (open+close)/2}` — the mark shape the model banks."""
+    kl = fetch_klines(symbol, "1m", start_ms=int((start - 120) * 1000))
+    return {k[0] / 1000: (float(k[1]) + float(k[4])) / 2 for k in kl}
+
+
+# ---------- market data: which series the pre-flight prices off ----------
+
+def _binance_data(sem: dict, now: float) -> dict:
+    """Spot, vol and marks off the venue proxy. Raises SymbolNotOnBinance
+    when the pair does not exist, so the caller can reach for the stream."""
+    spot = spot_price(sem["symbol"])
+    return {
+        "spot": spot,
+        "sig1m": _sigma_1m(sem["symbol"], now),
+        "per_min": _binance_per_min(sem["symbol"], sem["start"]) if sem["kind"] == "twap" else {},
+        "spot_source": "binance",
+        "sigma_source": "binance-klines-1m",
+    }
+
+
+def _rtds_data(sem: dict, now: float, settle_tw_s: int = 60) -> dict:
+    """Spot, vol and marks off the Chainlink settlement stream.
+
+    Fallback order, and the reason for it:
+      1. the recorder corpus tail — free, already on disk, and it IS the same
+         socket, so nothing is more current than the recorder is;
+      2. a one-shot socket read — for when the recorder is down, which is the
+         only case where a live connect beats reading the tape;
+      3. a named error. Never a Binance retry: if we are here the pair does
+         not exist on Binance, and "400 Invalid symbol" is exactly the
+         useless message this path was added to stop printing.
+
+    Vol has no socket fallback — one print is a price, not a series — so a
+    cold corpus is where `--sigma-bp` earns its keep.
+    """
+    from . import rtds_read
+
+    sym = rtds_symbol(sem["symbol"])
+    if not sym:
+        raise ValueError(f"cannot map {sem['symbol']} onto an rtds stream symbol")
+
+    hit = rtds_read.corpus_spot(sym, now=now)
+    if hit is not None:
+        spot, spot_ts = hit
+        spot_source = f"rtds-corpus({now - spot_ts:.0f}s)"
+    else:
+        hit = rtds_read.live_spot(sym)
+        if hit is None:
+            raise ValueError(
+                f"{sym} is not in the rtds stream or corpus: no print within "
+                f"{rtds_read.MAX_SPOT_AGE_S:.0f}s under {rtds_read.RTDS_DIR}, and a "
+                f"live read of {rtds_read.RTDS_URL} returned nothing for it. "
+                f"Binance does not list {sem['symbol']}, so there is no proxy to fall "
+                f"back on. Check the recorder (`~/.pmt/corpus/rtds/recorder.log`)."
+            )
+        spot, spot_ts = hit
+        spot_source = f"rtds-live({now - spot_ts:.0f}s)"
+
+    # One corpus walk feeds both closes and marks — the marks a 5m window
+    # needs sit inside the sigma lookback anyway.
+    since = min(now - (rtds_read.CLOSES_CAP + 2) * 60, sem["start"] - 120)
+    rows = rtds_read.read_back(sym, since)
+    sig = rtds_read.corpus_sigma(sym, now=now,
+                                 closes=rtds_read.minute_closes(sym, since, rows=rows))
+    per_min = (rtds_read.twap_marks(sym, since, window_s=settle_tw_s, rows=rows)
+               if sem["kind"] == "twap" else {})
+    return {
+        "spot": spot,
+        "sig1m": sig[0] if sig else None,
+        "per_min": per_min,
+        "spot_source": spot_source,
+        "sigma_source": f"rtds-closes-1m(n={sig[1]})" if sig else None,
+    }
+
+
+def market_data(sem: dict, now: float, feed: str = "binance",
+                sigma_bp: float | None = None, settle_tw_s: int = 60) -> dict:
+    """Spot, vol and per-minute marks for the model, plus where each came from.
+
+    `feed="binance"` still means Binance for every listed pair — the stream
+    is reached for only when Binance answers "no such symbol", which is a
+    path that used to be an unhandled traceback. `feed="rtds"` goes straight
+    to the stream and never touches Binance at all.
+    """
+    if feed == "rtds":
+        if sem["kind"] != "twap":
+            # Half-and-half would be worse than either: chainlink spot judged
+            # against a Binance candle open is a basis measurement wearing a
+            # model's clothes.
+            raise ValueError(
+                f"--feed rtds does not support {sem['kind']} markets — the settlement "
+                "stream has no candle opens. Use --feed binance."
+            )
+        data = _rtds_data(sem, now, settle_tw_s)
+    else:
+        try:
+            data = _binance_data(sem, now)
+        except SymbolNotOnBinance:
+            if sem["kind"] != "twap":
+                raise ValueError(
+                    f"Binance does not list {sem['symbol']}, and a {sem['kind']} market "
+                    "resolves on a venue's candle open — the settlement stream has none. "
+                    "This market cannot be priced from here."
+                ) from None
+            data = _rtds_data(sem, now, settle_tw_s)
+            data["fell_back"] = True
+
+    if sigma_bp is not None:
+        data["sig1m"] = sigma_bp / 1e4
+        data["sigma_source"] = "override(--sigma-bp)"
+    elif data["sig1m"] is None:
+        raise ValueError(
+            f"no per-minute history for {rtds_symbol(sem['symbol'])} in the rtds corpus yet — "
+            "sigma cannot be estimated. Let the recorder accumulate a few minutes, or pass "
+            "--sigma-bp explicitly (the alts run 12-20 bp/min)."
+        )
+    return data
+
+
 def _model_close_open(sem: dict, now: float, sig1m: float, spot: float) -> dict:
     h = fetch_klines(sem["symbol"], "1h", start_ms=int(sem["start"] * 1000))
     if now < sem["start"] or not h:
@@ -135,12 +288,15 @@ def _model_close_open(sem: dict, now: float, sig1m: float, spot: float) -> dict:
             "p_up": p_up(1.0), "p_up_lowvol": p_up(0.5), "p_up_highvol": p_up(1.5)}
 
 
-def _model_twap(sem: dict, now: float, sig1m: float, spot: float) -> dict:
+def _model_twap(sem: dict, now: float, sig1m: float, spot: float,
+                per_min: dict[float, float] | None = None) -> dict:
     start, end = sem["start"], sem["end"]
-    kl = fetch_klines(sem["symbol"], "1m", start_ms=int((start - 120) * 1000))
-    per_min = {k[0] / 1000: (float(k[1]) + float(k[4])) / 2 for k in kl}
+    if per_min is None:
+        per_min = _binance_per_min(sem["symbol"], start)
 
     # Range-start reference: Chainlink's 60s TWAP at t0 ~ the prior minute's avg.
+    # (On the rtds source it is not an approximation — per_min[start-60] IS the
+    # settlement print at the window's start instant.)
     ref_px = per_min.get(start - 60)
     if now < start or ref_px is None:
         return {"pending": True, "p_up": 0.5, "p_up_lowvol": 0.5, "p_up_highvol": 0.5,
@@ -173,18 +329,24 @@ def _model_twap(sem: dict, now: float, sig1m: float, spot: float) -> dict:
             "basis_coinflip": abs(margin_bp) < BASIS_NOISE_BP}
 
 
-def eval_updown(ref: str) -> dict:
-    """Everything needed to decide (or arm the engine on) one up/down market."""
+def eval_updown(ref: str, feed: str = "binance", sigma_bp: float | None = None,
+                settle_tw_s: int = 60) -> dict:
+    """Everything needed to decide (or arm the engine on) one up/down market.
+
+    `feed` picks the market-data series (see `market_data`); `sigma_bp` is the
+    explicit vol override for a symbol whose stream history is still cold.
+    """
     slug = slug_of(ref)
     event = fetch_event(slug)
     if not event:
         raise ValueError(f"no event found for slug '{slug}'")
     sem = parse_semantics(event)
     now = time.time()
-    spot = spot_price(sem["symbol"])
-    sig1m = _sigma_1m(sem["symbol"], now)
+    data = market_data(sem, now, feed=feed, sigma_bp=sigma_bp, settle_tw_s=settle_tw_s)
+    spot, sig1m = data["spot"], data["sig1m"]
 
-    model = (_model_twap if sem["kind"] == "twap" else _model_close_open)(sem, now, sig1m, spot)
+    model = (_model_twap(sem, now, sig1m, spot, data["per_min"])
+             if sem["kind"] == "twap" else _model_close_open(sem, now, sig1m, spot))
     p_up = model["p_up"]
 
     books, edges = {}, {}
@@ -221,4 +383,6 @@ def eval_updown(ref: str) -> dict:
             "rem_s": max(sem["end"] - now, 0.0), "spot": spot,
             "sigma_bp_per_min": sig1m * 1e4, "model": model,
             "edges": edges, "books": books, "verdict": verdict,
+            "spot_source": data["spot_source"], "sigma_source": data["sigma_source"],
+            "feed_fell_back": bool(data.get("fell_back")),
             "tokens": {"up": sem["token_up"], "down": sem["token_down"]}}
