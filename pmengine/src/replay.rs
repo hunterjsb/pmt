@@ -416,9 +416,96 @@ struct FillSim {
     fire_count: usize,
     first_fire_t: Option<f64>,
     max_committed: f64,
+    /// Post-only ASKS the strategy has left resting, by token. A resting ask
+    /// is not a fill — see `lift_resting_asks` for the convention that turns
+    /// one into a fill, and why it is the mirror of the post-only BUY's
+    /// "never fills here at all".
+    resting_asks: HashMap<String, RestingAsk>,
 }
 
-fn apply_fills(arm: &mut ArmState, sim: &mut FillSim, out: &DecideOut, now: f64, fee_rate: f64) {
+/// One post-only ask standing on the simulated book.
+#[derive(Clone, Copy, Debug)]
+struct RestingAsk {
+    px: f64,
+    size: f64,
+}
+
+/// Lift any resting post-only ask this tick's book has come up to.
+///
+/// The convention is `analysis/bracket_exit.md` §0's, verbatim, because that
+/// is the convention the entire exit study was scored under: an ask at `r` is
+/// LIFTED iff a sampled book instant shows our side's best **BID >= r**. Not
+/// "a trade printed at r" — the whole book has to come to us. A bid spike
+/// between two book samples is invisible and scores as no-fill, so the sim
+/// under-counts lifts, which is the same safe direction the post-only BUY
+/// takes by never filling at all.
+///
+/// The interval is half-open on the placing tick: a rest placed by THIS
+/// tick's actions is only tested against LATER samples. That is not a
+/// convenience — a post-only order that would match at placement is rejected
+/// by the exchange outright (docs/maker-design.md §2), so an ask cannot both
+/// be placed and be lifted by the book that was standing when it went out.
+///
+/// A lifted ask is the MAKER side of the trade and pays `fees::maker_fee` —
+/// zero, on 526 of 526 wallet rows. This is the one place in the sim where a
+/// fill is booked with no fee at all, and it is honest.
+///
+/// What it deliberately does NOT model is depth: the ask sells its whole size
+/// the instant the bid reaches it, ignoring what size stood there. That is the
+/// headline convention of `bracket_exit.md` §2 and its known weak point —
+/// §6's depth-constrained variant flipped the best candidate's sign — so a
+/// maker-exit policy replays here as an UPPER bound on how well it filled.
+fn lift_resting_asks(arm: &ArmState, sim: &mut FillSim, view: &ArmView, fee_rate: f64) {
+    for (token, top) in [(&arm.p.token_up, view.up), (&arm.p.token_down, view.dn)] {
+        let Some(rest) = sim.resting_asks.get(token).copied() else { continue };
+        let held = sim.shares.get(token).copied().unwrap_or(0.0);
+        if held <= 1e-9 {
+            // Nothing left to sell — an evacuation took the inventory out
+            // from under the quote, and the cancel that went with it is what
+            // pulls the order. Drop the rest rather than sell shares twice.
+            sim.resting_asks.remove(token);
+            continue;
+        }
+        let Some((bid, _)) = top.bid else { continue };
+        if bid < rest.px {
+            continue; // the book has not come to us
+        }
+        let size = rest.size.min(held);
+        sim.resting_asks.remove(token);
+        let fee = size * crate::fees::maker_fee(rest.px, fee_rate);
+        book_sell(sim, token, rest.px, size, fee);
+    }
+}
+
+/// Book one SELL against the sim's inventory.
+///
+/// `proceeds` carries the sale net of `fee`; `cost_basis` walks down at the
+/// average entry, because it feeds the next tick's `position_floor` (which is
+/// currently-committed notional, not money ever spent). `cost` and `fees` are
+/// deliberately untouched — money spent stays spent.
+fn book_sell(sim: &mut FillSim, token: &str, price: f64, size: f64, fee: f64) {
+    sim.proceeds += size * price - fee;
+    let held = sim.shares.entry(token.to_string()).or_insert(0.0);
+    let basis = sim.cost_basis.entry(token.to_string()).or_insert(0.0);
+    if *held > 1e-9 {
+        let avg = *basis / *held;
+        *basis = (*basis - avg * size).max(0.0);
+    }
+    *held = (*held - size).max(0.0);
+}
+
+fn apply_fills(
+    arm: &mut ArmState,
+    sim: &mut FillSim,
+    out: &DecideOut,
+    now: f64,
+    fee_rate: f64,
+    view: &ArmView,
+) {
+    // Rests standing from EARLIER ticks are tested against this tick's book
+    // before this tick's own actions are applied — the half-open interval
+    // documented on `lift_resting_asks`.
+    lift_resting_asks(arm, sim, view, fee_rate);
     for a in &out.actions {
         match a {
             Action::Buy { token, price, size, post_only } => {
@@ -450,17 +537,26 @@ fn apply_fills(arm: &mut ArmState, sim: &mut FillSim, out: &DecideOut, now: f64,
                     sim.max_committed = committed;
                 }
             }
-            Action::Sell { token, price, size } => {
+            Action::Sell { token, price, size, post_only } => {
                 let (price, size) = (*price, *size);
-                let fee = size * taker_fee(price, fee_rate);
-                sim.proceeds += size * price - fee;
-                let held = sim.shares.entry(token.clone()).or_insert(0.0);
-                let basis = sim.cost_basis.entry(token.clone()).or_insert(0.0);
-                if *held > 1e-9 {
-                    let avg = *basis / *held;
-                    *basis = (*basis - avg * size).max(0.0);
+                if *post_only {
+                    // A post-only ask RESTS; it is not a cross. Booking it as
+                    // a fill here would manufacture the counterparty the whole
+                    // exit study refused to assume — the exact mirror of the
+                    // post-only BUY twenty lines up. It becomes a fill only
+                    // when a LATER book sample brings the bid to it.
+                    sim.resting_asks.insert(token.clone(), RestingAsk { px: price, size });
+                    continue;
                 }
-                *held = (*held - size).max(0.0);
+                let fee = size * taker_fee(price, fee_rate);
+                book_sell(sim, token, price, size, fee);
+            }
+            Action::Cancel(token) => {
+                // A cancel is what takes a resting ask OFF the book. Without
+                // this the sim would keep lifting an order the strategy had
+                // already pulled — at quiesce, at window close, or on the
+                // evacuation's own cancel/sell pair.
+                sim.resting_asks.remove(token);
             }
             _ => {}
         }
@@ -641,14 +737,19 @@ pub(crate) fn replay_evals_window_traced(
                 let view = view_from_sides(&rec["sides"], &sim);
                 let out = arm.decide(&view, Ok(model), now);
                 trace.extend(out.tape.iter().cloned());
-                apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate);
+                apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate, &view);
             }
             EV_GATED => {
                 // decide()'s Err branch never reads `view` — a default is
                 // fine, we're only here to keep gate bookkeeping faithful.
-                let out = arm.decide(&ArmView::default(), Err(gate_from_record(rec)), now);
+                // A default view has no bid, so a gated tick can never lift a
+                // resting ask: an evals-mode tape carries no bids anyway (see
+                // `view_from_sides`), which makes this mode strictly
+                // rest-and-never-fill for maker sells.
+                let view = ArmView::default();
+                let out = arm.decide(&view, Err(gate_from_record(rec)), now);
                 trace.extend(out.tape.iter().cloned());
-                apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate);
+                apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate, &view);
             }
             _ => {} // fire/roll/cleanup — real fires come from the shared tally
         }
@@ -1168,7 +1269,7 @@ pub(crate) fn replay_full_window_with(
         let view = view_from_book_record(rec, &sim, p);
         let out = arm.decide(&view, model, now);
         trace.extend(out.tape.iter().cloned());
-        apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate);
+        apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate, &view);
     }
 
     let outcome =
@@ -1441,6 +1542,9 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
         room_low = room_low.min(fleet_room);
 
         let a = &mut arms[i];
+        // The book this tick decided on, kept for the fill sim: a resting
+        // post-only ask is lifted by the SAME sample decide() just read.
+        let mut tick_view = ArmView::default();
         let out = if full {
             let spot = rec["spot"].as_f64().unwrap_or(0.0);
             let spot_age = rec["spot_age_s"].as_f64().unwrap_or(0.0);
@@ -1452,6 +1556,7 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
             let feed = src.state_at(start, spot, now - spot_age, now);
             let model = eval_model(&a.p, &feed, now, a.p.basis_guard_bp, &tun);
             let view = view_from_book_record(rec, &a.sim, &a.p);
+            tick_view = view;
             Some(a.arm.decide_fleet(&view, model, now, &mut fleet_room))
         } else {
             match rec.get("ev").and_then(|v| v.as_str()).unwrap_or("") {
@@ -1460,6 +1565,7 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
                     a.last_p_up = Some(p_up);
                     let model = model_from_eval_record(rec, p_up, &a.p, &a.arm.tunables);
                     let view = view_from_sides(&rec["sides"], &a.sim);
+                    tick_view = view;
                     Some(a.arm.decide_fleet(&view, Ok(model), now, &mut fleet_room))
                 }
                 EV_GATED => Some(a.arm.decide_fleet(
@@ -1476,7 +1582,7 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
             traced.extend(out.tape.iter().cloned());
         }
         let fee_rate = a.p.fee_rate;
-        apply_fills(&mut a.arm, &mut a.sim, &out, now, fee_rate);
+        apply_fills(&mut a.arm, &mut a.sim, &out, now, fee_rate, &tick_view);
         if a.fleet_braked() {
             a.fleet_blocks += 1;
         }
@@ -1552,6 +1658,180 @@ mod tests {
         assert_eq!(report["sim"]["fires"], 1);
         assert!((report["sim"]["notional"].as_f64().unwrap() - 26.0 * 0.94).abs() < 1e-9);
         assert_eq!(report["sim"]["outcome"], "up");
+    }
+
+    // ---------- the post-only SELL convention ----------------------------
+
+    /// Drive the fill sim directly with hand-built actions and books. The
+    /// decision core never emits a post-only sell today (the incumbent's only
+    /// sell is L1's crossing evacuation), so this is the seam that proves the
+    /// SIM half of the capability on its own.
+    fn sim_with(shares: f64, basis: f64, p: &ArmParams) -> (ArmState, FillSim) {
+        let mut arm = ArmState::with_params(p.clone());
+        arm.subscribed = true;
+        let mut sim = FillSim::default();
+        sim.shares.insert(p.token_up.clone(), shares);
+        sim.cost_basis.insert(p.token_up.clone(), basis);
+        sim.cost = basis;
+        (arm, sim)
+    }
+
+    fn up_book(bid: Option<f64>) -> ArmView {
+        ArmView {
+            up: TopOfBook { bid: bid.map(|b| (b, 500.0)), ask: None },
+            ..ArmView::default()
+        }
+    }
+
+    fn actions(a: Vec<Action>) -> DecideOut {
+        DecideOut { actions: a, ..DecideOut::default() }
+    }
+
+    /// The convention, verbatim from `analysis/bracket_exit.md` §0: an ask at
+    /// `r` is lifted iff a sampled book instant shows our side's best BID at
+    /// or above `r`. A bid one tick short is NOT a fill, however close, and
+    /// the placing tick's own book can never lift it — a post-only order that
+    /// would match at placement is rejected, not filled.
+    #[test]
+    fn a_resting_ask_fills_only_when_the_bid_comes_through_it() {
+        let p = test_params("s");
+        let (mut arm, mut sim) = sim_with(50.0, 30.0, &p);
+        let rest = actions(vec![Action::Sell {
+            token: p.token_up.clone(),
+            price: 0.70,
+            size: 50.0,
+            post_only: true,
+        }]);
+
+        // Placed against a book already bid at 0.70. It does not fill on the
+        // tick it goes out on, at any price.
+        apply_fills(&mut arm, &mut sim, &rest, 1400.0, p.fee_rate, &up_book(Some(0.70)));
+        assert_eq!(sim.proceeds, 0.0, "a rest is not a fill");
+        assert_eq!(sim.shares[&p.token_up], 50.0);
+
+        // A LATER sample one tick short: still no fill. The whole book has to
+        // come to us — "a trade printed at r" is not the test.
+        apply_fills(&mut arm, &mut sim, &actions(vec![]), 1405.0, p.fee_rate, &up_book(Some(0.69)));
+        assert_eq!(sim.proceeds, 0.0, "0.69 does not lift a 0.70 ask");
+        assert_eq!(sim.shares[&p.token_up], 50.0);
+
+        // …and no bid at all is no fill, not a fill at the last price seen.
+        apply_fills(&mut arm, &mut sim, &actions(vec![]), 1410.0, p.fee_rate, &up_book(None));
+        assert_eq!(sim.proceeds, 0.0);
+
+        // The bid crosses it: lifted, at the ASK's price, not the bid's.
+        apply_fills(&mut arm, &mut sim, &actions(vec![]), 1415.0, p.fee_rate, &up_book(Some(0.72)));
+        assert!((sim.proceeds - 35.0).abs() < 1e-9, "50 shares at the resting 0.70");
+        assert_eq!(sim.shares[&p.token_up], 0.0);
+        // And it is gone — a lifted ask cannot be lifted twice.
+        apply_fills(&mut arm, &mut sim, &actions(vec![]), 1420.0, p.fee_rate, &up_book(Some(0.99)));
+        assert!((sim.proceeds - 35.0).abs() < 1e-9);
+    }
+
+    /// A lifted resting ask is the MAKER side and pays nothing — 526 of 526
+    /// wallet rows. Running it through the taker curve is how the ledger
+    /// drifts off the scoreboard (`bracket_exit.md` §9.4).
+    #[test]
+    fn a_lifted_ask_pays_the_maker_fee_and_a_crossing_sell_does_not() {
+        let p = test_params("s");
+        let (mut arm, mut sim) = sim_with(50.0, 30.0, &p);
+        let rest = actions(vec![Action::Sell {
+            token: p.token_up.clone(),
+            price: 0.50,
+            size: 50.0,
+            post_only: true,
+        }]);
+        apply_fills(&mut arm, &mut sim, &rest, 1400.0, p.fee_rate, &up_book(None));
+        apply_fills(&mut arm, &mut sim, &actions(vec![]), 1405.0, p.fee_rate, &up_book(Some(0.50)));
+        assert!((sim.proceeds - 25.0).abs() < 1e-9, "50 x 0.50, no fee taken out");
+        assert_eq!(sim.fees, 0.0, "a maker sell is charged exactly nothing");
+
+        // The same size and price crossing, for contrast: 0.50 is the widest
+        // point of the taker curve, 1.75 cents a share.
+        let (mut arm, mut sim) = sim_with(50.0, 30.0, &p);
+        let cross = actions(vec![Action::Sell {
+            token: p.token_up.clone(),
+            price: 0.50,
+            size: 50.0,
+            post_only: false,
+        }]);
+        apply_fills(&mut arm, &mut sim, &cross, 1400.0, p.fee_rate, &up_book(Some(0.50)));
+        let fee = 50.0 * taker_fee(0.50, p.fee_rate);
+        assert!(fee > 0.87, "the taker curve at mid: {fee}");
+        assert!((sim.proceeds - (25.0 - fee)).abs() < 1e-9);
+    }
+
+    /// A cancel is what takes a resting ask off the book — at quiesce, at
+    /// window close, or on the evacuation's own cancel/sell pair. Without it
+    /// the sim would keep lifting an order the strategy had already pulled.
+    #[test]
+    fn a_cancel_takes_a_resting_ask_off_the_simulated_book() {
+        let p = test_params("s");
+        let (mut arm, mut sim) = sim_with(50.0, 30.0, &p);
+        let rest_then_cancel = actions(vec![
+            Action::Sell {
+                token: p.token_up.clone(),
+                price: 0.70,
+                size: 50.0,
+                post_only: true,
+            },
+            Action::Cancel(p.token_up.clone()),
+        ]);
+        apply_fills(&mut arm, &mut sim, &rest_then_cancel, 1400.0, p.fee_rate, &up_book(None));
+        apply_fills(&mut arm, &mut sim, &actions(vec![]), 1405.0, p.fee_rate, &up_book(Some(0.99)));
+        assert_eq!(sim.proceeds, 0.0, "a cancelled ask is not on the book to lift");
+        assert_eq!(sim.shares[&p.token_up], 50.0);
+    }
+
+    /// An ask cannot sell inventory that is no longer there. The evacuation
+    /// takes the shares AND cancels; if the two ever arrive out of order the
+    /// sim must not book the same shares twice.
+    #[test]
+    fn a_resting_ask_over_empty_inventory_is_dropped_not_filled() {
+        let p = test_params("s");
+        let (mut arm, mut sim) = sim_with(50.0, 30.0, &p);
+        let both = actions(vec![
+            Action::Sell {
+                token: p.token_up.clone(),
+                price: 0.70,
+                size: 50.0,
+                post_only: true,
+            },
+        ]);
+        apply_fills(&mut arm, &mut sim, &both, 1400.0, p.fee_rate, &up_book(None));
+        // Everything sold out from under it by a crossing exit.
+        let evac = actions(vec![Action::Sell {
+            token: p.token_up.clone(),
+            price: 0.30,
+            size: 50.0,
+            post_only: false,
+        }]);
+        apply_fills(&mut arm, &mut sim, &evac, 1405.0, p.fee_rate, &up_book(Some(0.30)));
+        let after_evac = sim.proceeds;
+        apply_fills(&mut arm, &mut sim, &actions(vec![]), 1410.0, p.fee_rate, &up_book(Some(0.99)));
+        assert!((sim.proceeds - after_evac).abs() < 1e-12, "no second sale of the same shares");
+        assert_eq!(sim.shares[&p.token_up], 0.0);
+    }
+
+    /// The mirror the whole convention rests on: a post-only BUY never fills
+    /// in the sim at all, and a post-only SELL never fills on the tick it is
+    /// placed. Both under-count, which is the safe direction for a strategy
+    /// whose edge depends on not overstating how easily a thin book fills.
+    #[test]
+    fn post_only_buys_and_sells_are_the_same_conservative_convention() {
+        let p = test_params("s");
+        let (mut arm, mut sim) = sim_with(0.0, 0.0, &p);
+        let maker_bid = actions(vec![Action::Buy {
+            token: p.token_up.clone(),
+            price: 0.98,
+            size: 25.0,
+            post_only: true,
+        }]);
+        for t in [1400.0, 1405.0, 1410.0] {
+            apply_fills(&mut arm, &mut sim, &maker_bid, t, p.fee_rate, &up_book(Some(0.99)));
+        }
+        assert_eq!(sim.fire_count, 0, "a post-only bid never fills here, ever");
+        assert_eq!(sim.cost, 0.0);
     }
 
     #[test]

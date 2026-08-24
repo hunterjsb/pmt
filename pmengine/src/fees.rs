@@ -37,6 +37,9 @@
 //! `analysis/strat15_search.md` §0a in the vault is the study; the check is
 //! reproducible from the corpus dump at any time.
 
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::Decimal;
+
 /// Per-share taker fee at `px` for a market whose schedule is `fee_rate`.
 ///
 /// Symmetric about 0.5 by construction, which is what makes it the same
@@ -58,6 +61,25 @@ pub fn taker_fee(px: f64, fee_rate: f64) -> f64 {
 #[inline]
 pub fn maker_fee(_px: f64, _fee_rate: f64) -> f64 {
     0.0
+}
+
+/// `maker_fee` in the money type the live fill path speaks.
+///
+/// The realized-fill accounting (`Engine`'s trades poller -> `process_fill`)
+/// works in `Decimal`, and it computes the fee the caller passes. Before this
+/// it ran EVERY fill through the taker arithmetic — including the ones where
+/// the exchange's own `trader_side` says we were resting — so a maker fill
+/// booked a fee the wallet never charged and the ledger drifted off the
+/// scoreboard by exactly that amount (`analysis/bracket_exit.md` §9.4).
+///
+/// Delegating to the same schedule rather than writing `Decimal::ZERO` at the
+/// call site is the L18 rule: one definition, so a rebate or a maker fee
+/// lands in one place and cannot be half-applied.
+#[inline]
+pub fn maker_fee_dec(px: Decimal, fee_rate: Decimal) -> Decimal {
+    let px = px.to_f64().unwrap_or(0.0);
+    let rate = fee_rate.to_f64().unwrap_or(0.0);
+    Decimal::from_f64(maker_fee(px, rate)).unwrap_or(Decimal::ZERO)
 }
 
 #[cfg(test)]
@@ -107,5 +129,21 @@ mod tests {
             assert_eq!(maker_fee(p, 0.07), 0.0);
             assert_eq!(maker_fee(p, 0.0), 0.0);
         }
+    }
+
+    /// The `Decimal` face of the same schedule. The live fill path books in
+    /// this type, and a resting SELL is the first order shape that makes the
+    /// maker branch reachable from `process_fill` — it has to charge the
+    /// wallet's zero, not the taker curve's cents.
+    #[test]
+    fn the_decimal_maker_fee_is_the_same_zero() {
+        use rust_decimal_macros::dec;
+        for p in [dec!(0.05), dec!(0.50), dec!(0.95), dec!(0.99)] {
+            assert_eq!(maker_fee_dec(p, dec!(0.07)), Decimal::ZERO, "{p}");
+            assert_eq!(maker_fee_dec(p, dec!(0.0)), Decimal::ZERO, "{p}");
+        }
+        // …and it is a real zero, not a rounding of the taker number: at 0.50
+        // the taker schedule is 1.75 cents a share, the widest the curve gets.
+        assert!(taker_fee(0.50, 0.07) > 0.017);
     }
 }

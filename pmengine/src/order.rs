@@ -452,6 +452,31 @@ mod tests {
         assert!(post_only, "Low is the strategy asking to add liquidity");
     }
 
+    /// A post-only SELL is the mirror of the post-only buy on the wire, and
+    /// the flag is what the adapter dispatches on — never re-derived from
+    /// price or side downstream. This is the whole public half of a resting
+    /// exit ask: `Urgency::Low` on a `Signal::Sell` becomes GTC + `postOnly`
+    /// at a price rounded UP, away from the bid it must not cross.
+    #[test]
+    fn a_low_urgency_sell_goes_out_post_only_and_never_rounds_into_the_bid() {
+        let (post_only, price) = wire_shape(Urgency::Low, false, dec!(0.612), 2);
+        assert!(post_only, "Low on a SELL is the strategy asking to add liquidity");
+        assert_eq!(price, dec!(0.62), "an ask ceils onto the tick, away from the book");
+
+        // The hazard the direction exists for: nearest-rounding 0.612 to 0.61
+        // would put the ask AT a 0.61 bid, and Polymarket rejects a post-only
+        // order that would match rather than repricing it.
+        assert!(price > dec!(0.61));
+
+        // Every other urgency is still a plain crossing sell — L1's
+        // math-forced evacuation has to be able to hit the bid.
+        for u in [Urgency::Medium, Urgency::High, Urgency::Immediate] {
+            let (post_only, price) = wire_shape(u, false, dec!(0.612), 2);
+            assert!(!post_only, "{u:?} must still cross");
+            assert_eq!(price, dec!(0.61), "and round to nearest, as it always did");
+        }
+    }
+
     #[test]
     fn a_post_only_quote_never_rounds_toward_the_book() {
         // The hazard: 0.987 is a legal price on a 0.001-tick market and
