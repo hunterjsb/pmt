@@ -27,7 +27,7 @@ import click
 from rich.table import Table
 
 from cli_common import _pnl_color
-from polymarket import tape, updown_slugs
+from polymarket import regime, tape, updown_slugs
 
 
 def _tape_slug(slug: str) -> str:
@@ -1054,6 +1054,53 @@ def feed_row(status: dict | None) -> tuple | None:
             f"[dim]{' · '.join(bits[2:])}[/dim]" if len(bits) > 2 else "")
 
 
+# The regime gauge is a SETTLEMENT-graded quantity: it advances when the
+# outcomes corpus does (hours), not when the fleet ticks (seconds). An hour
+# cold is normal; past this the corpus has stopped and the row says so rather
+# than presenting an old regime as the current one.
+_REGIME_STALE_S = 6 * 3600
+_REGIME_BAND_STYLE = {"strong": "green", "mixed": "yellow", "weak": "red",
+                      "unknown": "dim"}
+
+
+def regime_row(row: dict | None, now: float | None = None) -> tuple | None:
+    """Leader persistence as one header-grid row, or None on a cold gauge.
+
+    None is the COLD-START contract, and it is the whole reason this is a
+    separate function: a box that has never run `pmt crypto regime` has no
+    `regime.jsonl`, and the dashboard must drop the row entirely rather than
+    paint a 0% — "we have not measured this" and "the leader never holds" are
+    opposite facts and may not share a rendering. Same for a row this build
+    can't read: an unrecognised shape is a cold gauge, not a zero.
+
+    What it says: of the last N resolved windows fleet-wide, how often the
+    book's leader at elapsed 0.25 went on to win, its Wilson95, the trend
+    arrow against the previous N, and how old the newest graded window is.
+    Nothing sizes off it (docs/regime-gauge.md); it is here so the operator
+    can SEE the volatility regime the fleet's dog/favourite exposure sits in.
+    """
+    if not isinstance(row, dict):
+        return None
+    p, n = row.get("fleet_persist"), row.get("fleet_n")
+    if not isinstance(p, (int, float)) or isinstance(p, bool):
+        return None
+    if not isinstance(n, int) or isinstance(n, bool) or n <= 0:
+        return None
+    style = _REGIME_BAND_STYLE[regime.band(float(p))]
+    arrow = row.get("fleet_arrow") or "·"
+    lo, hi = row.get("fleet_lo"), row.get("fleet_hi")
+    ci = (f"[{lo * 100:.0f}, {hi * 100:.0f}]"
+          if isinstance(lo, (int, float)) and isinstance(hi, (int, float))
+          else "—")
+    age_s = (time.time() if now is None else now) - float(row.get("end") or 0)
+    age = "now" if age_s < 0 else f"{_dur_label(age_s, coarse=True)} old"
+    age_style = "yellow" if age_s > _REGIME_STALE_S else "dim"
+    return ("regime",
+            f"[dim]leader[/dim] [{style}]{p * 100:.1f}%[/{style}] {arrow}",
+            f"[dim]{ci} · {n} windows[/dim]",
+            f"[{age_style}]{age}[/{age_style}]")
+
+
 # ---------- the windows table: the fleet's state, one row per window ----------
 #
 # The dashboard's ONE table. It is not a log of trades; it is the strategy's
@@ -1643,7 +1690,7 @@ WATCH_KEYS = (
 
 # Keep in sync with cli_crypto_watch's cadence constants.
 _REFRESH_LINE = ("tape 1s (remote 2s) · engine 2s · stats 10s · odds 30s · "
-                 "balance 60s")
+                 "balance 60s · regime 60s")
 
 _HELP_MODAL_W = 78  # readable prose width; clamped to the terminal by the caller
 
@@ -1661,6 +1708,13 @@ _MODAL_LEGEND = (
              "`btc,eth,sol+2 5m` names them, ×N counts every record it stands "
              "for, and per-crypto figures show as a range. One arm's own "
              "numbers are its row in the table above[/dim]"),
+    ("regime", "[dim]leader persistence — how often the book's leader at "
+               "elapsed 0.25 held to settlement, over the last N resolved "
+               "windows fleet-wide. A price band IS a volatility position, and "
+               "this is which way it is paying: high = favourites hold, low = "
+               "the dog side is live. It GATES NOTHING. Absent until "
+               "`pmt crypto regime` has run; `old` means the outcomes corpus "
+               "stopped, not that the market did[/dim]"),
     ("refresh", f"[dim]{_REFRESH_LINE}[/dim]"),
     ("--since", "[dim]moves the header's `recent` floor only (default 6h) — "
                 "all-time, riding and the windows table always walk the full "
@@ -1741,9 +1795,9 @@ def header_rows(snap: dict) -> list[tuple]:
 
     Row order is the order the question is asked: how are we doing lately,
     how are we doing overall, what is at risk right now, is the engine there,
-    is the feed alive, and what broke. A row with nothing to say is dropped,
-    never padded with a zero — which is why the panel's height is
-    `header_height`, not a constant.
+    is the feed alive, what regime we are trading into, and what broke. A row
+    with nothing to say is dropped, never padded with a zero — which is why
+    the panel's height is `header_height`, not a constant.
     """
     sb = snap.get("sb") or {}
     sliding = sb.get("sliding") or _SB_EMPTY_SLIDING
@@ -1764,7 +1818,11 @@ def header_rows(snap: dict) -> list[tuple]:
          _pnl_cell(sb.get("net", 0.0)), cap),
     ]
     rows += exposure_rows(snap.get("status"), sb)
-    for extra in (engine_row(snap.get("status")), feed_row(snap.get("status"))):
+    # `regime` is LAST among the data rows and deliberately so: it is the only
+    # row that describes the market rather than us, it gates nothing, and a
+    # box that has never run `pmt crypto regime` drops it entirely.
+    for extra in (engine_row(snap.get("status")), feed_row(snap.get("status")),
+                  regime_row(snap.get("regime"))):
         if extra:
             rows.append(extra)
     return rows

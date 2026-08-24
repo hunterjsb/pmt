@@ -36,7 +36,7 @@ from cli_common import _api, _parse_since
 from cli_crypto_stats import _tape_scoreboard
 from engine import fetch as _engine_get
 from engine import post as _engine_post
-from polymarket import positions, tape, wallet
+from polymarket import positions, regime, tape, wallet
 from watch_ui import (
     _SB_EMPTY, build_header_panel, build_help_modal, build_windows_table,
     header_height, tape_title, window_rows, windows_title,
@@ -122,6 +122,11 @@ ENGINE_EVERY_S = 2.0
 SB_EVERY_S = 10.0
 ODDS_EVERY_S = 30.0       # per-position marks: a display feed, not a control input
 BAL_EVERY_S = 60.0
+# The regime gauge advances only when a window RESOLVES and the outcomes
+# corpus is refreshed — minutes at best, hours in practice. A 60s tail-read of
+# a local JSONL is already far faster than the quantity moves, and it is the
+# one worker source that touches no network at all.
+REGIME_EVERY_S = 60.0
 TAPE_EVERY_S = 2.0        # remote-tape poll — see TapeFeed; free while local is fresh
 # A local tape whose newest record is older than this is not being written by
 # an engine on THIS box. 30s because the fleet evaluates on a 5s throttle, so a
@@ -204,12 +209,17 @@ class WatchState:
     handing the renderer one internally consistent snapshot per frame.
     """
 
-    _FIELDS = ("status", "bal", "sb", "sb_stale", "sb_fetched_at", "err", "odds")
+    _FIELDS = ("status", "bal", "sb", "sb_stale", "sb_fetched_at", "err",
+               "odds", "regime")
 
     def __init__(self, sb: dict | None = None) -> None:
         self._lock = threading.Lock()
         self._d: dict = {
             "status": {}, "bal": {},
+            # The regime gauge's newest corpus row, or None on a box that has
+            # never run `pmt crypto regime`. None IS the cold-start value the
+            # header row is built to drop — never a zeroed dict.
+            "regime": None,
             "sb": dict(_SB_EMPTY) if sb is None else sb,
             # Not stale, just not fetched yet: sb_fetched_at None already
             # renders as the header's "—" data-age, which is the honest cue
@@ -397,7 +407,7 @@ class WatchFetcher:
         # value it re-reads every frame. See TapeFeed.
         self.tape_feed = TapeFeed() if tape_feed is None else tape_feed
         self._due: dict[str, float] = {"status": 0.0, "sb": 0.0, "bal": 0.0,
-                                       "odds": 0.0, "tape": 0.0}
+                                       "odds": 0.0, "tape": 0.0, "regime": 0.0}
 
     # -- individual fetches: each may raise; tick() belts them --
 
@@ -432,6 +442,16 @@ class WatchFetcher:
         # On the desktop this returns without making a request at all.
         self.tape_feed.poll()
 
+    def fetch_regime(self) -> None:
+        # A tail read of ~/.pmt/corpus/regime.jsonl and nothing else. It rides
+        # the fetch thread rather than the render loop for one reason: the
+        # render loop is allowed ZERO I/O it can be blocked on, and the gauge
+        # is the only header row backed by a file the dashboard doesn't write.
+        # It never computes the gauge — that is `pmt crypto regime`'s job, and
+        # a dashboard that re-derived it would walk the whole book tape once a
+        # minute to repaint one line.
+        self.state.update(regime=regime.latest())
+
     # -- failure handling: last good value + a visible marker --
 
     def _status_failed(self, exc: BaseException) -> None:
@@ -452,6 +472,12 @@ class WatchFetcher:
         # trades table paints "—" and says nothing rather than something wrong.
         self.state.update(odds={})
 
+    def _regime_failed(self, exc: BaseException) -> None:
+        # Keep the last good gauge. A regime read is a slow-moving fact about
+        # the market, so the previous one is still the best answer available —
+        # and its `old` age label already says how much to trust it.
+        pass
+
     def _tape_failed(self, exc: BaseException) -> None:
         # Keep the records already on the panel and the cursor that got them.
         # A tape is a log: what it showed a second ago is still true, and the
@@ -466,6 +492,7 @@ class WatchFetcher:
             ("odds", ODDS_EVERY_S, self.fetch_odds, self._odds_failed),
             ("bal", BAL_EVERY_S, self.fetch_bal, self._bal_failed),
             ("tape", TAPE_EVERY_S, self.fetch_tape, self._tape_failed),
+            ("regime", REGIME_EVERY_S, self.fetch_regime, self._regime_failed),
         ):
             if now < self._due[name]:
                 continue

@@ -325,6 +325,65 @@ def test_header_carries_the_stream_state_when_an_arm_reads_it():
     assert cc.feed_row(binance) is None
 
 
+# ---------- the regime gauge row ----------
+#
+# One header row for a book-only quantity that GATES NOTHING (see
+# docs/regime-gauge.md). Its whole safety property is the cold start: a box
+# that has never run `pmt crypto regime` has no corpus file, and the row must
+# vanish rather than paint a 0% — "we have not measured this" and "the leader
+# never holds" are opposite facts.
+
+_REGIME_ROW = {"slug": "btc-updown-5m-1787538600", "end": 1787538900,
+               "fleet_persist": 0.715, "fleet_n": 50, "fleet_k": 36,
+               "fleet_lo": 0.676, "fleet_hi": 0.752, "fleet_arrow": "↓"}
+
+
+def test_regime_row_reports_persistence_its_interval_and_its_trend():
+    row = cc.regime_row(_REGIME_ROW, now=_REGIME_ROW["end"] + 600)
+    assert row is not None and row[0] == "regime"
+    assert "71.5%" in row[1] and "↓" in row[1]
+    assert "[68, 75]" in row[2] and "50 windows" in row[2]
+    assert "10m old" in row[3]
+
+
+def test_regime_row_colours_by_the_studys_own_bands():
+    weak = cc.regime_row(dict(_REGIME_ROW, fleet_persist=0.715))     # the holdout
+    strong = cc.regime_row(dict(_REGIME_ROW, fleet_persist=0.797))   # the train
+    assert "red" in weak[1] and "green" in strong[1]
+
+
+def test_regime_row_is_dropped_on_a_cold_gauge():
+    # No file, a file this build can't read, and a row missing the fields it
+    # would need — all three are "not measured", not "measured at zero".
+    assert cc.regime_row(None) is None
+    assert cc.regime_row({}) is None
+    assert cc.regime_row({"fleet_persist": 0.7}) is None            # no n
+    assert cc.regime_row({"fleet_n": 50}) is None                   # no rate
+    assert cc.regime_row(dict(_REGIME_ROW, fleet_n=0)) is None      # empty block
+    assert cc.regime_row("nope") is None
+
+
+def test_a_stale_gauge_says_so_rather_than_passing_as_current():
+    """It advances when the OUTCOMES corpus does, not when the fleet ticks.
+    Half a day old means grading stopped, not that the market did."""
+    fresh = cc.regime_row(_REGIME_ROW, now=_REGIME_ROW["end"] + 60)
+    old = cc.regime_row(_REGIME_ROW, now=_REGIME_ROW["end"] + 12 * 3600)
+    assert "yellow" not in fresh[3] and "yellow" in old[3]
+
+
+def test_the_header_paints_the_regime_row_only_once_the_gauge_exists():
+    cold = _hdr_snap(regime=None)        # the file isn't there / never ran
+    absent = _hdr_snap()                 # a snapshot from before the field existed
+    warm = _hdr_snap(regime=dict(_REGIME_ROW, end=time.time() - 60))
+    assert not any(r[0] == "regime" for r in cc.header_rows(cold))
+    assert sum(1 for r in cc.header_rows(warm) if r[0] == "regime") == 1
+    # A cold box paints EXACTLY what it painted before the gauge existed —
+    # same rows, same height, same panel.
+    assert _hdr_lines(cold) == _hdr_lines(absent)
+    assert cc.header_height(cold) == cc.header_height(absent)
+    assert cc.header_height(warm) == cc.header_height(cold) + 1
+
+
 def test_the_arm_cell_marks_which_feed_an_arm_reads():
     # The arms table's flag column folded into the arm cell; the markers are
     # what the fold may not lose.
@@ -1642,7 +1701,7 @@ def test_the_refresh_legend_still_names_every_cadence():
     import cli_crypto_watch as cw
     line = cc._REFRESH_LINE
     for secs in (cw.ENGINE_EVERY_S, cw.SB_EVERY_S, cw.ODDS_EVERY_S,
-                 cw.BAL_EVERY_S, cw.TAPE_EVERY_S):
+                 cw.BAL_EVERY_S, cw.TAPE_EVERY_S, cw.REGIME_EVERY_S):
         assert f"{secs:g}s" in line, f"{secs}s cadence is not in the help modal"
 
 

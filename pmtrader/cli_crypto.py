@@ -26,8 +26,8 @@ from cli_crypto_arm import (
     crypto_arm, crypto_disarm, crypto_fleet, crypto_trigger, crypto_updown,
 )
 from cli_crypto_data import (
-    crypto_activity, crypto_basis, crypto_journal, crypto_outcomes, crypto_tape,
-    crypto_window,
+    crypto_activity, crypto_basis, crypto_journal, crypto_outcomes, crypto_regime,
+    crypto_tape, crypto_window,
 )
 from cli_crypto_fixture import crypto_fixture
 from cli_crypto_stats import crypto_stats
@@ -41,7 +41,7 @@ def crypto_group() -> None:
 
 for _cmd in (
     crypto_activity, crypto_arm, crypto_basis, crypto_disarm, crypto_fixture,
-    crypto_fleet, crypto_journal, crypto_outcomes, crypto_stats, crypto_tape,
-    crypto_trigger, crypto_updown, crypto_watch, crypto_window,
+    crypto_fleet, crypto_journal, crypto_outcomes, crypto_regime, crypto_stats,
+    crypto_tape, crypto_trigger, crypto_updown, crypto_watch, crypto_window,
 ):
     crypto_group.add_command(_cmd)

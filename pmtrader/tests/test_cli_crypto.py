@@ -65,7 +65,8 @@ def test_every_command_module_is_actually_attached():
     # there. Name them explicitly — a set comparison, not a count.
     assert set(cc.crypto_group.commands) == {
         "activity", "arm", "basis", "disarm", "fixture", "fleet", "journal",
-        "outcomes", "stats", "tape", "trigger", "updown", "watch", "window",
+        "outcomes", "regime", "stats", "tape", "trigger", "updown", "watch",
+        "window",
     }
 
 
