@@ -215,6 +215,20 @@ impl TokenMetaCache {
 /// new window meets an open connection whatever the poller is doing.
 const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How often the idle HTTP/2 connection to the CLOB is pinged.
+///
+/// Two jobs, both about never discovering a dead socket with a live order.
+/// It keeps the connection genuinely in use, so Cloudflare's own idle reaper
+/// never closes it underneath us; and it makes hyper find a half-open
+/// connection with a ping rather than with an order that then has to be
+/// re-sent on a fresh handshake. 30s sits well inside any edge idle window.
+const H2_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long an unanswered ping waits before the connection is declared dead.
+/// Generous next to the ~30ms the CLOB round trip actually takes: this must
+/// only fire on a genuinely gone connection, never on a slow one.
+const H2_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The order path's HTTP client.
 ///
 /// Its settings are money-path invariants, pinned here rather than inherited
@@ -236,6 +250,15 @@ fn order_http_builder() -> reqwest::ClientBuilder {
         // states it rather than depending on that staying true.
         .tcp_nodelay(true)
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        // The CLOB already speaks h2 (ALPN negotiates it today), so the
+        // engine holds ONE multiplexed connection — which makes that single
+        // connection's liveness the whole order path's liveness.
+        .http2_keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+        .http2_keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
+        // Pinging only while there is traffic would defend exactly the case
+        // that is already fine. The gap between two fires is when the
+        // connection dies, so the pings have to run through it.
+        .http2_keep_alive_while_idle(true)
 }
 
 impl PolymarketClient {
@@ -1318,6 +1341,33 @@ mod tests {
             5,
             "a per-order client cannot pool — if this ever passes at 1 the \
              pooling assertion above has stopped proving anything"
+        );
+    }
+
+    /// reqwest's `Debug` does not surface the h2 keep-alive fields, so the
+    /// wiring is checked by the compiler and what is asserted here is the part
+    /// that can silently be WRONG: the relationship between the three
+    /// durations. Each of these misorderings leaves the keep-alive doing
+    /// nothing while still looking configured.
+    #[test]
+    fn the_keepalive_durations_cannot_defeat_each_other() {
+        assert!(
+            H2_KEEPALIVE_INTERVAL < POOL_IDLE_TIMEOUT,
+            "pings slower than the pool reaper never refresh anything — the \
+             connection is gone before the next ping is due"
+        );
+        assert!(
+            H2_KEEPALIVE_TIMEOUT < H2_KEEPALIVE_INTERVAL,
+            "a ping deadline that outlives the next ping can never fire, so a \
+             dead connection is still found by an order"
+        );
+        // The CLOB round trip is ~30ms from the EU box. A deadline anywhere
+        // near that would tear down healthy connections under a latency
+        // spike, which costs a handshake instead of saving one.
+        assert!(
+            H2_KEEPALIVE_TIMEOUT >= std::time::Duration::from_secs(5),
+            "keep-alive timeout is close enough to a normal round trip to \
+             kill healthy connections"
         );
     }
 
