@@ -569,7 +569,9 @@ impl Engine {
         for token_id in self.subscribed_tokens.clone() {
             match self.client.get_position(&token_id).await {
                 Ok(Some((size, avg))) => {
-                    let delta = self.positions.reconcile(&token_id, size, avg);
+                    // Nothing is marked yet at startup, so the settling guard
+                    // cannot fire here: seeding a fresh tracker only ever adds.
+                    let delta = self.positions.reconcile(&token_id, size, avg).delta();
                     tracing::info!(
                         token_id = %token_id, size = %size, avg_price = %avg, delta = %delta,
                         "Startup reconcile: seeded position from data-api"
@@ -1019,12 +1021,24 @@ impl Engine {
                         if let Ok(all) = self.client.get_all_positions().await {
                             for token_id in self.subscribed_tokens.clone() {
                                 if let Some(&(size, avg)) = all.get(&token_id) {
-                                    let delta = self.positions.reconcile(&token_id, size, avg);
-                                    if delta != Decimal::ZERO {
-                                        tracing::warn!(
-                                            token_id = %token_id, corrected_to = %size, delta = %delta,
-                                            "Position reconcile: corrected drift from missed fill(s)"
-                                        );
+                                    match self.positions.reconcile(&token_id, size, avg) {
+                                        crate::position::ReconcileOutcome::Unchanged => {}
+                                        crate::position::ReconcileOutcome::Corrected(delta) => {
+                                            tracing::warn!(
+                                                token_id = %token_id, corrected_to = %size, delta = %delta,
+                                                "Position reconcile: corrected drift from missed fill(s)"
+                                            );
+                                        }
+                                        // The data-api zeroes a resolved window's row
+                                        // before our own cleanup unsubscribes the token.
+                                        // Settlement, not drift — the shares are real
+                                        // and stay on the books until cleanup drops them.
+                                        crate::position::ReconcileOutcome::RefusedSettling(held) => {
+                                            tracing::warn!(
+                                                token_id = %token_id, held = %held,
+                                                "Position reconcile: refused to zero an unpriceable position (settling, not drift)"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1103,6 +1117,25 @@ impl Engine {
                         }
                     }
 
+                    // Mark positions off the live book. This used to ride on
+                    // the WS select arm; now that the feed owns its own task,
+                    // the tick is where engine state is mutable — and it runs
+                    // at 50ms, far tighter than the marks ever needed.
+                    //
+                    // Runs BEFORE the breaker: the breaker must never judge on
+                    // a mark from a previous tick, least of all one the
+                    // reconcile above just multiplied by a corrected share
+                    // count. `mid_price` yields nothing for a one-sided book,
+                    // so tokens missing here are the ones going stale — the
+                    // call is unconditional so that clock keeps running even
+                    // when every book has gone dark.
+                    let books = self.market_data.get_all_books().await;
+                    let marks: HashMap<String, Decimal> = books
+                        .iter()
+                        .filter_map(|(t, b)| b.mid_price().map(|m| (t.clone(), m)))
+                        .collect();
+                    self.positions.update_prices(&marks);
+
                     // Check P&L for circuit breaker
                     self.risk_manager.check_pnl(&self.positions);
 
@@ -1116,19 +1149,6 @@ impl Engine {
                             );
                         }
                         continue;
-                    }
-
-                    // Mark positions off the live book. This used to ride on
-                    // the WS select arm; now that the feed owns its own task,
-                    // the tick is where engine state is mutable — and it runs
-                    // at 50ms, far tighter than the marks ever needed.
-                    let books = self.market_data.get_all_books().await;
-                    let marks: HashMap<String, Decimal> = books
-                        .iter()
-                        .filter_map(|(t, b)| b.mid_price().map(|m| (t.clone(), m)))
-                        .collect();
-                    if !marks.is_empty() {
-                        self.positions.update_prices(&marks);
                     }
 
                     // Build strategy context with full-depth order books
