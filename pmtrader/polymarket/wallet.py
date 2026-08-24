@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import requests
@@ -30,6 +31,18 @@ PAGE_SIZE = 500
 # pagination over a LIVE feed keeps shifting, absorbing up to 100 fresh
 # inserts per fetch; row_key dedupe collapses the rest. docs/LESSONS.md#L25.
 PAGE_STEP = 400
+
+# Rows older than this are IMMUTABLE AS A CLASS: every measured in-place
+# mutation is a REDEEM finalizing (docs/LESSONS.md#L25's autopsy), and
+# finalization completes in minutes — 48h is ~50x padding. This is the
+# boundary that keeps the all-time ledger reachable forever: data-api caps
+# `offset` at 5000, so a full offset-walk dies for good near ~5,300 rows
+# (~this week at current fill rates). The splice below re-walks only the
+# mutable window and takes the immutable past from the on-disk dump — a
+# clean TIMESTAMP partition, never an identity-keyed cache, which is the
+# second-code-path trap the autopsy warns about (draft/final duplicates
+# cannot arise when each row comes from exactly one side of a time cut).
+IMMUTABLE_AFTER_S = 48 * 3600.0
 
 
 def row_key(a: dict) -> tuple:
@@ -208,7 +221,69 @@ def fetch_wallet_activity(addr: str, floor: float = 0.0) -> list[dict]:
         if len(page) < PAGE_SIZE or (page and _oldest_ts(page) < floor):
             break
         offset += PAGE_STEP
+        if offset >= 4000:
+            # The 5000 cap is a deadline, not a possibility. This fires while
+            # the walk still WORKS, so the splice migration happens on a
+            # warning instead of an outage.
+            errlog.note("wallet.fetch_wallet_activity.offset_cap",
+                        RuntimeError(f"offset {offset} nearing data-api cap 5000"))
     return rows
+
+
+def _dump_rows(path: Path | str = ACTIVITY_DUMP) -> list[dict]:
+    """Every parseable row in the on-disk dump, oldest-first. [] if absent."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    rows: list[dict] = []
+    with p.open() as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError as e:
+                errlog.note("wallet._dump_rows", e)
+                continue
+            if isinstance(r, dict):
+                rows.append(r)
+    return rows
+
+
+def activity_since(addr: str, floor: float = 0.0, *, now: float | None = None,
+                   path: Path | str = ACTIVITY_DUMP) -> list[dict]:
+    """Every activity row back to `floor` — the splice: a fresh walk of the
+    MUTABLE window (now − IMMUTABLE_AFTER_S onward) plus the immutable past
+    read from the dump. THE accessor for deep floors; a shallow floor inside
+    the mutable window degenerates to a plain fresh walk, unchanged.
+
+    The partition is by timestamp, exclusive on the dump side: a row belongs
+    to the walk iff ts >= cut, to the dump iff floor <= ts < cut. No row can
+    appear on both sides, so no identity key is ever compared — the trap the
+    module autopsy documents cannot arise.
+
+    Falls back to the full offset-walk (today's behavior, with today's
+    deadline) when the dump is missing or does not COVER the cut — a splice
+    against a stale dump would silently drop the gap between its coverage
+    and the cut, which is exactly the confident-wrong-ledger failure this
+    module refuses everywhere else.
+    """
+    t = time.time() if now is None else now
+    cut = t - IMMUTABLE_AFTER_S
+    if floor >= cut:
+        return fetch_wallet_activity(addr, floor)
+    dump = _dump_rows(path)
+    coverage = max((float(r.get("timestamp") or 0) for r in dump), default=0.0)
+    if coverage < cut:
+        errlog.note("wallet.activity_since",
+                    RuntimeError(f"dump coverage {coverage:.0f} < cut {cut:.0f} "
+                                 "— full walk fallback (refresh the dump)"))
+        return fetch_wallet_activity(addr, floor)
+    fresh = [r for r in fetch_wallet_activity(addr, cut)
+             if float(r.get("timestamp") or 0) >= cut]
+    old = [r for r in dump
+           if floor <= float(r.get("timestamp") or 0) < cut]
+    merged = old + fresh
+    merged.sort(key=lambda r: r.get("timestamp") or 0)
+    return merged
 
 
 def refresh_activity_dump(path: Path | str = ACTIVITY_DUMP,
@@ -220,7 +295,7 @@ def refresh_activity_dump(path: Path | str = ACTIVITY_DUMP,
     one. Written to a temp file and renamed, so a reader mid-refresh sees the
     old dump rather than a truncated one. Returns the row count written.
     """
-    rows = fetch_wallet_activity(addr or funder_address())
+    rows = activity_since(addr or funder_address(), 0.0, path=path)
     rows.sort(key=lambda r: r.get("timestamp") or 0)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -148,7 +148,7 @@ def crypto_window(slug: str) -> None:
     addr = _funder_or_usage_error()
 
     try:
-        rows = [a for a in wallet.fetch_wallet_activity(addr, start) if a.get("slug") == slug]
+        rows = [a for a in wallet.activity_since(addr, start) if a.get("slug") == slug]
     except Exception as e:
         console.print(f"[red]data-api unreachable: {e}[/red]")
         sys.exit(1)
@@ -451,7 +451,7 @@ def crypto_outcomes(since: float, out_path: str | None, fetch_only: bool,
 
     addr = _funder_or_usage_error()
     try:
-        activity = wallet.fetch_wallet_activity(addr, windows[0]["start"])
+        activity = wallet.activity_since(addr, windows[0]["start"])
     except Exception as e:
         console.print(f"[red]data-api unreachable: {e}[/red]")
         sys.exit(1)

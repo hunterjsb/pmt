@@ -120,7 +120,7 @@ def _tape_scoreboard(floor: float, sliding_floor: float | None = None,
     # funder_address() RAISES on an unset addr, like every sibling command —
     # never fall through to a clean-looking "0W-0L" (docs/LESSONS.md#L26).
     addr = wallet.funder_address()
-    rows = wallet.fetch_wallet_activity(addr, floor if walk_floor is None else walk_floor)
+    rows = wallet.activity_since(addr, floor if walk_floor is None else walk_floor)
     sb = score_activity(rows, floor, sliding_floor=sliding_floor, ceiling=ceiling,
                         tape_records=tape_records)
     if keep_activity:

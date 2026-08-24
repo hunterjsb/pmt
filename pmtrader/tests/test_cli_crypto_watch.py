@@ -77,6 +77,8 @@ def test_a_graded_trade_always_reaches_the_watch_windows_table(monkeypatch):
              for s in (done, live)]
     monkeypatch.setattr(cs.wallet, "funder_address", lambda: "0xabc")
     monkeypatch.setattr(cs.wallet, "fetch_wallet_activity", lambda addr, floor: rows)
+    # the splice accessor must not reach the REAL dump under test
+    monkeypatch.setattr(cs.wallet, "activity_since", lambda addr, floor, **kw: rows)
     monkeypatch.setattr(cs.tape, "iter_records", lambda *a, **k: iter(fires))
     monkeypatch.setattr(cs, "_gamma_resolution_cached", lambda slug: None)
 
@@ -123,6 +125,7 @@ def test_a_riding_position_stays_on_the_panel_through_a_roll_until_it_grades(mon
 
     monkeypatch.setattr(cs.wallet, "funder_address", lambda: "0xabc")
     monkeypatch.setattr(cs.wallet, "fetch_wallet_activity", lambda addr, floor: list(rows))
+    monkeypatch.setattr(cs.wallet, "activity_since", lambda addr, floor, **kw: list(rows))
     monkeypatch.setattr(cs.tape, "iter_records", lambda *a_, **k: iter(fires))
     monkeypatch.setattr(cs, "_gamma_resolution_cached", lambda slug: None)
 

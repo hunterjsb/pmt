@@ -20,6 +20,8 @@ import cli_crypto_stats as cs
 def _install_fake_pipeline(monkeypatch, rows, fires_by_slug, gamma_by_slug):
     monkeypatch.setattr(cs.wallet, "funder_address", lambda: "0xabc")
     monkeypatch.setattr(cs.wallet, "fetch_wallet_activity", lambda addr, floor: rows)
+    # the splice accessor must not reach the REAL dump under test
+    monkeypatch.setattr(cs.wallet, "activity_since", lambda addr, floor, **kw: rows)
 
     def fake_iter_records(path, evs=None, floor=None):
         out = []
