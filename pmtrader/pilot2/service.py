@@ -12,11 +12,19 @@ Shadow and live keep SEPARATE risk books. A shadow window must obey every law
 the live one does — that is what makes the tape a faithful record of what the
 pilot would have done — but a shadow position must never consume live budget.
 
-Positions are never sold. `retire_settled` releases exposure once a window's
-settlement grace has passed and hands the position to the redeem queue; the
-tokens themselves are swept by hand (see README) because pmtrader has no
-relayer batch-redeem path and inventing one for a $40 book would be building a
-money-moving code path nobody has reviewed.
+Positions are never sold. A live clip is written to the redeem queue as a
+CANDIDATE the moment it is booked — before the order leaves — and again as DUE
+when `retire_settled` releases its exposure at the settlement grace; the tokens
+themselves are swept by hand (see README) because pmtrader has no relayer
+batch-redeem path and inventing one for a $40 book would be building a
+money-moving code path nobody has reviewed. The candidate row exists because
+the settlement row is written 300s after the close by a process that may not
+still be running: a position that filled and then lost its process was
+invisible to the sweep.
+
+The live risk book itself is rebuilt from `live-tape.jsonl` on startup
+(`Pilot.rehydrate`), so a restart cannot forget which window-sides are already
+spent and buy one of them again.
 """
 
 from __future__ import annotations
@@ -115,6 +123,58 @@ class Pilot:
         self._w_mtime = 0.0
         self.polls = 0
         self.refresh_weight()
+        self.rehydrated = self.rehydrate()
+
+    # ---- coming back up -------------------------------------------------
+
+    def rehydrate(self, now: float | None = None) -> int:
+        """Rebuild the LIVE risk book from the order tape. Returns rows read.
+
+        `RiskBook` lives in memory, so a restart used to come back with an
+        empty one: the escalation ban forgot every (slug, side) it had already
+        fired, and a window still open could be bought a SECOND time — the
+        exact -9.48% RoN shape §1.1 prices. Exposure forgot its positions with
+        it, so the $40 cap read as fully free.
+
+        The tape is the authority because it is written BEFORE the send
+        (`_fire_live`): a clip that reached the tape is a clip that was spent,
+        whether or not the ack came back. Only windows inside their settlement
+        grace are restored as POSITIONS — anything older was already retired
+        and queued — while the fired keys of any window that has not ended yet
+        are what actually keep the one-clip law true across a restart.
+
+        Shadow keeps no book across a restart on purpose: paper exposure that
+        outlives the process would seize the $40 shadow budget at boot and stop
+        producing the record the pilot exists to produce.
+        """
+        if not self.live:
+            return 0
+        now = time.time() if now is None else now
+        rows = 0
+        for r in state.iter_records(state.LIVE_TAPE, self.home, evs=(state.EV_ORDER,)):
+            slug, side = r.get("slug"), r.get("side")
+            end = r.get("end")
+            if not (isinstance(slug, str) and side in ("up", "down")
+                    and isinstance(end, (int, float))):
+                continue
+            if now >= float(end) + SETTLE_GRACE_S:
+                continue    # already retired and queued by the process that ran it
+            shares = float(r.get("shares") or 0.0)
+            ask = float(r.get("ask") or r.get("price") or 0.0)
+            self.live_risk.record_fill(
+                slug, side, shares=shares, notional=float(r.get("notional") or shares * ask),
+                ask=ask, end=float(end), token=str(r.get("token") or ""),
+                t=float(r.get("t") or now))
+            rows += 1
+        if rows:
+            self.log(f"rehydrated {rows} live position(s) from {state.LIVE_TAPE} "
+                     f"(${self.live_risk.exposure_used:.2f} exposure, "
+                     f"{len(self.live_risk.fired)} spent window-side(s))")
+            state.append(state.LIVE_TAPE,
+                         {"ev": state.EV_REHYDRATE, "rows": rows,
+                          "exposure": round(self.live_risk.exposure_used, 4),
+                          "fired": len(self.live_risk.fired)}, self.home)
+        return rows
 
     # ---- the blend weight ------------------------------------------------
 
@@ -315,6 +375,17 @@ class Pilot:
         book.record_fill(w.slug, d.side, shares=sizing.shares, notional=sizing.notional,
                          ask=d.ask, end=w.end, token=plan.token)
         state.append(state.LIVE_TAPE, {**rec, "ev": state.EV_ORDER, **plan.record()}, self.home)
+        # The redeem queue gets its candidate HERE, before the order leaves —
+        # not at settlement. `_retire` is the only thing that used to write the
+        # queue, and it runs 300s after the close: a process that died in
+        # between left a filled position with nothing anywhere saying it needed
+        # sweeping. Writing early can only ever queue a position that turns out
+        # not to have filled, which the sweep sees and skips; writing late can
+        # lose one, which is money left on the chain.
+        state.append(state.REDEEM_QUEUE,
+                     {"ev": state.EV_REDEEM_CANDIDATE, "slug": w.slug, "side": d.side,
+                      "token": plan.token, "shares": sizing.shares,
+                      "notional": sizing.notional, "ask": d.ask, "end": w.end}, self.home)
         try:
             ack = execution.place(self.clob, plan)
         except Exception as e:  # noqa: BLE001 — a failed send is a spent clip, not a crash
@@ -353,7 +424,7 @@ class Pilot:
         # and stops producing the record this pilot exists to produce.
         self.shadow_risk.retire_settled(now, SETTLE_GRACE_S)
         for p in self.live_risk.retire_settled(now, SETTLE_GRACE_S):
-            state.append(state.REDEEM_QUEUE, {"ev": "redeem_due", **p}, self.home)
+            state.append(state.REDEEM_QUEUE, {"ev": state.EV_REDEEM_DUE, **p}, self.home)
 
     # ---- the loop --------------------------------------------------------
 

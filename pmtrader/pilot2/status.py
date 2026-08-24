@@ -53,7 +53,15 @@ def summarise(home, since_s: float | None = None, now: float | None = None) -> d
     live_orders = [r for r in state.iter_records(state.LIVE_TAPE, home, evs=(state.EV_ORDER,))]
     acks = [r for r in state.iter_records(state.LIVE_TAPE, home, evs=(state.EV_ACK,))]
     filled = sum(float(r.get("filled") or 0.0) for r in acks)
-    open_live = [r for r in state.iter_records(state.REDEEM_QUEUE, home)]
+    # One entry per (slug, side), newest row wins: a position is written to the
+    # queue twice — as a CANDIDATE the moment its clip is booked, so a process
+    # that dies before settlement still leaves the sweep something to find, and
+    # again as DUE when its window settles. Counting both would double the
+    # queue depth and the notional an operator sweeps against.
+    by_position: dict[str, dict] = {}
+    for r in state.iter_records(state.REDEEM_QUEUE, home):
+        by_position[f"{r.get('slug')}:{r.get('side')}"] = r
+    open_live = list(by_position.values())
 
     weight = state.read_json(state.BLEND_WEIGHT, home,
                              {"w": policy.W_SEED, "source": policy.W_SOURCE_SEED, "rows": 0})

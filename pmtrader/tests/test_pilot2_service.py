@@ -376,6 +376,9 @@ def test_shadow_and_live_keep_separate_exposure_ledgers(tmp_path, monkeypatch):
 
 
 def test_a_live_position_is_queued_for_the_manual_sweep_at_settlement(tmp_path, monkeypatch):
+    """Twice, and the first one is the point: the CANDIDATE goes down at fill
+    time, so a process that dies before the settlement grace still leaves the
+    sweep something to find. `redeem_due` is the same position at settlement."""
     monkeypatch.setattr(service.execution, "place",
                         lambda *a, **kw: {"success": True, "takingAmount": "9"})
     w = a_window()
@@ -383,9 +386,89 @@ def test_a_live_position_is_queued_for_the_manual_sweep_at_settlement(tmp_path, 
                       shadow_series=[], stream=FakeStream(), poller=FakePoller(),
                       cache=FakeCache(w), clob_client=RecordingClient(), log=lambda *_: None)
     p.poll_once(now=START + 60.0)
+    # The candidate exists BEFORE the window has settled — that is the whole
+    # fix, and it is the row a crash in between would otherwise have cost.
+    early = list(state.iter_records(state.REDEEM_QUEUE, tmp_path))
+    assert [r["ev"] for r in early] == [state.EV_REDEEM_CANDIDATE]
+    assert early[0]["slug"] == SLUG and early[0]["token"] == "TOK_UP"
+
     p.poll_once(now=END + service.SETTLE_GRACE_S + 1.0)
     queued = list(state.iter_records(state.REDEEM_QUEUE, tmp_path))
-    assert len(queued) == 1 and queued[0]["slug"] == SLUG and queued[0]["token"] == "TOK_UP"
+    assert [r["ev"] for r in queued] == [state.EV_REDEEM_CANDIDATE, state.EV_REDEEM_DUE]
+    assert all(r["slug"] == SLUG and r["token"] == "TOK_UP" for r in queued)
+    # …and the operator's view counts the POSITION once, not the rows.
+    from pilot2 import status as status_mod
+    assert status_mod.summarise(tmp_path)["live"]["redeem_queue"] == 1
+
+
+def test_a_restart_rebuilds_the_live_risk_book_from_the_order_tape(tmp_path, monkeypatch):
+    """The escalation ban has to survive a restart. `RiskBook` is in memory, so
+    a fresh process forgot every (slug, side) it had fired and could buy the
+    same still-open window a SECOND time — §1.1's -9.48% RoN shape, rebuilt by
+    a systemd restart. The order tape is the authority because it is written
+    before the send: a clip that reached it is a clip that was spent."""
+    sent = []
+    monkeypatch.setattr(service.execution, "place",
+                        lambda c, plan, tick_size=None: sent.append(plan)
+                        or {"success": True, "takingAmount": "9"})
+    w = a_window()
+
+    def a_live_pilot():
+        return service.Pilot(home=tmp_path, live=True, live_series=["doge-updown-5m"],
+                             shadow_series=[], stream=FakeStream(), poller=FakePoller(),
+                             cache=FakeCache(w), clob_client=RecordingClient(),
+                             log=lambda *_: None)
+
+    p = a_live_pilot()
+    assert p.poll_once(now=START + 60.0) == 1
+    assert len(sent) == 1
+
+    # The process dies and comes back mid-window. (The constructor rehydrates
+    # off the wall clock; these windows are a fixed synthetic epoch, so the
+    # clock is handed in explicitly here.)
+    q = a_live_pilot()
+    assert q.rehydrate(now=START + 100.0) == 1
+    assert q.live_risk.has_fired(SLUG, "up"), "the clip is still spent"
+    assert q.live_risk.exposure_used == pytest.approx(p.live_risk.exposure_used)
+    assert q.poll_once(now=START + 120.0) == 0, "and the window cannot be bought again"
+    assert len(sent) == 1, "no second order left the process"
+    refused = [r["refused"] for r in tape(tmp_path, state.EV_REFUSED)]
+    assert refused and refused[-1] == risk.R_CLIP_ALREADY_FIRED
+
+
+def test_rehydration_ignores_positions_the_previous_process_already_retired(tmp_path,
+                                                                            monkeypatch):
+    """A window past its settlement grace was already released and queued.
+    Restoring it would hold $5 of the $40 budget against a position nobody is
+    managing any more."""
+    monkeypatch.setattr(service.execution, "place",
+                        lambda *a, **kw: {"success": True, "takingAmount": "9"})
+    w = a_window()
+    p = service.Pilot(home=tmp_path, live=True, live_series=["doge-updown-5m"],
+                      shadow_series=[], stream=FakeStream(), poller=FakePoller(),
+                      cache=FakeCache(w), clob_client=RecordingClient(), log=lambda *_: None)
+    p.poll_once(now=START + 60.0)
+    q = service.Pilot(home=tmp_path, live=True, live_series=["doge-updown-5m"],
+                      shadow_series=[], stream=FakeStream(), poller=FakePoller(),
+                      cache=FakeCache(w), clob_client=RecordingClient(), log=lambda *_: None)
+    assert q.rehydrate(now=END + service.SETTLE_GRACE_S + 1.0) == 0
+    assert q.live_risk.exposure_used == 0.0
+
+
+def test_a_shadow_pilot_never_rehydrates_a_live_book(tmp_path, monkeypatch):
+    """Paper exposure that outlived the process would seize the shadow budget
+    at boot and stop the pilot producing the record it exists to produce."""
+    monkeypatch.setattr(service.execution, "place",
+                        lambda *a, **kw: {"success": True, "takingAmount": "9"})
+    w = a_window()
+    live = service.Pilot(home=tmp_path, live=True, live_series=["doge-updown-5m"],
+                         shadow_series=[], stream=FakeStream(), poller=FakePoller(),
+                         cache=FakeCache(w), clob_client=RecordingClient(), log=lambda *_: None)
+    live.poll_once(now=START + 60.0)
+    shadow = a_pilot(tmp_path)
+    assert shadow.rehydrated == 0
+    assert shadow.live_risk.exposure_used == 0.0
+    assert shadow.shadow_risk.exposure_used == 0.0
 
 
 def test_no_key_material_ever_reaches_a_tape(tmp_path, monkeypatch):

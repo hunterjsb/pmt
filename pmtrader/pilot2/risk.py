@@ -132,6 +132,11 @@ class RiskBook:
     Fired keys are (slug, side) and are NEVER cleared for a window that is
     still known — that is what makes MAX_CLIPS_PER_WINDOW_SIDE mean "ever"
     rather than "currently".
+
+    In memory is not the same as forgotten: the LIVE book is rebuilt on startup
+    from the order tape (`service.Pilot.rehydrate`), because a restart that
+    forgets its fired keys can buy a still-open window a second time — the
+    escalation the whole class exists to forbid, arriving through systemd.
     """
 
     home: Path
