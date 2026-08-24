@@ -21,17 +21,19 @@ User=ec2-user
 Group=ec2-user
 WorkingDirectory=/home/ec2-user
 
-# The EOA key lives in l0.env and ONLY there. engine.env carries the
-# non-secret knobs. Both are `-` optional so a missing file is a clean
-# start failure rather than a systemd load error.
-EnvironmentFile=-/home/ec2-user/.pmt/l0.env
+# Key material lives in main.env (main proxy wallet, 2026-08-24 migration)
+# and ONLY there; l0.env (the retired deposit-wallet EOA, generated on-box)
+# stays on disk untouched but is no longer sourced. engine.env carries the
+# non-secret knobs. `-` optional so a missing file is a clean start failure
+# rather than a systemd load error.
+EnvironmentFile=-/home/ec2-user/.pmt/main.env
 EnvironmentFile=-/home/ec2-user/.pmt/engine.env
 
 # --env-file is also passed explicitly: the engine's own dotenv load is what
 # populates config.rs, and it must see the same file systemd sourced.
 ExecStart=/home/ec2-user/pmt/bin/pmengine \
     --env-file /home/ec2-user/.pmt/engine.env \
-    run updown --skip-warmup
+    run updown updown2 --skip-warmup
 
 Restart=on-failure
 RestartSec=5
