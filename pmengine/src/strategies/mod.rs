@@ -21,6 +21,12 @@ mod example;
 #[path = "private/updown.rs"]
 pub(crate) mod updown;
 #[cfg(private_strategies)]
+#[path = "private/updown2.rs"]
+mod updown2;
+#[cfg(private_strategies)]
+#[path = "private/updown2_model.rs"]
+pub(crate) mod updown2_model;
+#[cfg(private_strategies)]
 #[path = "private/updown_model.rs"]
 pub(crate) mod updown_model;
 #[cfg(private_strategies)]
@@ -39,6 +45,8 @@ use crate::strategy::Strategy;
 pub use example::Example;
 #[cfg(private_strategies)]
 pub use updown::Updown;
+#[cfg(private_strategies)]
+pub use updown2::Updown2;
 
 /// Information about a strategy in the registry.
 pub struct StrategyInfo {
@@ -60,6 +68,11 @@ pub fn registry() -> HashMap<&'static str, StrategyInfo> {
     #[cfg(private_strategies)]
     m.insert("updown", StrategyInfo {
         factory: || Box::new(updown::Updown::new()),
+    });
+
+    #[cfg(private_strategies)]
+    m.insert("updown2", StrategyInfo {
+        factory: || Box::new(updown2::Updown2::new()),
     });
 
     m

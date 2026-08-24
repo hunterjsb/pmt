@@ -6,8 +6,10 @@
 //!
 //! Public flavor (no pmt-strategies submodule): exactly `["example"]` —
 //! proving the public artifact carries no private strategy. Private flavor:
-//! exactly `["example", "updown"]` — the example is a permanent canary for
-//! the strategy plumbing, updown the live strategy.
+//! exactly `["example", "updown", "updown2"]` — the example is a permanent
+//! canary for the strategy plumbing, `updown` the live strategy, `updown2`
+//! the Strategy 2.0 pricer, registered but SHADOW by default (it places
+//! nothing until an operator arms it live with a second key).
 
 use pmengine::engine::EngineError;
 use pmengine::strategies::registry;
@@ -45,7 +47,7 @@ fn private_registry_is_exactly_the_surviving_set() {
     let reg = registry();
     let mut names: Vec<&str> = reg.keys().copied().collect();
     names.sort_unstable();
-    assert_eq!(names, vec!["example", "updown"]);
+    assert_eq!(names, vec!["example", "updown", "updown2"]);
 }
 
 #[cfg(private_strategies)]
@@ -55,6 +57,17 @@ fn private_registry_carries_updown() {
     assert!(
         reg.contains_key("updown"),
         "updown is the live strategy — registry has {:?}",
+        reg.keys().collect::<Vec<_>>()
+    );
+}
+
+#[cfg(private_strategies)]
+#[test]
+fn private_registry_carries_updown2() {
+    let reg = registry();
+    assert!(
+        reg.contains_key("updown2"),
+        "updown2 is the Strategy 2.0 shadow — registry has {:?}",
         reg.keys().collect::<Vec<_>>()
     );
 }
@@ -74,10 +87,9 @@ fn public_artifact_carries_no_private_strategy() {
     // The whole point of the split: a public build must not even KNOW the
     // private strategy's name.
     let reg = registry();
-    assert!(
-        !reg.contains_key("updown"),
-        "updown leaked into the public registry"
-    );
+    for name in ["updown", "updown2"] {
+        assert!(!reg.contains_key(name), "{name} leaked into the public registry");
+    }
 }
 
 #[test]
