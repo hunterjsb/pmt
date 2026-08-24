@@ -383,6 +383,56 @@ def test_backoff_recovers_full_range_after_reset():
     assert [b.next_delay() for _ in range(3)] == [0.5, 1.0, 2.0]
 
 
+# ================================================= the loud-failure contract
+
+def _stats(venue, frames, rows, connects=1):
+    s = spot.VenueStats(venue)
+    s.frames, s.rows, s.connects = frames, rows, connects
+    return s
+
+
+def test_healthy_run_exits_zero():
+    rc, msgs = spot.exit_code({"binance": _stats("binance", 900, 850),
+                               "kraken": _stats("kraken", 90, 80)})
+    assert rc == 0
+    assert msgs == []
+
+
+def test_a_venue_with_no_frames_is_a_hard_failure():
+    """Zero frames means the socket or the subscription is broken, and the
+    file it leaves behind holds only a start marker."""
+    rc, msgs = spot.exit_code({"binance": _stats("binance", 900, 850),
+                               "kraken": _stats("kraken", 0, 0, connects=0)})
+    assert rc == 1
+    assert any("FAIL" in m and "kraken" in m for m in msgs)
+
+
+def test_frames_everywhere_but_nothing_parsed_is_its_own_exit_code():
+    """Distinct from rc=1 on purpose: the plumbing is fine and a payload shape
+    moved under the parsers, which is a different thing to go and fix."""
+    rc, msgs = spot.exit_code({"binance": _stats("binance", 900, 0),
+                               "kraken": _stats("kraken", 90, 0)})
+    assert rc == 2
+    assert any("NOTHING parsed" in m for m in msgs)
+
+
+def test_a_quiet_market_warns_but_does_not_fail():
+    """hype can legitimately go an hour without a trade. Failing on that would
+    train everyone to ignore the exit code, which is the real dead-sampler
+    lesson — the zero bytes were only the symptom."""
+    rc, msgs = spot.exit_code({"binance": _stats("binance", 900, 850),
+                               "hyperliquid": _stats("hyperliquid", 40, 0)})
+    assert rc == 0
+    assert any(m.startswith("WARN") and "hyperliquid" in m for m in msgs)
+
+
+def test_a_hard_failure_outranks_a_warning():
+    rc, msgs = spot.exit_code({"binance": _stats("binance", 0, 0, connects=0),
+                               "hyperliquid": _stats("hyperliquid", 40, 0)})
+    assert rc == 1
+    assert not any(m.startswith("WARN") for m in msgs)
+
+
 # ============================================================ the clock
 
 def test_clock_is_epoch_comparable_and_advances():

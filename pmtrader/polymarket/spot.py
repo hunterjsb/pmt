@@ -800,20 +800,41 @@ def run(directory: Path = SPOT_DIR, *, venues: list[str] | None = None,
             f"connects={s.connects} reconnects={s.reconnects}  {syms}")
     log(f"  {'TOTAL':12s} rows={total:8d}  clock_skew={clock.skew() * 1000:+.0f}ms")
 
+    rc, messages = exit_code(stats)
+    for m in messages:
+        errlog(m)
+    return rc
+
+
+def exit_code(stats: dict) -> tuple[int, list[str]]:
+    """The loud-failure contract, as a pure function so it can be tested.
+
+      0  every venue got frames, and something parsed
+      1  a venue never received a frame          (plumbing / subscription)
+      2  frames everywhere but nothing parsed    (a payload shape moved)
+
+    A venue with frames but no rows is a WARNING, not a failure: a market can
+    legitimately be silent for an hour (hype at 04:00Z), and turning that into
+    a nonzero exit would train everyone to ignore the exit code — which is the
+    actual lesson of the dead btc1h sampler, not the zero bytes.
+    """
+    msgs: list[str] = []
     rc = 0
     for v, s in sorted(stats.items()):
         if s.frames == 0:
-            errlog(f"FAIL [{v}] received ZERO frames "
-                   f"(connects={s.connects}, last error: {s.error or 'none'})")
+            msgs.append(f"FAIL [{v}] received ZERO frames "
+                        f"(connects={s.connects}, last error: {s.error or 'none'})")
             rc = 1
+    total = sum(s.rows for s in stats.values())
     if rc == 0 and total == 0:
-        errlog("FAIL every venue received frames but NOTHING parsed — "
-               "a payload shape changed under the parsers")
+        msgs.append("FAIL every venue received frames but NOTHING parsed — "
+                    "a payload shape changed under the parsers")
         rc = 2
-    for v, s in sorted(stats.items()):
-        if s.frames and s.rows == 0 and rc == 0:
-            errlog(f"WARN [{v}] {s.frames} frames but zero rows parsed")
-    return rc
+    if rc == 0:
+        for v, s in sorted(stats.items()):
+            if s.frames and s.rows == 0:
+                msgs.append(f"WARN [{v}] {s.frames} frames but zero rows parsed")
+    return rc, msgs
 
 
 # ---------- entrypoint ----------
