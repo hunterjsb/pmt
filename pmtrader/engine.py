@@ -31,6 +31,8 @@ import click
 import requests
 from rich.console import Console
 
+from polymarket import errlog
+
 console = Console()
 
 
@@ -83,24 +85,41 @@ def fetch(path: str, params: dict | None = None, timeout: float = 3.0) -> Any | 
     operator's terminal every few seconds for a link that reconnects on its
     own. Strict `get()` stays the right call when the operator asked a
     question and a non-answer is the answer.
+
+    Prints nothing, but no longer says nothing: the marks go to errlog, where a
+    tunnel that has been down for an hour looks different from one that
+    blinked. This is the call behind the watch dashboard's tape panel, and a
+    panel that quietly stops advancing is indistinguishable from a fleet with
+    nothing to say.
     """
     try:
         r = requests.get(f"{base_url()}{path}", params=params, timeout=timeout)
         if r.status_code >= 400:
+            errlog.note("engine.fetch.http", RuntimeError(f"HTTP {r.status_code}"),
+                        path=path, body=r.text[:200])
             return None
         return r.json()
-    except (requests.RequestException, ValueError):
+    except (requests.RequestException, ValueError) as e:
+        errlog.note("engine.fetch", e, path=path)
         return None
 
 
 def notify(path: str, body: dict | None = None) -> dict | None:
-    """Returns the JSON response on success, or None if unreachable / 4xx."""
+    """Returns the JSON response on success, or None if unreachable / 4xx.
+
+    Best-effort by design and marked by errlog anyway — a notify that has
+    silently failed every time for a day is a control-plane outage nobody was
+    told about.
+    """
     try:
         r = requests.post(f"{base_url()}{path}", json=body, timeout=3)
         if r.status_code >= 400:
+            errlog.note("engine.notify.http", RuntimeError(f"HTTP {r.status_code}"),
+                        path=path, body=r.text[:200])
             return None
         return r.json()
-    except (requests.ConnectionError, requests.Timeout):
+    except (requests.ConnectionError, requests.Timeout) as e:
+        errlog.note("engine.notify", e, path=path)
         return None
 
 

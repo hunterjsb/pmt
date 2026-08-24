@@ -36,7 +36,7 @@ from cli_common import _api, _parse_since
 from cli_crypto_stats import _tape_scoreboard
 from engine import fetch as _engine_get
 from engine import post as _engine_post
-from polymarket import positions, regime, tape, wallet
+from polymarket import errlog, positions, regime, tape, wallet
 from watch_ui import (
     _SB_EMPTY, build_header_panel, build_help_modal, build_windows_table,
     header_height, tape_title, window_rows, windows_title,
@@ -61,7 +61,11 @@ def _cbreak_stdin() -> tuple[int, list] | None:
 
 def _restore_stdin(saved: tuple[int, list] | None) -> None:
     """Undo _cbreak_stdin — must run even on an exception, or the shell is
-    left echo-less after the dashboard exits."""
+    left echo-less after the dashboard exits.
+
+    LEGITIMATELY SILENT (errlog census, 2026-08-24): this runs on the way out,
+    the terminal is already being handed back, and there is no one left to tell.
+    """
     if saved is None:
         return
     fd, old = saved
@@ -76,6 +80,10 @@ def _poll_key(timeout: float = 0.0) -> str | None:
     wait in seconds; 0 (the default) polls without blocking at all.
 
     os.read on the raw fd, NEVER sys.stdin.read — see docs/LESSONS.md#L30.
+
+    LEGITIMATELY SILENT (errlog census, 2026-08-24): called at 20Hz, and every
+    failure mode here (a closed fd on teardown, a resize interrupting select)
+    means the same thing as no key — which is what it returns.
     """
     if not sys.stdin.isatty():
         return None
@@ -502,6 +510,16 @@ class WatchFetcher:
             except (Exception, SystemExit) as e:
                 # engine.post() sys.exit()s on failure — SystemExit isn't an
                 # Exception, so it must be named explicitly.
+                #
+                # THE most important mark in the codebase. Every belt in this
+                # class is correct — a flaky source must not kill the thread
+                # that owns five others — but the whole failure used to reach
+                # the operator as `scoreboard: AttributeError` in a header
+                # cell: a type name, no site, no message, no traceback, no
+                # count. A source that has been failing every 10s for an hour
+                # looked exactly like one that blinked once. errlog keeps the
+                # first traceback and the count; `pmt crypto errors` reads it.
+                errlog.note(f"watch.fetch_{name}", e)
                 failed(e)
 
     def loop(self, stop: threading.Event, interval: float = WORKER_INTERVAL_S) -> None:
@@ -511,6 +529,7 @@ class WatchFetcher:
             try:
                 self.tick(time.time())
             except Exception as e:  # a bug in tick() itself must not kill the feed
+                errlog.note("watch.WatchFetcher.loop", e)
                 self.state.update(err=f"{type(e).__name__}: {e}"[:100])
             stop.wait(interval)
 
@@ -534,6 +553,13 @@ def crypto_watch(since: float | None) -> None:
     from rich.text import Text
 
     WATCH_DEFAULT_LOOKBACK_H = 6.0  # sliding recent window — it's a live dashboard, not the ledger
+
+    # This command owns the whole terminal (Rich Live, alternate screen), so a
+    # traceback printed to stderr is painted over within 250ms and reaches
+    # nobody. The marks still go to the file, which is the point: the operator
+    # reads them with `pmt crypto errors` after quitting, instead of watching
+    # the dashboard tear itself up trying to tell them.
+    os.environ.setdefault("PMT_ERRLOG_STDERR", "0")
 
     collapser = watch_ui.TapeCollapser()
 
@@ -661,12 +687,20 @@ def crypto_watch(since: float | None) -> None:
                 except KeyboardInterrupt:
                     raise
                 except (Exception, SystemExit) as e:
+                    # The header cell truncates to 100 chars and keeps no
+                    # frames. A render bug that only fires on one data shape is
+                    # exactly the kind that needs the traceback kept.
+                    errlog.note("watch.render", e)
                     render_err = f"{type(e).__name__}: {e}"[:100]
                     try:
                         layout["head"].size = header_height(
                             snap, render_err, live.console.size.width)
                         layout["head"].update(header())
                     except Exception:
+                        # LEGITIMATELY SILENT (errlog census, 2026-08-24): this
+                        # is the belt on the belt — the header repaint that
+                        # exists only to SHOW render_err. The error it would be
+                        # reporting is already marked by the handler above.
                         pass
                 # The modal is FOREGROUND: it takes the screen while open. The
                 # dashboard behind it is still rebuilt every frame above (and

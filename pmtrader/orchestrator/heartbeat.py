@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from polymarket import errlog
 from polymarket.updown_slugs import dur_label, parse_updown_slug
 
 # Below this, a node cannot meaningfully take over anyone's series — it may
@@ -75,10 +76,14 @@ def series_held(paths: list[str | Path]) -> list[str]:
             raw = json.loads(p.read_text())
         except FileNotFoundError:
             continue
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as e:
             # A torn or unreadable state file is a real signal, but it is not
             # this function's to raise: report what we could see and let the
-            # caller's `engine_active` carry the alarm.
+            # caller's `engine_active` carry the alarm. Marked, because an
+            # arms-state.json nobody can read makes the heartbeat under-report
+            # the series this node is actually trading — which is the exact
+            # input the lease protocol fences on.
+            errlog.note("orchestrator.heartbeat.armed_series", e, path=str(p))
             continue
         for arm in raw.get("arms") or []:
             s = series_of(str(arm.get("slug", "")))

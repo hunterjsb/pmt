@@ -27,7 +27,7 @@ import click
 from rich.table import Table
 
 from cli_common import _pnl_color
-from polymarket import regime, tape, updown_slugs
+from polymarket import errlog, regime, tape, updown_slugs
 
 
 def _tape_slug(slug: str) -> str:
@@ -333,7 +333,7 @@ def _tape_head(r: dict, n: int = 1, t0: float | None = None,
     line that stands for several arms at once (_group_label).
     """
     t1 = r.get("t", 0)
-    ident = _tape_slug(r.get("slug", "")) if label is None else label
+    ident = _tape_slug(r.get("slug") or "") if label is None else label
     return (f"{_hms(t1 if t0 is None else t0)} {_tape_agg(n, t1)}"
             f" {ident:<{_TAPE_SLUG_WIDTH}}")
 
@@ -350,6 +350,11 @@ def _money(v: float) -> str:
 
 
 def _tape_render(line: str) -> str | None:
+    # LEGITIMATELY SILENT (errlog census, 2026-08-24): callers feed this raw
+    # lines straight off a file that is being appended to, so a torn tail is
+    # expected input and None is the answer. TapeCollapser.add is where a
+    # mid-file corruption gets surfaced; tape.iter_records is where a file
+    # scan does.
     try:
         r = json.loads(line)
     except ValueError:
@@ -890,12 +895,17 @@ class TapeCollapser:
             return
         try:
             run = self._route(r, raw, lines)
-        except Exception:
-            run = None  # a malformed record must never take the dashboard down
+        except Exception as e:
+            # A malformed record must never take the dashboard down — but a
+            # collapse rule that throws on every record of some shape silently
+            # demotes that whole event class to raw text, forever.
+            errlog.note("watch_ui.TapeCollapser._route", e, raw=raw[:200])
+            run = None
         if run is not None:
             try:
                 out = run.rule.render(run)
-            except Exception:
+            except Exception as e:
+                errlog.note("watch_ui.TapeCollapser.render", e, raw=raw[:200])
                 # This run can no longer render itself. Fall through to the raw
                 # path below rather than return: a belt that swallows a record
                 # is the failure the panel exists to prevent, and _runs.clear()
@@ -912,8 +922,11 @@ class TapeCollapser:
         self._runs.clear()
         try:
             rendered = _render_record(r, raw)
-        except Exception:
-            rendered = raw.rstrip()  # unrenderable, but never unseen
+        except Exception as e:
+            # Unrenderable, but never unseen. The raw line still reaches the
+            # panel; the mark is how the renderer's own bug reaches anyone.
+            errlog.note("watch_ui._render_record", e, raw=raw[:200])
+            rendered = raw.rstrip()
         if rendered:
             lines.append(rendered)
 

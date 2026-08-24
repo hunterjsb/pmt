@@ -32,7 +32,9 @@ import click
 import stats_render
 from cli_common import _api, _parse_since, console
 from engine import post as _engine_post
-from polymarket import effectiveness, eras, tape, updown_slugs, updown_stats, wallet
+from polymarket import (
+    effectiveness, eras, errlog, tape, updown_slugs, updown_stats, wallet,
+)
 
 
 _GAMMA_CACHE: dict[str, tuple[float, dict]] = {}
@@ -67,7 +69,13 @@ def _gamma_resolution_cached(slug: str) -> dict | None:
                           headers=hosts.UA, timeout=8)
         r.raise_for_status()
         result = outcomes.gamma_resolution(r.json())
-    except Exception:
+    except Exception as e:
+        # SURFACED, not just swallowed. None here reads downstream as "not
+        # resolved yet", which is the honest answer for an unsettled window
+        # and a LIE for a gamma outage — and the lie's cost is a settled
+        # window that rides forever with real money marked as still at risk.
+        # The degradation is right; the silence was not.
+        errlog.note("cli_crypto_stats._gamma_resolution_cached", e, slug=slug)
         return None
     _GAMMA_CACHE[slug] = (now, result)
     return result
@@ -225,7 +233,8 @@ def score_activity(rows: list[dict], floor: float,
                                           "buy_ts_usd": 0.0, "exit_ts": 0.0})
         usd = a.get("usdcSize") or 0.0
         ts = float(a.get("timestamp") or 0.0)
-        if a["type"] == "TRADE":
+        a_type = a.get("type")
+        if a_type == "TRADE":
             w["buy" if a.get("side") == "BUY" else "sell"] += usd
             if a.get("side") == "BUY":
                 w["buy_shares"] += a.get("size") or 0.0
@@ -237,7 +246,7 @@ def score_activity(rows: list[dict], floor: float,
                 # Shares out, not dollars out: what decides whether anything
                 # is still held at settlement (outcomes.exited_flat).
                 w["sell_shares"] += a.get("size") or 0.0
-        elif a["type"] == "REDEEM":
+        elif a_type == "REDEEM":
             # A zero-share, zero-dollar REDEEM is a stub, not a redemption
             # (data-api posted them beside two resolution-confirmed wins,
             # 2026-08-23 23:01Z): it burned nothing and proves nothing, but
@@ -259,8 +268,16 @@ def score_activity(rows: list[dict], floor: float,
     for r in records:
         ev = r.get("ev")
         if ev == tape.EV_FIRE:
-            if _in_range(updown_slugs.window_start(r.get("slug", ""))):
-                fires.setdefault(r["slug"], []).append(r)
+            # Bind the slug ONCE and require a string. `.get("slug", "")`
+            # returns None for an explicit `"slug": null` (the default only
+            # applies to a MISSING key), and a `""` slug ranged as start 0.0,
+            # which an all-time floor accepts — so the old code reached
+            # `r["slug"]` on a record that has no usable slug at all.
+            slug_r = r.get("slug")
+            if not isinstance(slug_r, str) or not slug_r:
+                continue
+            if _in_range(updown_slugs.window_start(slug_r)):
+                fires.setdefault(slug_r, []).append(r)
         # A roll has no window of its own, so it is ranged on its own record
         # time — the one place in this function that is not a window start.
         elif ev == tape.EV_ROLL and _in_range(r.get("t", 0)):
@@ -359,10 +376,21 @@ def score_activity(rows: list[dict], floor: float,
         else:
             won_side = ""
         for f in fires.get(slug, []):
-            b = min(int(f["fair"] * 20) / 20, 0.95)
+            # A calibration bucket needs both halves of the claim: the stated
+            # fair AND the side it was stated for. A fire record that is
+            # missing either (an older tape generation, a truncated write) can
+            # only be skipped — it used to KeyError/TypeError out of the whole
+            # scoreboard, taking every OTHER window's grade down with it.
+            fair, f_side = f.get("fair"), f.get("side")
+            if not isinstance(fair, (int, float)) or isinstance(fair, bool) or not f_side:
+                errlog.note("cli_crypto_stats.score_activity.calibration",
+                            ValueError("fire record has no usable fair/side"),
+                            slug=slug, fair=fair, side=f_side)
+                continue
+            b = min(int(fair * 20) / 20, 0.95)
             cal.setdefault(b, [0, 0])
             cal[b][0] += 1
-            cal[b][1] += f["side"] == won_side
+            cal[b][1] += f_side == won_side
     # A series' TYPICAL window, which its total P&L hides: one -$300 tail on
     # forty +$4 windows reads as a broken series by sum and a working one by
     # median, and the difference is the whole sizing question.
@@ -478,7 +506,7 @@ def _stats_blocks(sb: dict, status: dict, floor: float,
         # These blocks fold TAPE records, which carry a record time and no
         # window of their own — so an era scope closes them on `t`, not on a
         # window start the way the scoreboard does.
-        return [r for r in rs if ceiling is None or r.get("t", 0) < ceiling]
+        return [r for r in rs if ceiling is None or tape.record_floor_t(r) < ceiling]
 
     evals = _under(tape.iter_records(tape.UPDOWN_TAPE, floor=floor,
                                       evs={tape.EV_EVAL, tape.EV_FIRE}))
@@ -546,15 +574,27 @@ def crypto_stats(since: float | None, full: bool, gates: bool,
 
     status, bal = {}, {}
     try:
-        status = _engine_post("/strategies/updown/command", {"action": "status"})
-    except (Exception, SystemExit):
+        reply = _engine_post("/strategies/updown/command", {"action": "status"})
+        # isinstance, the same guard WatchFetcher.fetch_status already applies:
+        # engine.post hands back whatever a 2xx body parsed to, and a JSON list
+        # or string is a legal body. `status.get("arms")` on one of those is
+        # `AttributeError: 'list' object has no attribute 'get'` thrown from
+        # _stats_blocks — OUTSIDE this belt, straight out of the command.
+        status = reply if isinstance(reply, dict) else {}
+        if reply is not None and not isinstance(reply, dict):
+            errlog.note("cli_crypto_stats.crypto_stats.status_shape",
+                        TypeError(f"/status replied {type(reply).__name__}, not an object"))
+    except (Exception, SystemExit) as e:
         # engine.post() sys.exit()s on failure (SystemExit, not Exception) —
         # engine down shouldn't blank the rest of a one-shot report.
-        pass
+        errlog.note("cli_crypto_stats.crypto_stats.status", e)
     try:
         bal = _api().get_usdc_balance()
-    except Exception:
-        pass
+    except Exception as e:
+        # An empty balance silently removes the bankroll DENOMINATOR from
+        # effectiveness_summary — every per-bankroll rate comes back None and
+        # the report just has fewer numbers in it. Worth a mark.
+        errlog.note("cli_crypto_stats.crypto_stats.balance", e)
 
     # A scope that has CLOSED is measured on its own clock, not on the wall
     # clock — see effectiveness_summary. The running era's ceiling is +inf,

@@ -16,13 +16,14 @@ from __future__ import annotations
 import json
 import sys
 import time
+from pathlib import Path
 
 import click
 from rich.table import Table
 
 from cli_common import _parse_since, _pnl_color, console
 from cli_crypto_stats import _gamma_resolution_cached, _tape_scoreboard
-from polymarket import tape, updown_slugs, updown_stats, wallet
+from polymarket import errlog, tape, updown_slugs, updown_stats, wallet
 from watch_ui import _tape_render, _tape_slug
 
 
@@ -186,7 +187,12 @@ def crypto_window(slug: str) -> None:
             continue
         try:
             rendered = _tape_render(json.dumps(r))
-        except Exception:
+        except Exception as e:
+            # A window post-mortem that silently drops the one record
+            # explaining the trade is worse than one that says it couldn't
+            # render it.
+            errlog.note("cli_crypto_data.window.tape_render", e,
+                        slug=slug, ev=r.get("ev"))
             continue
         if rendered:
             events.append((r.get("t", 0), rendered))
@@ -805,3 +811,137 @@ def crypto_regime(trail: int | None, series: str | None, tenor: str | None,
         click.echo(json.dumps(payload, indent=2, sort_keys=True, default=str))
         return
     _print_regime(est, wrote, dest, dry_run)
+
+
+# ---------- the swallowed-error log ----------
+
+def _age_label(seconds: float) -> str:
+    """`4m`, `3h`, `2d` — coarse, because this column answers "still
+    happening?" and never "when exactly"."""
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 172800:
+        return f"{seconds / 3600:.0f}h"
+    return f"{seconds / 86400:.0f}d"
+
+
+# How much of an exception message the table carries. Enough to recognise the
+# failure, short enough that the count and age columns always survive an
+# 80-column terminal — `--tail` and `--json` have the untruncated text.
+_ERR_MSG_W = 44
+
+
+@click.command("errors")
+@click.option("--since", type=float, default=None,
+              help="Only marks after this point: hours-ago if small, raw unix "
+                   "epoch if large (default: everything on file)")
+@click.option("--site", "site_filter", type=str, default=None,
+              help="Only sites containing this substring")
+@click.option("--trace", is_flag=True,
+              help="Print the first traceback kept for each row — the frames, "
+                   "which is what the header cell could never carry")
+@click.option("--tail", "tail_n", type=int, default=None,
+              help="Instead of the aggregate, print the last N marks in the "
+                   "order they landed")
+@click.option("--path", "path_override", type=str, default=None,
+              help="Read a different errlog file (default ~/.pmt/engine/"
+                   "swallowed-errors.jsonl, or $PMT_ERRLOG_PATH)")
+@click.option("--json", "as_json", is_flag=True)
+def crypto_errors(since: float | None, site_filter: str | None, trace: bool,
+                  tail_n: int | None, path_override: str | None,
+                  as_json: bool) -> None:
+    """Errors the code caught and kept going from — what the belts swallowed.
+
+    Most `except` handlers in this codebase are correct: a torn tape line must
+    not take the dashboard down, a flaky balance call must not blank a report.
+    What was wrong is that they were also SILENT — the watch header's
+    `scoreboard: AttributeError` was the entire record of a failure, with no
+    site, no message, no traceback and no count.
+
+    polymarket/errlog.py fixes the silence without touching the belts: the
+    first occurrence of each (site, exception type) keeps a full traceback,
+    and every one after that is counted. This reads the result.
+
+    `count` is a HIGH-WATER mark, not a number of lines — repeats are written
+    on a power-of-two schedule, so a site at 4096 really did fail that many
+    times. A big count on a cheap site is noise; a big count on a fetch loop
+    is a loop that has quietly been dead.
+    """
+    import time as _t
+
+    from polymarket import errlog
+
+    floor = _parse_since(since) if since else 0.0
+    src = path_override or errlog.path()
+    records = errlog.load(src, since=floor)
+    if site_filter:
+        records = [r for r in records if site_filter in str(r.get("site") or "")]
+
+    if tail_n is not None:
+        records = records[-max(tail_n, 0):]
+        if as_json:
+            click.echo(json.dumps(records, indent=2, sort_keys=True))
+            return
+        if not records:
+            console.print("[dim]no marks[/dim]")
+            return
+        for r in records:
+            when = _t.strftime("%m-%d %H:%M:%S", _t.localtime(float(r.get("t") or 0)))
+            n = int(r.get("n") or 1)
+            console.print(f"[dim]{when}[/dim] [cyan]{r.get('site')}[/cyan] "
+                          f"[red]{r.get('exc')}[/red]"
+                          + (f" [dim]×{n}[/dim]" if n > 1 else "")
+                          + f" {r.get('msg') or ''}")
+            if trace and r.get("traceback"):
+                console.print(f"[dim]{r['traceback']}[/dim]")
+        return
+
+    rows = errlog.aggregate(records)
+    if as_json:
+        click.echo(json.dumps(rows, indent=2, sort_keys=True))
+        return
+    if not rows:
+        # A clean file and a missing file are the same good news, and saying
+        # which one it is stops "no errors" from meaning "nothing is writing".
+        exists = Path(str(src)).exists()
+        console.print("[green]no swallowed errors[/green] [dim]· "
+                      + ("clean" if exists else "no file yet") + f"[/dim]\n[dim]{src}[/dim]")
+        return
+
+    now = _t.time()
+    t = Table(box=None, pad_edge=False, padding=(0, 1))
+    # min_width, not just width: on a narrow console Rich shrinks every column
+    # proportionally, and the two that must never become `…` are the count and
+    # the age — "how bad" and "still happening".
+    t.add_column("count", justify="right", width=7, min_width=7, no_wrap=True)
+    t.add_column("age", justify="right", width=11, min_width=11, no_wrap=True)
+    # The two identity columns flex: a narrow terminal shortens a site name,
+    # which is legible. Fixed widths here add past 80 and Rich answers by
+    # dropping whole columns, starting with the count — the one number this
+    # report exists to show.
+    t.add_column("site", justify="left", overflow="ellipsis", no_wrap=True)
+    t.add_column("exception", justify="left", overflow="ellipsis", no_wrap=True)
+    # No `ratio` anywhere: a ratio column claims ALL the slack and Rich pays for
+    # it by squeezing the fixed ones down to ellipses — the count first, which
+    # is the number this report exists to show. The message is truncated in
+    # Python instead, so the table sizes to its content.
+    t.add_column("message", justify="left", overflow="ellipsis", no_wrap=True)
+    for r in rows:
+        n = int(r["n"])
+        # first→last, because "started an hour ago, last seen 2s ago" and
+        # "started an hour ago, last seen an hour ago" are opposite situations.
+        span = (f"{_age_label(now - float(r['first_t'] or now))}"
+                f"→{_age_label(now - float(r['last_t'] or now))}")
+        t.add_row(f"[{'red' if n > 1 else 'yellow'}]{n:,}[/]",
+                  f"[dim]{span}[/dim]",
+                  f"[cyan]{r['site']}[/cyan]", f"[red]{r['exc']}[/red]",
+                  f"[dim]{str(r['msg'])[:_ERR_MSG_W]}[/dim]")
+    console.print(t)
+    if trace:
+        for r in rows:
+            if not r.get("traceback"):
+                continue
+            console.print(f"\n[cyan]{r['site']}[/cyan] [dim]· first occurrence[/dim]")
+            console.print(f"[dim]{r['traceback']}[/dim]")

@@ -64,9 +64,9 @@ def test_every_command_module_is_actually_attached():
     # nobody adds it to the registration list, so the command silently isn't
     # there. Name them explicitly — a set comparison, not a count.
     assert set(cc.crypto_group.commands) == {
-        "activity", "arm", "basis", "disarm", "fixture", "fleet", "journal",
-        "outcomes", "regime", "stats", "tape", "trigger", "updown", "watch",
-        "window",
+        "activity", "arm", "basis", "disarm", "errors", "fixture", "fleet",
+        "journal", "outcomes", "regime", "stats", "tape", "trigger", "updown",
+        "watch", "window",
     }
 
 
