@@ -74,6 +74,48 @@ def funder_address() -> str:
     return addr
 
 
+# Other engines' wallets, as `label=0xaddr` pairs. The fleet runs one engine
+# per ACCOUNT, not one account with several series on it: the EU box
+# collateralises through its own deposit wallet, so there is no view of its
+# ledger from this box's rows and no way to reach it except by naming it.
+# Read from the environment rather than a config file so the one place a
+# private address is written stays the operator's own .env.
+FLEET_WALLETS_ENV = "PMT_FLEET_WALLETS"
+# The orchestrator's name for THIS box (pmtrader/orchestrator/heartbeat.py),
+# reused so the dashboard's P&L rows and a fleet heartbeat call it one thing.
+NODE_ENV = "PMT_FLEET_NODE"
+
+
+def node_label(env: dict | None = None) -> str:
+    """What to call this box on a fleet-wide view. Never raises: a dashboard
+    row's label is not worth failing a render over."""
+    env = os.environ if env is None else env
+    return (env.get(NODE_ENV) or "").strip() or "local"
+
+
+def peer_wallets(env: dict | None = None) -> list[tuple[str, str]]:
+    """[(label, address)] for OTHER engines' wallets — never this box's own.
+
+    Malformed entries are DROPPED rather than raised on: this feeds a display
+    panel that must degrade to the wallets it can read, and a typo'd pair
+    cannot be allowed to take the dashboard down. The local funder is filtered
+    out by address, so listing it changes nothing — a peer row duplicating the
+    local ledger would double the fleet line.
+    """
+    env = os.environ if env is None else env
+    mine = (env.get("PM_FUNDER_ADDRESS") or "").strip().lower()
+    out: list[tuple[str, str]] = []
+    seen = {mine} if mine else set()
+    for item in (env.get(FLEET_WALLETS_ENV) or "").split(","):
+        label, _, addr = item.partition("=")
+        label, addr = label.strip(), addr.strip()
+        if not label or not addr.lower().startswith("0x") or addr.lower() in seen:
+            continue
+        seen.add(addr.lower())
+        out.append((label, addr))
+    return out
+
+
 class ActivityPageError(RuntimeError):
     """data-api answered /activity with something that is not a page of rows.
 

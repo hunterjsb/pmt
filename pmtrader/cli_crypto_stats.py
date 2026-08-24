@@ -98,7 +98,8 @@ def _impute_win_pnl(buy_usd: float, sell_usd: float, buy_shares: float,
 def _tape_scoreboard(floor: float, sliding_floor: float | None = None,
                       keep_activity: bool = False, ceiling: float | None = None,
                       walk_floor: float | None = None,
-                      tape_records: list[dict] | None = None) -> dict:
+                      tape_records: list[dict] | None = None,
+                      addr: str | None = None) -> dict:
     """Fetch the wallet's activity and grade it. THE acquisition path — every
     consumer of the graded record calls this one: `stats`, `watch`, `journal`.
 
@@ -115,12 +116,28 @@ def _tape_scoreboard(floor: float, sliding_floor: float | None = None,
     exists for exactly one caller: `--era` grades one era but still owes the
     operator a complete era table, which needs the whole ledger. Defaults to
     `floor`, so every other caller pages back exactly as far as it grades.
+
+    `addr` grades ANOTHER engine's wallet through this same function — the
+    watch dashboard's per-engine P&L line, and the only caller that passes it.
+    The fleet runs one ACCOUNT per engine (the EU box collateralises through
+    its own deposit wallet), so a peer's ledger has no overlap with this box's
+    and none of the series arithmetic changes; what does change is the splice.
+    `wallet.activity_since` reaches for THIS box's on-disk activity dump for
+    any floor deeper than `wallet.IMMUTABLE_AFTER_S`, and splicing one
+    account's fresh rows onto another's dump would invent a ledger, so a peer
+    walk that deep is REFUSED here rather than silently mixed.
     """
     # Ground truth: every updown trade + redemption on the proxy wallet.
     # funder_address() RAISES on an unset addr, like every sibling command —
     # never fall through to a clean-looking "0W-0L" (docs/LESSONS.md#L26).
-    addr = wallet.funder_address()
-    rows = wallet.activity_since(addr, floor if walk_floor is None else walk_floor)
+    walk = floor if walk_floor is None else walk_floor
+    if addr is None:
+        addr = wallet.funder_address()
+    elif walk < time.time() - wallet.IMMUTABLE_AFTER_S:
+        raise ValueError(
+            f"peer wallet walk floor {walk:.0f} is older than the activity "
+            f"dump's cut — that would splice this box's dump onto {addr[:10]}…")
+    rows = wallet.activity_since(addr, walk)
     sb = score_activity(rows, floor, sliding_floor=sliding_floor, ceiling=ceiling,
                         tape_records=tape_records)
     if keep_activity:
