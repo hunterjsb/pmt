@@ -22,9 +22,13 @@ from polymarket.updown_slugs import parse_updown_slug
 
 # Shadow-only. These are the desktop engine's book and the calibration corpus's
 # best-covered series; the pilot prices them and writes down what it WOULD have
-# done, and never touches them with capital in any mode.
+# done, and never touches them with capital in any mode. The 15m tier is here
+# because arming it is BLOCKED on the incumbent's _model_twap misspec (breadth
+# scout §7, proven live by cohort_0140z) — this shadow builds the 15m evidence
+# under the terminal rule that would actually trade it.
 SHADOW_SERIES: tuple[str, ...] = (
     "btc-updown-5m", "eth-updown-5m", "sol-updown-5m", "xrp-updown-5m",
+    "btc-updown-15m", "eth-updown-15m", "sol-updown-15m", "xrp-updown-15m",
 )
 
 # Live default. Non-engine series: doge and hype have ZERO book coverage in the

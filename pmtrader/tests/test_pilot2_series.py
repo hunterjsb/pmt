@@ -18,9 +18,11 @@ def test_default_live_series_are_the_approved_three():
     assert series.live_series("") == list(series.DEFAULT_LIVE_SERIES)
 
 
-def test_shadow_series_are_the_majors():
+def test_shadow_series_are_the_majors_both_tiers():
     assert series.shadow_series() == ["btc-updown-5m", "eth-updown-5m",
-                                      "sol-updown-5m", "xrp-updown-5m"]
+                                      "sol-updown-5m", "xrp-updown-5m",
+                                      "btc-updown-15m", "eth-updown-15m",
+                                      "sol-updown-15m", "xrp-updown-15m"]
 
 
 @pytest.mark.parametrize("bad", [
