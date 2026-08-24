@@ -378,25 +378,38 @@ _HYPERLIQUID_REV = {v: k for k, v in HYPERLIQUID_SYMBOLS.items()}
 
 # ---------- pure: subscribe messages ----------
 
-def binance_url(symbols: list[str], base: str = BINANCE_WS) -> str:
-    """One combined connection carrying every symbol's trade and ticker stream.
+KINDS: tuple[str, ...] = (KIND_TRADE, KIND_BOOK)
+
+# Which venue stream serves each record kind.
+_BINANCE_STREAM = {KIND_TRADE: "trade", KIND_BOOK: "ticker"}
+
+
+def binance_url(symbols: list[str], base: str = BINANCE_WS,
+                kinds: tuple[str, ...] | list[str] = KINDS) -> str:
+    """One combined connection carrying every symbol's requested streams.
 
     Well under the documented 1024-streams-per-connection ceiling at 2 per
     symbol, so the whole venue stays on one socket and one file.
+
+    `kinds` exists because of a measured result, not for symmetry:
+    `analysis/spot_lead.md` §S5 finds the 1 Hz `@ticker` quote captures the
+    same lead as the full trade tape (btc r +0.934 at k=+2 against +0.919 at
+    k=+3) at **0.8 rows/s instead of 106** — a ~130x disk saving for equal
+    signal. A resident recorder should almost certainly run `--kinds book`.
     """
-    streams = "/".join(f"{BINANCE_SYMBOLS[s]}@{k}"
-                       for s in symbols for k in ("trade", "ticker"))
+    streams = "/".join(f"{BINANCE_SYMBOLS[s]}@{_BINANCE_STREAM[k]}"
+                       for s in symbols for k in kinds if k in _BINANCE_STREAM)
     return f"{base}?streams={streams}"
 
 
-def kraken_subscribes(symbols: list[str]) -> list[str]:
+def kraken_subscribes(symbols: list[str],
+                      kinds: tuple[str, ...] | list[str] = KINDS) -> list[str]:
     pairs = [KRAKEN_SYMBOLS[s] for s in symbols]
-    return [
-        json.dumps({"method": "subscribe",
-                    "params": {"channel": "trade", "symbol": pairs}}),
-        json.dumps({"method": "subscribe",
-                    "params": {"channel": "ticker", "symbol": pairs}}),
-    ]
+    channels = [c for k, c in ((KIND_TRADE, "trade"), (KIND_BOOK, "ticker"))
+                if k in kinds]
+    return [json.dumps({"method": "subscribe",
+                        "params": {"channel": c, "symbol": pairs}})
+            for c in channels]
 
 
 def hyperliquid_subscribes(symbols: list[str]) -> list[str]:
@@ -411,6 +424,18 @@ def venue_symbols(venue: str, wanted: list[str]) -> list[str]:
     table = {"binance": BINANCE_SYMBOLS, "kraken": KRAKEN_SYMBOLS,
              "hyperliquid": HYPERLIQUID_SYMBOLS}[venue]
     return [s for s in wanted if s in table]
+
+
+def venue_kinds(venue: str, wanted: tuple[str, ...] | list[str]) -> list[str]:
+    """The requested record kinds this venue can actually serve.
+
+    Hyperliquid is trades-only here: it does publish a stamped `bbo` channel,
+    but nothing has needed it, and claiming a kind the recorder does not
+    subscribe to would put trade rows in a book-only file.
+    """
+    served = {"binance": KINDS, "kraken": KINDS,
+              "hyperliquid": (KIND_TRADE,)}[venue]
+    return [k for k in wanted if k in served]
 
 
 # ---------- pure: reconnect policy ----------
@@ -581,6 +606,7 @@ class VenueStats:
 
 def run_venue(venue: str, symbols: list[str], directory: Path, *,
               clock: Clock, stop: threading.Event, stats: VenueStats,
+              kinds: tuple[str, ...] | list[str] = KINDS,
               deadline: float | None = None, once: bool = False,
               ping_s: float = 20.0, stall_s: float = 90.0,
               heartbeat_s: float = 60.0, max_backoff: float = 30.0,
@@ -592,10 +618,11 @@ def run_venue(venue: str, symbols: list[str], directory: Path, *,
     """
     from websockets.sync.client import connect
 
+    kinds = tuple(kinds)
     if venue == "binance":
-        url, subs, parse = binance_url(symbols), [], parse_binance
+        url, subs, parse = binance_url(symbols, kinds=kinds), [], parse_binance
     elif venue == "kraken":
-        url, subs, parse = KRAKEN_WS, kraken_subscribes(symbols), parse_kraken
+        url, subs, parse = KRAKEN_WS, kraken_subscribes(symbols, kinds), parse_kraken
     elif venue == "hyperliquid":
         url, subs, parse = HYPERLIQUID_WS, hyperliquid_subscribes(symbols), parse_hyperliquid
     else:
@@ -738,7 +765,8 @@ def run_venue(venue: str, symbols: list[str], directory: Path, *,
 # ---------- supervisor ----------
 
 def run(directory: Path = SPOT_DIR, *, venues: list[str] | None = None,
-        symbols: list[str] | None = None, duration: float | None = None,
+        symbols: list[str] | None = None, kinds: list[str] | None = None,
+        duration: float | None = None,
         once: bool = False, stop: threading.Event | None = None,
         **kw) -> int:
     """Record every venue in parallel. Returns a process exit code.
@@ -752,29 +780,36 @@ def run(directory: Path = SPOT_DIR, *, venues: list[str] | None = None,
     """
     venues = list(venues or VENUES)
     symbols = list(symbols or SYMBOLS)
+    kinds = list(kinds or KINDS)
     stop = stop if stop is not None else threading.Event()
     clock = Clock()
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     deadline = clock.now() + duration if duration else None
 
-    plan = {v: venue_symbols(v, symbols) for v in venues}
-    plan = {v: s for v, s in plan.items() if s}
+    plan = {v: (venue_symbols(v, symbols), venue_kinds(v, kinds))
+            for v in venues}
+    plan = {v: (s, k) for v, (s, k) in plan.items() if s and k}
     if not plan:
-        errlog(f"no venue lists any of {','.join(symbols)} — nothing to record")
+        errlog(f"no venue serves {','.join(kinds)} for any of "
+               f"{','.join(symbols)} — nothing to record")
         return 1
 
-    dropped = sorted(set(symbols) - {s for ss in plan.values() for s in ss})
+    dropped = sorted(set(symbols) - {s for ss, _ in plan.values() for s in ss})
     if dropped:
         log(f"note: no configured venue carries {','.join(dropped)}")
+    for v in venues:
+        if v not in plan:
+            log(f"note: {v} serves none of kinds={','.join(kinds)} — skipped")
 
     stats = {v: VenueStats(v) for v in plan}
     threads = []
-    for v, syms in plan.items():
+    for v, (syms, vkinds) in plan.items():
         t = threading.Thread(target=run_venue, name=f"spot-{v}",
                              args=(v, syms, directory),
                              kwargs=dict(clock=clock, stop=stop, stats=stats[v],
-                                         deadline=deadline, once=once, **kw),
+                                         kinds=vkinds, deadline=deadline,
+                                         once=once, **kw),
                              daemon=True)
         t.start()
         threads.append(t)
@@ -850,6 +885,12 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"comma-separated subset of {','.join(VENUES)}")
     ap.add_argument("--symbols", default=",".join(SYMBOLS),
                     help=f"comma-separated subset of {','.join(SYMBOLS)}")
+    ap.add_argument("--kinds", default=",".join(KINDS),
+                    help=f"comma-separated subset of {','.join(KINDS)}. "
+                         "`book` alone is ~1%% of the rows for the same "
+                         "measured lead (analysis/spot_lead.md §S5) and is "
+                         "the sane choice for a resident recorder; "
+                         "hyperliquid serves `trade` only.")
     ap.add_argument("--minutes", type=float, default=None,
                     help="stop after N minutes (bounded run)")
     ap.add_argument("--duration", type=float, default=None,
@@ -876,9 +917,14 @@ def main(argv: list[str] | None = None) -> int:
 
     venues = [v.strip() for v in args.venues.split(",") if v.strip()]
     symbols = [s.strip().lower() for s in args.symbols.split(",") if s.strip()]
+    kinds = [k.strip().lower() for k in args.kinds.split(",") if k.strip()]
     bad = [v for v in venues if v not in VENUES]
     if bad:
         errlog(f"unknown venue(s): {','.join(bad)}")
+        return 1
+    bad = [k for k in kinds if k not in KINDS]
+    if bad:
+        errlog(f"unknown kind(s): {','.join(bad)} (known: {','.join(KINDS)})")
         return 1
 
     pidfile = None
@@ -899,7 +945,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _handle)
 
     try:
-        return run(directory, venues=venues, symbols=symbols,
+        return run(directory, venues=venues, symbols=symbols, kinds=kinds,
                    duration=duration, once=args.once, stop=stop)
     finally:
         if pidfile is not None:

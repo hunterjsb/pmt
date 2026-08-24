@@ -8,7 +8,7 @@ them is a decision with a diff behind it, not a thing that happened.
 | `pmengine.service` | `pmengine ... run updown --skip-warmup`, same as `pmt engine start` | on failure, 5s→120s backoff, 5 tries / 5min |
 | `pmt-rtds-recorder.service` | `uv run python -m polymarket.rtds` in `pmtrader/` | on failure, 10s→300s backoff, 10 tries / 10min |
 | `pmt-print-recorder.service` | `uv run python -m polymarket.prints` in `pmtrader/` | on failure, 10s→300s backoff, 10 tries / 10min |
-| `pmt-spot-recorder.service` | `uv run python -m polymarket.spot` in `pmtrader/` — **~5 GB/day at full width, read its header first** | on failure, 10s→300s backoff, 10 tries / 10min |
+| `pmt-spot-recorder.service` | `uv run python -m polymarket.spot --kinds book` in `pmtrader/` — **read its header before widening `--kinds`** | on failure, 10s→300s backoff, 10 tries / 10min |
 | `pmt-pilot2.service` | `uv run python -m pilot2 run` in `pmtrader/` — **SHADOW, places no orders** | on failure, 10s→300s backoff; **never** on exit 2 |
 | `pmt-fleet-doctor.service` | `uv run python -m orchestrator beat` in `pmtrader/` — **observation only, places no orders** | on failure, 10s→300s backoff; **never** on exit 2 |
 | `pmt-backup.service` + `.timer` | `scripts/pmt-backup.sh` — ~/.pmt corpus + tapes → `s3://xanmc/pmt-backups/YYYY-MM-DD.tar.zst` | no. oneshot, daily 03:30, `Persistent=true` |
@@ -75,7 +75,7 @@ It shares nothing mutable with `pmengine.service`: separate process, separate
 state directory (`~/.pmt/pilot2`), separate wallet when live, and a series
 partition checked at startup.
 
-## The spot recorder, and the one that can actually fill the disk
+## The spot recorder, and why it records quotes rather than trades
 
 `pmt-spot-recorder.service` records the underlying the oracle follows.
 `opponent_model.md` §1d splits the makers' ~3s lead over our settlement feed
@@ -88,14 +88,20 @@ because `stream.binance.com` answers **HTTP 451** from this box), Kraken v2, and
 Hyperliquid for HYPE. Every venue is its own thread and its own socket, so a
 stall on one cannot silence another.
 
-**It is the first unit here that can fill the disk.** Measured over the study
-run: Binance alone is ~370 rows/s and ~215 MB/h, which is ~5 GB/day — three
-orders of magnitude past anything else in `~/.pmt/corpus`, and it has no
-`--retention-days` sweep like the print recorder does. The unit's `ExecStart`
-is therefore narrowed to the low-volume venues on purpose; widening it is a
-decision to make deliberately, after picking a retention story. Until then the
-honest way to run it is bounded — `--minutes N`, which is how the lead study
-ran it.
+**It is the first unit here that could fill the disk, and a measurement is
+what stops it.** Binance's raw trade tape is ~370 rows/s and ~215 MB/h — ~5
+GB/day, three orders of magnitude past anything else in `~/.pmt/corpus`, and
+there is no `--retention-days` sweep here like the print recorder has. But
+`analysis/spot_lead.md` §S5 finds the 1 Hz `@ticker` **quote** carries the same
+lead as the full trade tape (btc r +0.934 at k=+2 against +0.919 at k=+3) at
+about **1/130th of the rows**, because the effect lives at 1–3 seconds and the
+oracle it is measured against only publishes at 1 Hz. There is nothing below a
+second to resolve, so the extra two orders of magnitude buy nothing.
+
+The unit therefore runs `--kinds book`, which turns ~5 GB/day into well under
+100 MB/day with no loss of the signal the corpus exists for. Anyone who later
+needs the full trade tape should run it **bounded** under a `.timer` with
+`--minutes N` rather than making it resident.
 
 Unlike prints, this tape is **not backfillable**: neither Binance nor Kraken
 serves a free historical tick feed, so an hour nobody recorded is an hour the

@@ -517,6 +517,32 @@ def test_binance_url_carries_both_the_trade_and_quote_arm():
     assert "@bookTicker" not in url  # it has no clock; see the parser test
 
 
+def test_kinds_narrows_the_binance_subscription():
+    """`--kinds book` is the ~130x disk saving spot_lead.md §S5 justifies."""
+    assert spot.binance_url(["btc"], kinds=["book"]).endswith("btcusdt@ticker")
+    assert spot.binance_url(["btc"], kinds=["trade"]).endswith("btcusdt@trade")
+
+
+def test_kinds_narrows_the_kraken_subscription():
+    subs = [json.loads(s) for s in spot.kraken_subscribes(["btc"], ["book"])]
+    assert [s["params"]["channel"] for s in subs] == ["ticker"]
+    subs = [json.loads(s) for s in spot.kraken_subscribes(["btc"], ["trade"])]
+    assert [s["params"]["channel"] for s in subs] == ["trade"]
+
+
+def test_hyperliquid_serves_trades_only_and_says_so():
+    """Claiming a kind the recorder never subscribes to would put trade rows
+    in a book-only file — worse than the venue simply being absent."""
+    assert spot.venue_kinds("hyperliquid", ["trade", "book"]) == ["trade"]
+    assert spot.venue_kinds("hyperliquid", ["book"]) == []
+    assert spot.venue_kinds("binance", ["trade", "book"]) == ["trade", "book"]
+    assert spot.venue_kinds("kraken", ["book"]) == ["book"]
+
+
+def test_venue_kinds_preserves_requested_order():
+    assert spot.venue_kinds("binance", ["book", "trade"]) == ["book", "trade"]
+
+
 def test_binance_url_stays_under_the_stream_ceiling():
     """1024 streams per connection, documented. Two per symbol leaves the whole
     venue on one socket and one file with room to spare."""

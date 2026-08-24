@@ -18,29 +18,34 @@
 # equally uncontroversial: it writes tapes, it never places an order.
 #
 # ---------------------------------------------------------------------------
-# READ THIS BEFORE INSTALLING: this unit writes ~5 GB/day at defaults.
+# READ THIS BEFORE INSTALLING: the FULL form writes ~5 GB/day. This unit
+# does not run the full form, and the reason is a measurement, not caution.
 # ---------------------------------------------------------------------------
-# Measured on the 2026-08-24 run, six symbols, one weekday European afternoon:
+# Row rates on the 2026-08-24 study run, six symbols, weekday European
+# afternoon:
 #
-#     binance      ~370 rows/s   (btc alone ~150/s)   ~215 MB/h
-#     kraken       ~5 rows/s                          ~0.4 MB/h
-#     hyperliquid  ~0.2 rows/s                        ~0.02 MB/h
+#     binance  trade   ~370 rows/s  (btc alone ~106/s)   ~215 MB/h
+#     binance  book      ~0.8 rows/s (1 Hz @ticker)      ~0.5 MB/h
+#     kraken   both      ~5 rows/s                       ~0.4 MB/h
+#     hyperliquid       ~0.2 rows/s                      ~0.02 MB/h
 #
-# Binance's raw trade tape is three orders of magnitude the volume of anything
-# else in ~/.pmt/corpus, and it is NOT swept by `scripts/pmt-backup.sh` sizing
-# assumptions. Before this becomes resident, pick one:
+# `analysis/spot_lead.md` §S5 then settles which of those is worth keeping:
+# the 1 Hz `@ticker` QUOTE captures the same lead as the full trade tape —
+# btc r +0.934 at k=+2 against +0.919 at k=+3, and the same on every other
+# symbol — at roughly **1/130th of the rows**. The trade tape's extra two
+# orders of magnitude buy no additional lead, because the effect being
+# measured lives at 1-3 SECONDS and the oracle it is measured against
+# publishes at 1 Hz. There is nothing below one second to resolve.
 #
-#   * narrow it   — `--symbols btc,eth` is ~65% of the rows for the two symbols
-#                   the fleet actually trades most;
-#   * bound it    — add a retention sweep like the print recorder's
-#                   `--retention-days`, which this recorder does NOT yet have;
-#   * or keep it bounded — `--minutes N` under a .timer, which is how the
-#                   study ran it and is the honest default until someone has
-#                   decided what the steady-state corpus is for.
+# Hence `--kinds book` below. That is the whole disk story: it turns ~5 GB/day
+# into well under 100 MB/day with no loss of the signal this corpus exists
+# for. Hyperliquid serves `trade` only and is therefore skipped under
+# `--kinds book`; it is listed anyway so that widening `--kinds` picks it up.
 #
-# The ExecStart below is deliberately the NARROW form rather than the full
-# universe, so an install that skips this comment still fits on the disk.
-# Widen it on purpose, not by default.
+# If someone later needs the full trade tape (microstructure work, a
+# sub-second question against a different target), run it BOUNDED with
+# `--minutes N` under a .timer rather than making it resident — this recorder
+# has no `--retention-days` sweep, unlike the print recorder.
 
 [Unit]
 Description=pmt spot recorder — live exchange tick capture (Binance/Kraken/Hyperliquid)
@@ -56,8 +61,8 @@ WorkingDirectory=/var/home/hunter/Desktop/code/pmt/pmtrader
 # `uv run` resolves the pmtrader venv from the cwd's pyproject.toml, so the
 # WorkingDirectory above is load-bearing, not cosmetic.
 #
-# --symbols is narrowed on purpose; see the disk note in the header.
-ExecStart=/var/home/hunter/.local/bin/uv run python -m polymarket.spot --symbols btc,eth,sol,xrp,bnb,doge,hype --venues kraken,hyperliquid
+# --kinds book is the 130x disk saving with no signal loss; see the header.
+ExecStart=/var/home/hunter/.local/bin/uv run python -m polymarket.spot --kinds book
 
 Restart=on-failure
 RestartSec=10
