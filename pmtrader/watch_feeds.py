@@ -252,7 +252,9 @@ class FeedTail:
         from polymarket import updown_slugs
 
         for slug in slugs:
-            parsed = updown_slugs.parse_updown_slug(slug or "")
+            # /status is a parsed JSON body, so an arm key is only a slug by
+            # convention — the same isinstance discipline the header applies.
+            parsed = updown_slugs.parse_updown_slug(slug if isinstance(slug, str) else "")
             if parsed is None:
                 continue
             sym, start = parsed["symbol"], float(parsed["start"])
