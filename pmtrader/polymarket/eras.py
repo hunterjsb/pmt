@@ -116,6 +116,22 @@ ERAS: tuple[Era, ...] = (
     # first stream-fed window instead would date an era by its outcome.
     Era("stream", 1787484570.0,
         "arms can read the Chainlink settlement stream itself, --feed rtds (e296336)"),
+
+    # a80b522 "Merge updown2: the terminal rule, priced" — deployed at the
+    # recorded 2026-08-24 03:25:12Z boundary restart; 1787542200 = 03:30:00Z
+    # is the first window START born entirely under it (same deploy-not-commit
+    # rule as `theta`). The regime bundle this era names: the Kelly ladder
+    # from analysis/sizing_rederivation.md (sizes derived from the wallet,
+    # cap = sum-of-sizes + one clip per arm, inflight released by the
+    # reconcile so the cap is honest — 1d3cc80), the plumbing trilogy closed
+    # (phantom breaker, cancel-storm, ask-flicker hysteresis), theta 0.30 as
+    # settled law and CLI default, and TWO models writing a tape for every
+    # window: updown2 SHADOW (M1 x book blend, updown2-tape.jsonl) beside the
+    # incumbent, pilot2 shadowing both tiers. Every era before this changed
+    # how the fleet avoids losing; this one changes how it sizes and what
+    # it knows.
+    Era("kelly", 1787542200.0,
+        "wallet-derived sizes + honest cap; updown2 shadow prices every window (a80b522)"),
 )
 
 
