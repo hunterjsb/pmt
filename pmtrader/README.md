@@ -158,6 +158,7 @@ pmtrader/
     ├── tape.py         # decision-tape paths, event names, record iteration
     ├── shadow.py       # shadow P&L ledger (pure)
     ├── outcomes.py     # resolved-window corpus
+    ├── regime.py       # leader-persistence gauge (book-only; gates nothing)
     ├── pnl.py          # activity-ledger replay
     └── models.py       # plain dataclasses
 ```

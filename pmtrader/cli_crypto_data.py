@@ -1,10 +1,11 @@
 """Read-only `pmt crypto` reports over the wallet, the decision tape, and the
-Chainlink corpus: `tape`, `activity`, `window`, `basis`, `outcomes`, `journal`.
+Chainlink corpus: `tape`, `activity`, `window`, `basis`, `outcomes`, `journal`,
+`regime`.
 
 Nothing here posts to the engine or places an order — these are the commands
-you reach for AFTER something happened, to find out what. `outcomes` and
-`journal` do write to disk, but only to the local corpus and the private
-journal, never to the repo and never to the book.
+you reach for AFTER something happened, to find out what. `outcomes`,
+`journal` and `regime` do write to disk, but only to the local corpus and the
+private journal, never to the repo and never to the book.
 
 Grading and wallet acquisition are not defined here: they come from
 cli_crypto_stats, which is the one place that owns them.
@@ -590,3 +591,217 @@ def crypto_journal(since: float | None, show: bool, n: int, dry_run: bool) -> No
         console.print(f"[green]{len(written)}[/green] line(s) → {journal.JOURNAL_PATH}")
     else:
         console.print("[dim]nothing notable since the last run[/dim]")
+
+
+# ---------- regime: the book-only leader-persistence gauge ----------
+#
+# MEASUREMENT ONLY. This command computes a quantity, prints it, and appends it
+# to the corpus. It gates nothing, sizes nothing and touches no arm — the
+# sizing hook it exists to feed is documented DARK in docs/regime-gauge.md and
+# needs its own A/B before a single dollar moves on it.
+#
+# The BACKFILL METHODOLOGY, frozen here rather than left to the operator's
+# flags, so "the gauge since day one" means one thing:
+#
+#   sources    every book tape on the box — the live engine tape plus every
+#              frozen `*book-tape*.jsonl` archive in the corpus, oldest first.
+#              Globbed, not named: a dated snapshot is cut whenever one is
+#              needed and a hard-coded list goes stale the next time.
+#   scope      every updown tenor the tapes hold. The study's headline is 5m;
+#              `--tenor 5m` reproduces it, and the per-series table splits by
+#              tenor anyway, so pooling costs no information.
+#   grading    the outcomes corpus, TERMINAL sources only. This command never
+#              refreshes it (that is `pmt crypto outcomes` / `stats --gates`)
+#              — a gauge that grades windows as a side effect of reporting is
+#              a gauge that changes what it measures.
+#   ordering   window END then slug. Reproducible from the corpus alone,
+#              never from the order the estimator happened to run in.
+#   writing    `--rebuild` re-cuts the whole file (the only correct move after
+#              a METHOD bump, because each row's gauge state depends on every
+#              row before it); the default appends the slugs the file lacks.
+
+_REGIME_BANDS = {"strong": "green", "mixed": "yellow", "weak": "red",
+                 "unknown": "dim"}
+# Below this the gauge's own span is mostly ungraded, and the windows that
+# grade FIRST are the ones we traded — a selection on the very axis being
+# measured. Loud, not a footnote.
+_COVERAGE_WARN = 0.75
+
+
+def _regime_stamp(ts: float | None) -> str:
+    import time as _t
+
+    return _t.strftime("%m-%d %H:%MZ", _t.gmtime(ts)) if ts else "—"
+
+
+def _regime_span(sec: float | None) -> str:
+    if sec is None:
+        return "—"
+    h, m = int(sec // 3600), int(sec % 3600 // 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+def _regime_cells(g: dict) -> tuple[str, str, str, str, str, str]:
+    """One gauge as (n, k, persist, Wilson95, trend, band) display cells."""
+    from polymarket import regime
+
+    p = g["persist"]
+    b = regime.band(p)
+    pct = "—" if p is None else f"{p * 100:.1f}%"
+    ci = "—" if p is None else f"[{g['lo'] * 100:.1f}, {g['hi'] * 100:.1f}]"
+    if g["delta"] is None or g["arrow"] == "·":
+        trend = f"[dim]· {g['prior_n']} prior[/dim]"
+    else:
+        z = "" if g["z"] is None else f" [dim]z {g['z']:+.2f}[/dim]"
+        trend = f"{g['arrow']} {g['delta'] * 100:+.1f}pp{z}"
+    return (str(g["n"]), str(g["k"]), pct, ci, trend,
+            f"[{_REGIME_BANDS[b]}]{b}[/{_REGIME_BANDS[b]}]")
+
+
+# Beyond this the two grading populations are not one population, and the
+# headline is partly a read of our own entry filter rather than of the market.
+_SELECTION_Z = 2.0
+
+
+def _print_selection_check(bg: dict) -> None:
+    """Persistence split by grade source, whenever the split disagrees.
+
+    A `wallet` grade exists because we TRADED the window; a `resolution` grade
+    exists whether we did or not. Wallet rows also grade FIRST, so the most
+    recent slice of the gauge is its most selected slice. On this corpus the
+    two disagree by 16 points (z 4.73) — big enough that quoting the headline
+    without the split would be quoting the engine back at itself.
+    """
+    srcs = bg.get("sources") or {}
+    w, r, z = srcs.get("wallet"), srcs.get("resolution"), bg.get("z")
+    if not w or not r or w["persist"] is None or r["persist"] is None:
+        return
+    body = (f"  by grade · wallet {w['persist'] * 100:.1f}% ({w['n']}) vs "
+            f"resolution {r['persist'] * 100:.1f}% ({r['n']})"
+            + (f" · z {z:+.2f}" if z is not None else ""))
+    if z is not None and abs(z) >= _SELECTION_Z:
+        console.print(f"[yellow]{body}[/yellow]")
+        console.print("[yellow]  a wallet grade exists because we TRADED that "
+                      "window — that gap is our entry filter,[/yellow]")
+        console.print("[yellow]  not the market, and wallet rows grade FIRST. "
+                      "Weigh the recent end accordingly.[/yellow]")
+    else:
+        console.print(f"[dim]{body}[/dim]")
+
+
+def _print_regime(est: dict, wrote: int, out_path, dry_run: bool) -> None:
+    from polymarket import regime
+
+    f, cov = est["fleet"], est["coverage"]
+    n, k, pct, ci, trend, band = _regime_cells(f)
+    console.print(f"\n[bold]leader persistence[/bold] [dim]· the book's leader at "
+                  f"elapsed {regime.ELAPSED_MARK} held to settlement[/dim]")
+    console.print(f"\n  [bold]FLEET[/bold]  {pct} {ci}  {trend}  {band}")
+    console.print(f"  [dim]{k}/{n} windows · trailing {est['trail']} · "
+                  f"{_regime_stamp(f['span_start'])} → "
+                  f"{_regime_stamp(f['t_end'])}[/dim]")
+
+    t = Table(box=None, pad_edge=False, padding=(0, 2))
+    t.add_column("series", justify="left")
+    for col in ("n", "held"):
+        t.add_column(col, justify="right")
+    t.add_column("persist", justify="right")
+    t.add_column("Wilson95", justify="right")
+    t.add_column("trend", justify="left")
+    t.add_column("band", justify="left")
+    for name, g in est["series"].items():
+        t.add_row(name, *_regime_cells(g))
+    console.print()
+    console.print(t)
+
+    skips = est["skips"]
+    console.print(f"\n[dim]  {est['observations']}/{est['resolved']} graded "
+                  f"windows had a leader · dropped "
+                  f"{skips.get(regime.SKIP_STALE, 0)} stale, "
+                  f"{skips.get(regime.SKIP_NO_LEAD, 0)} no-lead, "
+                  f"{skips.get(regime.SKIP_NO_MARK, 0)} no-book, "
+                  f"{skips.get(regime.SKIP_NO_PRICE, 0)} unquoted[/dim]")
+
+    # The corpus lag is the honest headline qualifier: on a box whose grading
+    # has fallen behind, the gauge is a read of the windows that graded FIRST.
+    frac = cov["span_frac"]
+    line = (f"  corpus ends {_regime_stamp(cov['gauge_end'])}, tape reaches "
+            f"{_regime_stamp(cov['book_end'])} "
+            f"({_regime_span(cov['lag_s'])} behind) · {cov['pending']} windows "
+            f"await a grade")
+    if frac is not None and frac < _COVERAGE_WARN:
+        console.print(f"[yellow]{line}[/yellow]")
+        console.print(f"[yellow]  grading covers {cov['span_graded']}/"
+                      f"{cov['span_marked']} ({frac * 100:.0f}%) of this span, and "
+                      f"traded windows grade FIRST —[/yellow]")
+        console.print("[yellow]  a selection on the very axis being measured. "
+                      "Refresh with `pmt crypto outcomes` first.[/yellow]")
+    else:
+        console.print(f"[dim]{line}[/dim]")
+
+    _print_selection_check(est["by_grade"])
+    console.print(f"[dim]  method {regime.METHOD}[/dim]")
+    console.print("[dim]  MEASUREMENT ONLY — nothing sizes off this gauge; "
+                  "the dark hook is docs/regime-gauge.md[/dim]")
+    if dry_run:
+        console.print(f"[yellow]  dry run[/yellow] [dim]— {wrote} row(s) would "
+                      f"be written to {out_path}[/dim]")
+    elif wrote:
+        console.print(f"[green]  {wrote}[/green] [dim]row(s) → {out_path}[/dim]")
+    else:
+        console.print(f"[dim]  {out_path} already current[/dim]")
+
+
+@click.command("regime")
+@click.option("--trail", default=None, type=int,
+              help="Windows in the trailing block (default 50)")
+@click.option("--series", default=None,
+              help="Only this series key prefix, e.g. `btc` or `btc 5m`")
+@click.option("--tenor", default=None,
+              help="Only this window duration, e.g. `5m` (the study's scope)")
+@click.option("--out", "out_path", default=None,
+              type=click.Path(dir_okay=False),
+              help="JSONL destination (default ~/.pmt/corpus/regime.jsonl)")
+@click.option("--rebuild", is_flag=True,
+              help="Re-cut the whole JSONL instead of appending what's new")
+@click.option("--dry-run", is_flag=True, help="Print the gauge, write nothing")
+@click.option("--json", "as_json", is_flag=True, help="The estimate as JSON")
+def crypto_regime(trail: int | None, series: str | None, tenor: str | None,
+                  out_path: str | None, rebuild: bool, dry_run: bool,
+                  as_json: bool) -> None:
+    """Leader persistence — the book-only regime gauge, and its corpus row.
+
+    Of the windows where the book had a leader at elapsed 0.25, how often did
+    that leader go on to win? `pmt-alpha/analysis/underdog_search.md` §5 found
+    that number moved 79.7% -> 71.5% (z 3.12) inside 24 hours, and that when it
+    moved, the dog/favourite bias INVERTED in elapsed [0.00, 0.25). A binary's
+    price band is a volatility position; this is the one book-only number that
+    says which way that position is currently paying.
+
+    Reads the book tapes and the outcomes corpus, prints the fleet and
+    per-series gauge, and appends one row per resolved window (carrying the
+    gauge as of that window) to ~/.pmt/corpus/regime.jsonl for studies to join
+    against. It sizes nothing and gates nothing — see docs/regime-gauge.md.
+    """
+    from polymarket import regime
+
+    trail_n = regime.TRAIL_DEFAULT if trail is None else trail
+    if trail_n <= 0:
+        raise click.UsageError("--trail must be positive")
+    est = regime.estimate(trail=trail_n, series=series, tenor=tenor)
+    rows = regime.rows_for(est["obs"], trail_n)
+    dest = regime.REGIME_PATH if out_path is None else out_path
+    if dry_run:
+        have = {r["slug"] for r in regime.load_rows(dest)}
+        wrote = len(rows) if rebuild else sum(1 for r in rows
+                                              if r["slug"] not in have)
+    else:
+        wrote = regime.write_rows(rows, dest, rebuild=rebuild)
+
+    if as_json:
+        payload = {k: v for k, v in est.items() if k != "obs"}
+        payload["written"] = wrote
+        payload["out"] = str(dest)
+        click.echo(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return
+    _print_regime(est, wrote, dest, dry_run)

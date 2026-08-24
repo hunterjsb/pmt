@@ -129,3 +129,171 @@ def test_outcomes_fetch_only_stops_before_grading(monkeypatch, tmp_path):
     assert result.exit_code == 0, result.output
     assert refreshed == [["btc"]]
     assert not out_file.exists(), "fetch-only never rewrites the outcomes corpus"
+
+
+# ---------- `pmt crypto regime`: the output shape and what it refuses to claim ----------
+#
+# The gauge itself is tested in test_regime.py; these pin the COMMAND — that it
+# prints the fleet figure, the per-series split, the definition it used, the
+# grading coverage behind it, and the fact that it gates nothing. A report that
+# quietly drops the coverage caveat is a report that reads as a trading signal.
+
+def _rig_regime(monkeypatch, tmp_path, windows, args=()):
+    """Run `crypto regime` over a synthetic book tape + outcomes corpus.
+
+    ~/.pmt is never touched: the tapes are tmp files and `--out` is a tmp
+    path, which is also how the command must behave for anyone auditing what
+    it writes."""
+    from click.testing import CliRunner
+
+    from polymarket import regime as rg
+    from tests.test_regime import tape_files
+
+    book, out = tape_files(tmp_path, windows)
+    monkeypatch.setattr(rg, "book_tape_sources", lambda *a, **k: [book])
+    monkeypatch.setattr(rg, "OUTCOMES_PATH", out)
+    dest = tmp_path / "regime.jsonl"
+    result = CliRunner().invoke(cd.crypto_regime,
+                                ["--out", str(dest), *args])
+    return result, dest
+
+
+def _regime_windows(n_hit, n_miss, sym="btc", t0=1_700_000_000):
+    from tests.test_regime import _mixed
+
+    return _mixed(n_hit, n_miss, sym=sym, t0=t0)
+
+
+def test_regime_prints_the_fleet_gauge_its_interval_and_its_scope(monkeypatch, tmp_path):
+    result, dest = _rig_regime(monkeypatch, tmp_path, _regime_windows(8, 2),
+                               args=["--trail", "10"])
+    assert result.exit_code == 0, result.output
+    out = " ".join(result.output.split())          # the report wraps; shape doesn't
+    assert "leader persistence" in out
+    assert "FLEET 80.0%" in out
+    assert "8/10 windows · trailing 10" in out
+    assert "btc 5m" in out                          # the per-series split
+
+
+def test_regime_names_the_method_it_measured_with(monkeypatch, tmp_path):
+    """The definition is frozen in regime.METHOD, and the report quotes it —
+    a number whose method is not on the page cannot be joined to anything."""
+    from polymarket import regime as rg
+
+    result, _dest = _rig_regime(monkeypatch, tmp_path, _regime_windows(5, 0))
+    assert rg.METHOD in " ".join(result.output.split())
+
+
+def test_regime_says_out_loud_that_it_gates_nothing(monkeypatch, tmp_path):
+    result, _dest = _rig_regime(monkeypatch, tmp_path, _regime_windows(5, 0))
+    out = " ".join(result.output.split())
+    assert "MEASUREMENT ONLY" in out and "docs/regime-gauge.md" in out
+
+
+def test_regime_reports_the_windows_it_had_to_drop(monkeypatch, tmp_path):
+    from tests.test_regime import window
+
+    ws = (_regime_windows(3, 0)
+          + [window("btc", 1_700_100_000, 0.52, "up")]                   # no lead
+          + [window("btc", 1_700_200_000, 0.70, "up", up_age=9_000.0)])  # stale
+    result, _dest = _rig_regime(monkeypatch, tmp_path, ws)
+    out = " ".join(result.output.split())
+    assert "3/5 graded windows had a leader" in out
+    assert "1 stale" in out and "1 no-lead" in out
+
+
+def test_regime_warns_when_grading_covers_little_of_its_own_span(monkeypatch, tmp_path):
+    """The corpus lags the tape, and TRADED windows grade first — a selection
+    on the very axis being measured. That caveat is the headline's qualifier,
+    not a footnote, so it is yellow and it names the fix."""
+    from tests.test_regime import tape_files, window
+
+    ws = _regime_windows(4, 0)
+    book, out_path = tape_files(tmp_path, ws)
+    with open(book, "a") as fh:
+        for i in range(40):                       # marked, but nothing graded them
+            s, rows, _o = window("eth", 1_700_000_000 + i * 300, 0.70, "up")
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+
+    from polymarket import regime as rg
+    monkeypatch.setattr(rg, "book_tape_sources", lambda *a, **k: [book])
+    monkeypatch.setattr(rg, "OUTCOMES_PATH", out_path)
+    from click.testing import CliRunner
+    result = CliRunner().invoke(cd.crypto_regime,
+                                ["--out", str(tmp_path / "r.jsonl"), "--dry-run"])
+    joined = " ".join(result.output.split())
+    assert "await a grade" in joined
+    assert "traded windows grade FIRST" in joined
+    assert "pmt crypto outcomes" in joined
+
+
+def test_regime_appends_one_row_per_window_and_repeats_nothing(monkeypatch, tmp_path):
+    result, dest = _rig_regime(monkeypatch, tmp_path, _regime_windows(4, 1))
+    assert result.exit_code == 0, result.output
+    assert "5 row(s)" in " ".join(result.output.split())
+    rows = [json.loads(ln) for ln in dest.read_text().splitlines() if ln.strip()]
+    assert len(rows) == 5
+    assert {r["slug"] for r in rows} == {r["slug"] for r in rows}
+    # A second run says nothing new rather than doubling the file.
+    again, _ = _rig_regime(monkeypatch, tmp_path, _regime_windows(4, 1))
+    assert "already current" in " ".join(again.output.split())
+    assert len(dest.read_text().splitlines()) == 5
+
+
+def test_regime_dry_run_writes_nothing(monkeypatch, tmp_path):
+    result, dest = _rig_regime(monkeypatch, tmp_path, _regime_windows(4, 1),
+                               args=["--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "dry run" in " ".join(result.output.split())
+    assert not dest.exists()
+
+
+def test_regime_json_is_machine_readable_and_carries_no_prose(monkeypatch, tmp_path):
+    result, _dest = _rig_regime(monkeypatch, tmp_path, _regime_windows(6, 4),
+                                args=["--json", "--trail", "10"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["fleet"]["persist"] == 0.6
+    assert payload["fleet"]["n"] == 10
+    assert payload["method"]
+    assert "obs" not in payload, "the per-window rows belong in the JSONL, not here"
+
+
+def test_regime_refuses_a_nonsense_trail(monkeypatch, tmp_path):
+    result, _dest = _rig_regime(monkeypatch, tmp_path, _regime_windows(2, 0),
+                                args=["--trail", "0"])
+    assert result.exit_code != 0
+    assert "--trail must be positive" in result.output
+
+
+def test_regime_on_a_cold_box_reports_rather_than_crashes(monkeypatch, tmp_path):
+    """No tape, no outcomes, no corpus file — the command still prints a
+    gauge that says it has nothing, which is what a cold start looks like."""
+    result, dest = _rig_regime(monkeypatch, tmp_path, [])
+    assert result.exit_code == 0, result.output
+    out = " ".join(result.output.split())
+    assert "FLEET —" in out
+    assert not dest.exists() or dest.read_text() == ""
+
+
+def test_regime_prints_the_grade_split_when_the_two_populations_disagree(
+        monkeypatch, tmp_path):
+    """Wallet rows grade FIRST, so the most recent slice of the gauge is its
+    most selected slice. A headline quoted without that split is the engine's
+    own entry filter read back as a fact about the market."""
+    from tests.test_regime import _mixed
+
+    ws = [(s, r, {**o, "source": "wallet"})
+          for s, r, o in _mixed(20, 0)]
+    ws += [(s, r, {**o, "source": "resolution"})
+           for s, r, o in _mixed(10, 10, sym="eth", t0=1_700_100_000)]
+    result, _dest = _rig_regime(monkeypatch, tmp_path, ws)
+    out = " ".join(result.output.split())
+    assert "by grade · wallet 100.0% (20) vs resolution 50.0% (20)" in out
+    assert "we TRADED that window" in out
+
+
+def test_regime_stays_quiet_about_the_split_with_one_population(monkeypatch, tmp_path):
+    result, _dest = _rig_regime(monkeypatch, tmp_path, _regime_windows(5, 0))
+    assert "by grade" not in result.output

@@ -282,11 +282,16 @@ def test_the_modal_is_a_pure_renderable_and_never_touches_the_fetchers():
 
 
 def _fetcher(monkeypatch, *, sb=None, status=None, bal=None, sb_boom=None,
-             odds=None):
+             odds=None, regime_row=None):
     """A WatchFetcher with every network seam replaced. The scoreboard seam
     is _tape_scoreboard — the SAME function `pmt crypto stats` runs, which
-    is the whole point: one acquisition path, one truth."""
+    is the whole point: one acquisition path, one truth.
+
+    The regime gauge is stubbed for the same reason the tape feed is pointed
+    at nothing: it is backed by a file this box may or may not have, and no
+    test of the OTHER fetchers may depend on which."""
     state = cw.WatchState()
+    monkeypatch.setattr(cw.regime, "latest", lambda *a, **k: regime_row)
     # A tape feed pointed at nothing, with the control plane stubbed dead: the
     # fetchers under test here are the OTHER four, and none of them may be
     # made to depend on whether this box happens to have a tape file.
@@ -412,12 +417,12 @@ def test_fetcher_balance_failure_keeps_last_capital(monkeypatch):
 def test_fetcher_tick_honors_per_source_cadences(monkeypatch):
     state, f = _fetcher(monkeypatch, bal={"total": 1.0})
     ran: list[str] = []
-    for name in ("status", "sb", "bal", "odds", "tape"):
+    for name in ("status", "sb", "bal", "odds", "tape", "regime"):
         monkeypatch.setattr(f, f"fetch_{name}", lambda n=name: ran.append(n))
 
     f.tick(1000.0)
     # first tick primes everything
-    assert sorted(ran) == ["bal", "odds", "sb", "status", "tape"]
+    assert sorted(ran) == ["bal", "odds", "regime", "sb", "status", "tape"]
     ran.clear()
 
     f.tick(1001.0)                                   # nothing is due yet
@@ -432,7 +437,45 @@ def test_fetcher_tick_honors_per_source_cadences(monkeypatch):
     assert sorted(ran) == ["odds", "sb", "status", "tape"]  # position marks: 30s
     ran.clear()
     f.tick(1060.0)
-    assert sorted(ran) == ["bal", "odds", "sb", "status", "tape"]  # balance: 60s
+    # balance and the regime gauge share the slowest lane: one is a wallet
+    # call, the other a tail read of a file that advances only on settlement.
+    assert sorted(ran) == ["bal", "odds", "regime", "sb", "status", "tape"]
+
+
+# ---------- the regime gauge: a file read, on the worker, that gates nothing ----------
+
+def test_the_regime_fetch_publishes_the_newest_corpus_row(monkeypatch):
+    row = {"slug": "btc-updown-5m-1787538600", "end": 1787538900,
+           "fleet_persist": 0.715, "fleet_n": 50}
+    state, f = _fetcher(monkeypatch, regime_row=row)
+    f.fetch_regime()
+    assert state.read()["regime"] == row
+
+
+def test_the_regime_fetch_touches_no_network_and_never_recomputes(monkeypatch):
+    """A dashboard that re-derived the gauge would walk the whole book tape
+    once a minute to repaint one line. It reads the tail of the corpus file
+    `pmt crypto regime` writes, and nothing else."""
+    state, f = _fetcher(monkeypatch)
+    monkeypatch.setattr(cw, "_engine_post", _raiser(AssertionError("engine touched")))
+    monkeypatch.setattr(cw, "_api", _raiser(AssertionError("api touched")))
+    monkeypatch.setattr(cw.regime, "estimate",
+                        _raiser(AssertionError("gauge recomputed")))
+    f.fetch_regime()
+    assert state.read()["regime"] is None      # cold start: None, not a zero
+
+
+def test_a_failed_regime_read_keeps_the_last_good_gauge(monkeypatch):
+    row = {"slug": "btc-updown-5m-1787538600", "end": 1787538900,
+           "fleet_persist": 0.715, "fleet_n": 50}
+    state, f = _fetcher(monkeypatch, regime_row=row)
+    f.tick(0.0)
+    assert state.read()["regime"] == row
+    monkeypatch.setattr(cw.regime, "latest", _raiser(OSError("disk gone")))
+    f.tick(10_000.0)                                  # must not raise
+    # A regime is a slow-moving fact: the previous read is still the best
+    # answer, and its `old` age label already says how much to trust it.
+    assert state.read()["regime"] == row
 
 
 # ---------- current odds: a display feed, on the slow lane ----------
