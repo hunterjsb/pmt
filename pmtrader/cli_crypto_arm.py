@@ -22,10 +22,44 @@ from engine import post as _engine_post
 from watch_ui import _brake_badge, _rtds_line, _safety_badge, _tape_slug
 
 
+def _px_fmt(reference: float):
+    """A price formatter scaled to the symbol: enough decimals that a
+    few-bp move is still visible at $0.21 and at $115,000."""
+    ref = abs(reference or 0.0)
+    dp = 0 if ref >= 1000 else 2 if ref >= 10 else 4 if ref >= 0.1 else 6
+    return lambda v: "—" if v is None else f"{v:,.{dp}f}"
+
+
+_FEED_OPT = click.option(
+    "--feed", type=click.Choice(["binance", "rtds"]), default="binance",
+    show_default=True,
+    help="Market data source. 'binance' is the venue proxy every arm "
+         "has used. 'rtds' reads the Chainlink TWAP stream these "
+         "markets actually SETTLE on — same series for reference, "
+         "spot and TWAP marks, so the cross-venue basis the guard "
+         "was sized for disappears (twap markets only; close_open "
+         "needs a venue's candle open). This is what makes xrp/doge "
+         "tradeable at all — see analysis/xrp_fit.md. A symbol Binance "
+         "does not list AT ALL (hype) falls back to rtds on its own, "
+         "because there is nothing else to price it with")
+
+_SIGMA_OPT = click.option(
+    "--sigma-bp", type=float, default=None,
+    help="Override the per-minute vol handed to the engine (bp/min). "
+         "Normally derived: Binance 1m kline closes on the binance feed, "
+         "and the stream's OWN per-minute closes (the same vector "
+         "updown_rtds banks) on rtds. The escape hatch is for a symbol "
+         "whose recorder history is still too cold to estimate off — a "
+         "brand-new stream symbol has no klines corpus either. The "
+         "engine treats it as a vol FLOOR while its own history warms up")
+
+
 @click.command("updown")
 @click.argument("ref")
 @click.option("--json", "as_json", is_flag=True, help="Emit the full eval as JSON")
-def crypto_updown(ref: str, as_json: bool) -> None:
+@_FEED_OPT
+@_SIGMA_OPT
+def crypto_updown(ref: str, as_json: bool, feed: str, sigma_bp: float | None) -> None:
     """Price an up/down market: semantics, fair value, book edge, verdict.
 
     REF is a polymarket.com event URL or bare slug. Detects TWAP vs
@@ -34,7 +68,7 @@ def crypto_updown(ref: str, as_json: bool) -> None:
     from polymarket.crypto import eval_updown
 
     try:
-        r = eval_updown(ref)
+        r = eval_updown(ref, feed=feed, sigma_bp=sigma_bp)
     except ValueError as e:
         raise click.UsageError(str(e))
     if as_json:
@@ -43,16 +77,22 @@ def crypto_updown(ref: str, as_json: bool) -> None:
 
     m = r["model"]
     console.print(f"[bold]{r['title']}[/bold]  [dim]{r['kind']} · {r['symbol']} · {r['rem_s']:.0f}s left[/dim]")
+    console.print(f"[dim]spot {r['spot_source']} · σ {r['sigma_source']}[/dim]")
+    # Significant figures, not whole dollars: a 5m window turns on single
+    # basis points, and `,.0f` renders hype's $80.9 as "81" and doge's $0.21
+    # as "0" — the margin line then reads as a contradiction of the prices
+    # above it.
+    px = _px_fmt(r["spot"])
     if m.get("pending"):
-        console.print(f"spot {r['spot']:,.0f}  σ {r['sigma_bp_per_min']:.2f}bp/min")
+        console.print(f"spot {px(r['spot'])}  σ {r['sigma_bp_per_min']:.2f}bp/min")
     else:
         if r["kind"] == "twap":
-            line = (f"spot {r['spot']:,.0f}  ref {m['ref']:,.0f}  banked({m.get('banked_s', 0):.0f}s) "
-                    f"{m['banked']:,.0f}")
+            line = (f"spot {px(r['spot'])}  ref {px(m['ref'])}  banked({m.get('banked_s', 0):.0f}s) "
+                    f"{px(m['banked'])}")
             if not m.get("expired"):
-                line += f"  proj {m['proj']:,.0f}  breakeven {m['breakeven']:,.0f}"
+                line += f"  proj {px(m['proj'])}  breakeven {px(m['breakeven'])}"
         else:
-            line = f"spot {r['spot']:,.0f}  open {m['open']:,.0f}"
+            line = f"spot {px(r['spot'])}  open {px(m['open'])}"
         console.print(f"{line}  margin {m['margin_bp']:+.1f}bp  σ {r['sigma_bp_per_min']:.2f}bp/min")
         if not m.get("expired"):
             console.print(f"P(UP) [bold]{m['p_up']:.3f}[/bold]  [dim]vol x0.5: {m['p_up_lowvol']:.3f} · x1.5: {m['p_up_highvol']:.3f}[/dim]")
@@ -151,20 +191,13 @@ def _resolve_basis_guard(explicit: float | None, symbol: str) -> tuple[float, st
                    "5s), so this is a narrow, late-window, theta-approved "
                    "resting bid. Off by default. Read the maker_candidate "
                    "counts on the tape before arming it, and arm ONE symbol")
-@click.option("--feed", type=click.Choice(["binance", "rtds"]), default="binance",
-              show_default=True,
-              help="Market data source. 'binance' is the venue proxy every arm "
-                   "has used. 'rtds' reads the Chainlink TWAP stream these "
-                   "markets actually SETTLE on — same series for reference, "
-                   "spot and TWAP marks, so the cross-venue basis the guard "
-                   "was sized for disappears (twap markets only; close_open "
-                   "needs a venue's candle open). This is what makes xrp/doge "
-                   "tradeable at all — see analysis/xrp_fit.md")
+@_FEED_OPT
+@_SIGMA_OPT
 def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
                side: str | None, quiesce: float, min_fair: float, min_elapsed: float,
                roll: bool, clip: float, basis_guard: float | None, theta: float,
                pay_up: float, p_cap: float, maker_bid: bool, feed: str,
-               settle_tw: float) -> None:
+               settle_tw: float, sigma_bp: float | None) -> None:
     """Arm the pmengine updown trigger on a market.
 
     Prices the market (semantics, vol, fee) and hands the parameters to the
@@ -174,12 +207,35 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
     """
     from polymarket.crypto import eval_updown
 
+    # The pre-flight source is decided by LISTABILITY, not by --feed: Binance
+    # whenever Binance has the pair, the stream only when it does not. --feed
+    # is about what the ENGINE reads, and every symbol armed on rtds so far
+    # (xrp, doge, bnb) is also listed on Binance, so routing the pre-flight by
+    # the flag would quietly re-derive their sigma off a different series —
+    # a live-money change nobody asked for, in a commit about hype. Compare
+    # the two by hand with `pmt crypto updown <slug> --feed rtds`.
+    #
+    # settle_tw picks which TWAP series the stream marks come from, and a
+    # fallback pre-flight has to read the same one the arm will. 60 is the
+    # measured settlement width everywhere (analysis/settle_width.md) and the
+    # auto-raise below makes it the arm's value too; only an explicit
+    # `--settle-tw 30` asks for the other series.
     try:
-        r = eval_updown(ref)
+        r = eval_updown(ref, feed="binance", sigma_bp=sigma_bp,
+                        settle_tw_s=30 if settle_tw == 30 else 60)
     except ValueError as e:
         raise click.UsageError(str(e))
     if r["rem_s"] <= 0:
         raise click.UsageError("window already over")
+    # Binance has no such pair, so an engine armed on the Binance feed would
+    # gate on a feed that never ticks, forever. The eval only got a price by
+    # reaching for the stream; make the arm say so instead of arming a corpse.
+    if r["feed_fell_back"] and feed != "rtds":
+        raise click.UsageError(
+            f"Binance does not list {r['symbol']} — priced off the settlement stream "
+            f"({r['spot_source']}), but the engine would still be armed on the Binance "
+            "feed and never see a tick. Re-run with --feed rtds."
+        )
     # The engine refuses this too; catching it here saves a round trip and
     # says why in the same breath as the flag that caused it.
     if feed == "rtds" and r["kind"] != "twap":
@@ -217,6 +273,11 @@ def crypto_arm(ref: str, size: float, min_edge: float, max_price: float,
                   f"[dim]{r['kind']} · {r['rem_s']:.0f}s left · size ${size:.0f} · "
                   f"min edge {min_edge * 100:.0f}¢ · σ {r['sigma_bp_per_min']:.2f}bp/min · "
                   f"guard {guard_bp:.1f}bp · feed {feed}{rolling}{making}[/dim]")
+    # Where the handed-over numbers came from. It is NOT in the payload on
+    # purpose: ArmParams round-trips through serde as the durable arm state,
+    # so an unknown key would be dropped on the first restart and the record
+    # would quietly lie about its own provenance.
+    console.print(f"[dim]pre-flight: spot {r['spot_source']} · σ {r['sigma_source']}[/dim]")
     console.print(f"[dim]market now: {r['verdict']}[/dim]")
 
 

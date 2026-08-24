@@ -79,3 +79,192 @@ def test_taker_fee_defaults_to_the_live_rate():
     from polymarket.constants import FEE_RATE, taker_fee
 
     assert taker_fee(0.91) == pytest.approx(FEE_RATE * 0.09)
+
+
+# ---------- market data: symbols Binance does not list ----------
+#
+# `hype` resolves off a Chainlink HYPE/USD feed and Binance has no HYPEUSDT
+# pair at all, so the venue-proxy pre-flight 400s before the model ever runs.
+# These pin the source selection, its fallback order, and — most importantly —
+# that the Binance path for a listed pair never reaches for the stream.
+
+import requests
+
+
+_HYPE_SEM = {"slug": "hype-updown-5m-1787538000", "title": "Hyperliquid Up or Down",
+             "kind": "twap", "symbol": "HYPEUSDT", "start": 1787538000.0,
+             "end": 1787538300.0, "token_up": "1", "token_down": "2",
+             "fee_rate": 0.07, "closed": False}
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        return self._body
+
+
+def test_unlisted_reads_binances_own_invalid_symbol_code():
+    assert crypto_mod._unlisted(_Resp(400, {"code": -1121, "msg": "Invalid symbol."}))
+    # A real outage is not a listing fact and must NOT reroute to the stream.
+    assert not crypto_mod._unlisted(_Resp(418, {"code": -1003, "msg": "Way too many requests"}))
+    assert not crypto_mod._unlisted(_Resp(200, {"price": "80.6"}))
+    assert not crypto_mod._unlisted(_Resp(400, {"code": -1100, "msg": "Illegal characters"}))
+
+
+def test_symbol_not_on_binance_is_still_an_http_error():
+    # Subclassing keeps every existing `except requests.HTTPError` working.
+    assert issubclass(crypto_mod.SymbolNotOnBinance, requests.HTTPError)
+
+
+def test_market_data_on_a_listed_pair_never_touches_the_stream(monkeypatch):
+    calls = []
+    monkeypatch.setattr(crypto_mod, "spot_price", lambda s: calls.append(("spot", s)) or 115000.0)
+    monkeypatch.setattr(crypto_mod, "_sigma_1m", lambda s, n: calls.append(("sigma", s)) or 0.0006)
+    monkeypatch.setattr(crypto_mod, "_binance_per_min", lambda s, t: {t - 60: 114990.0})
+
+    def no_stream(*a, **kw):
+        raise AssertionError("the Binance path must not reach for rtds")
+
+    monkeypatch.setattr(crypto_mod, "_rtds_data", no_stream)
+
+    sem = dict(_HYPE_SEM, symbol="BTCUSDT")
+    data = crypto_mod.market_data(sem, sem["start"] + 100)
+    assert data["spot"] == 115000.0
+    assert data["sigma_source"] == "binance-klines-1m" and data["spot_source"] == "binance"
+    assert not data.get("fell_back")
+    assert calls == [("spot", "BTCUSDT"), ("sigma", "BTCUSDT")]
+
+
+def test_market_data_falls_back_to_the_stream_for_an_unlisted_pair(monkeypatch):
+    def unlisted(symbol):
+        raise crypto_mod.SymbolNotOnBinance(f"Binance does not list {symbol}")
+
+    monkeypatch.setattr(crypto_mod, "spot_price", unlisted)
+    monkeypatch.setattr(crypto_mod, "_rtds_data",
+                        lambda sem, now, tw=60: {"spot": 80.6, "sig1m": 0.0014,
+                                                 "per_min": {sem["start"] - 60: 80.5},
+                                                 "spot_source": "rtds-corpus(2s)",
+                                                 "sigma_source": "rtds-closes-1m(n=120)"})
+    data = crypto_mod.market_data(dict(_HYPE_SEM), _HYPE_SEM["start"] + 100)
+    assert data["spot"] == 80.6
+    assert data["fell_back"] is True, "the arm has to know the feed flag is now wrong"
+
+
+def test_market_data_refuses_a_close_open_market_binance_cannot_serve(monkeypatch):
+    # close_open resolves on a venue's candle open and the settlement stream
+    # has none — there is no fallback, only a message that says so.
+    def unlisted(symbol):
+        raise crypto_mod.SymbolNotOnBinance(f"Binance does not list {symbol}")
+
+    monkeypatch.setattr(crypto_mod, "spot_price", unlisted)
+    with pytest.raises(ValueError) as e:
+        crypto_mod.market_data(dict(_HYPE_SEM, kind="close_open"), _HYPE_SEM["start"])
+    assert "HYPEUSDT" in str(e.value) and "close_open" in str(e.value)
+
+
+def test_rtds_data_error_names_the_stream_not_a_binance_400(monkeypatch, tmp_path):
+    from polymarket import rtds_read
+
+    monkeypatch.setattr(rtds_read, "RTDS_DIR", tmp_path)
+    monkeypatch.setattr(rtds_read, "corpus_spot", lambda *a, **kw: None)
+    monkeypatch.setattr(rtds_read, "live_spot", lambda *a, **kw: None)
+    with pytest.raises(ValueError) as e:
+        crypto_mod._rtds_data(dict(_HYPE_SEM), _HYPE_SEM["start"])
+    msg = str(e.value)
+    assert "hype/usd" in msg, "the message must name the stream symbol that is missing"
+    assert "binance.vision" not in msg and "400" not in msg
+    assert "recorder" in msg
+
+
+def test_rtds_data_uses_the_live_socket_when_the_recorder_is_down(monkeypatch):
+    from polymarket import rtds_read
+
+    monkeypatch.setattr(rtds_read, "corpus_spot", lambda *a, **kw: None)
+    monkeypatch.setattr(rtds_read, "live_spot", lambda *a, **kw: (80.6, 1787538000.0))
+    monkeypatch.setattr(rtds_read, "read_back", lambda *a, **kw: [])
+    monkeypatch.setattr(rtds_read, "minute_closes", lambda *a, **kw: [])
+    monkeypatch.setattr(rtds_read, "corpus_sigma", lambda *a, **kw: None)
+    monkeypatch.setattr(rtds_read, "twap_marks", lambda *a, **kw: {})
+    data = crypto_mod._rtds_data(dict(_HYPE_SEM), 1787538000.0)
+    assert data["spot"] == 80.6 and data["spot_source"].startswith("rtds-live")
+    assert data["sig1m"] is None, "one print is a price, not a series"
+
+
+def test_market_data_demands_a_sigma_override_when_history_is_cold(monkeypatch):
+    monkeypatch.setattr(crypto_mod, "_rtds_data",
+                        lambda sem, now, tw=60: {"spot": 80.6, "sig1m": None, "per_min": {},
+                                                 "spot_source": "rtds-live(1s)",
+                                                 "sigma_source": None})
+    with pytest.raises(ValueError) as e:
+        crypto_mod.market_data(dict(_HYPE_SEM), _HYPE_SEM["start"], feed="rtds")
+    assert "--sigma-bp" in str(e.value) and "hype/usd" in str(e.value)
+
+
+def test_sigma_override_wins_over_every_derived_source(monkeypatch):
+    monkeypatch.setattr(crypto_mod, "_rtds_data",
+                        lambda sem, now, tw=60: {"spot": 80.6, "sig1m": 0.0014, "per_min": {},
+                                                 "spot_source": "rtds-corpus(2s)",
+                                                 "sigma_source": "rtds-closes-1m(n=120)"})
+    data = crypto_mod.market_data(dict(_HYPE_SEM), _HYPE_SEM["start"], feed="rtds", sigma_bp=18.0)
+    assert data["sig1m"] == pytest.approx(0.0018)
+    assert data["sigma_source"] == "override(--sigma-bp)"
+
+
+def test_rtds_data_reads_the_settlement_width_it_was_asked_for(monkeypatch):
+    from polymarket import rtds_read
+
+    seen = {}
+    monkeypatch.setattr(rtds_read, "corpus_spot", lambda *a, **kw: (80.6, 1787538000.0))
+    monkeypatch.setattr(rtds_read, "read_back", lambda *a, **kw: [])
+    monkeypatch.setattr(rtds_read, "minute_closes", lambda *a, **kw: [])
+    monkeypatch.setattr(rtds_read, "corpus_sigma", lambda *a, **kw: (0.0014, 120))
+    monkeypatch.setattr(rtds_read, "twap_marks",
+                        lambda *a, **kw: seen.update(window_s=kw["window_s"]) or {})
+    crypto_mod._rtds_data(dict(_HYPE_SEM), 1787538100.0, 30)
+    assert seen["window_s"] == 30
+
+
+def test_eval_prices_an_unlisted_symbol_end_to_end(monkeypatch):
+    # The whole point: a hype window prices with no Binance call anywhere.
+    start = _HYPE_SEM["start"]
+    monkeypatch.setattr(crypto_mod, "fetch_event", lambda slug: {"markets": [{}]})
+    monkeypatch.setattr(crypto_mod, "parse_semantics", lambda ev: dict(_HYPE_SEM))
+    monkeypatch.setattr(crypto_mod, "time", type("T", (), {"time": staticmethod(lambda: start + 120)}))
+    monkeypatch.setattr(crypto_mod, "fetch_book",
+                        lambda tok: {"best_bid": 0.40, "best_ask": 0.45,
+                                     "bid_depth": 100.0, "ask_depth": 100.0})
+
+    def boom(*a, **kw):
+        raise AssertionError("Binance must not be touched for an rtds-fed eval")
+
+    monkeypatch.setattr(crypto_mod, "spot_price", boom)
+    monkeypatch.setattr(crypto_mod, "_sigma_1m", boom)
+    monkeypatch.setattr(crypto_mod, "_binance_per_min", boom)
+    monkeypatch.setattr(crypto_mod, "fetch_klines", boom)
+    monkeypatch.setattr(crypto_mod, "_rtds_data",
+                        lambda sem, now, tw=60: {
+                            "spot": 80.90, "sig1m": 0.0014,
+                            # the range-start reference IS the settlement print at t0
+                            "per_min": {start - 60: 80.60, start: 80.70, start + 60: 80.80},
+                            "spot_source": "rtds-corpus(1s)",
+                            "sigma_source": "rtds-closes-1m(n=123)"})
+
+    r = crypto_mod.eval_updown("hype-updown-5m-1787538000", feed="rtds")
+    assert r["symbol"] == "HYPEUSDT" and r["kind"] == "twap"
+    assert r["spot_source"] == "rtds-corpus(1s)"
+    assert r["sigma_bp_per_min"] == pytest.approx(14.0)
+    assert r["model"]["ref"] == pytest.approx(80.60)
+    assert 0.0 < r["model"]["p_up"] < 1.0
+    assert r["model"]["margin_bp"] > 0, "spot above the reference projects UP"
+
+
+def test_market_data_refuses_rtds_on_close_open_in_the_read_path_too(monkeypatch):
+    # `crypto arm` refuses this at the flag; the read-only pricer has to as
+    # well, or it silently blends chainlink spot with a Binance candle open.
+    monkeypatch.setattr(crypto_mod, "_rtds_data",
+                        lambda *a, **kw: pytest.fail("must refuse before reading"))
+    with pytest.raises(ValueError) as e:
+        crypto_mod.market_data(dict(_HYPE_SEM, kind="close_open"), _HYPE_SEM["start"], feed="rtds")
+    assert "close_open" in str(e.value) and "--feed binance" in str(e.value)
