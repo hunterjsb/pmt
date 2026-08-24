@@ -34,6 +34,7 @@
 //! No wall-clock reads: every `now` used for a decide() call comes from a
 //! record's own `t` field, so a replay run is deterministic and repeatable.
 
+use crate::fees::taker_fee;
 use crate::strategies::updown::{
     Action, ArmParams, ArmState, ArmView, DecideOut, TopOfBook, FEED_RTDS,
 };
@@ -401,6 +402,10 @@ fn load_real_tally(path: &Path) -> HashMap<String, RealTally> {
 /// already sized against room/ask_size. `cost`/`fees` never shrink (money
 /// spent stays spent); `cost_basis` does shrink on a sell, since it feeds
 /// the next tick's position_floor (currently-committed notional).
+///
+/// `fees` is the `crate::fees::taker_fee` schedule on every crossing fill.
+/// A post-only bid never fills here at all, which is also the honest maker
+/// fee: the wallet charges a resting fill exactly nothing.
 #[derive(Default)]
 struct FillSim {
     shares: HashMap<String, f64>,
@@ -429,7 +434,7 @@ fn apply_fills(arm: &mut ArmState, sim: &mut FillSim, out: &DecideOut, now: f64,
                     continue;
                 }
                 let (price, size) = (*price, *size);
-                let fee = size * fee_rate * price.min(1.0 - price);
+                let fee = size * taker_fee(price, fee_rate);
                 sim.cost += size * price;
                 sim.fees += fee;
                 *sim.shares.entry(token.clone()).or_insert(0.0) += size;
@@ -447,7 +452,7 @@ fn apply_fills(arm: &mut ArmState, sim: &mut FillSim, out: &DecideOut, now: f64,
             }
             Action::Sell { token, price, size } => {
                 let (price, size) = (*price, *size);
-                let fee = size * fee_rate * price.min(1.0 - price);
+                let fee = size * taker_fee(price, fee_rate);
                 sim.proceeds += size * price - fee;
                 let held = sim.shares.entry(token.clone()).or_insert(0.0);
                 let basis = sim.cost_basis.entry(token.clone()).or_insert(0.0);
