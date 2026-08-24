@@ -137,3 +137,29 @@ def realized_pnl(shares: float, ask: float, won: bool) -> float:
     """`ev_policy.replay`'s accounting, unchanged: a winner pays $1/share and
     the loss leg is exactly -100% of notional. Fees are charged either way."""
     return shares * ((1.0 if won else 0.0) - ask - taker_fee(ask))
+
+
+def reprice(row: dict) -> float:
+    """One graded row's P&L, recomputed from its OWN inputs (shares, ask, won)
+    at today's fee schedule — never the `pnl` the row was stamped with.
+
+    `graded.jsonl` is append-only and idempotent by (slug, side), so a row is
+    priced once, at whatever `taker_fee` said the day it was graded, and never
+    revisited. That makes the stored column a MIXED-VINTAGE ledger the moment
+    the fee model changes, and it did: 1ff4b59 replaced `rate * min(p, 1-p)`
+    with the measured `rate * p * (1-p)` after the old shape was contradicted
+    by 822 of 1017 wallet fills (it over-charges by `1/max(p, 1-p)` — 2x at
+    p=0.50, dead centre of the lane this pilot trades).
+
+    Summing the stored column therefore adds two different fee schedules
+    together. Live on 2026-08-24, 102 of 423 rows still carried the retired
+    shape and the cumulative read -$84.14 (-4.94c/$) against -$76.75
+    (-4.51c/$) priced consistently — an 8.8% overstatement of the loss, in
+    the one number that decides whether Strategy 2.0 goes live.
+
+    The row keeps every input needed to re-derive itself, so the fix is to
+    re-derive rather than to rewrite history in place.
+    """
+    return realized_pnl(float(row.get("shares") or 0.0),
+                        float(row.get("ask") or 0.0),
+                        bool(row.get("won")))

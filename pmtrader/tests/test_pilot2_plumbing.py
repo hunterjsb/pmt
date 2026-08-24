@@ -357,3 +357,26 @@ def test_pilot_home_prefers_the_explicit_argument_then_the_env(monkeypatch, tmp_
     monkeypatch.setenv(state.HOME_ENV, str(tmp_path / "fromenv"))
     assert state.pilot_home() == tmp_path / "fromenv"
     assert state.pilot_home(tmp_path / "explicit") == tmp_path / "explicit"
+
+
+def test_status_folds_the_graded_ledger_at_one_fee_schedule(tmp_path):
+    """A graded.jsonl holding a row priced under the RETIRED fee shape must
+    still fold at today's schedule — the cumulative is a decision number and
+    cannot be the sum of two fee models (bughunt 2026-08-24).
+    """
+    shares, ask = 10.0, 0.5
+    retired_fee = 0.07 * min(ask, 1.0 - ask)          # the pre-1ff4b59 shape
+    state.append(state.GRADED, {
+        "ev": "graded", "slug": SLUG, "side": "up", "end": END,
+        "ask": ask, "shares": shares, "notional": shares * ask,
+        "winner": "up", "won": True,
+        "pnl": shares * (1.0 - ask - retired_fee),    # stale, over-charged
+    }, tmp_path)
+
+    s = status.summarise(tmp_path, now=END + 1000.0)
+    assert s["graded"]["n"] == 1 and s["graded"]["wins"] == 1
+    assert s["graded"]["pnl"] == round(policy.realized_pnl(shares, ask, True), 2)
+    assert s["graded"]["pnl"] > round(shares * (1.0 - ask - retired_fee), 2)
+    # c/$ is derived from the same re-priced number, not the stored one
+    assert s["graded"]["c_per_dollar"] == round(
+        100.0 * policy.realized_pnl(shares, ask, True) / (shares * ask), 2)

@@ -46,7 +46,11 @@ def summarise(home, since_s: float | None = None, now: float | None = None) -> d
             refused[reason] = refused.get(reason, 0) + 1
 
     graded = [r for r in state.iter_records(state.GRADED, home) if _in(r)]
-    g_pnl = sum(float(r.get("pnl") or 0.0) for r in graded)
+    # Re-priced from each row's own (shares, ask, won) at today's fee schedule,
+    # never summed off the stored `pnl` column — that column is stamped once at
+    # grade time and a fee-model change leaves the file mixed-vintage. See
+    # policy.reprice for the measured size of that drift.
+    g_pnl = sum(policy.reprice(r) for r in graded)
     g_notional = sum(float(r.get("notional") or 0.0) for r in graded)
     g_wins = sum(1 for r in graded if r.get("won"))
 
