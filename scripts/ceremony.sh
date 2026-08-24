@@ -516,6 +516,13 @@ cmd_deploy() {
     printf 'deploy: sleeping %ds until %s (next 5-minute boundary + 12s)\n' "$wait_s" "$target_human"
     sleep "$wait_s"
 
+    # Captured BEFORE the restart: the proof at the end compares the running
+    # process's /proc/<pid>/exe against this, because "is-active + /tape 200"
+    # is also true of a process still executing a deleted pre-deploy inode —
+    # which is exactly how the 2026-08-24 stale-floor engine passed as shipped.
+    local built_sha
+    built_sha="$(sha256sum "$PMT_ROOT/pmengine/target/release/pmengine" | cut -d' ' -f1)"
+
     local restart_ts
     restart_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if ! systemctl --user restart pmengine; then
@@ -559,7 +566,22 @@ cmd_deploy() {
             "expected HTTP 200 within 15s, last got '$http_code'"
     fi
 
-    printf 'deploy OK — pmengine restarted at %s, is-active=active, GET /tape=200\n' "$restart_ts"
+    local main_pid run_sha
+    main_pid="$(systemctl --user show -p MainPID --value pmengine)"
+    if [ -z "$main_pid" ] || [ "$main_pid" = "0" ]; then
+        abort "deploy: running-image check" "systemctl --user" \
+            "systemctl --user show -p MainPID --value pmengine" \
+            "no MainPID for an 'active' unit"
+    fi
+    # /proc/<pid>/exe reads the executing image itself, deleted or not.
+    run_sha="$(sha256sum "/proc/$main_pid/exe" | cut -d' ' -f1)"
+    if [ "$run_sha" != "$built_sha" ]; then
+        abort "deploy: running-image check" "/proc/$main_pid/exe" \
+            "sha256sum /proc/$main_pid/exe" \
+            "running image $run_sha != built $built_sha — the engine that answered the health checks is not the binary this deploy shipped"
+    fi
+
+    printf 'deploy OK — pmengine restarted at %s, is-active=active, GET /tape=200, running image sha verified (%s)\n' "$restart_ts" "${run_sha:0:16}"
 }
 
 # ================================================================
