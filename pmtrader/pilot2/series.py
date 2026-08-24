@@ -80,8 +80,16 @@ def parse_series(raw: str | None) -> list[str]:
 
 def live_series(raw: str | None = None) -> list[str]:
     """The series live mode may trade. Raises SeriesRefused on any engine-owned
-    entry — including the case where the operator emptied the list, because an
-    empty live allowlist means "nothing to do" and should say so, not run.
+    or unparseable entry.
+
+    An EMPTY or unset `PILOT2_SERIES` falls back to `DEFAULT_LIVE_SERIES` —
+    it is not a refusal, and `test_default_live_series_are_the_approved_three`
+    pins that. Worth saying out loud because the shapes are easy to confuse:
+    `PILOT2_SERIES=` reads as "nothing configured", not as "trade nothing", so
+    an operator who blanks the variable expecting live mode to stand down gets
+    doge/hype/bnb-15m traded instead. The way to trade nothing is to not pass
+    `--live` (or to leave `PILOT2_LIVE` unset), which is the switch that
+    actually gates capital.
     """
     configured = parse_series(raw if raw is not None else os.environ.get(SERIES_ENV))
     series = configured or list(DEFAULT_LIVE_SERIES)
