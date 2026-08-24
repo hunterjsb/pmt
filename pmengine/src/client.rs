@@ -193,6 +193,42 @@ impl TokenMetaCache {
         Ok(meta)
     }
 
+    /// `resolve`, re-asking a failed fetch a few times before giving up.
+    ///
+    /// Only the PREWARM path uses this. The order path must never sleep, so
+    /// `resolve` stays the call inside `token_meta`: on the hot path a cold
+    /// miss fetches once and flies with whatever it gets.
+    ///
+    /// Generic over the fetch for the same reason `resolve` is — the retry
+    /// policy is testable without a live CLOB.
+    pub async fn resolve_retrying<F, Fut, E>(
+        &self,
+        token_id: &str,
+        attempts: u32,
+        backoff: std::time::Duration,
+        mut fetch: F,
+    ) -> Result<TokenMeta, E>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<TokenMeta, E>>,
+    {
+        let mut wait = backoff;
+        let mut last: Option<E> = None;
+        for attempt in 0..attempts.max(1) {
+            if attempt > 0 {
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                wait = wait.saturating_mul(2);
+            }
+            match self.resolve(token_id, &mut fetch).await {
+                Ok(meta) => return Ok(meta),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("attempts.max(1) guarantees one attempt ran"))
+    }
+
     /// Number of tokens resolved so far.
     pub async fn len(&self) -> usize {
         self.map.read().await.len()
@@ -201,6 +237,77 @@ impl TokenMetaCache {
     pub async fn is_empty(&self) -> bool {
         self.len().await == 0
     }
+}
+
+/// How long an idle pooled connection survives before hyper reaps it.
+///
+/// reqwest's default is 90s. The order path is only ever fast because it
+/// finds a WARM connection: `analysis/order_latency_eu.md` measures a cold
+/// TCP+TLS handshake to the CLOB at ~18ms (1.7ms connect + 16ms TLS), which
+/// an order would pay in full. Today nothing drops out of the pool only
+/// because the REST book poller happens to run every 10s — an accident of
+/// `PMENGINE_BOOK_POLL_SLOW_MS`, not a property of the order path. Five
+/// minutes spans a whole quiet window between arms, so the first fire of a
+/// new window meets an open connection whatever the poller is doing.
+const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often the idle HTTP/2 connection to the CLOB is pinged.
+///
+/// Two jobs, both about never discovering a dead socket with a live order.
+/// It keeps the connection genuinely in use, so Cloudflare's own idle reaper
+/// never closes it underneath us; and it makes hyper find a half-open
+/// connection with a ping rather than with an order that then has to be
+/// re-sent on a fresh handshake. 30s sits well inside any edge idle window.
+const H2_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long an unanswered ping waits before the connection is declared dead.
+/// Generous next to the ~30ms the CLOB round trip actually takes: this must
+/// only fire on a genuinely gone connection, never on a slow one.
+const H2_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many times `prewarm_token` re-asks for a token's metadata.
+///
+/// Four attempts at a doubling 250ms backoff finish inside ~1.75s. The budget
+/// is set by what prewarm is racing — a window opens minutes before its first
+/// clip — so this can afford to be patient, and it only ever runs off the
+/// order path.
+const PREWARM_ATTEMPTS: u32 = 4;
+
+/// First prewarm backoff; doubles per attempt. Long enough that a retry is
+/// not simply the same failing instant again, short enough that four of them
+/// disappear inside the gap before a fire.
+const PREWARM_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The order path's HTTP client.
+///
+/// Its settings are money-path invariants, pinned here rather than inherited
+/// from reqwest's defaults: a default that changes under a version bump would
+/// change order latency silently, and this is the one client whose round trip
+/// is the trade. Built ONCE per engine (see `new_internal`) — a client built
+/// per order would pool nothing and hand every fire a fresh handshake.
+pub fn build_order_http_client() -> reqwest::Result<reqwest::Client> {
+    order_http_builder().build()
+}
+
+/// The settings themselves, split from `build` so a test can read them back —
+/// a built `reqwest::Client` does not expose its own transport config.
+fn order_http_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        // Nagle would hold a small order POST waiting for more bytes that
+        // never come. reqwest already defaults this on; the money path
+        // states it rather than depending on that staying true.
+        .tcp_nodelay(true)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        // The CLOB already speaks h2 (ALPN negotiates it today), so the
+        // engine holds ONE multiplexed connection — which makes that single
+        // connection's liveness the whole order path's liveness.
+        .http2_keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+        .http2_keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
+        // Pinging only while there is traffic would defend exactly the case
+        // that is already fine. The gap between two fires is when the
+        // connection dies, so the pings have to run through it.
+        .http2_keep_alive_while_idle(true)
 }
 
 impl PolymarketClient {
@@ -293,9 +400,7 @@ impl PolymarketClient {
         let address = signer.address();
 
         // Create HTTP client for L2 requests
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
+        let http = build_order_http_client()
             .map_err(|e| ClientError::SdkError(e.to_string()))?;
 
         // Resolve the CLOB protocol version once, here. The SDK caches it
@@ -372,8 +477,26 @@ impl PolymarketClient {
     /// is p10 150s). Cost lands there instead of inside decision->ack.
     /// Best-effort: a failure just leaves the order path to fetch it cold,
     /// exactly as it did before.
+    ///
+    /// It RETRIES because one attempt was not enough in practice. A cache
+    /// stores successes only, so a single transient failure here left the
+    /// token cold until an order paid for it — and it did: 20 of the 1462
+    /// orders on the desktop tape spent 100-175ms inside `sign`, and 20 of
+    /// those 21 slow signs were the FIRST order on their token
+    /// (analysis/order_latency_eu.md). The whole retry chain finishes in
+    /// under two seconds, far inside the minutes this has before a fire.
     pub async fn prewarm_token(&self, token_id: &str) {
-        match self.token_meta(token_id).await {
+        let meta = match U256::from_str(token_id) {
+            Ok(t) => {
+                self.meta
+                    .resolve_retrying(token_id, PREWARM_ATTEMPTS, PREWARM_BACKOFF, || {
+                        self.fetch_token_meta(t)
+                    })
+                    .await
+            }
+            Err(e) => Err(ClientError::OrderError(format!("Invalid token_id: {}", e))),
+        };
+        match meta {
             Ok(meta) => {
                 // A V1 CLOB also resolves a per-token fee rate inside
                 // `build()`; V2 carries fees in the market info instead.
@@ -1213,6 +1336,120 @@ mod tests {
         }
     }
 
+    /// HTTP/1.1 stub that counts ACCEPTED CONNECTIONS, not requests.
+    /// Connections are the only honest measure of pooling: the order path's
+    /// cost is the handshake, and a handshake is exactly one accept.
+    async fn counting_stub() -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let conns = Arc::new(AtomicUsize::new(0));
+        let counter = conns.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {
+                                let resp = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+                                if sock.write_all(resp).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/order"), conns)
+    }
+
+    #[tokio::test]
+    async fn the_order_client_reuses_one_connection_across_sequential_orders() {
+        let (url, conns) = counting_stub().await;
+        let http = build_order_http_client().expect("build order client");
+        for _ in 0..12 {
+            let resp = http.get(&url).send().await.expect("stub request");
+            assert!(resp.status().is_success());
+            // The body must be drained or the connection never returns to
+            // the pool — a half-read response is a leaked connection.
+            resp.text().await.expect("stub body");
+        }
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            1,
+            "every order after the first must ride the pooled connection; a \
+             second accept is a TCP+TLS handshake charged to a live fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_built_per_order_would_handshake_every_time() {
+        // The regression the test above guards, demonstrated: pooling lives in
+        // the CLIENT, so moving construction onto the order path defeats it
+        // completely. This is what the old `reqwest::Client::new()`-per-call
+        // shape costs, and why `new_internal` builds exactly one.
+        let (url, conns) = counting_stub().await;
+        for _ in 0..5 {
+            let http = build_order_http_client().expect("build order client");
+            let resp = http.get(&url).send().await.expect("stub request");
+            resp.text().await.expect("stub body");
+        }
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            5,
+            "a per-order client cannot pool — if this ever passes at 1 the \
+             pooling assertion above has stopped proving anything"
+        );
+    }
+
+    /// reqwest's `Debug` does not surface the h2 keep-alive fields, so the
+    /// wiring is checked by the compiler and what is asserted here is the part
+    /// that can silently be WRONG: the relationship between the three
+    /// durations. Each of these misorderings leaves the keep-alive doing
+    /// nothing while still looking configured.
+    #[test]
+    fn the_keepalive_durations_cannot_defeat_each_other() {
+        assert!(
+            H2_KEEPALIVE_INTERVAL < POOL_IDLE_TIMEOUT,
+            "pings slower than the pool reaper never refresh anything — the \
+             connection is gone before the next ping is due"
+        );
+        assert!(
+            H2_KEEPALIVE_TIMEOUT < H2_KEEPALIVE_INTERVAL,
+            "a ping deadline that outlives the next ping can never fire, so a \
+             dead connection is still found by an order"
+        );
+        // The CLOB round trip is ~30ms from the EU box. A deadline anywhere
+        // near that would tear down healthy connections under a latency
+        // spike, which costs a handshake instead of saving one.
+        assert!(
+            H2_KEEPALIVE_TIMEOUT >= std::time::Duration::from_secs(5),
+            "keep-alive timeout is close enough to a normal round trip to \
+             kill healthy connections"
+        );
+    }
+
+    #[test]
+    fn the_order_client_pins_tcp_nodelay() {
+        // Nagle on a small order POST is pure added latency. reqwest defaults
+        // this on today; the assertion is what makes it a pinned property of
+        // the money path rather than a default we happen to inherit.
+        let cfg = format!("{:?}", order_http_builder());
+        assert!(
+            cfg.contains("tcp_nodelay: true"),
+            "order client lost TCP_NODELAY: {cfg}"
+        );
+    }
+
     fn meta(dp: u32) -> TokenMeta {
         TokenMeta {
             tick_decimals: dp,
@@ -1276,6 +1513,91 @@ mod tests {
                 .resolve("tok", || async { Ok::<_, &str>(meta(2)) })
                 .await,
             Ok(meta(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn prewarm_retries_a_transient_failure_and_then_caches() {
+        // The real bug: a cache stores successes only, so ONE failed prewarm
+        // left the token cold and handed the first order a ~130ms round trip
+        // inside sign.
+        let cache = TokenMetaCache::new();
+        let calls = AtomicUsize::new(0);
+        let got = cache
+            .resolve_retrying("tok", 4, std::time::Duration::ZERO, || async {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err("clob hiccup")
+                } else {
+                    Ok(meta(3))
+                }
+            })
+            .await;
+        assert_eq!(got, Ok(meta(3)));
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "should have re-asked twice");
+        assert_eq!(
+            cache.get("tok").await,
+            Some(meta(3)),
+            "a retry that succeeded must warm the cache like any other resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn prewarm_giving_up_leaves_the_token_cold_not_poisoned() {
+        // Exhausting the retries must not be worse than never trying: the
+        // order path still has to be able to fetch it cold and trade.
+        let cache = TokenMetaCache::new();
+        let calls = AtomicUsize::new(0);
+        let out: Result<TokenMeta, &str> = cache
+            .resolve_retrying("tok", 4, std::time::Duration::ZERO, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err("clob down")
+            })
+            .await;
+        assert_eq!(out, Err("clob down"));
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "must use its whole budget");
+        assert_eq!(cache.get("tok").await, None);
+        // ...and the order path's own single-shot resolve still works.
+        assert_eq!(
+            cache.resolve("tok", || async { Ok::<_, &str>(meta(2)) }).await,
+            Ok(meta(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prewarm_of_an_already_known_token_never_fetches() {
+        // Re-subscribing a token the engine already traded must not spend a
+        // request, let alone four.
+        let cache = TokenMetaCache::new();
+        cache
+            .resolve("tok", || async { Ok::<_, &str>(meta(4)) })
+            .await
+            .unwrap();
+        let calls = AtomicUsize::new(0);
+        let got = cache
+            .resolve_retrying("tok", 4, std::time::Duration::ZERO, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err("must not be called")
+            })
+            .await;
+        assert_eq!(got, Ok(meta(4)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_prewarm_retry_chain_finishes_long_before_a_fire() {
+        // Prewarm is racing the window's first clip, which the latency report
+        // puts at p10 150s after open. If the chain ever grew past that it
+        // would be doing its work on the order path's clock.
+        let mut total = std::time::Duration::ZERO;
+        let mut wait = PREWARM_BACKOFF;
+        for _ in 1..PREWARM_ATTEMPTS {
+            total += wait;
+            wait *= 2;
+        }
+        assert!(
+            total < std::time::Duration::from_secs(10),
+            "prewarm backoff chain is {total:?} — too slow to beat a first fire"
         );
     }
 
