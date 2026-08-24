@@ -199,19 +199,28 @@ def test_the_folded_away_panels_paid_for_the_tables_rows():
 
 def test_the_dashboard_paints_exactly_one_table():
     """The operator's ask, and the thing that regressed once already: header,
-    ONE table, tape — nothing else builds a Table."""
+    charts, ONE table, tape — nothing else builds a Table.
+
+    The charts row is deliberately inside this test rather than exempt from
+    it. Its two panels are plain text (braille lines in a Text), so the rule
+    still holds by the only measure that matters: exactly one `build_*_table`
+    in the whole render layer, and no second grid competing with the windows
+    panel for the operator's eye.
+    """
     import inspect
 
+    import watch_charts
     import watch_ui
 
     src = inspect.getsource(cw.crypto_watch.callback)
     assert src.count("split_column") == 1
     assert 'Layout(name="arms"' not in src
-    assert [n for n in ("head", "windows", "tape") if f'name="{n}"' in src] == [
-        "head", "windows", "tape"]
+    assert [n for n in ("head", "charts", "windows", "tape") if f'name="{n}"' in src] == [
+        "head", "charts", "windows", "tape"]
     builders = [n for n in dir(watch_ui)
                 if n.startswith("build_") and n.endswith("_table")]
     assert builders == ["build_windows_table"], builders
+    assert "Table" not in inspect.getsource(watch_charts)
 
 
 def test_a_taller_header_costs_the_tape_rows_not_the_windows_floor():
@@ -285,21 +294,26 @@ def test_the_modal_is_a_pure_renderable_and_never_touches_the_fetchers():
 
 
 def _fetcher(monkeypatch, *, sb=None, status=None, bal=None, sb_boom=None,
-             odds=None, regime_row=None):
+             odds=None, regime_row=None, peers=()):
     """A WatchFetcher with every network seam replaced. The scoreboard seam
     is _tape_scoreboard — the SAME function `pmt crypto stats` runs, which
     is the whole point: one acquisition path, one truth.
 
-    The regime gauge is stubbed for the same reason the tape feed is pointed
-    at nothing: it is backed by a file this box may or may not have, and no
-    test of the OTHER fetchers may depend on which."""
+    The regime gauge is stubbed for the same reason the tape feed and the
+    corpus tails are pointed at nothing: each is backed by a file this box may
+    or may not have, and no test of the OTHER fetchers may depend on which.
+    `peers` is the peer-wallet list, empty by default so an operator's own
+    PMT_FLEET_WALLETS cannot change what these tests assert."""
     state = cw.WatchState()
     monkeypatch.setattr(cw.regime, "latest", lambda *a, **k: regime_row)
+    monkeypatch.setattr(cw.wallet, "peer_wallets", lambda *a, **k: list(peers))
     # A tape feed pointed at nothing, with the control plane stubbed dead: the
     # fetchers under test here are the OTHER four, and none of them may be
     # made to depend on whether this box happens to have a tape file.
     f = cw.WatchFetcher(state, sliding_floor=0.0,
-                        tape_feed=cw.TapeFeed(path="/nonexistent/tape.jsonl"))
+                        tape_feed=cw.TapeFeed(path="/nonexistent/tape.jsonl"),
+                        feed_tail=cw.FeedTail(rtds_dir="/nonexistent/rtds",
+                                              spot_dir="/nonexistent/spot"))
     monkeypatch.setattr(cw, "_engine_get", lambda *a, **k: None)
     monkeypatch.setattr(wallet, "funder_address", lambda: "0xabc")
     monkeypatch.setattr(cw.positions, "fetch_positions",
@@ -420,29 +434,34 @@ def test_fetcher_balance_failure_keeps_last_capital(monkeypatch):
 def test_fetcher_tick_honors_per_source_cadences(monkeypatch):
     state, f = _fetcher(monkeypatch, bal={"total": 1.0})
     ran: list[str] = []
-    for name in ("status", "sb", "bal", "odds", "tape", "regime"):
+    for name in ("status", "sb", "bal", "odds", "tape", "regime", "feeds", "peers"):
         monkeypatch.setattr(f, f"fetch_{name}", lambda n=name: ran.append(n))
 
     f.tick(1000.0)
     # first tick primes everything
-    assert sorted(ran) == ["bal", "odds", "regime", "sb", "status", "tape"]
+    assert sorted(ran) == ["bal", "feeds", "odds", "peers", "regime", "sb",
+                           "status", "tape"]
     ran.clear()
 
     f.tick(1001.0)                                   # nothing is due yet
     assert ran == []
     f.tick(1002.0)
-    assert sorted(ran) == ["status", "tape"]          # engine + tape: 2s
+    # engine, tape and the corpus tails: 2s. The tails are local-file reads of
+    # bytes already appended, which is why they can ride the fast lane.
+    assert sorted(ran) == ["feeds", "status", "tape"]
     ran.clear()
     f.tick(1010.0)
-    assert sorted(ran) == ["sb", "status", "tape"]    # scoreboard: 10s
+    assert sorted(ran) == ["feeds", "sb", "status", "tape"]    # scoreboard: 10s
     ran.clear()
     f.tick(1030.0)
-    assert sorted(ran) == ["odds", "sb", "status", "tape"]  # position marks: 30s
+    assert sorted(ran) == ["feeds", "odds", "sb", "status", "tape"]  # marks: 30s
     ran.clear()
     f.tick(1060.0)
-    # balance and the regime gauge share the slowest lane: one is a wallet
-    # call, the other a tail read of a file that advances only on settlement.
-    assert sorted(ran) == ["bal", "odds", "regime", "sb", "status", "tape"]
+    # balance, the regime gauge and the peer wallets share the slowest lane:
+    # two are wallet calls, the third a tail read of a file that advances only
+    # on settlement.
+    assert sorted(ran) == ["bal", "feeds", "odds", "peers", "regime", "sb",
+                           "status", "tape"]
 
 
 # ---------- the regime gauge: a file read, on the worker, that gates nothing ----------
@@ -1182,3 +1201,719 @@ def test_a_collapsed_line_never_claims_more_records_than_it_absorbed():
     raws = _fleet_tape(2000)
     _, lines = _replay(raws)
     assert _absorbed(lines) == 2000
+
+
+# ---------- the charts row ----------
+#
+# Two line charts, both drawn off data the worker already holds. The rules they
+# are built on, and what each of these pins:
+#
+#   * a P&L figure comes from the WALLET GRADE and nowhere else — the same
+#     `eff_windows` the header's ledger is folded from, never a mark, never a
+#     stated fair off the tape;
+#   * a second engine is a second WALLET, walked through the SAME
+#     `_tape_scoreboard`, and shallowly enough that this box's activity dump
+#     can never be spliced onto another account's rows;
+#   * the feed charts read bytes APPENDED to the recorder corpora since the
+#     last poll, on the worker — never a re-read, never on the render thread;
+#   * every one of them drops rather than degrades into something wrong: a
+#     screen too short loses the whole row, an unreachable peer loses its line,
+#     a missing spot corpus loses the lead block whole.
+
+import json                        # noqa: E402
+import watch_charts as wc          # noqa: E402
+import watch_feeds as wf           # noqa: E402
+
+
+def _cols(values, n=None):
+    """Dot-column values for a chart `n` cells wide (2 dot columns per cell)."""
+    return list(values) if n is None else list(values)[: 2 * n]
+
+
+# -- the canvas --
+
+def test_a_braille_chart_draws_a_line_and_not_a_spray_of_dots():
+    """At four dot rows a scatter of unconnected dots reads as noise. Every
+    cell of a dense series must carry ink, and a jump must be joined."""
+    ramp = [float(i) for i in range(40)]
+    row = wc.sparkline(ramp, 20)
+    assert len(row) == 20
+    assert wc.BRAILLE_BLANK not in row and " " not in row
+    # A one-column vertical jump is a stroke: the cell holds more than the two
+    # dots its endpoints would set on their own.
+    step = wc.sparkline([0.0, 0.0, 10.0, 10.0], 2)
+    assert sum(bin(ord(c) - 0x2800).count("1") for c in step) > 4
+
+
+def test_a_flat_series_never_renders_as_a_spike():
+    """A quiet minute of chainlink prints is one price repeated. Dividing by a
+    zero span would put every dot on one rail and read as a move."""
+    flat = wc.sparkline([77_000.0] * 40, 20)
+    assert len(set(flat)) == 1                      # one glyph, all the way
+    assert flat[0] not in ("⠉", "⣀")                # neither rail
+
+
+def test_a_value_off_the_scale_lands_on_the_rail_rather_than_vanishing():
+    """A chart that silently loses its outlier is worse than one whose outlier
+    sits on the edge — the exact figure is in the field beside it either way."""
+    row = wc.sparkline([0.0, 500.0], 1, lo=-1.0, hi=1.0)
+    assert (ord(row[0]) - 0x2800) & 0x08            # dot column 1, top row
+
+
+def test_a_missing_sample_breaks_the_line_instead_of_being_drawn_through():
+    row = wc.sparkline([1.0, None, None, None, None, 1.0], 3)
+    assert row[1] == wc.BRAILLE_BLANK               # nothing invented in the gap
+    assert row[0] != wc.BRAILLE_BLANK and row[2] != wc.BRAILLE_BLANK
+
+
+# -- columns --
+
+def test_downsample_carries_forward_and_never_invents_a_leading_value():
+    """Carry-forward is right for a step series (a P&L curve IS one between
+    settlements) and honest for a price gap. What it may never do is imply a
+    value before the first sample — that would draw a flat zero where the
+    answer is "no history yet"."""
+    cols = wc.downsample([(50.0, 7.0), (90.0, 9.0)], 10, 0.0, 100.0)
+    assert cols[:5] == [None] * 5                   # nothing before the first
+    assert cols[5:9] == [7.0] * 4                   # carried, not interpolated
+    assert cols[9] == 9.0
+
+
+def test_downsample_keeps_the_last_sample_in_a_column():
+    cols = wc.downsample([(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)], 1, 0.0, 10.0)
+    assert cols == [3.0]
+
+
+def test_downsample_ignores_samples_outside_the_axis():
+    cols = wc.downsample([(-5.0, 99.0), (5.0, 1.0), (500.0, 99.0)], 4, 0.0, 10.0)
+    assert 99.0 not in cols
+
+
+# -- P&L: the wallet grade, cumulated --
+
+def _graded(pnl, end_ts, exit_ts=0.0):
+    return {"pnl": pnl, "end_ts": end_ts, "exit_ts": exit_ts, "won": pnl > 0}
+
+
+def test_cumulative_pnl_is_the_running_wallet_grade_in_settlement_order():
+    now = 1_787_500_000.0
+    curve = wc.cumulative_pnl([_graded(-5.0, now - 100), _graded(+2.0, now - 300),
+                               _graded(+1.0, now - 50)])
+    assert curve == [(now - 300, 2.0), (now - 100, -3.0), (now - 50, -2.0)]
+
+
+def test_a_riding_window_is_not_pnl():
+    """An undecided position has no verdict, so it has no line on this chart.
+    Marking it to market here would put a number on the panel that the wallet
+    has never agreed to — the exact drift the header's ledger refuses."""
+    now = 1_787_500_000.0
+    riding = {"pnl": None, "end_ts": now - 60, "exit_ts": 0.0, "won": None}
+    assert wc.cumulative_pnl([riding, _graded(4.0, now - 30)]) == [(now - 30, 4.0)]
+
+
+def test_the_pnl_curve_rebases_at_the_trailing_floor():
+    """A 24h chart answers "what did today do". Opened at the all-time level
+    it would flatten the day into a rounding error."""
+    now = 1_787_500_000.0
+    windows = [_graded(-900.0, now - 40 * 3600), _graded(+3.0, now - 3600),
+               _graded(+2.0, now - 60)]
+    cols, net = wc.pnl_series(windows, 8, now, 24 * 3600)
+    assert net == 5.0                                # yesterday's -900 is not in it
+    assert cols[0] == 0.0                            # the line opens on the axis
+    assert cols[-1] == 5.0
+
+
+def test_the_closing_figure_is_not_read_off_the_last_column():
+    """A settlement landing inside the final column must not round the
+    headline figure away: the columns are the picture, the number is the
+    answer."""
+    now = 1_787_500_000.0
+    cols, net = wc.pnl_series([_graded(1.0, now - 3), _graded(1.0, now - 1)],
+                              4, now, 3600.0)
+    assert net == 2.0 and cols[-1] == 2.0
+
+
+def test_the_exit_row_is_when_the_money_landed():
+    now = 1_787_500_000.0
+    w = _graded(3.0, now - 500, exit_ts=now - 100)
+    assert wc.settle_ts(w) == now - 100
+    assert wc.settle_ts(_graded(3.0, now - 500)) == now - 500
+
+
+# -- P&L: one line per engine --
+
+def _snap_with(**kw):
+    base = {"sb": {}, "sb_fetched_at": None, "peers": {}, "feeds": {},
+            "status": {}, "node": "desktop"}
+    base.update(kw)
+    return base
+
+
+def test_both_engines_reach_the_pnl_panel_and_the_fleet_line_is_their_sum():
+    """Hunter's ask, literally: "line charts for both P&Ls". This box off the
+    scoreboard the header already prints, the peer off its own wallet walk,
+    and a fleet line that is the two ledgers summed — safe to sum because the
+    series partition means the two accounts never hold the same window."""
+    now = 1_787_500_000.0
+    snap = _snap_with(
+        sb={"eff_windows": [_graded(+10.0, now - 600)]}, sb_fetched_at=now,
+        peers={"eu": {"windows": [_graded(-4.0, now - 300)], "net": -4.0}})
+    rows = wc.pnl_rows(snap, 60, now)
+    labels = [r.split("[/dim]")[0].split("]")[-1].strip() for r in rows]
+    assert labels == ["desktop", "eu", "fleet"]
+    assert "+10.00" in rows[0] and "-4.00" in rows[1] and "+6.00" in rows[2]
+
+
+def test_a_lone_engine_gets_no_fleet_line():
+    """A "fleet" that is one box restating itself is a second row saying
+    nothing."""
+    now = 1_787_500_000.0
+    snap = _snap_with(sb={"eff_windows": [_graded(1.0, now - 10)]}, sb_fetched_at=now)
+    assert len(wc.pnl_rows(snap, 60, now)) == 1
+
+
+def test_an_unreachable_peer_has_no_line_rather_than_a_flat_one():
+    """"this box made nothing today" and "we cannot reach this box's ledger"
+    are opposite facts and may not share a rendering."""
+    now = 1_787_500_000.0
+    snap = _snap_with(sb={"eff_windows": []}, sb_fetched_at=now,
+                      peers={"eu": {"windows": None}})
+    assert [e["label"] for e in wc.engine_curves(snap, now)] == ["desktop"]
+    # ...whereas a peer that answered with nothing to show DOES get its line.
+    snap["peers"] = {"eu": {"windows": []}}
+    assert [e["label"] for e in wc.engine_curves(snap, now)] == ["desktop", "eu", "fleet"]
+
+
+def test_no_pnl_line_at_all_until_the_first_wallet_walk_lands():
+    """sb_fetched_at is the "—" the header's data-age already paints. A zero
+    line drawn before the first walk is a confident claim about a ledger we
+    have not read."""
+    assert wc.pnl_rows(_snap_with(), 60, 1_787_500_000.0) == []
+
+
+# -- the peer walk: same acquisition, another account --
+
+def test_the_peer_walk_is_the_stats_acquisition_path_with_an_address(monkeypatch):
+    """Same rule as fetch_sb, and for the same reason: two engines' P&L lines
+    sitting one above the other must be two runs of ONE definition of a win."""
+    calls = []
+    state, f = _fetcher(monkeypatch, peers=[("eu", "0xdead")])
+    monkeypatch.setattr(cw, "_tape_scoreboard",
+                        lambda floor, **kw: calls.append((floor, kw)) or
+                        {"eff_windows": [], "net": 0.0})
+    f.fetch_peers()
+    assert len(calls) == 1
+    floor, kw = calls[0]
+    assert kw["addr"] == "0xdead"
+    # Shallow enough that wallet.activity_since never reaches this box's dump,
+    # and the local tape has no opinion about another box's fires.
+    assert time.time() - floor <= wallet.IMMUTABLE_AFTER_S
+    assert kw["tape_records"] == []
+
+
+def test_a_peer_walk_may_never_splice_this_boxs_activity_dump(monkeypatch):
+    """The dump is ONE wallet's immutable past. Splicing it under another
+    account's fresh rows would invent a ledger — refused, loudly, rather than
+    mixed."""
+    import cli_crypto_stats as cs
+
+    monkeypatch.setattr(cs.wallet, "activity_since",
+                        lambda *a, **k: pytest.fail("walked before refusing"))
+    with pytest.raises(ValueError, match="splice"):
+        cs._tape_scoreboard(0.0, addr="0xdead")
+
+
+def test_one_flaky_peer_never_blanks_the_other(monkeypatch):
+    state, f = _fetcher(monkeypatch, peers=[("eu", "0xaaa"), ("ap", "0xbbb")])
+
+    def scoreboard(floor, **kw):
+        if kw["addr"] == "0xbbb":
+            raise ConnectionError("data-api down")
+        return {"eff_windows": [_graded(1.0, floor + 10)], "net": 1.0}
+
+    monkeypatch.setattr(cw, "_tape_scoreboard", scoreboard)
+    f.fetch_peers()                                   # must not raise
+    peers = state.read()["peers"]
+    assert peers["eu"]["windows"] and peers["ap"]["windows"] is None
+
+
+def test_a_peer_that_answered_once_keeps_its_line_through_a_later_failure(monkeypatch):
+    state, f = _fetcher(monkeypatch, peers=[("eu", "0xaaa")])
+    monkeypatch.setattr(cw, "_tape_scoreboard",
+                        lambda floor, **kw: {"eff_windows": [_graded(1.0, floor + 5)],
+                                             "net": 1.0})
+    f.fetch_peers()
+    good = state.read()["peers"]["eu"]
+    monkeypatch.setattr(cw, "_tape_scoreboard",
+                        _raiser(ConnectionError("data-api down")))
+    f.fetch_peers()
+    assert state.read()["peers"]["eu"] == good        # last good curve stands
+
+
+def test_a_box_with_no_peer_configured_makes_no_extra_wallet_call(monkeypatch):
+    state, f = _fetcher(monkeypatch)                  # peers=() by default
+    monkeypatch.setattr(cw, "_tape_scoreboard",
+                        _raiser(AssertionError("walked with no peer configured")))
+    f.fetch_peers()
+    assert state.read()["peers"] == {}
+
+
+def test_peer_wallets_drops_junk_and_never_returns_this_box():
+    env = {"PM_FUNDER_ADDRESS": "0xMINE",
+           "PMT_FLEET_WALLETS": "eu=0xdead, =0xbeef, nope, mine=0xmine, ap=0xf00d"}
+    assert wallet.peer_wallets(env) == [("eu", "0xdead"), ("ap", "0xf00d")]
+    assert wallet.peer_wallets({}) == []
+    assert wallet.node_label({}) == "local"
+    assert wallet.node_label({"PMT_FLEET_NODE": "desktop"}) == "desktop"
+
+
+# -- feeds: the underlying against the window's own strike --
+
+def test_the_strike_is_the_reference_the_arm_was_priced_against():
+    """One keying convention with polymarket.rtds_read.twap_marks and
+    polymarket.crypto._model_twap — the print at `m+60` averages minute `m`,
+    so a window opening at `start` reads its strike at `start - 60`. A
+    different key here and the chart's zero line is not the market's."""
+    start = 1_787_500_000.0
+    assert wc.target_of({start - 60: 77_000.0}, start) == 77_000.0
+    assert wc.target_of({start: 77_000.0}, start) is None
+    assert wc.target_of(None, start) is None
+    assert wc.target_of({start - 60: 0.0}, start) is None      # never a zero strike
+
+
+def test_the_target_delta_is_the_basis_guards_own_axis():
+    """bp above/below the strike — the same quantity the `gated  margin -4.9
+    vs 6.0bp` cell reports, so the chart and the table share one axis."""
+    assert wc.delta_bp(100.5, 100.0) == pytest.approx(50.0)
+    assert wc.delta_bp(99.5, 100.0) == pytest.approx(-50.0)
+    assert wc.delta_bp(100.0, None) is None and wc.delta_bp(None, 100.0) is None
+
+
+def test_the_strike_is_always_on_the_feed_chart():
+    """A window 20-40bp above its strike is entirely on one side. The axis
+    stretches to include zero rather than centring on it, so the shape
+    survives AND the strike stays the rail the line is measured off."""
+    lo, hi = wc.span_with_zero([20.0, 30.0, 41.0])
+    assert lo == 0.0 and hi == 41.0
+    lo, hi = wc.span_with_zero([-3.0, 5.0])
+    assert lo == -3.0 and hi == 5.0
+    # A window that has barely moved is not drawn as a full-scale swing.
+    lo, hi = wc.span_with_zero([0.05, -0.05])
+    assert hi - lo >= 2.0
+
+
+def test_the_side_we_hold_decides_the_colour_and_an_unfilled_arm_has_none():
+    assert wc._side_style("up", 4.0) == "green"
+    assert wc._side_style("up", -4.0) == "red"
+    assert wc._side_style("down", -4.0) == "green"
+    assert wc._side_style(None, 4.0) == "dim"        # nothing held, no stake
+    assert wc._side_style("up", None) == "dim"       # no strike, no sign
+
+
+def _armed_snap(now, syms=("btc",), dur="5m", start=None, feeds=None, **pos):
+    start = int(now - 60) if start is None else start
+    arms = {f"{s}-updown-{dur}-{start}": {"eval": {"state": "armed"}, "roll": True}
+            for s in syms}
+    sb = {"riding_windows": [dict({"slug": f"{s}-updown-{dur}-{start}"}, **pos)
+                             for s in syms if pos], "windows": []}
+    return _snap_with(status={"arms": arms}, sb=sb, feeds=feeds or {})
+
+
+def test_a_feed_row_carries_the_path_the_strike_and_our_bet():
+    now = 1_787_500_100.0
+    start = int(now - 60)
+    feeds = {"chain": {"btc": [(now - 30, 77_000.0), (now - 1, 77_077.0)]},
+             "marks": {"btc": {start - 60: 77_000.0}}, "spot": {}, "venue": {}}
+    snap = _armed_snap(now, feeds=feeds, start=start, side="up", entry_px=0.62)
+    row = wc.feed_row(wc.armed_windows(snap)[0], feeds, 60, now)
+    assert "btc 5m" in row and "▲" in row            # identity + the side we took
+    assert "+10.0bp" in row                          # 77,077 vs a 77,000 strike
+    assert "[green]" in row                          # up, and the price is above
+
+
+def test_a_symbol_the_corpus_cannot_price_gets_no_row_rather_than_an_empty_one():
+    """A price chart with no prices in it is a claim about the feed's health,
+    and the header's own feed row is where that belongs."""
+    now = 1_787_500_100.0
+    snap = _armed_snap(now, feeds={"chain": {}, "marks": {}})
+    assert wc.feed_row(wc.armed_windows(snap)[0], snap["feeds"], 60, now) is None
+
+
+def test_a_window_with_no_strike_still_plots_its_price_and_says_so():
+    now = 1_787_500_100.0
+    feeds = {"chain": {"btc": [(now - 10, 77_000.0), (now - 1, 77_050.0)]},
+             "marks": {}}
+    snap = _armed_snap(now, feeds=feeds)
+    row = wc.feed_row(wc.armed_windows(snap)[0], feeds, 60, now)
+    assert "tgt —" in row and "bp" not in row
+
+
+def test_the_feed_panel_never_paints_half_a_lead_comparison():
+    """Two lines of one comparison or none. The panel used to build the
+    symbol rows first and truncate from the bottom, which left the settlement
+    line on screen with nothing to compare it against."""
+    now = 1_787_500_100.0
+    start = int(now - 60)
+    syms = ("btc", "eth", "sol", "xrp", "bnb", "doge", "hype")
+    feeds = {"chain": {s: [(now - 20, 100.0), (now - 1, 101.0)] for s in syms},
+             "spot": {"btc": [(now - 20, 100.0), (now - 1, 101.0)]},
+             "venue": {"btc": "binance"},
+             "marks": {s: {start - 60: 100.0} for s in syms}}
+    rows = wc.feeds_rows(_armed_snap(now, syms=syms, start=start, feeds=feeds), 60, now)
+    assert len(rows) <= wc.CHARTS_MAX_INNER
+    assert sum(1 for r in rows if "rtds" in r) == 1
+    assert sum(1 for r in rows if "binance" in r) == 1
+    # ...and every armed window the panel could not fit is counted, never
+    # silently dropped.
+    assert any("more armed" in r for r in rows)
+
+
+def test_the_lead_block_drops_whole_when_a_venue_is_missing():
+    now = 1_787_500_100.0
+    feeds = {"chain": {"btc": [(now - 20, 100.0), (now - 1, 101.0)]},
+             "spot": {}, "venue": {}, "marks": {}}
+    rows = wc.feeds_rows(_armed_snap(now, feeds=feeds), 60, now)
+    assert rows and not any("rtds" in r for r in rows)
+
+
+def test_the_two_lead_lines_share_one_scale_and_each_is_centred_on_itself():
+    """The rtds reference and a spot venue carry a standing basis wider than
+    half a minute's range, so an absolute scale pins each to an opposite rail
+    and the shapes stop being comparable. Centred, the lead reads as the
+    horizontal offset it is."""
+    now = 1_787_500_100.0
+    shape = [1.0, 1.0, 2.0, 2.0]
+    chain = [(now - 28 + i * 8, 100.0 + v) for i, v in enumerate(shape)]
+    spot = [(now - 28 + i * 8, 5_000.0 + v) for i, v in enumerate(shape)]
+    c_cols = wc.deviation_cols(chain, 2, now - 30, now)
+    s_cols = wc.deviation_cols(spot, 2, now - 30, now)
+    assert [v for v in c_cols if v is not None] == [v for v in s_cols if v is not None]
+    lo, hi = wc.shared_span(c_cols, s_cols)
+    assert wc.sparkline(c_cols, 2, lo, hi) == wc.sparkline(s_cols, 2, lo, hi)
+
+
+def test_armed_windows_take_the_side_and_entry_from_the_wallet_not_the_arm():
+    """Same merge the windows table makes: the engine's /status is the only
+    source of an arm with no fill yet, the scoreboard the only source of a
+    side and an entry price."""
+    now = 1_787_500_100.0
+    snap = _armed_snap(now, side="down", entry_px=0.44)
+    w = wc.armed_windows(snap)[0]
+    assert w["live"] is True and w["side"] == "down" and w["entry_px"] == 0.44
+
+
+def test_armed_windows_lead_with_whatever_settles_first():
+    now = 1_787_500_100.0
+    arms = {"btc-updown-15m-1787500000": {"eval": {}},
+            "eth-updown-5m-1787500000": {"eval": {}}}
+    rows = wc.armed_windows(_snap_with(status={"arms": arms}))
+    assert [r["slug"].split("-")[0] for r in rows] == ["eth", "btc"]
+
+
+# -- geometry: the charts row is the first thing to go --
+
+def test_a_box_with_nothing_to_chart_paints_no_charts_row():
+    """The whole degradation contract. No peer wallet, no armed symbol, no
+    corpus: no row at all, rather than an empty box taking rows off the tape."""
+    assert wc.charts_inner_height(_snap_with(), 120) == 0
+
+
+def test_the_charts_row_is_dropped_whole_when_the_screen_cannot_hold_it():
+    """Braille loses its vertical resolution first, so a squeezed chart would
+    still be drawn and still be read — just wrongly. It goes whole."""
+    assert cw.charts_rows_shown(50, cw.HEAD_MIN_H, 8) == 8
+    assert cw.charts_rows_shown(20, cw.HEAD_MIN_H, 8) == 0
+    assert cw.charts_rows_shown(50, cw.HEAD_MIN_H, 0) == 0
+
+
+def test_the_charts_row_never_costs_the_tape_its_floor_or_the_table_its_row():
+    for h in range(16, 60):
+        for head_h in (cw.HEAD_MIN_H, cw.HEAD_MIN_H + 2):
+            charts_h = cw.charts_rows_shown(h, head_h, 8)
+            n = cw.windows_rows_shown(h, 20, head_h, charts_h)
+            assert 1 <= n <= cw.WINDOWS_MAX_ROWS
+            left = h - head_h - charts_h - (n + cw.WINDOWS_CHROME)
+            assert left >= cw.MIN_TAPE_ROWS or n == 1
+
+
+def test_a_panel_too_narrow_for_a_line_keeps_the_numbers():
+    """A smudge is worse than no chart. The figures are the answer either
+    way, and they never go."""
+    now = 1_787_500_000.0
+    snap = _snap_with(sb={"eff_windows": [_graded(3.0, now - 10)]}, sb_fetched_at=now)
+    wide, narrow = wc.pnl_rows(snap, 60, now), wc.pnl_rows(snap, 26, now)
+    assert "+3.00" in wide[0] and "+3.00" in narrow[0]
+    assert "⠀" not in narrow[0] and len(narrow[0]) < len(wide[0])
+
+
+def test_the_two_panels_split_the_row():
+    assert wc.split_widths(120) == (60, 60)
+    assert sum(wc.split_widths(121)) == 121
+    assert wc.split_widths(0) == (0, 0)
+
+
+# -- the corpus tails: appended bytes only, on the worker --
+
+def test_the_corpus_tail_reads_only_what_was_appended(tmp_path):
+    """The rule the module exists to hold. rtds alone is ~240MB/day, so a
+    re-read per poll — or per minute — is the blocking-call-in-the-render-loop
+    shape the dashboard was split in two to avoid."""
+    p = tmp_path / "rtds-20260824.jsonl"
+    p.write_text('{"a": 1}\n{"a": 2}\n')
+    tail = wf.CorpusTail(tmp_path, "rtds-*.jsonl", seed_bytes=1 << 20)
+    assert tail.read_new() == ['{"a": 1}', '{"a": 2}']
+    assert tail.read_new() == []                       # nothing appended
+    with p.open("a") as fh:
+        fh.write('{"a": 3}\n')
+    assert tail.read_new() == ['{"a": 3}']             # ...and only the new one
+
+
+def test_a_record_still_being_written_is_left_for_the_next_poll(tmp_path):
+    p = tmp_path / "rtds-20260824.jsonl"
+    p.write_text('{"a": 1}\n{"a": 2')                  # torn mid-write append
+    tail = wf.CorpusTail(tmp_path, "rtds-*.jsonl")
+    assert tail.read_new() == ['{"a": 1}']
+    with p.open("a") as fh:
+        fh.write('}\n')
+    assert tail.read_new() == ['{"a": 2}']             # completed, then served
+
+
+def test_the_first_sight_of_a_corpus_seeds_from_its_tail_not_its_head(tmp_path):
+    """A day's file opened mid-run holds hours of history no chart plots.
+    Reading it from byte 0 is the whole-corpus read this class refuses."""
+    p = tmp_path / "rtds-20260824.jsonl"
+    p.write_text("".join(f'{{"i": {i}}}\n' for i in range(2000)))
+    tail = wf.CorpusTail(tmp_path, "rtds-*.jsonl", seed_bytes=64)
+    lines = tail.read_new()
+    assert len(lines) < 20 and lines[-1] == '{"i": 1999}'
+    assert all(ln.startswith("{") for ln in lines)     # never half a record
+
+
+def test_a_day_rollover_is_read_from_the_start(tmp_path):
+    """The new file opens empty, so every byte of it is new — seeding from its
+    tail would skip the day's first minutes."""
+    (tmp_path / "rtds-20260824.jsonl").write_text('{"a": 1}\n')
+    tail = wf.CorpusTail(tmp_path, "rtds-*.jsonl", seed_bytes=1 << 20)
+    tail.read_new()
+    (tmp_path / "rtds-20260825.jsonl").write_text('{"a": 2}\n{"a": 3}\n')
+    assert tail.read_new() == ['{"a": 2}', '{"a": 3}']
+
+
+def test_a_truncated_corpus_starts_over_rather_than_seeking_past_the_end(tmp_path):
+    p = tmp_path / "rtds-20260824.jsonl"
+    p.write_text('{"a": 1}\n{"a": 2}\n')
+    tail = wf.CorpusTail(tmp_path, "rtds-*.jsonl")
+    tail.read_new()
+    p.write_text('{"a": 9}\n')                          # rotated under us
+    assert tail.read_new() == ['{"a": 9}']
+
+
+def test_a_stalled_worker_skips_forward_instead_of_parsing_the_backlog(tmp_path):
+    """A suspended laptop must not answer by parsing an hour of corpus on one
+    tick — it jumps to the recent end, which is the only part any chart plots."""
+    p = tmp_path / "rtds-20260824.jsonl"
+    p.write_text('{"a": 0}\n')
+    tail = wf.CorpusTail(tmp_path, "rtds-*.jsonl", max_chunk=64)
+    tail.read_new()
+    with p.open("a") as fh:
+        fh.write("".join(f'{{"i": {i}}}\n' for i in range(500)))
+    lines = tail.read_new()
+    assert 0 < len(lines) < 20 and lines[-1] == '{"i": 499}'
+
+
+def test_a_missing_corpus_directory_is_no_samples_and_no_traceback():
+    tail = wf.CorpusTail("/nonexistent/corpus", "rtds-*.jsonl")
+    assert tail.read_new() == []
+
+
+# -- the tails, joined into per-symbol paths --
+
+def _rtds_line(topic, sym, ts, value):
+    return json.dumps({"t_recv": ts, "topic": topic, "symbol": f"{sym}/usd",
+                       "ts": int(ts * 1000), "value": value,
+                       "full_accuracy_value": None,
+                       "window_s": 60 if "sixty" in topic else None})
+
+
+def _feed_tail(tmp_path):
+    (tmp_path / "rtds").mkdir(exist_ok=True)
+    (tmp_path / "spot").mkdir(exist_ok=True)
+    return wf.FeedTail(rtds_dir=tmp_path / "rtds", spot_dir=tmp_path / "spot")
+
+
+def test_the_feed_tail_banks_the_strike_the_arm_was_priced_against(tmp_path):
+    """The tailed mark and polymarket.rtds_read.twap_marks must key a window's
+    strike identically, or the chart's zero line is not the one the engine
+    gated on. Same corpus, both readers, one answer."""
+    from polymarket import rtds, rtds_read
+
+    minute = 1_787_500_020 // 60 * 60 + 60             # a clean minute boundary
+    rows = [_rtds_line(rtds.TOPIC_TWAP60, "btc", minute + 0.4, 77_000.0),
+            _rtds_line(rtds.TOPIC_TWAP60, "btc", minute + 31.0, 77_999.0)]
+    (tmp_path / "rtds").mkdir(exist_ok=True)
+    (tmp_path / "rtds" / "rtds-20260824.jsonl").write_text("\n".join(rows) + "\n")
+
+    tailed = _feed_tail(tmp_path).poll(now=minute + 60)["marks"]["btc"]
+    read_back = rtds_read.twap_marks("btc/usd", 0.0, directory=tmp_path / "rtds")
+    assert tailed == read_back == {float(minute - 60): 77_000.0}
+    # ...and that IS the key polymarket.crypto._model_twap reads a window's
+    # reference at.
+    assert wc.target_of(tailed, float(minute)) == 77_000.0
+
+
+def test_the_chainlink_path_is_on_the_settlement_clock(tmp_path):
+    """`ts`, never `t_recv`: every boundary these markets settle on is defined
+    on the chainlink clock, and our receive clock is the lookahead the corpus
+    format exists to keep out."""
+    from polymarket import rtds
+
+    (tmp_path / "rtds").mkdir(exist_ok=True)
+    (tmp_path / "rtds" / "rtds-20260824.jsonl").write_text(
+        json.dumps({"t_recv": 9_999.0, "topic": rtds.TOPIC_SPOT,
+                    "symbol": "btc/usd", "ts": 1_787_500_000_000,
+                    "value": 77_000.0, "window_s": None}) + "\n")
+    chain = _feed_tail(tmp_path).poll(now=1_787_500_001.0)["chain"]
+    assert chain["btc"] == [(1_787_500_000.0, 77_000.0)]
+
+
+def test_the_spot_path_is_on_the_venues_clock(tmp_path):
+    """t_exch, for the same reason: a null there silently re-creates the
+    ~1.7s lookahead that made the lead read backwards (polymarket/spot.py)."""
+    now = 1_787_500_000.0
+    (tmp_path / "spot").mkdir(exist_ok=True)
+    (tmp_path / "spot" / "spot-binance-20260824.jsonl").write_text("\n".join([
+        json.dumps({"t_recv": now, "venue": "binance", "ev": "start"}),
+        json.dumps({"t_recv": now + 5, "t_exch": now, "venue": "binance",
+                    "sym": "btc", "kind": "trade", "px": 77_000.0}),
+    ]) + "\n")
+    snap = _feed_tail(tmp_path).poll(now=now + 1)
+    assert snap["spot"]["btc"] == [(now, 77_000.0)]     # the venue's clock
+    assert snap["venue"]["btc"] == "binance"
+
+
+def test_a_torn_corpus_line_never_reaches_a_chart(tmp_path, monkeypatch):
+    """Belt with a mark. A write that finished badly loses its sample for
+    good, so it is noted — but it may not take the poll, or the dashboard,
+    down with it."""
+    from polymarket import errlog, rtds
+
+    noted = []
+    monkeypatch.setattr(errlog, "note",
+                        lambda site, exc, **kw: noted.append(site))
+    (tmp_path / "rtds").mkdir(exist_ok=True)
+    (tmp_path / "rtds" / "rtds-20260824.jsonl").write_text(
+        '{"ts": 1787500000000, "topic": "x"\n'          # never closed
+        + _rtds_line(rtds.TOPIC_SPOT, "btc", 1_787_500_001.0, 77_000.0) + "\n")
+    snap = _feed_tail(tmp_path).poll(now=1_787_500_002.0)
+    assert snap["chain"]["btc"] == [(1_787_500_001.0, 77_000.0)]
+    assert any("rtds_line" in s for s in noted)
+
+
+def test_samples_older_than_the_widest_axis_are_dropped(tmp_path):
+    from polymarket import rtds
+
+    now = 1_787_500_000.0
+    (tmp_path / "rtds").mkdir(exist_ok=True)
+    (tmp_path / "rtds" / "rtds-20260824.jsonl").write_text("\n".join(
+        _rtds_line(rtds.TOPIC_SPOT, "btc", now - age, 77_000.0)
+        for age in (10_000, 100, 1)) + "\n")
+    chain = _feed_tail(tmp_path).poll(now=now)["chain"]
+    assert [t for t, _ in chain["btc"]] == [now - 100, now - 1]
+
+
+def test_the_feeds_fetch_touches_no_network(monkeypatch, tmp_path):
+    state, f = _fetcher(monkeypatch)
+    monkeypatch.setattr(cw, "_engine_post", _raiser(AssertionError("engine touched")))
+    monkeypatch.setattr(cw, "_engine_get", _raiser(AssertionError("engine touched")))
+    monkeypatch.setattr(cw, "_api", _raiser(AssertionError("api touched")))
+    monkeypatch.setattr(cw, "_tape_scoreboard", _raiser(AssertionError("wallet walked")))
+    f.feed_tail = _feed_tail(tmp_path)
+    f.fetch_feeds()
+    assert state.read()["feeds"]["chain"] == {}        # a cold corpus, not a crash
+
+
+def test_a_failed_feeds_poll_keeps_the_last_snapshot(monkeypatch, tmp_path):
+    """The charts freeze rather than blank, which is the honest read: those
+    prices DID print, they just stopped arriving — and every feed row carries
+    its window's own countdown, so a frozen panel beside a running clock says
+    so."""
+    from polymarket import rtds
+
+    now = 1_787_500_000.0
+    (tmp_path / "rtds").mkdir(exist_ok=True)
+    (tmp_path / "rtds" / "rtds-20260824.jsonl").write_text(
+        _rtds_line(rtds.TOPIC_SPOT, "btc", now - 1, 77_000.0) + "\n")
+    state, f = _fetcher(monkeypatch)
+    f.feed_tail = _feed_tail(tmp_path)
+    f.fetch_feeds()
+    good = state.read()["feeds"]
+    f.feed_tail = None                                  # the poll now raises
+    f.tick(1e12)
+    assert state.read()["feeds"] is good
+
+
+def test_the_backfill_reads_the_corpus_once_per_window_not_once_per_tick(
+        monkeypatch, tmp_path):
+    """A window whose opening print predates the dashboard needs ONE bounded
+    reverse read. Rediscovering "the recorder was down then" every two seconds
+    is the corpus re-read this module exists to refuse."""
+    reads = []
+    monkeypatch.setattr(wf.rtds_read, "twap_marks",
+                        lambda sym, since, **kw: reads.append(sym) or {})
+    tail = _feed_tail(tmp_path)
+    now = 1_787_500_000.0
+    slug = f"btc-updown-5m-{int(now - 120)}"
+    for _ in range(5):
+        tail.poll([slug], now=now)
+    assert reads == ["btc/usd"]
+    tail.poll([slug], now=now + wf.BACKFILL_RETRY_S + 1)
+    assert len(reads) == 2                              # throttled, not abandoned
+
+
+def test_a_backfilled_strike_is_never_re_read(monkeypatch, tmp_path):
+    reads = []
+    start = 1_787_500_000
+    monkeypatch.setattr(wf.rtds_read, "twap_marks",
+                        lambda sym, since, **kw: reads.append(sym) or
+                        {float(start - 60): 77_000.0})
+    tail = _feed_tail(tmp_path)
+    slug = f"btc-updown-5m-{start}"
+    for _ in range(3):
+        snap = tail.poll([slug], now=start + 300 + wf.BACKFILL_RETRY_S * 3)
+    assert reads == ["btc/usd"]
+    assert wc.target_of(snap["marks"]["btc"], float(start)) == 77_000.0
+
+
+def test_a_backfill_that_raises_leaves_the_panel_without_a_strike(
+        monkeypatch, tmp_path):
+    from polymarket import errlog
+
+    noted = []
+    monkeypatch.setattr(errlog, "note", lambda site, exc, **kw: noted.append(site))
+    monkeypatch.setattr(wf.rtds_read, "twap_marks",
+                        _raiser(OSError("corpus unreadable")))
+    now = 1_787_500_000.0
+    snap = _feed_tail(tmp_path).poll([f"btc-updown-5m-{int(now)}"], now=now)
+    assert snap["marks"] == {}
+    assert any("backfill" in s for s in noted)
+
+
+def test_every_top_level_module_the_dashboard_imports_ships_with_the_package():
+    """pyproject's `py-modules` list is not a formality.
+
+    A top-level module missing from it imports perfectly from the source tree
+    and ImportErrors the moment the package is INSTALLED — which is what `pmt
+    crypto watch` did the first time the charts row landed, with a traceback
+    the alternate screen never even got the chance to paint over. Tests import
+    from the tree, so nothing else in this file can catch it.
+    """
+    import pathlib
+    import tomllib
+
+    root = pathlib.Path(cw.__file__).parent
+    listed = set(tomllib.loads((root / "pyproject.toml").read_text())
+                 ["tool"]["setuptools"]["py-modules"])
+    loaded = {name for name, mod in sys.modules.items()
+              if "." not in name and getattr(mod, "__file__", None)
+              and pathlib.Path(mod.__file__).parent == root}
+    assert loaded <= listed, sorted(loaded - listed)

@@ -50,6 +50,7 @@ pilot2 = ["vectors/*.json"]
 # this list imports fine from the source tree and ImportErrors once installed.
 py-modules = [
     "cli", "cli_common", "cli_sports", "engine", "stats_render", "watch_ui",
+    "watch_charts", "watch_feeds",
     "cli_crypto", "cli_crypto_arm", "cli_crypto_data", "cli_crypto_fixture",
     "cli_crypto_stats", "cli_crypto_watch",
 ]
