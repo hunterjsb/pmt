@@ -3,9 +3,9 @@
 Two engines under one operator must never share a series: their orders sit on
 the same book under the same beneficial owner, so one can match the other's
 quote, which is wash-trade shaped no matter what either intended
-(CLAUDE.md, "Series partition"). The desktop engine owns the majors; the EU
-engine owns `bnb-updown-5m`. This pilot is a THIRD participant and gets a
-disjoint slice or it gets nothing.
+(CLAUDE.md, "Series partition"). The desktop engine owns the majors and
+`bnb-updown-5m` (home since 2026-08-24; the EU box is retired). This pilot is
+another participant and gets a disjoint slice or it gets nothing.
 
 The refusal is loud and fatal by design. `PMENGINE_SERIES_ALLOWLIST` is an
 allowlist with no deny form and unset means unpartitioned; the failure mode
@@ -32,8 +32,8 @@ SHADOW_SERIES: tuple[str, ...] = (
 )
 
 # Live default. Non-engine series: doge and hype have ZERO book coverage in the
-# fleet's tape (nobody ever subscribed) and bnb-15m is a duration the EU box
-# does not run. calibrated_model.md §5 measures the model at Brier 0.1413 /
+# fleet's tape (nobody ever subscribed) and bnb-15m is a duration no engine
+# runs (the desktop claims exactly bnb-updown-5m). calibrated_model.md §5 measures the model at Brier 0.1413 /
 # 0.1442 on doge/hype against the incumbent's 0.1780 / 0.2016 — the model is
 # not competing with a market there, it is the only estimator in the room.
 DEFAULT_LIVE_SERIES: tuple[str, ...] = (
