@@ -15,7 +15,14 @@ the render loop seeks, and — when that file isn't this box's, because
 PMENGINE_CONTROL_URL points down an SSM tunnel — the engine's `GET /tape` on
 the worker.
 
-Pairs with watch_ui.py, which owns every render function this uses.
+The charts row is two more views of data already on the worker: the P&L lines
+come off the SAME scoreboard the header prints (plus one `_tape_scoreboard`
+walk per peer wallet, same function, another account), and the feed lines come
+off watch_feeds' incremental tails of the rtds/spot corpora. Neither adds a
+call to the render path.
+
+Pairs with watch_ui.py, which owns every render function this uses, and
+watch_charts.py, which owns the chart math and the two chart panels.
 """
 
 from __future__ import annotations
@@ -31,15 +38,17 @@ import tty
 
 import click
 
+import watch_charts
 import watch_ui
 from cli_common import _api, _parse_since
 from cli_crypto_stats import _tape_scoreboard
 from engine import fetch as _engine_get
 from engine import post as _engine_post
 from polymarket import errlog, positions, regime, tape, wallet
+from watch_feeds import FeedTail
 from watch_ui import (
-    _SB_EMPTY, build_header_panel, build_help_modal, build_windows_table,
-    header_height, tape_title, window_rows, windows_title,
+    _SB_EMPTY, PANEL_CHROME_W, build_header_panel, build_help_modal,
+    build_windows_table, header_height, tape_title, window_rows, windows_title,
 )
 
 
@@ -135,6 +144,14 @@ BAL_EVERY_S = 60.0
 # a local JSONL is already far faster than the quantity moves, and it is the
 # one worker source that touches no network at all.
 REGIME_EVERY_S = 60.0
+# A peer engine's wallet: one full walk of ANOTHER account per tick, and the
+# chart it feeds has a 24h axis. 60s is already ~1400 points of resolution on
+# that axis and keeps the fleet to one extra data-api walk a minute.
+PEERS_EVERY_S = 60.0
+# Incremental tails of the rtds/spot corpora — bytes appended since the last
+# poll, never a re-read. Matched to the engine cadence because the feed charts
+# are the only panel whose subject moves every second.
+FEEDS_EVERY_S = 2.0
 TAPE_EVERY_S = 2.0        # remote-tape poll — see TapeFeed; free while local is fresh
 # A local tape whose newest record is older than this is not being written by
 # an engine on THIS box. 30s because the fleet evaluates on a 5s throttle, so a
@@ -161,14 +178,26 @@ WINDOWS_MAX_ROWS = 16
 WINDOWS_CHROME = 6        # panel border (2) + table border/header/rule (4)
 MIN_TAPE_ROWS = 6         # the tape never gets squeezed below this for a window row
 HEAD_MIN_H = 5            # header border + the four rows it always paints
-# What a Panel costs the renderable inside it: two border columns plus its one
-# space of padding either side. The windows table picks its column set from the
-# room it will actually get, not from the console width.
-PANEL_CHROME_W = 4
+
+
+def charts_rows_shown(console_h: int, head_h: int, want_h: int) -> int:
+    """Terminal rows the charts row may claim, or 0.
+
+    Charts are the FIRST thing to go on a short screen, and they go WHOLE. The
+    windows table's floor of one row and the tape's MIN_TAPE_ROWS are both
+    load-bearing — one says where the fleet's money is and the other is the
+    only live event feed — where a chart is context. A half-height chart panel
+    is worse than none: braille loses its vertical resolution first, so the
+    line would still be drawn and would still be read, just wrongly.
+    """
+    if want_h <= 0:
+        return 0
+    room = console_h - head_h - MIN_TAPE_ROWS - WINDOWS_CHROME - 1
+    return want_h if room >= want_h else 0
 
 
 def windows_rows_shown(console_h: int, n_rows: int,
-                       head_h: int = HEAD_MIN_H) -> int:
+                       head_h: int = HEAD_MIN_H, charts_h: int = 0) -> int:
     """Window rows this screen can hold: what there is, capped, and never so
     many that the tape stops being readable.
 
@@ -180,9 +209,10 @@ def windows_rows_shown(console_h: int, n_rows: int,
     `head_h` is the header panel's live height (watch_ui.header_height): it
     grows a row for the settlement feed, for an unreachable engine and for a
     render error, and the tape is what pays for that, never the windows
-    panel's floor of one row.
+    panel's floor of one row. `charts_h` is what the charts row took (0 when
+    it was dropped) and is spent the same way.
     """
-    room = console_h - head_h - MIN_TAPE_ROWS - WINDOWS_CHROME
+    room = console_h - head_h - charts_h - MIN_TAPE_ROWS - WINDOWS_CHROME
     return max(1, min(WINDOWS_MAX_ROWS, n_rows, room))
 
 
@@ -218,12 +248,17 @@ class WatchState:
     """
 
     _FIELDS = ("status", "bal", "sb", "sb_stale", "sb_fetched_at", "err",
-               "odds", "regime")
+               "odds", "regime", "peers", "feeds", "node")
 
     def __init__(self, sb: dict | None = None) -> None:
         self._lock = threading.Lock()
         self._d: dict = {
             "status": {}, "bal": {},
+            # Other engines' graded ledgers, keyed by label; and the recorder
+            # corpora's recent price paths. Both absent until their first poll
+            # lands, and both panels are built to drop rather than zero-fill —
+            # a box with no peer wallet configured never grows either key.
+            "peers": {}, "feeds": {},
             # The regime gauge's newest corpus row, or None on a box that has
             # never run `pmt crypto regime`. None IS the cold-start value the
             # header row is built to drop — never a zeroed dict.
@@ -407,15 +442,21 @@ class WatchFetcher:
     """
 
     def __init__(self, state: WatchState, sliding_floor: float,
-                 tape_feed: TapeFeed | None = None) -> None:
+                 tape_feed: TapeFeed | None = None,
+                 feed_tail: FeedTail | None = None) -> None:
         self.state = state
         self.sliding_floor = sliding_floor
         # The tape is the one source that publishes somewhere other than
         # WatchState: it's a queue the renderer consumes exactly once, not a
         # value it re-reads every frame. See TapeFeed.
         self.tape_feed = TapeFeed() if tape_feed is None else tape_feed
+        # The corpus tails, by contrast, publish whole snapshots like every
+        # other source — they are a picture of the last two minutes, not a
+        # queue of events, so a missed frame costs nothing.
+        self.feed_tail = FeedTail() if feed_tail is None else feed_tail
         self._due: dict[str, float] = {"status": 0.0, "sb": 0.0, "bal": 0.0,
-                                       "odds": 0.0, "tape": 0.0, "regime": 0.0}
+                                       "odds": 0.0, "tape": 0.0, "regime": 0.0,
+                                       "peers": 0.0, "feeds": 0.0}
 
     # -- individual fetches: each may raise; tick() belts them --
 
@@ -449,6 +490,53 @@ class WatchFetcher:
         # cursor keeps it to what's new and the engine caps it at 500 records.
         # On the desktop this returns without making a request at all.
         self.tape_feed.poll()
+
+    def fetch_peers(self) -> None:
+        """Every OTHER engine's wallet, graded through the SAME function.
+
+        `_tape_scoreboard` with an address — not a second walk, not a lighter
+        one: the peer's P&L line on the charts row is scored by the same
+        wallet-first grader `pmt crypto stats` runs, or the two engines' rows
+        would be two different definitions of a win sitting one above the other.
+
+        Two things are deliberately different for a peer. The floor is the
+        chart's own 24h axis rather than all time — that keeps the walk inside
+        wallet.IMMUTABLE_AFTER_S, which is what stops this box's activity dump
+        from being spliced onto another account's rows. And the tape slice is
+        EMPTY: fire records are this engine's own account of what it did, and
+        under the series partition they have nothing to say about a window the
+        other box traded.
+
+        Belted per peer, inside the belt tick() already puts around this: one
+        unreachable wallet must not blank the other engine's line.
+        """
+        peers = wallet.peer_wallets()
+        if not peers:
+            return
+        floor = time.time() - watch_charts.PNL_WINDOW_S
+        books = dict(self.state.read().get("peers") or {})
+        for label, addr in peers:
+            try:
+                sb = _tape_scoreboard(floor, addr=addr, tape_records=[])
+            except (Exception, SystemExit) as e:
+                errlog.note("watch.fetch_peers", e, peer=label)
+                # Only on a peer we have NEVER read: `windows: None` is the
+                # "cannot see this ledger" the chart drops the row for, and it
+                # must not overwrite a book that did land earlier.
+                books.setdefault(label, {"windows": None})
+                continue
+            books[label] = {"windows": sb.get("eff_windows") or [],
+                            "net": sb.get("net", 0.0)}
+        self.state.update(peers=books)
+
+    def fetch_feeds(self) -> None:
+        # Local files, read forward from a remembered offset — the bytes the
+        # recorders appended since the last poll and nothing else. It rides the
+        # worker for the same reason the regime gauge does: the render loop is
+        # allowed ZERO I/O it can be blocked on, and this one follows a corpus
+        # that grows ~240MB a day.
+        arms = (self.state.read().get("status") or {}).get("arms") or {}
+        self.state.update(feeds=self.feed_tail.poll(list(arms)))
 
     def fetch_regime(self) -> None:
         # A tail read of ~/.pmt/corpus/regime.jsonl and nothing else. It rides
@@ -486,6 +574,19 @@ class WatchFetcher:
         # and its `old` age label already says how much to trust it.
         pass
 
+    def _peers_failed(self, exc: BaseException) -> None:
+        # Keep the last good peer books. A 24h P&L curve is a slow-moving fact
+        # and a minute-old one is still the best answer available; the per-peer
+        # belt above is what decides which line goes missing.
+        pass
+
+    def _feeds_failed(self, exc: BaseException) -> None:
+        # Keep the last snapshot. The charts then freeze rather than blank,
+        # which is the honest read: those prices DID print, they just stopped
+        # arriving — and every feed row carries the window's own countdown, so
+        # a frozen panel beside a running clock says so.
+        pass
+
     def _tape_failed(self, exc: BaseException) -> None:
         # Keep the records already on the panel and the cursor that got them.
         # A tape is a log: what it showed a second ago is still true, and the
@@ -501,6 +602,8 @@ class WatchFetcher:
             ("bal", BAL_EVERY_S, self.fetch_bal, self._bal_failed),
             ("tape", TAPE_EVERY_S, self.fetch_tape, self._tape_failed),
             ("regime", REGIME_EVERY_S, self.fetch_regime, self._regime_failed),
+            ("feeds", FEEDS_EVERY_S, self.fetch_feeds, self._feeds_failed),
+            ("peers", PEERS_EVERY_S, self.fetch_peers, self._peers_failed),
         ):
             if now < self._due[name]:
                 continue
@@ -541,8 +644,14 @@ class WatchFetcher:
                    "last 6h — a live dashboard cares about the recent pulse). "
                    "All-time P&L, and the riding/windows-table figures, "
                    "always walk the full wallet history regardless of this.")
-def crypto_watch(since: float | None) -> None:
-    """Full-screen live dashboard: risk header + the windows table + streaming tape."""
+@click.option("--charts/--no-charts", default=True,
+              help="The charts row (per-engine P&L over 24h, and each armed "
+                   "symbol's underlying against its window's strike). It "
+                   "already drops itself on a screen too short to hold it "
+                   "without squeezing the tape; --no-charts gives those rows "
+                   "back on a screen that can.")
+def crypto_watch(since: float | None, charts: bool) -> None:
+    """Full-screen live dashboard: risk header + charts + the windows table + streaming tape."""
     import time as _t
     from collections import deque
     from datetime import datetime, timezone
@@ -584,6 +693,9 @@ def crypto_watch(since: float | None) -> None:
     # snapshot, so the first paint is immediate (data age "—" until the first
     # wallet walk lands). See docs/LESSONS.md#L28.
     state = WatchState()
+    # The label the P&L chart calls this box, resolved once: it is a fact about
+    # the environment, not something a worker fetches.
+    state.update(node=wallet.node_label())
     stop = threading.Event()
     fetcher = WatchFetcher(state, floor, tape_feed=tape_feed)
     worker = threading.Thread(target=fetcher.loop, args=(stop,),
@@ -619,13 +731,19 @@ def crypto_watch(since: float | None) -> None:
         body.no_wrap, body.overflow = True, "ellipsis"
         return Panel(body, title=tape_title(tape_feed.remote), border_style="dim")
 
-    # Three slots, one of them a table: header, the windows table, the tape.
+    # Four slots, still exactly ONE table: header, the charts row, the windows
+    # table, the tape. The charts row holds two panels of plain text — braille
+    # lines, not a grid — so the "one table" rule the windows panel is built on
+    # is untouched, and the row sizes itself to nothing whenever it has neither
+    # a second engine's ledger nor an armed symbol to draw.
     layout = Layout()
     layout.split_column(
         Layout(name="head", size=HEAD_MIN_H),
+        Layout(name="charts", size=0, visible=False),
         Layout(name="windows", size=WINDOWS_MAX_ROWS + WINDOWS_CHROME),
         Layout(name="tape", ratio=1),
     )
+    layout["charts"].split_row(Layout(name="pnl"), Layout(name="feeds"))
 
     show_help = False
     next_render = 0.0
@@ -672,16 +790,33 @@ def crypto_watch(since: float | None) -> None:
                     # that says what broke.
                     layout["head"].size = header_height(
                         snap, render_err, live.console.size.width)
+                    # The charts row is sized to what it has to say and then
+                    # to what the screen can spare — in that order, so a box
+                    # with nothing to chart never costs the tape a row.
+                    inner = (watch_charts.charts_inner_height(
+                        snap, live.console.size.width, now) if charts else 0)
+                    charts_h = charts_rows_shown(
+                        live.console.size.height, layout["head"].size,
+                        inner + watch_charts.CHARTS_CHROME if inner else 0)
+                    layout["charts"].size = charts_h
+                    layout["charts"].visible = charts_h > 0
                     n_win = windows_rows_shown(
                         live.console.size.height,
                         len(window_rows(snap["sb"], snap["status"].get("arms"))),
-                        layout["head"].size)
+                        layout["head"].size, charts_h)
                     layout["windows"].size = n_win + WINDOWS_CHROME
                     layout["head"].update(header())
+                    if charts_h:
+                        left, right = watch_charts.split_widths(
+                            live.console.size.width)
+                        layout["pnl"].update(
+                            watch_charts.build_pnl_panel(snap, left, now))
+                        layout["feeds"].update(
+                            watch_charts.build_feeds_panel(snap, right, now))
                     layout["windows"].update(
                         windows_panel(n_win, live.console.size.width))
                     h = (live.console.size.height - layout["head"].size
-                         - layout["windows"].size)
+                         - charts_h - layout["windows"].size)
                     layout["tape"].update(tape_panel(h))
                     render_err = None
                 except KeyboardInterrupt:

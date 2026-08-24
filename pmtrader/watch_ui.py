@@ -44,6 +44,12 @@ _SAFETY_STRONG = 0.3  # display cue only; mirrors the deployed theta (docs/LESSO
 
 _DASH = "[dim]—[/dim]"  # what a cell with nothing honest to say prints
 
+# What a Panel costs the renderable inside it: two border columns plus its one
+# space of padding either side. Every panel body that sizes itself (the windows
+# table's column set, a chart's cell count) subtracts this from the slot width
+# rather than guessing, so none of them can drift from the others.
+PANEL_CHROME_W = 4
+
 
 def _side_safety(sides: list[dict]) -> tuple[float | None, float | None]:
     """(up, down) safety values from an eval's `sides` list."""
@@ -1702,8 +1708,8 @@ WATCH_KEYS = (
 )
 
 # Keep in sync with cli_crypto_watch's cadence constants.
-_REFRESH_LINE = ("tape 1s (remote 2s) · engine 2s · stats 10s · odds 30s · "
-                 "balance 60s · regime 60s")
+_REFRESH_LINE = ("tape 1s (remote 2s) · engine 2s · feeds 2s · stats 10s · "
+                 "odds 30s · balance 60s · regime 60s · peer P&L 60s")
 
 _HELP_MODAL_W = 78  # readable prose width; clamped to the terminal by the caller
 
@@ -1728,6 +1734,18 @@ _MODAL_LEGEND = (
                "the dog side is live. It GATES NOTHING. Absent until "
                "`pmt crypto regime` has run; `old` means the outcomes corpus "
                "stopped, not that the market did[/dim]"),
+    ("P&L", "[dim]cumulative wallet-graded P&L over the last 24h, one line "
+            "per engine — this box, every wallet in PMT_FLEET_WALLETS, and "
+            "their sum. Riding windows are NOT in it: an undecided position "
+            "is not P&L. An engine whose ledger we cannot reach has no line "
+            "at all, rather than a flat one[/dim]"),
+    ("feeds", "[dim]each armed window's underlying over the last 2 minutes "
+              "against that window's own settlement strike — the strike is "
+              "always on the chart, so the line's distance from it IS the "
+              "margin, and the colour is whether the side we hold is the side "
+              "it is on. Under it, the settlement stream and a spot venue over "
+              "the same 30s at the same scale: the horizontal offset between "
+              "them is the lead the makers trade on[/dim]"),
     ("refresh", f"[dim]{_REFRESH_LINE}[/dim]"),
     ("--since", "[dim]moves the header's `recent` floor only (default 6h) — "
                 "all-time, riding and the windows table always walk the full "
