@@ -38,7 +38,8 @@ use crate::strategies::updown::{
     Action, ArmParams, ArmState, ArmView, DecideOut, TopOfBook, FEED_RTDS,
 };
 use crate::strategies::updown_model::{
-    eval_model, lag1_autocorr, shape_klines, FeedState, GateReason, Kline, ModelEval, Tunables,
+    eval_model, lag1_autocorr, shape_klines, FeedState, GateReason, GuardShape, Kline, ModelEval,
+    Tunables,
     BINANCE_DATA, EV_EVAL, EV_FIRE, EV_GATED, KLINE_LOOKBACK_S,
 };
 use crate::strategies::updown_rtds;
@@ -95,7 +96,30 @@ pub fn run(opts: ReplayOpts) -> Result<(), String> {
 
 /// Replay-only policy override, deserialized separately since Tunables
 /// itself has no serde impl (live arms never take it from JSON).
+///
+/// **Every absent field falls back to `Tunables::default()`, NOT to
+/// `Tunables::law(dur_s)`.** So the mere PRESENCE of a `tunables` object
+/// drops the window off the production law — at 15m it reverts
+/// `decided_k` 1.25 → 1.0, and at 5m it reverts `latch_release_on_proof`
+/// true → false. That is long-standing behaviour and one committed fixture
+/// (`btc-updown-15m-1787449500`, the pre-brake reproduction) depends on it,
+/// so it is documented rather than fixed here.
+///
+/// The consequence for any A/B: **legs must emit the COMPLETE block,
+/// baseline included**, carrying the law's values explicitly. A leg that
+/// sends only its own knob is not being compared against the live engine,
+/// it is being compared against `Tunables::default()`.
+///
+/// `deny_unknown_fields` because the failure it prevents is not a crash but
+/// a FINDING: a leg whose knob name is misspelled deserializes to the
+/// defaults, replays the baseline, and reports a delta of exactly zero —
+/// which reads as "the knob does nothing" rather than "the config was
+/// wrong". The A/B harness caught two such legs by their bit-identity to
+/// the baseline and had to warn about it in prose; this makes it an error
+/// at parse time instead. Same reasoning as `guard_shape_from`'s refusal to
+/// fall back to `flat`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TunablesOverride {
     #[serde(default = "default_distrust_net")]
     distrust_net: f64,
@@ -111,6 +135,21 @@ struct TunablesOverride {
     late_terminal_agree: bool,
     #[serde(default = "default_latch_release_on_proof")]
     latch_release_on_proof: bool,
+    #[serde(default = "default_disagreement_veto_c")]
+    disagreement_veto_c: f64,
+    #[serde(default = "default_disagreement_veto_late_only")]
+    disagreement_veto_late_only: bool,
+    #[serde(default = "default_decided_early_frac")]
+    decided_early_frac: f64,
+    #[serde(default = "default_decided_early_k")]
+    decided_early_k: f64,
+    /// `"flat"` (the live default) / `"sqrt_floor"` / `"linear_floor"` /
+    /// `"quadrature"`. A name outside that set is a hard error, never a
+    /// silent fallback to flat — a typo in a leg's config that quietly
+    /// replayed the baseline would report "no effect" and look like a
+    /// finding.
+    #[serde(default = "default_guard_shape")]
+    guard_shape: String,
 }
 fn default_distrust_net() -> f64 {
     Tunables::default().distrust_net
@@ -133,9 +172,43 @@ fn default_late_terminal_agree() -> bool {
 fn default_latch_release_on_proof() -> bool {
     Tunables::default().latch_release_on_proof
 }
-impl From<TunablesOverride> for Tunables {
-    fn from(t: TunablesOverride) -> Self {
-        Tunables {
+fn default_disagreement_veto_c() -> f64 {
+    Tunables::default().disagreement_veto_c
+}
+fn default_disagreement_veto_late_only() -> bool {
+    Tunables::default().disagreement_veto_late_only
+}
+fn default_decided_early_frac() -> f64 {
+    Tunables::default().decided_early_frac
+}
+fn default_decided_early_k() -> f64 {
+    Tunables::default().decided_early_k
+}
+fn default_guard_shape() -> String {
+    "flat".to_string()
+}
+
+/// The `guard_shape` JSON contract. Unknown names are refused rather than
+/// defaulted: a leg whose shape silently fell back to `flat` would replay
+/// the baseline and report a Δ of exactly zero, which reads as "the knob
+/// does nothing" instead of "the config was wrong".
+fn guard_shape_from(name: &str) -> Result<GuardShape, String> {
+    match name {
+        "flat" => Ok(GuardShape::Flat),
+        "sqrt_floor" => Ok(GuardShape::SqrtFloor),
+        "linear_floor" => Ok(GuardShape::LinearFloor),
+        "quadrature" => Ok(GuardShape::Quadrature),
+        other => Err(format!(
+            "unknown guard_shape '{}' — expected flat, sqrt_floor, linear_floor or quadrature",
+            other
+        )),
+    }
+}
+
+impl TryFrom<TunablesOverride> for Tunables {
+    type Error = String;
+    fn try_from(t: TunablesOverride) -> Result<Self, String> {
+        Ok(Tunables {
             distrust_net: t.distrust_net,
             avg_down_tol: t.avg_down_tol,
             decided_k: t.decided_k,
@@ -143,7 +216,12 @@ impl From<TunablesOverride> for Tunables {
             late_clip_mult: t.late_clip_mult,
             late_terminal_agree: t.late_terminal_agree,
             latch_release_on_proof: t.latch_release_on_proof,
-        }
+            disagreement_veto_c: t.disagreement_veto_c,
+            disagreement_veto_late_only: t.disagreement_veto_late_only,
+            decided_early_frac: t.decided_early_frac,
+            decided_early_k: t.decided_early_k,
+            guard_shape: guard_shape_from(&t.guard_shape)?,
+        })
     }
 }
 
@@ -160,7 +238,7 @@ struct ParamsFileEntry {
 pub(crate) fn params_from_value(v: &Value) -> Result<(ArmParams, Option<Tunables>), String> {
     let e: ParamsFileEntry =
         serde_json::from_value(v.clone()).map_err(|e| format!("parse params: {}", e))?;
-    let tun = e.tunables.map(Tunables::from);
+    let tun = e.tunables.map(Tunables::try_from).transpose()?;
     Ok((e.p, tun))
 }
 
@@ -169,13 +247,17 @@ fn load_params_map(path: Option<&Path>) -> Result<HashMap<String, (ArmParams, Op
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let entries: Vec<ParamsFileEntry> =
         serde_json::from_str(&text).map_err(|e| format!("parse {}: {}", path.display(), e))?;
-    Ok(entries
+    entries
         .into_iter()
         .map(|e| {
-            let tun = e.tunables.map(Tunables::from);
-            (e.p.slug.clone(), (e.p, tun))
+            let tun = e
+                .tunables
+                .map(Tunables::try_from)
+                .transpose()
+                .map_err(|err| format!("{}: {}", e.p.slug, err))?;
+            Ok((e.p.slug.clone(), (e.p, tun)))
         })
-        .collect())
+        .collect()
 }
 
 /// Minimal params from a bare slug — last resort for evals-mode ad-hoc
@@ -579,33 +661,60 @@ pub(crate) fn replay_evals_window_traced(
 /// copies of this parse would let the two drivers judge different engines.
 fn model_from_eval_record(rec: &Value, p_up: f64, p: &ArmParams, tun: &Tunables) -> ModelEval {
     // Evals mode replays the recorded decidedness as-is — it is the flag the
-    // live engine actually acted on. `decided_k` may only SUBTRACT from it,
-    // and only where the record carries the two numbers to judge by. The
-    // `> 1.0` guard is what makes the default provably inert: at k = 1.0 the
-    // recomputation would just be the record's own inequality, and on tape
-    // written before banked_bp/cushion_bp shipped it would read 0 > 0 and
-    // wrongly un-decide the window.
+    // live engine actually acted on. The decidedness knobs may only SUBTRACT
+    // from it, and only where the record carries the two numbers to judge by.
+    //
+    // The `k_eff > 1.0` guard is what makes the defaults provably inert: at
+    // k = 1.0 the recomputation would just be the record's own inequality,
+    // and on tape written before banked_bp/cushion_bp shipped it would read
+    // 0 > 0 and wrongly un-decide the window. `decided_early_frac` routes
+    // through the SAME guard rather than adding a second one — the early
+    // knob raises k only on early ticks, so on a late tick `k_eff` collapses
+    // to `decided_k` and the recomputation is correctly skipped.
+    //
+    // `elapsed_frac` is rebuilt from the record's own `t` against the arm's
+    // window rather than read from a tape field: `elapsed_frac` is written
+    // on `fire` records, not on `eval` records, so there is nothing to read.
+    let now = rec["t"].as_f64().unwrap_or(p.start);
+    let elapsed_frac = (now - p.start) / (p.end - p.start).max(1.0);
+    let sig_bp = rec["sig_bp"].as_f64().unwrap_or(0.0);
+    let banked_bp = rec.get("banked_bp").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let recorded_cushion = rec.get("cushion_bp").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    // Tape written before the dynamic guard shipped has no "guard_bp" field
+    // — fall back to the arm's static param, matching what the engine
+    // actually enforced back then.
+    let guard_bp = rec.get("guard_bp").and_then(|v| v.as_f64()).unwrap_or(p.basis_guard_bp);
+
+    let reshaped = reshape_recorded_cushion(tun, rec, p, now, sig_bp, recorded_cushion);
+    let cushion_bp = reshaped.unwrap_or(recorded_cushion);
+
     let mut banked_decided = rec["banked_decided"].as_bool().unwrap_or(false);
-    if banked_decided && tun.decided_k > 1.0 {
+    if reshaped.is_some() {
+        // The cushion itself moved, so the recorded flag is an answer to a
+        // different inequality and cannot be trusted in EITHER direction —
+        // a narrower cushion can newly decide a window as easily as a wider
+        // one can un-decide it. Recompute outright. Safe because the
+        // reshape only returns `Some` where the record carried every number
+        // the live formula uses, so this is the live inequality on live
+        // inputs, not a reconstruction of one.
+        banked_decided = tun.decided(banked_bp, cushion_bp, p_up, elapsed_frac);
+    } else if banked_decided && tun.decided_k_at(elapsed_frac) > 1.0 {
         if let (Some(b), Some(c)) = (
             rec.get("banked_bp").and_then(|v| v.as_f64()),
             rec.get("cushion_bp").and_then(|v| v.as_f64()),
         ) {
-            banked_decided = tun.decided(b, c, p_up);
+            banked_decided = tun.decided(b, c, p_up, elapsed_frac);
         }
     }
     ModelEval {
         p_up,
-        sig_bp: rec["sig_bp"].as_f64().unwrap_or(0.0),
+        sig_bp,
         rho: rec["rho"].as_f64().unwrap_or(0.0),
         banked_decided,
         margin_bp: rec.get("margin_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        banked_margin_bp: rec.get("banked_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        cushion_bp: rec.get("cushion_bp").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        // Tape written before the dynamic guard shipped has no "guard_bp"
-        // field — fall back to the arm's static param, matching what the
-        // engine actually enforced back then.
-        guard_bp: rec.get("guard_bp").and_then(|v| v.as_f64()).unwrap_or(p.basis_guard_bp),
+        banked_margin_bp: banked_bp,
+        cushion_bp,
+        guard_bp,
         flip_proof: false,
         // Absent on every tape written before `term_bp` shipped, and on
         // every Binance arm forever. `None` is the honest reconstruction
@@ -614,6 +723,74 @@ fn model_from_eval_record(rec: &Value, p_up: f64, p: &ArmParams, tun: &Tunables)
         // knob's A/B belongs in `--mode full`, which recomputes the read.
         term_bp: rec.get("term_bp").and_then(|v| v.as_f64()),
     }
+}
+
+/// Re-shape a RECORDED cushion under a non-`Flat` `guard_shape`, or `None`
+/// when this tick cannot be re-shaped honestly.
+///
+/// Evals mode has no feed, so a cushion cannot be recomputed from scratch —
+/// but the live `range_avg` form inverts exactly, with no assumption about
+/// feed gaps or banked-minute counts:
+///
+/// ```text
+///   vol   = cushion - guard
+///   denom = sig * sqrt(max(rem/60, 0.02) / 3)
+///   rw    = vol / denom            (= rem / window)
+///   window = rem / rw
+/// ```
+///
+/// which is `analysis/cushion_calibration.md` §0's recovery, measured there
+/// to reproduce the taped `cushion_bp` bit-exactly on 90.6% of ticks (the
+/// 9.4% residual is feed gaps, concentrated in rtds arms). Every one of the
+/// conditions below is a refusal to guess on the other 9.4%:
+///
+///   * `Flat` — nothing to do, and the caller keeps today's subtract-only
+///     decidedness path rather than a full recomputation.
+///   * a settle_rule other than `range_avg`, or a `close_open` arm — the
+///     recorded cushion came from `terminal_lock` (or is identically zero)
+///     and this algebra does not describe it. `GuardShape` deliberately
+///     does not reach those cushions in full mode either, so refusing here
+///     keeps the two conventions answering the same question.
+///   * **no explicit `guard_bp` on the record** — the static-param fallback
+///     is right for reading a cushion the engine already computed and wrong
+///     for taking one apart, because `vol = cushion - guard` with the wrong
+///     guard yields a `vol` that never existed.
+///   * a `rw` outside `(0, 1]` — the inversion did not close, so the record
+///     is one of the feed-gap ticks.
+///
+/// A refusal leaves the recorded cushion standing, i.e. that tick replays
+/// FLAT. The bias is therefore always toward the baseline: an evals-mode
+/// leg understates its own knob by whatever share of ticks refuse, and the
+/// report has to carry that share.
+fn reshape_recorded_cushion(
+    tun: &Tunables,
+    rec: &Value,
+    p: &ArmParams,
+    now: f64,
+    sig_bp: f64,
+    recorded_cushion: f64,
+) -> Option<f64> {
+    if tun.guard_shape == GuardShape::Flat {
+        return None;
+    }
+    if p.kind == "close_open" || (p.settle_rule != "range_avg" && !p.settle_rule.is_empty()) {
+        return None;
+    }
+    let guard_bp = rec.get("guard_bp").and_then(|v| v.as_f64())?;
+    let rem = p.end - now;
+    if rem <= 0.0 || sig_bp <= 0.0 {
+        return None;
+    }
+    let vol_bp = recorded_cushion - guard_bp;
+    let denom = sig_bp * ((rem / 60.0).max(0.02) / 3.0).sqrt();
+    if vol_bp <= 0.0 || denom <= 0.0 {
+        return None;
+    }
+    let rw = vol_bp / denom;
+    if !(1e-6 < rw && rw <= 1.000_001) {
+        return None;
+    }
+    Some(tun.guard_shape.cushion_bp(guard_bp, vol_bp, rem, rem / rw.min(1.0)))
 }
 
 /// Rebuild a `GateReason` from a recorded `gated` tape line.
