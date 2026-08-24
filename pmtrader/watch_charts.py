@@ -109,110 +109,75 @@ def sparkline(cols: list[float | None], width: int,
     return braille_rows(cols, width, 1, lo, hi)[0]
 
 
-# ---------- candle canvas ----------
+# ---------- the echo correlator ----------
 #
-# Half-block resolution: `height` terminal rows give 2*height vertical levels,
-# one candle per character cell. Bodies are blocks, wicks are the thin bar,
-# and each candle carries its own up/down colour — which is the point of a
-# candle over a line: one cell says open, close, range and direction at once.
+# Three clocks price one underlying: the exchange spot tape, the chainlink
+# stream the window settles on, and the market's own odds. The vault's
+# opponent model says the first leads the second by ~3s and the makers price
+# off the first — so the odds should carry a time-shifted ECHO of the spot
+# tape, and the lag that maximises delta-correlation is that echo measured.
 
-def candle_cols(points: list[tuple[float, float]], n: int,
-                floor: float, ceiling: float
-                ) -> list[tuple[float, float, float, float] | None]:
-    """`n` (open, high, low, close) tuples from (t, v) samples on the
-    half-open [floor, ceiling) axis — None where no sample landed, and
-    deliberately NOT carried forward: an empty candle is a gap in the corpus,
-    and painting yesterday's close there would invent a print."""
-    n = max(int(n), 1)
-    out: list[list[float] | None] = [None] * n
-    span = ceiling - floor
-    if span <= 0:
-        return out
+def resample_1s(points: list[tuple[float, float]], floor: float,
+                ceiling: float) -> list[float | None]:
+    """Last sample per 1-second bin, NOT carried forward — the correlator
+    works in deltas, and a carried sample would manufacture zero-deltas that
+    dilute r toward nothing exactly when a feed goes quiet."""
+    n = max(int(ceiling - floor), 1)
+    out: list[float | None] = [None] * n
     for t, v in points:
-        if t < floor or t >= ceiling:
-            continue
-        i = min(n - 1, max(0, int((t - floor) / span * n)))
-        v = float(v)
-        c = out[i]
-        if c is None:
-            out[i] = [v, v, v, v]
-        else:
-            c[1] = max(c[1], v)
-            c[2] = min(c[2], v)
-            c[3] = v
-    return [tuple(c) if c else None for c in out]
+        if floor <= t < ceiling:
+            out[int(t - floor)] = float(v)
+    return out
 
 
-def _candle_bounds(candles, lo: float | None, hi: float | None
-                   ) -> tuple[float, float]:
-    flat: list[float | None] = []
-    for c in candles:
-        if c:
-            flat.extend((c[1], c[2]))
-    return series_bounds(flat, lo, hi)
+def _deltas(grid: list[float | None]) -> list[float | None]:
+    prev = None
+    out: list[float | None] = []
+    for v in grid:
+        out.append(v - prev if (v is not None and prev is not None) else None)
+        if v is not None:
+            prev = v
+    return out
 
 
-def candle_rows(candles, width: int, height: int,
-                lo: float | None = None, hi: float | None = None) -> list[str]:
-    """`height` Rich-markup strings of `width` cells, one candle per cell.
+ECHO_WINDOW_S = 180.0    # the correlator's axis
+ECHO_MAX_LAG_S = 8       # |lag| searched, seconds — the echo we hunt is ~1-4s
+ECHO_MIN_N = 30          # overlapping delta pairs below this say nothing
 
-    Each terminal row is two half-cells: a body covering both paints █, one
-    half ▀/▄, and a row the wick alone passes through paints │. Green when the
-    candle closed at or above its open, red below — adjacent same-colour cells
-    share one markup span so a row is a handful of tags, not one per cell.
+
+def echo_lag(a: list[tuple[float, float]], b: list[tuple[float, float]],
+             floor: float, ceiling: float
+             ) -> tuple[int, float, int] | None:
+    """(lag_s, r, n) at the |r|-maximising shift, or None below ECHO_MIN_N.
+
+    Positive lag means A LEADS B: A's move at t correlates with B's move at
+    t+lag. Pearson on 1s DELTAS, not levels — two random walks correlate on
+    levels by construction, and the standing basis between venues cancels in
+    differences (the same reason the spot-pred spec is delta-form only).
     """
-    width = max(int(width), 1)
-    height = max(int(height), 1)
-    halves = 2 * height
-    lo, hi = _candle_bounds(candles, lo, hi)
-    span = hi - lo
-
-    def hrow(v: float) -> int:
-        return max(0, min(halves - 1, int(round((hi - v) / span * (halves - 1)))))
-
-    cells = [[(None, " ")] * width for _ in range(height)]
-    for i in range(width):
-        c = candles[i] if i < len(candles) else None
-        if c is None:
-            continue
-        o, h, l, close = c
-        style = "green" if close >= o else "red"
-        b_top, b_bot = hrow(max(o, close)), hrow(min(o, close))
-        w_top, w_bot = hrow(h), hrow(l)
-        for r in range(height):
-            top, bot = 2 * r, 2 * r + 1
-            t_body = b_top <= top <= b_bot
-            b_body = b_top <= bot <= b_bot
-            if t_body and b_body:
-                glyph = "█"
-            elif t_body:
-                glyph = "▀"
-            elif b_body:
-                glyph = "▄"
-            elif w_top <= top <= w_bot or w_top <= bot <= w_bot:
-                glyph = "│"
-            else:
+    da = _deltas(resample_1s(a, floor, ceiling))
+    db = _deltas(resample_1s(b, floor, ceiling))
+    best: tuple[int, float, int] | None = None
+    for lag in range(-ECHO_MAX_LAG_S, ECHO_MAX_LAG_S + 1):
+        xs, ys = [], []
+        for i, x in enumerate(da):
+            j = i + lag
+            if x is None or not 0 <= j < len(db) or db[j] is None:
                 continue
-            cells[r][i] = (style, glyph)
-
-    rows = []
-    for r in range(height):
-        parts, run_style, run = [], None, []
-
-        def flush():
-            if run:
-                text = "".join(run)
-                parts.append(f"[{run_style}]{text}[/{run_style}]"
-                             if run_style else text)
-
-        for style, glyph in cells[r]:
-            if style != run_style:
-                flush()
-                run_style, run = style, []
-            run.append(glyph)
-        flush()
-        rows.append("".join(parts))
-    return rows
+            xs.append(x)
+            ys.append(db[j])
+        n = len(xs)
+        if n < ECHO_MIN_N:
+            continue
+        mx, my = sum(xs) / n, sum(ys) / n
+        sxx = sum((x - mx) ** 2 for x in xs)
+        syy = sum((y - my) ** 2 for y in ys)
+        if sxx <= 0 or syy <= 0:
+            continue
+        r = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / (sxx * syy) ** 0.5
+        if best is None or abs(r) > abs(best[1]):
+            best = (lag, r, n)
+    return best
 
 
 # ---------- turning samples into columns ----------
@@ -329,17 +294,13 @@ def span_with_zero(cols: list[float | None], floor_span: float = 2.0
 
 # ---------- panel geometry ----------
 
-FEED_WINDOW_S = 120.0         # the compact line's axis (h=1 fallback)
-CANDLE_LOOKBACK_WINDOWS = 3.0  # a tall chart's axis, in window durations —
-#                                15min of candles behind a 5m window, so the
-#                                interval scales with what the arm trades and
-#                                every candle aggregates real OHLC instead of
-#                                the line's carried-forward last sample
-FOCUS_WINDOW_S = 30.0         # the rtds-vs-spot lead block: seconds, not minutes
-CHARTS_MAX_INNER = 6          # inner rows, compact: every chart one terminal row
-CHARTS_MAX_INNER_TALL = 14    # inner rows, tall: every chart two terminal
-#                               rows — sized so four 5m lanes + the "+N" note
-#                               + the lead block all seat (4*2 + 1 + 4 = 13)
+FEED_WINDOW_S = 120.0         # every sparkline's axis
+FOCUS_WINDOW_S = 30.0         # the rtds/spot/odds overlay: seconds, not minutes
+CHARTS_MAX_INNER = 6          # inner rows, compact: sparks + the stats rows
+CHARTS_MAX_INNER_TALL = 14    # inner rows, tall: each window gets a spark row
+#                               + an intent row — sized so four 5m lanes + the
+#                               "+N" note + the overlay/echo/latency block all
+#                               seat (4*2 + 1 + 5 = 14)
 CHARTS_CHROME = 2             # panel border, top and bottom
 _FEED_IDENT_W = 10            # "hype 15m ▲" — the side rides the identity cell
 _FEED_TAIL_W = 16             # "  -4.7bp   2:41"
@@ -434,16 +395,16 @@ def _feed_ident(w: dict, side: str | None) -> str:
 
 def feed_row(w: dict, feeds: dict, panel_w: int, now: float,
              h: int = 1) -> list[str] | None:
-    """One armed window: its underlying's recent path against the strike, as
-    `h` terminal rows (the chart spans all of them — at h=2 a braille line has
-    eight vertical levels instead of four, which is the difference between
-    "above or below" and an actual shape).
+    """One armed window: a compact sparkline of the underlying against the
+    strike, and (at h=2) an INTENT row under it — what the engine is doing
+    about this window right now: gate state, its own reason string, the
+    market's de-vigged P(up), and the money already committed.
 
-    The chart's axis always contains the strike (span_with_zero), so the line's
-    distance from that rail IS the margin the window settles on and its shape
-    is how the margin got there — the number beside it is the same figure to a
-    decimal. The side we took rides the identity glyph and the colour: green
-    while the underlying is on the side we bought, red while it is not.
+    The spark's axis always contains the strike (span_with_zero), so the
+    line's distance from that rail IS the margin the window settles on — the
+    number beside it is the same figure to a decimal. The side we took rides
+    the identity glyph and the colour: green while the underlying is on the
+    side we bought, red while it is not.
 
     None when this box's rtds corpus has nothing for the symbol: a price chart
     with no prices in it is a claim about the feed's health, and the header's
@@ -472,52 +433,65 @@ def feed_row(w: dict, feeds: dict, panel_w: int, now: float,
     style = _side_style(side, d_bp)
     delta = f"{d_bp:+.1f}bp" if d_bp is not None else "tgt —"
     ident = _feed_ident(w, side)
-    prefix = f"{watch_ui._stage_cell(w)} [dim]{ident:<{_FEED_IDENT_W}}[/dim] "
+    line = (f"[{style}]{sparkline(cols, chart_w, lo, hi)}[/{style}]"
+            if chart_w else "")
+    spark = (f"{watch_ui._stage_cell(w)} [dim]{ident:<{_FEED_IDENT_W}}[/dim] "
+             f"{line} [{style}]{delta:>9}[/{style}] "
+             f"{watch_ui._countdown_markup(slug, now)}")
     if h <= 1:
-        # Compact fallback: the 2-minute carried-forward line.
-        line = (f"[{style}]{sparkline(cols, chart_w, lo, hi)}[/{style}]"
-                if chart_w else "")
-        return [f"{prefix}{line} [{style}]{delta:>9}[/{style}] "
-                f"{watch_ui._countdown_markup(slug, now)}"]
-    # Tall form: real OHLC candles over a lookback that scales with the
-    # window, one candle per cell — each cell aggregates every print in its
-    # interval instead of the line's one carried sample.
-    dur = max(float(parsed["end"]) - float(parsed["start"]), 60.0)
-    c_floor = now - CANDLE_LOOKBACK_WINDOWS * dur
-    if target:
-        candles = candle_cols([(t, delta_bp(px, target)) for t, px in samples],
-                              max(chart_w, 1), c_floor, now)
-        c_lo, c_hi = span_with_zero(
-            [v for c in candles if c for v in (c[1], c[2])])
-    else:
-        candles = candle_cols(samples, max(chart_w, 1), c_floor, now)
-        c_lo = c_hi = None
-    chart = (candle_rows(candles, chart_w, h, c_lo, c_hi) if chart_w
-             else [""] * h)
-    candle_s = CANDLE_LOOKBACK_WINDOWS * dur / max(chart_w, 1)
-    per = (f"{candle_s:.0f}s/c" if candle_s < 60
-           else f"{candle_s / 60:.0f}m/c")
-    rows = [f"{prefix}{chart[0]} [{style}]{delta:>9}[/{style}] [dim]{per}[/dim]"]
-    # Continuation rows: the chart keeps its columns (the pad mirrors the
-    # stage-glyph + identity prefix exactly), the countdown lands on the last
-    # row where the eye ends the stroke.
+        return [spark]
+    return [spark, _intent_row(w, feeds, parsed["symbol"], panel_w)]
+
+
+def _intent_row(w: dict, feeds: dict, sym: str, panel_w: int) -> str:
+    """`state · the engine's own reason · mkt p(up) · $committed` — the
+    reason string verbatim because it already names the binding gate with its
+    numbers (that is what it is for), clipped to the panel rather than
+    paraphrased."""
+    e = w.get("eval") or {}
+    state = str(w.get("state") or e.get("state") or "armed")
+    odds = (feeds.get("odds") or {}).get(sym) or []
+    p_up = f"p(up) {odds[-1][1]:.2f}" if odds else "p(up) —"
+    committed = float(w.get("notional") or 0.0)
+    tail = f"[cyan]{p_up}[/cyan] [dim]· in ${committed:,.0f}[/dim]"
+    # 24 ≈ the tail's rendered width + separators; the reason gets the rest.
+    room = max((panel_w or 0) - watch_ui.PANEL_CHROME_W
+               - (_FEED_IDENT_W + 3) - len(state) - 24, 8)
+    reason = str(e.get("reason") or "").strip()[:room]
     pad = " " * (_FEED_IDENT_W + 3)
-    for line in chart[1:-1]:
-        rows.append(f"{pad}{line}")
-    rows.append(f"{pad}{chart[-1]} "
-                f"{'':>9} {watch_ui._countdown_markup(slug, now)}")
-    return rows
+    return (f"{pad}[bold dim]{state}[/bold dim] [dim]{reason}[/dim] {tail}"
+            if reason else f"{pad}[bold dim]{state}[/bold dim] {tail}")
+
+
+def _z_cols(cols: list[float | None]) -> list[float | None]:
+    """Deviation columns scaled to their own std, so series in different
+    units (dollars, probability) share one axis by SHAPE — which is all the
+    overlay compares."""
+    vals = [v for v in cols if v is not None]
+    if len(vals) < 2:
+        return cols
+    m = sum(vals) / len(vals)
+    sd = (sum((v - m) ** 2 for v in vals) / len(vals)) ** 0.5
+    if sd <= 0:
+        return cols
+    return [None if v is None else (v - m) / sd for v in cols]
 
 
 def focus_rows(w: dict | None, feeds: dict, panel_w: int, now: float,
                h: int = 1) -> list[str]:
-    """The settlement stream against a spot venue, one window, one axis.
+    """The echo triangle for the window closest to settling: rtds, the spot
+    venue and the market's own odds overlaid on one 30s axis, then the
+    cross-correlation and latency stats underneath.
 
-    This is the ~3s maker lead made visible rather than asserted: the two lines
-    are the same 30 seconds at the same scale, each centred on its own mean
-    (see deviation_cols), so a move reaching the spot line several dot columns
-    before it reaches the chainlink line IS the lead we are paying. Dropped
-    whole when either side is missing — half a comparison is not a comparison.
+    The overlay is the ~3s maker lead made visible; the echo row is the same
+    thing MEASURED — the delta-correlation-maximising lag for each pair over
+    the trailing 3 minutes, positive meaning the left series leads. The
+    latency row says how stale and how dense each of the three clocks is,
+    because a lag number read off a stale feed is a lie with a decimal point.
+
+    Overlay lines paint only at h>=2 (they are shape, and shape is what the
+    tall panel buys); the stats rows always try. Pairs below ECHO_MIN_N
+    overlapping deltas print nothing rather than a confident r off noise.
     """
     if w is None:
         return []
@@ -527,34 +501,69 @@ def focus_rows(w: dict | None, feeds: dict, panel_w: int, now: float,
     sym = parsed["symbol"]
     chain = (feeds.get("chain") or {}).get(sym) or []
     spot = (feeds.get("spot") or {}).get(sym) or []
-    if not chain or not spot:
-        return []
+    odds = (feeds.get("odds") or {}).get(sym) or []
     chart_w = _chart_width(panel_w, _FEED_IDENT_W + _FEED_TAIL_W + 3)
-    if not chart_w:
-        return []
+    venue = ((feeds.get("venue") or {}).get(sym) or "spot")[:7]
     floor = now - FOCUS_WINDOW_S
-    c_cols = deviation_cols(chain, chart_w, floor, now)
-    s_cols = deviation_cols(spot, chart_w, floor, now)
-    lo, hi = shared_span(c_cols, s_cols)
-    venue = (feeds.get("venue") or {}).get(sym) or "spot"
-    return (_focus_row("rtds", c_cols, chart_w, h, lo, hi, chain[-1][1],
-                       "cyan", "settles")
-            + _focus_row(venue[:7], s_cols, chart_w, h, lo, hi, spot[-1][1],
-                         "magenta", "leads"))
-
-
-def _focus_row(label: str, cols: list[float | None], chart_w: int, h: int,
-               lo: float, hi: float, last: float, style: str,
-               note: str) -> list[str]:
-    tail = f" [dim]{f'{_px(last)} {note}':>{_FEED_TAIL_W}}[/dim]"
-    chart = braille_rows(cols, chart_w, h, lo, hi)
-    rows = [f"[dim]{'  ' + label:<{_FEED_IDENT_W}}[/dim] "
-            f"[{style}]{chart[0]}[/{style}]"]
-    pad = " " * (_FEED_IDENT_W + 1)
-    for line in chart[1:]:
-        rows.append(f"{pad}[{style}]{line}[/{style}]")
-    rows[-1] += tail
+    rows: list[str] = []
+    if h >= 2 and chart_w and chain and spot:
+        series = [("rtds", chain, "cyan", "settles"),
+                  (venue, spot, "magenta", "leads")]
+        if odds:
+            series.append(("odds", odds, "yellow", "p(up)"))
+        cols = {label: _z_cols(deviation_cols(pts, chart_w, floor, now))
+                for label, pts, _s, _n in series}
+        lo, hi = shared_span(*cols.values())
+        for label, pts, style, note in series:
+            tail = f"{_px(pts[-1][1])} {note}"
+            rows.append(f"[dim]{'  ' + label:<{_FEED_IDENT_W}}[/dim] "
+                        f"[{style}]{sparkline(cols[label], chart_w, lo, hi)}"
+                        f"[/{style}] [dim]{tail:>{_FEED_TAIL_W}}[/dim]")
+    echo = _echo_row(chain, spot, odds, venue, now)
+    if echo:
+        rows.append(echo)
+    lat = _latency_row(chain, spot, odds, venue, now)
+    if lat:
+        rows.append(lat)
     return rows
+
+
+def _echo_row(chain, spot, odds, venue: str, now: float) -> str | None:
+    e_floor = now - ECHO_WINDOW_S
+    pairs = [(venue, "rtds", spot, chain),
+             (venue, "odds", spot, odds),
+             ("rtds", "odds", chain, odds)]
+    cells = []
+    for a_name, b_name, a, b in pairs:
+        if not a or not b:
+            continue
+        hit = echo_lag(a, b, e_floor, now)
+        if hit is None:
+            continue
+        lag, r, _n = hit
+        cells.append(f"{a_name}→{b_name} [bold]{lag:+d}s[/bold] r{r:+.2f}")
+    if not cells:
+        return None
+    return (f"[dim]{'  echo':<{_FEED_IDENT_W}}[/dim] " +
+            " [dim]·[/dim] ".join(cells) +
+            f" [dim]({ECHO_WINDOW_S:.0f}s deltas)[/dim]")
+
+
+def _latency_row(chain, spot, odds, venue: str, now: float) -> str | None:
+    def cell(label: str, pts) -> str | None:
+        if not pts:
+            return None
+        age = max(now - pts[-1][0], 0.0)
+        rate = sum(1 for t, _v in pts if t >= now - 60.0) / 60.0
+        style = "red" if age > 10.0 else "dim"
+        return (f"{label} [{style}]{age:.1f}s[/{style}] "
+                f"[dim]{rate:.1f}/s[/dim]")
+    cells = [c for c in (cell("rtds", chain), cell(venue, spot),
+                         cell("odds", odds)) if c]
+    if not cells:
+        return None
+    return (f"[dim]{'  lat':<{_FEED_IDENT_W}}[/dim] " +
+            "   ".join(cells) + " [dim]age · rate[/dim]")
 
 
 def feeds_rows(snap: dict, panel_w: int, now: float | None = None,

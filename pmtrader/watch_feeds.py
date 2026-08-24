@@ -25,30 +25,26 @@ import time
 from collections import deque
 from pathlib import Path
 
-from polymarket import errlog, rtds, rtds_read, spot
+from polymarket import errlog, rtds, rtds_read, spot, tape, updown_slugs
 
 # Seeds: enough tail to fill the charts' own axes on the first frame, and no
-# more. rtds appends ~6KB/s and the candle rows look back up to 45min
-# (KEEP_S), so the seed covers that once instead of waiting 45min of live
-# tailing to fill the first chart; the spot tape runs ~3x the rate and only
-# the 30s lead block reads it.
-RTDS_SEED_BYTES = 18 << 20
+# more. rtds appends ~6KB/s and the widest axis reading it is the echo
+# window (watch_charts ECHO_WINDOW_S); the spot tape runs ~3x that and only
+# the 30s lead block plus the echo read it; the book tape appends one row per
+# subscribed window every ~2s.
+RTDS_SEED_BYTES = 2 << 20
 SPOT_SEED_BYTES = 1 << 20
+BOOK_SEED_BYTES = 2 << 20
 # Per-poll ceiling. A dashboard whose worker stalled (a slow wallet walk, a
 # suspended laptop) must not answer by parsing the whole backlog on one tick —
 # it skips forward to the recent end, which is the only part any chart plots.
-# Sized ABOVE the seed or the first poll would skip most of it; the worst
-# case, a ~20MB parse, is a 1-2s worker tick the 60s wallet walk dwarfs.
-MAX_CHUNK_BYTES = 20 << 20
+MAX_CHUNK_BYTES = 4 << 20
 
-# How much history the ring buffers hold — per stream, because the widest
-# axis each feeds differs by an order of magnitude: the candle charts look
-# back 3 window durations (45min for a 15m window; watch_charts
-# CANDLE_LOOKBACK_WINDOWS), while the spot venues only ever feed the 30s lead
-# block and their tapes are ~17 prints/s/symbol — holding 45 minutes of THAT
-# would put ~50k tuples per symbol under the render thread's snapshot copy.
-KEEP_S = 2700.0
-SPOT_KEEP_S = 150.0
+# How much history the ring buffers hold — sized by the echo correlator's
+# axis, the widest thing any panel reads, with the spot tapes capped tighter
+# (~17 prints/s/symbol; the deques are copied under the render snapshot).
+KEEP_S = 300.0
+SPOT_KEEP_S = 300.0
 # Spot trade tapes run ~17 prints/s/symbol; a chart cell is worth far less
 # resolution than that, and the deques are read on the render thread.
 SPOT_MIN_GAP_S = 0.2
@@ -157,7 +153,7 @@ class FeedTail:
     is appending to — the same hand-off every other watch source uses.
     """
 
-    def __init__(self, rtds_dir=None, spot_dir=None, *,
+    def __init__(self, rtds_dir=None, spot_dir=None, book_dir=None, *,
                  keep_s: float = KEEP_S, venues=None) -> None:
         self._keep_s = keep_s
         self._rtds = CorpusTail(rtds.RTDS_DIR if rtds_dir is None else rtds_dir,
@@ -169,8 +165,15 @@ class FeedTail:
                           f"spot-{v}-*.jsonl", seed_bytes=SPOT_SEED_BYTES)
             for v in self._venues
         }
+        # The engine's own book tape — the third leg of the echo triangle.
+        # The market's odds are a PRICE series like the other two, just
+        # denominated in probability.
+        self._book = CorpusTail(tape.ENGINE_DIR if book_dir is None else book_dir,
+                                "book-tape*.jsonl", seed_bytes=BOOK_SEED_BYTES)
         self._chain: dict[str, deque] = {}
         self._spot: dict[tuple[str, str], deque] = {}
+        self._odds: dict[str, deque] = {}
+        self._odds_dur: dict[str, float] = {}
         self._marks: dict[str, dict[float, float]] = {}
         self._backfilled: dict[str, float] = {}
 
@@ -210,6 +213,47 @@ class FeedTail:
                 self._add_chain(sym, ts / 1000.0, px)
             elif topic == rtds.TOPIC_TWAP60:
                 self._bank_mark(sym, ts / 1000.0, px)
+
+    def _ingest_book(self, lines: list[str]) -> None:
+        """The engine's book rows -> a de-vigged P(up) series per symbol.
+
+        De-vigged (up mid over the sum of both mids) rather than the raw up
+        mid, so the series is the market's probability with the spread's
+        overround taken back out — the same normalisation the regime gauge
+        grades leaders with. The engine writes one row per SUBSCRIBED window;
+        two windows of one symbol (a 5m and a 15m) would interleave, so rows
+        keep the shortest-duration window per symbol — the lane the charts
+        care about, and the tightest book of the set.
+        """
+        for raw in lines:
+            try:
+                rec = json.loads(raw)
+            except ValueError as e:
+                errlog.note("watch_feeds.FeedTail.book_line", e, line=raw[:200])
+                continue
+            if not isinstance(rec, dict) or rec.get("ev") != "book":
+                continue
+            parsed = updown_slugs.parse_updown_slug(str(rec.get("slug") or ""))
+            if parsed is None:
+                continue
+            try:
+                up = (float(rec["up_bid"]) + float(rec["up_ask"])) / 2.0
+                dn = (float(rec["dn_bid"]) + float(rec["dn_ask"])) / 2.0
+                t = float(rec["t"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if up <= 0.0 or dn <= 0.0:
+                continue  # a one-sided or empty book has no opinion to de-vig
+            sym = parsed["symbol"]
+            dur = float(parsed["end"]) - float(parsed["start"])
+            last_dur = self._odds_dur.get(sym)
+            if last_dur is not None and dur > last_dur:
+                continue
+            d = self._odds.setdefault(sym, deque())
+            if last_dur is not None and dur < last_dur:
+                d.clear()
+            self._odds_dur[sym] = dur
+            d.append((t, up / (up + dn)))
 
     def _bank_mark(self, sym: str, ts: float, px: float) -> None:
         """One settlement TWAP print, keyed as rtds_read.twap_marks keys it —
@@ -293,13 +337,14 @@ class FeedTail:
         self._ingest_rtds(self._rtds.read_new())
         for venue, tail in self._spot_tails.items():
             self._ingest_spot(venue, tail.read_new())
+        self._ingest_book(self._book.read_new())
         self._backfill_marks(list(arm_slugs), now)
         self._trim(now)
         return self.snapshot(now)
 
     def _trim(self, now: float) -> None:
         floor = now - self._keep_s
-        for d in self._chain.values():
+        for d in list(self._chain.values()) + list(self._odds.values()):
             while d and d[0][0] < floor:
                 d.popleft()
         spot_floor = now - min(self._keep_s, SPOT_KEEP_S)
@@ -323,6 +368,7 @@ class FeedTail:
         syms = {s for _v, s in self._spot}
         venue = {s: v for s in sorted(syms) if (v := self._venue_for(s, now))}
         spot_px = {s: list(self._spot[(v, s)]) for s, v in venue.items()}
+        odds = {s: list(d) for s, d in self._odds.items() if d}
         marks = {s: dict(m) for s, m in self._marks.items() if m}
-        return {"chain": chain, "spot": spot_px, "venue": venue, "marks": marks,
-                "at": now}
+        return {"chain": chain, "spot": spot_px, "venue": venue, "odds": odds,
+                "marks": marks, "at": now}

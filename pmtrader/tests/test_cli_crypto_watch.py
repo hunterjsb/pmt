@@ -1559,12 +1559,17 @@ def test_the_feed_panel_never_paints_half_a_lead_comparison():
     assert any("more armed" in r for r in rows)
 
 
-def test_the_lead_block_drops_whole_when_a_venue_is_missing():
+def test_the_overlay_drops_whole_when_a_venue_is_missing():
+    """Half a comparison is not a comparison — no spot venue, no overlay and
+    no echo. The latency row stays: how stale the one clock we do have is
+    remains a fact worth a row."""
     now = 1_787_500_100.0
     feeds = {"chain": {"btc": [(now - 20, 100.0), (now - 1, 101.0)]},
-             "spot": {}, "venue": {}, "marks": {}}
-    rows = wc.feeds_rows(_armed_snap(now, feeds=feeds), 60, now)
-    assert rows and not any("rtds" in r for r in rows)
+             "spot": {}, "venue": {}, "odds": {}, "marks": {}}
+    rows = wc.feeds_rows(_armed_snap(now, feeds=feeds), 60, now, tall=True)
+    assert rows and not any("settles" in r for r in rows)
+    assert not any("echo" in r for r in rows)
+    assert any("lat" in r for r in rows)
 
 
 def test_the_two_lead_lines_share_one_scale_and_each_is_centred_on_itself():
@@ -1593,44 +1598,45 @@ def test_armed_windows_take_the_side_and_entry_from_the_wallet_not_the_arm():
     assert w["live"] is True and w["side"] == "down" and w["entry_px"] == 0.44
 
 
-def test_candles_aggregate_real_ohlc_and_a_gap_stays_empty():
-    """Each cell aggregates every print in its interval — the "more data per
-    point" the carried-forward line never had — and an empty interval stays
-    None rather than repeating yesterday's close as if it printed."""
-    floor = 0.0
-    pts = [(1.0, 10.0), (2.0, 14.0), (3.0, 8.0), (4.0, 12.0),  # candle 0
-           (14.0, 5.0)]                                        # candle 2
-    cols = wc.candle_cols(pts, 3, floor, 15.0)
-    assert cols[0] == (10.0, 14.0, 8.0, 12.0)                  # o, h, l, c
-    assert cols[1] is None
-    assert cols[2] == (5.0, 5.0, 5.0, 5.0)
+def test_the_echo_finds_a_planted_time_shift():
+    """A series that IS another series two seconds later must read as
+    'A leads B by +2s' with r near 1 — the maker lead, measured."""
+    now = 1_787_500_000.0
+    floor = now - 180.0
+    import math
+    a = [(floor + i, 100.0 + math.sin(i / 7.0) * 5.0) for i in range(175)]
+    b = [(t + 2.0, v) for t, v in a if t + 2.0 < now]
+    lag, r, n = wc.echo_lag(a, b, floor, now)
+    assert lag == 2 and r > 0.95 and n >= wc.ECHO_MIN_N
 
 
-def test_candle_rows_paint_body_wick_and_direction():
-    """An up candle is green, a down candle red, the body is blocks and a row
-    only the wick crosses is the thin bar (body wins a cell they share)."""
-    up = (4.0, 10.0, 0.0, 5.0)      # small mid body, wick to both rails
-    down = (5.0, 10.0, 0.0, 4.0)    # same shape, closed below its open
-    rows = wc.candle_rows([up, down], 2, 3, 0.0, 10.0)
-    assert len(rows) == 3
-    flat = "".join(rows)
-    assert "[green]" in flat and "[red]" in flat
-    assert "█" in rows[1]                                       # the body row
-    assert "│" in rows[0] and "│" in rows[2]                    # wick-only rows
+def test_the_echo_stays_silent_below_its_sample_floor():
+    """A confident r off thirty seconds of quiet tape is a lie with a decimal
+    point — below ECHO_MIN_N overlapping deltas the answer is None."""
+    now = 1_787_500_000.0
+    a = [(now - 20.0 + i, 100.0 + i) for i in range(10)]
+    assert wc.echo_lag(a, a, now - 180.0, now) is None
 
 
-def test_a_tall_feed_row_charts_candles_at_a_window_scaled_interval():
-    """The tall chart's axis is CANDLE_LOOKBACK_WINDOWS window durations, so
-    a 5m arm charts 15 minutes and says what one candle costs."""
+def test_resample_does_not_carry_samples_into_quiet_seconds():
+    """Carried samples manufacture zero-deltas that dilute r exactly when a
+    feed goes quiet — an empty second stays None."""
+    grid = wc.resample_1s([(0.5, 1.0), (3.5, 2.0)], 0.0, 5.0)
+    assert grid == [1.0, None, None, 2.0, None]
+
+
+def test_a_tall_feed_row_carries_the_engines_intent():
+    """Hunter's ask: show our intent. The second row is the gate state, the
+    engine's own reason string, the market's de-vigged odds and the money in."""
     now = 1_787_500_100.0
     start = int(now - 60)
-    feeds = {"chain": {"btc": [(now - 600, 77_000.0), (now - 599, 77_020.0),
-                               (now - 30, 77_010.0), (now - 1, 77_077.0)]},
-             "marks": {"btc": {start - 60: 77_000.0}}, "spot": {}, "venue": {}}
+    feeds = {"chain": {"btc": [(now - 30, 77_000.0), (now - 1, 77_077.0)]},
+             "marks": {"btc": {start - 60: 77_000.0}},
+             "odds": {"btc": [(now - 3, 0.57)]}, "spot": {}, "venue": {}}
     snap = _armed_snap(now, feeds=feeds, start=start, side="up", entry_px=0.62)
-    rows = wc.feed_row(wc.armed_windows(snap)[0], feeds, 60, now, h=2)
-    assert "/c" in rows[0]                       # the interval label
-    assert "[green]" in "".join(rows) or "[red]" in "".join(rows)
+    rows = wc.feed_row(wc.armed_windows(snap)[0], feeds, 80, now, h=2)
+    assert len(rows) == 2
+    assert "armed" in rows[1] and "p(up) 0.57" in rows[1] and "in $" in rows[1]
 
 
 def test_cared_windows_drop_idle_long_durations_but_never_a_stake():
@@ -1708,14 +1714,15 @@ def test_the_tall_panel_doubles_the_budget_not_the_window_count():
     snap = _armed_snap(now, syms=syms, start=start, feeds=feeds)
     rows = wc.feeds_rows(snap, 60, now, tall=True)
     assert len(rows) <= wc.CHARTS_MAX_INNER_TALL
-    assert sum(1 for r in rows if "rtds" in r) == 1
-    assert sum(1 for r in rows if "binance" in r) == 1
+    assert sum(1 for r in rows if "settles" in r) == 1   # the rtds overlay line
+    assert sum(1 for r in rows if "leads" in r) == 1     # the venue overlay line
+    assert any("lat" in r for r in rows)
     assert any("more armed" in r for r in rows)
-    # Never a clipped half-chart: every ident row is followed by its
-    # continuation row, and the whole panel stays inside its cap.
+    # Never a clipped half-pair: every spark row is followed by its intent
+    # row, and the whole panel stays inside its cap.
     tall_idents = sum(1 for r in rows if "5m" in r)
     assert tall_idents > 0
-    assert len(rows) == 2 * tall_idents + 1 + 4  # charts ×2 + note + lead block
+    assert len(rows) == 2 * tall_idents + 1 + 3  # pairs + note + overlay/lat
 
 
 # -- the corpus tails: appended bytes only, on the worker --
