@@ -80,6 +80,10 @@ pub struct Engine {
     /// Drained at the top of every tick — entries whose deadline has passed
     /// trigger a `cancel_order` call. Backs `pmt buy/sell --ttl`.
     pending_cancellations: Vec<(chrono::DateTime<chrono::Utc>, String)>,
+    /// Orders whose cancel the exchange could not answer, and when to ask
+    /// again. Keeps a transient failure from becoming a per-tick round trip
+    /// without letting a live order escape being cancelled.
+    cancel_backoff: CancelBackoff,
 }
 
 /// One quote the strategies want live this tick, carrying its Phase 7
@@ -92,6 +96,72 @@ struct Desired {
     price: Decimal,
     size: Decimal,
     decision_id: String,
+}
+
+/// First wait after a cancel the exchange could not answer.
+const CANCEL_RETRY_BASE: Duration = Duration::from_millis(500);
+
+/// Ceiling on the retry wait. The interval is bounded, not the attempt count:
+/// a transient refusal means the order may STILL BE RESTING, and an engine
+/// that gives up on cancelling a live order has left money on the book. So it
+/// keeps asking — every 30 s instead of every 50 ms, which is the whole
+/// difference between a retry and a storm.
+const CANCEL_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Bounded-backoff ledger for cancels the exchange refused for a reason that
+/// did not settle the order's fate.
+///
+/// Only TRANSIENT refusals land here. A terminal one is not a failure to
+/// retry — it is the cancel's answer, and the order leaves tracking instead
+/// (see `Engine::retire_order`).
+///
+/// The clock is injected on every call rather than read inside, so the retry
+/// schedule is testable without sleeping.
+#[derive(Default)]
+struct CancelBackoff {
+    /// order id -> (consecutive transient refusals, earliest next attempt)
+    entries: HashMap<String, (u32, std::time::Instant)>,
+}
+
+impl CancelBackoff {
+    /// May this order be sent to the CLOB right now?
+    ///
+    /// An order with no entry has never failed transiently, so it is always
+    /// ready — a fresh stale order is cancelled on the tick it goes stale,
+    /// with no added latency. That is the "live order still dies promptly"
+    /// half of the contract.
+    fn ready(&self, order_id: &str, now: std::time::Instant) -> bool {
+        match self.entries.get(order_id) {
+            Some((_, not_before)) => now >= *not_before,
+            None => true,
+        }
+    }
+
+    /// Record one transient refusal and schedule the next attempt. Returns
+    /// the wait, so a caller with its own deadline queue (the TTL drain) can
+    /// reschedule on the same curve.
+    fn record_failure(&mut self, order_id: &str, now: std::time::Instant) -> Duration {
+        let attempts = self.entries.get(order_id).map_or(0, |(n, _)| *n) + 1;
+        // Doubling from the base, capped. `attempts - 1` so the FIRST failure
+        // waits the base interval rather than twice it.
+        let delay = CANCEL_RETRY_BASE
+            .checked_mul(1u32 << attempts.saturating_sub(1).min(16))
+            .unwrap_or(CANCEL_RETRY_MAX)
+            .min(CANCEL_RETRY_MAX);
+        self.entries
+            .insert(order_id.to_string(), (attempts, now + delay));
+        delay
+    }
+
+    /// Forget an order — it was cancelled, retired, or otherwise settled.
+    fn clear(&mut self, order_id: &str) {
+        self.entries.remove(order_id);
+    }
+
+    /// Consecutive transient refusals recorded for this order.
+    fn attempts(&self, order_id: &str) -> u32 {
+        self.entries.get(order_id).map_or(0, |(n, _)| *n)
+    }
 }
 
 /// Half of one wire tick — 0.005 on a cent book, 0.0005 on a 0.001 one.
@@ -262,6 +332,7 @@ impl Engine {
             notifier: Arc::new(Notifier::from_env()),
             external_orders: HashMap::new(),
             pending_cancellations: Vec::new(),
+            cancel_backoff: CancelBackoff::default(),
         })
     }
 
@@ -1058,18 +1129,47 @@ impl Engine {
                         for (_, order_id) in due {
                             match self.client.cancel_order(&order_id).await {
                                 Ok(_) => {
-                                    self.external_orders.remove(&order_id);
-                                    self.risk_manager.release_order(&order_id);
+                                    self.retire_order(&order_id);
                                     tracing::info!(
                                         order_id = %order_id,
                                         "TTL cancel: order cancelled"
                                     );
                                 }
-                                Err(e) => tracing::warn!(
-                                    error = %e,
-                                    order_id = %order_id,
-                                    "TTL cancel: cancel failed (order may already be filled or cancelled)"
-                                ),
+                                // The TTL fired, the order was already gone:
+                                // the deadline got what it wanted. Release
+                                // the tracking the old code leaked — an
+                                // already-filled TTL order kept its exposure
+                                // reserved and stayed in `external_orders`
+                                // for the life of the process.
+                                Err(e) if crate::client::classify_cancel_refusal(&e.to_string())
+                                    == crate::client::CancelRefusal::Terminal =>
+                                {
+                                    self.retire_order(&order_id);
+                                    tracing::info!(
+                                        order_id = %order_id,
+                                        reason = %e,
+                                        "TTL cancel: order was already off the book — retired"
+                                    );
+                                }
+                                Err(e) => {
+                                    // Unanswered, so the order may still rest.
+                                    // Put the deadline back — a TTL that gave
+                                    // up on the first 502 left a live order on
+                                    // the book past the expiry the operator
+                                    // asked for.
+                                    let delay = self
+                                        .cancel_backoff
+                                        .record_failure(&order_id, std::time::Instant::now());
+                                    let retry_at = chrono::Utc::now()
+                                        + chrono::Duration::milliseconds(delay.as_millis() as i64);
+                                    self.pending_cancellations.push((retry_at, order_id.clone()));
+                                    tracing::warn!(
+                                        error = %e,
+                                        order_id = %order_id,
+                                        attempt = self.cancel_backoff.attempts(&order_id),
+                                        "TTL cancel failed — order may still be live, rescheduled"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1249,9 +1349,25 @@ impl Engine {
                                 match self.client.cancel_order(&order_id).await {
                                     Ok(_) => {
                                         tracing::info!(order_id = %order_id, "CancelOrder signal: cancelled");
-                                        self.risk_manager.release_order(&order_id);
+                                        self.retire_order(&order_id);
+                                    }
+                                    // Already gone. Retiring it here is what
+                                    // stops the delta matcher finding it in
+                                    // the active set next tick and cancelling
+                                    // it again, forever.
+                                    Err(e) if crate::client::classify_cancel_refusal(&e.to_string())
+                                        == crate::client::CancelRefusal::Terminal =>
+                                    {
+                                        tracing::info!(
+                                            order_id = %order_id,
+                                            reason = %e,
+                                            "CancelOrder signal: order was already off the book — retired"
+                                        );
+                                        self.retire_order(&order_id);
                                     }
                                     Err(e) => {
+                                        self.cancel_backoff
+                                            .record_failure(&order_id, std::time::Instant::now());
                                         tracing::warn!(error = %e, order_id = %order_id, "CancelOrder signal: cancel failed");
                                     }
                                 }
@@ -1367,6 +1483,22 @@ impl Engine {
                         }
                     }
 
+                    // Orders whose last cancel got a transient refusal are
+                    // held back until their backoff expires. Everything else
+                    // — every order the first time it goes stale — goes out
+                    // on this tick, so a live quote the strategy wants dead
+                    // still dies immediately.
+                    let now = std::time::Instant::now();
+                    let (ready, deferred): (Vec<String>, Vec<String>) = stale
+                        .into_iter()
+                        .partition(|id| self.cancel_backoff.ready(id, now));
+                    if !deferred.is_empty() {
+                        tracing::debug!(
+                            count = deferred.len(),
+                            "Stale cancels deferred by backoff (previous attempt failed transiently)"
+                        );
+                    }
+
                     // Retire the whole stale set in ONE request — a cancel per
                     // order was a full round trip each (~119ms to clob) inside
                     // the decision->ack window. The batch still completes
@@ -1375,23 +1507,57 @@ impl Engine {
                     // sell released while our own resting BUY is still live
                     // would cross it (see the order-path commit for the full
                     // pricing of this ordering).
-                    if !stale.is_empty() {
-                        let refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
+                    if !ready.is_empty() {
+                        let refs: Vec<&str> = ready.iter().map(|s| s.as_str()).collect();
                         match self.client.cancel_orders(&refs).await {
                             Ok(report) => {
                                 for id in &report.cancelled {
-                                    self.order_manager.mark_cancelled(id);
-                                    self.risk_manager.release_order(id);
+                                    self.retire_order(id);
                                 }
-                                // Refusals stay active locally on purpose — a
-                                // locally-cancelled order still on the book is
-                                // the ghost of docs/LESSONS.md#L6.
+                                // A refusal is not automatically a live order.
+                                // The engine used to treat every one as such
+                                // and re-issue next tick; because the CLOB's
+                                // commonest refusal — "already canceled or
+                                // matched" — can never change its answer,
+                                // that made one dead order a permanent 20 Hz
+                                // round trip. The 2026-08-24 00:09Z log has
+                                // 195 dead ids refused 16,028 times, and 4403
+                                // of 4525 batch cancels retired NOTHING.
+                                //
+                                // Fills are why they pile up: taker fills are
+                                // missed by `on_fill`, so a filled order sits
+                                // in the active set until something notices.
+                                // The cancel's own answer IS that notice.
                                 for (id, why) in &report.failed {
-                                    tracing::warn!(order_id = %id, reason = %why, "Stale order refused cancellation");
+                                    match crate::client::classify_cancel_refusal(why) {
+                                        crate::client::CancelRefusal::Terminal => {
+                                            tracing::info!(
+                                                order_id = %id,
+                                                reason = %why,
+                                                "Stale order was already off the book — retired, not re-attempted"
+                                            );
+                                            self.retire_order(id);
+                                        }
+                                        crate::client::CancelRefusal::Transient => {
+                                            self.cancel_backoff.record_failure(id, now);
+                                            tracing::warn!(
+                                                order_id = %id,
+                                                reason = %why,
+                                                attempt = self.cancel_backoff.attempts(id),
+                                                "Stale order refused cancellation — still live, retrying on backoff"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, count = stale.len(), "Batch cancel of stale orders failed");
+                                // Transport failure: nothing was cancelled and
+                                // nothing was answered. Every order in the
+                                // batch is still ours, on the same backoff.
+                                for id in &ready {
+                                    self.cancel_backoff.record_failure(id, now);
+                                }
+                                tracing::warn!(error = %e, count = ready.len(), "Batch cancel of stale orders failed");
                             }
                         }
                     }
@@ -1817,14 +1983,49 @@ impl Engine {
         combined
     }
 
+    /// Drop every trace of an order that is off the book for certain.
+    ///
+    /// THE cancel-storm invariant, in one place: an order the CLOB confirmed
+    /// cancelled, or refused with a terminal answer, is DONE. It leaves the
+    /// active set, releases its exposure, leaves the external map, drops any
+    /// TTL still scheduled for it and clears its retry entry — so nothing in
+    /// the engine can produce a second cancel for it.
+    ///
+    /// This is the opposite of the ghost `cancel_all` was fixed to avoid:
+    /// that bug marked a LIVE order dead locally. Here the exchange has just
+    /// told us the order does not exist, which is precisely the evidence that
+    /// was missing. Only call it on a confirmed cancel or a
+    /// `CancelRefusal::Terminal`.
+    fn retire_order(&mut self, order_id: &str) {
+        self.order_manager.mark_cancelled(order_id);
+        self.risk_manager.release_order(order_id);
+        self.external_orders.remove(order_id);
+        self.pending_cancellations.retain(|(_, id)| id != order_id);
+        self.cancel_backoff.clear(order_id);
+    }
+
     /// Cancel any order by id, engine-placed or external. Both cleanup calls
     /// are no-ops when the id isn't present on that side.
     async fn cancel_order_by_id(&mut self, order_id: &str) -> Result<(), String> {
         match self.client.cancel_order(order_id).await {
             Ok(_) => {
-                self.external_orders.remove(order_id);
-                self.risk_manager.release_order(order_id);
+                self.retire_order(order_id);
                 tracing::info!(order_id = %order_id, "CancelOrderById succeeded");
+                Ok(())
+            }
+            // An order the CLOB has never heard of is not a failed cancel —
+            // it is a cancel that had already happened. Reporting an error
+            // here made the CLI retry a request whose answer cannot change,
+            // which is the storm at human cadence.
+            Err(e) if crate::client::classify_cancel_refusal(&e.to_string())
+                == crate::client::CancelRefusal::Terminal =>
+            {
+                self.retire_order(order_id);
+                tracing::info!(
+                    order_id = %order_id,
+                    reason = %e,
+                    "CancelOrderById: order was already off the book — retired"
+                );
                 Ok(())
             }
             Err(e) => {
@@ -2165,6 +2366,245 @@ mod tests {
         assert!(!matches_standing(
             &want(dec!(0.975), size, Urgency::Low, true), TOK, true, dec!(0.98), size, dp,
         ));
+    }
+
+    // ---------------------------------------------------------------
+    // Cancel storm — the sweep must ask the CLOB about a dead order once.
+    // ---------------------------------------------------------------
+
+    use crate::client::{CancelRefusal, CancelReport, classify_cancel_refusal};
+    use std::collections::HashSet;
+    use std::time::Instant as StdInstant;
+
+    /// Polymarket's own words, off `~/.pmt/engine/engine-systemd.log`.
+    const ALREADY_GONE: &str = "order can't be found - already canceled or matched";
+
+    /// The CLOB's batch-cancel endpoint, counting every wire round trip.
+    ///
+    /// `calls` is the number the storm is measured in: the pre-fix engine
+    /// made 4525 of these in one instance and retired nothing in 4403 of them.
+    struct CountingClob {
+        /// Orders genuinely resting on the book.
+        live: HashSet<String>,
+        /// Orders this stub answers with an unanswerable failure instead.
+        flaky: HashSet<String>,
+        /// One per wire request.
+        calls: usize,
+        /// One per order named in a request.
+        refusals: usize,
+    }
+
+    impl CountingClob {
+        fn new(live: &[&str], flaky: &[&str]) -> Self {
+            Self {
+                live: live.iter().map(|s| s.to_string()).collect(),
+                flaky: flaky.iter().map(|s| s.to_string()).collect(),
+                calls: 0,
+                refusals: 0,
+            }
+        }
+
+        fn cancel_orders(&mut self, ids: &[String]) -> CancelReport {
+            self.calls += 1;
+            let mut report = CancelReport::default();
+            for id in ids {
+                if self.flaky.contains(id) {
+                    report.failed.insert(id.clone(), "502 Bad Gateway".to_string());
+                    self.refusals += 1;
+                } else if self.live.remove(id) {
+                    report.cancelled.push(id.clone());
+                } else {
+                    // Dead: cancelled earlier, or (the common case) filled by
+                    // a taker print `on_fill` never saw.
+                    report.failed.insert(id.clone(), ALREADY_GONE.to_string());
+                    self.refusals += 1;
+                }
+            }
+            report
+        }
+    }
+
+    /// The tick arm's stale sweep, driven off the same two primitives the
+    /// engine uses — `CancelBackoff` for who may go out, and
+    /// `classify_cancel_refusal` for what the answer meant.
+    struct Sweep {
+        /// The active set the delta matcher walks each tick. An order leaves
+        /// it only by being retired, which is the invariant under test.
+        tracked: Vec<String>,
+        backoff: CancelBackoff,
+        clob: CountingClob,
+    }
+
+    impl Sweep {
+        fn new(tracked: &[&str], clob: CountingClob) -> Self {
+            Self {
+                tracked: tracked.iter().map(|s| s.to_string()).collect(),
+                backoff: CancelBackoff::default(),
+                clob,
+            }
+        }
+
+        /// One 50 ms tick where every tracked order is stale.
+        fn tick(&mut self, now: StdInstant) {
+            let ready: Vec<String> = self
+                .tracked
+                .iter()
+                .filter(|id| self.backoff.ready(id, now))
+                .cloned()
+                .collect();
+            if ready.is_empty() {
+                return;
+            }
+            let report = self.clob.cancel_orders(&ready);
+            for id in &report.cancelled {
+                self.retire(id);
+            }
+            for (id, why) in &report.failed {
+                match classify_cancel_refusal(why) {
+                    CancelRefusal::Terminal => self.retire(id),
+                    CancelRefusal::Transient => {
+                        self.backoff.record_failure(id, now);
+                    }
+                }
+            }
+        }
+
+        fn retire(&mut self, order_id: &str) {
+            self.tracked.retain(|t| t != order_id);
+            self.backoff.clear(order_id);
+        }
+    }
+
+    #[test]
+    fn a_terminal_answer_retires_the_order_and_is_never_asked_twice() {
+        // THE invariant. One order, already off the book. The old engine
+        // logged "Stale order refused cancellation" and left it active, so
+        // the next tick asked again — 20 times a second, forever.
+        let mut sweep = Sweep::new(&["0xdead"], CountingClob::new(&[], &[]));
+        let t0 = StdInstant::now();
+        for tick in 0..600u64 {
+            sweep.tick(t0 + Duration::from_millis(50 * tick));
+        }
+        assert_eq!(sweep.clob.calls, 1, "one dead order, one round trip, ever");
+        assert_eq!(sweep.clob.refusals, 1);
+        assert!(sweep.tracked.is_empty(), "a terminal answer leaves tracking");
+    }
+
+    #[test]
+    fn the_0009z_log_shape_converges_to_zero_wire_calls() {
+        // The measured incident, replayed. 195 distinct order ids, every one
+        // answered "already canceled or matched", swept at 50 ms for the
+        // 30 s the window lasted. The log recorded 16,028 refusals across
+        // 4525 batch cancels; the sweep must spend exactly one.
+        let ids: Vec<String> = (0..195).map(|i| format!("0x{i:064x}")).collect();
+        let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let mut sweep = Sweep::new(&refs, CountingClob::new(&[], &[]));
+        let t0 = StdInstant::now();
+        for tick in 0..600u64 {
+            sweep.tick(t0 + Duration::from_millis(50 * tick));
+        }
+        assert_eq!(sweep.clob.calls, 1, "600 ticks, one batch — vs 4525 measured");
+        assert_eq!(
+            sweep.clob.refusals, 195,
+            "each dead id refused once — vs 16,028 measured",
+        );
+        assert!(sweep.tracked.is_empty());
+    }
+
+    #[test]
+    fn a_live_order_the_strategy_wants_dead_still_dies_on_the_first_tick() {
+        // The half of the contract the fix must not spend: no backoff, no
+        // deferral, no second tick. A stale live quote is cancelled the
+        // moment it goes stale.
+        let mut sweep = Sweep::new(&["0xlive"], CountingClob::new(&["0xlive"], &[]));
+        let t0 = StdInstant::now();
+        sweep.tick(t0);
+        assert_eq!(sweep.clob.calls, 1);
+        assert_eq!(sweep.clob.refusals, 0, "it was live — the CLOB confirmed the cancel");
+        assert!(sweep.tracked.is_empty());
+        assert!(sweep.clob.live.is_empty(), "and it is off the book");
+
+        // Nothing left to ask about.
+        for tick in 1..100u64 {
+            sweep.tick(t0 + Duration::from_millis(50 * tick));
+        }
+        assert_eq!(sweep.clob.calls, 1);
+    }
+
+    #[test]
+    fn a_transient_failure_retries_on_a_backoff_not_every_tick() {
+        // Unanswered means the order may still rest, so it stays tracked and
+        // is asked again — but on the curve, not at 20 Hz. Over the same
+        // 30 s window the storm spent 600 round trips in, this spends 6.
+        let mut sweep = Sweep::new(&["0xflaky"], CountingClob::new(&[], &["0xflaky"]));
+        let t0 = StdInstant::now();
+        for tick in 0..600u64 {
+            sweep.tick(t0 + Duration::from_millis(50 * tick));
+        }
+        assert!(
+            !sweep.tracked.is_empty(),
+            "an unanswered cancel must NOT drop a possibly-live order",
+        );
+        // Attempts land at 0, 0.5, 1.5, 3.5, 7.5 and 15.5 s — the next is at
+        // 31.5 s, past the window. Six round trips where the storm spent 600.
+        assert_eq!(sweep.clob.calls, 6, "bounded retries over 30 s");
+    }
+
+    #[test]
+    fn the_backoff_gate_opens_exactly_when_the_curve_says() {
+        let mut b = CancelBackoff::default();
+        let t0 = StdInstant::now();
+        assert!(b.ready("0x1", t0), "never failed — always ready");
+
+        assert_eq!(b.record_failure("0x1", t0), CANCEL_RETRY_BASE);
+        assert!(!b.ready("0x1", t0 + Duration::from_millis(499)));
+        assert!(b.ready("0x1", t0 + CANCEL_RETRY_BASE));
+
+        // Doubling.
+        let t1 = t0 + CANCEL_RETRY_BASE;
+        assert_eq!(b.record_failure("0x1", t1), Duration::from_secs(1));
+        assert!(!b.ready("0x1", t1 + Duration::from_millis(999)));
+        assert!(b.ready("0x1", t1 + Duration::from_secs(1)));
+
+        // Retiring the order forgets it.
+        b.clear("0x1");
+        assert_eq!(b.attempts("0x1"), 0);
+        assert!(b.ready("0x1", t1));
+    }
+
+    #[test]
+    fn the_backoff_is_bounded_and_never_overflows() {
+        // The interval is capped, the attempt count is not: an order that
+        // might still be resting has to keep being asked about. What must
+        // never happen is the shift overflowing into a panic or a zero wait.
+        let mut b = CancelBackoff::default();
+        let t0 = StdInstant::now();
+        let mut last = Duration::ZERO;
+        for _ in 0..200 {
+            let d = b.record_failure("0x1", t0);
+            assert!(d >= CANCEL_RETRY_BASE, "a retry always waits");
+            assert!(d <= CANCEL_RETRY_MAX, "and never longer than the ceiling");
+            assert!(d >= last, "monotonic up to the ceiling");
+            last = d;
+        }
+        assert_eq!(last, CANCEL_RETRY_MAX);
+        assert_eq!(b.attempts("0x1"), 200);
+    }
+
+    #[test]
+    fn a_dead_order_in_a_batch_of_live_ones_does_not_hold_the_others_back() {
+        // The 00:09Z batches were mixed: `requested=3 cancelled=1 refused=2`.
+        // Each order's fate is decided on its own answer.
+        let clob = CountingClob::new(&["0xlive"], &["0xflaky"]);
+        let mut sweep = Sweep::new(&["0xlive", "0xdead", "0xflaky"], clob);
+        let t0 = StdInstant::now();
+        sweep.tick(t0);
+        assert_eq!(sweep.tracked, vec!["0xflaky".to_string()], "only the unanswered one survives");
+        assert_eq!(sweep.clob.calls, 1);
+
+        // And the next tick asks about nothing — the flaky one is waiting.
+        sweep.tick(t0 + Duration::from_millis(50));
+        assert_eq!(sweep.clob.calls, 1);
     }
 
     #[test]

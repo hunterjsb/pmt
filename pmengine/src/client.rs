@@ -82,8 +82,74 @@ pub struct TokenMeta {
 pub struct CancelReport {
     /// Orders the CLOB confirmed are off the book.
     pub cancelled: Vec<String>,
-    /// order id -> the reason the CLOB refused. These are still LIVE.
+    /// order id -> the reason the CLOB refused. Read each one through
+    /// [`classify_cancel_refusal`]: a refusal is NOT automatically a live
+    /// order, and treating it as one is what fed the stale-cancel storm.
     pub failed: std::collections::HashMap<String, String>,
+}
+
+/// What a refused cancel says about the order's fate.
+///
+/// The distinction the engine was missing. `CancelReport::failed` used to be
+/// read as "still live, try again next tick", but the overwhelming majority
+/// of refusals are the exchange saying the order is *already gone* — which is
+/// the outcome the cancel wanted. Re-asking cannot change that answer, so a
+/// 50 ms tick loop turns one dead order into a permanent CLOB round trip:
+/// `analysis/watch_load.md` §2.4 measured 3514 refusals in one instance, and
+/// the 2026-08-24 00:09Z log has 195 dead ids refused 16,028 times, every one
+/// of them the same string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelRefusal {
+    /// The order is not on the book and no future request will change that:
+    /// already cancelled, already matched/filled, or unknown to the exchange.
+    /// A cancel answered this way SUCCEEDED — the order is off the book,
+    /// which is all a cancel ever wanted. It must leave engine tracking now
+    /// and never be re-attempted.
+    Terminal,
+    /// The exchange did not answer the question — auth, rate limit, 5xx,
+    /// timeout, or anything we do not recognise. The order may well still be
+    /// resting, so it stays tracked and gets tried again on a backoff.
+    Transient,
+}
+
+/// Terminal refusal families, matched case-insensitively as substrings of
+/// whatever the CLOB (or the SDK wrapping it) put in the message.
+///
+/// Substring matching rather than an exact table because this text is not a
+/// stable API — Polymarket's live string today is
+/// `order can't be found - already canceled or matched`, and the SDK prefixes
+/// its own wrapper onto errors from the single-cancel path. The families are
+/// narrow enough that a transient failure cannot land in one: nothing about a
+/// 502 or a nonce error says an order does not exist.
+const TERMINAL_CANCEL_MARKERS: &[&str] = &[
+    "can't be found",
+    "cant be found",
+    "not found",
+    "does not exist",
+    "no such order",
+    "unknown order",
+    "already canceled",
+    "already cancelled",
+    "already matched",
+    "already filled",
+    "order is filled",
+    "not cancellable",
+];
+
+/// Decide whether a refused cancel is done or worth retrying.
+///
+/// Unrecognised text is [`CancelRefusal::Transient`] on purpose: the failure
+/// direction of a wrong guess is asymmetric. Calling a live order terminal
+/// drops it from tracking while it still rests on the book — the ghost the
+/// `cancel_all` fix exists to prevent. Calling a dead order transient only
+/// costs one more round trip, and the backoff bounds even that.
+pub fn classify_cancel_refusal(reason: &str) -> CancelRefusal {
+    let lowered = reason.to_ascii_lowercase();
+    if TERMINAL_CANCEL_MARKERS.iter().any(|m| lowered.contains(m)) {
+        CancelRefusal::Terminal
+    } else {
+        CancelRefusal::Transient
+    }
 }
 
 /// Per-token metadata cache. No TTL and no invalidation on purpose: a
@@ -1082,6 +1148,70 @@ impl std::error::Error for ClientError {}
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The string Polymarket actually returns, byte-for-byte off
+    /// `~/.pmt/engine/engine-systemd.log` — all 16,028 refusals in the
+    /// 2026-08-24 00:09Z window carried exactly this text.
+    const LIVE_REFUSAL: &str = "order can't be found - already canceled or matched";
+
+    #[test]
+    fn the_refusal_the_storm_was_made_of_is_terminal() {
+        assert_eq!(
+            classify_cancel_refusal(LIVE_REFUSAL),
+            CancelRefusal::Terminal,
+            "the CLOB just said the order does not exist — asking again cannot change that",
+        );
+    }
+
+    #[test]
+    fn every_way_of_saying_the_order_is_gone_is_terminal() {
+        for reason in [
+            LIVE_REFUSAL,
+            "order not found",
+            "Order Not Found",
+            "order does not exist",
+            "no such order",
+            "unknown order id",
+            "order already cancelled",
+            "already canceled",
+            "order already matched",
+            "already filled",
+            // The SDK wraps the CLOB's text in its own error prose; the
+            // marker has to survive being embedded, which is why the match
+            // is a substring and not an equality.
+            "Order error: SDK error: order can't be found - already canceled or matched",
+        ] {
+            assert_eq!(
+                classify_cancel_refusal(reason),
+                CancelRefusal::Terminal,
+                "{reason:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_unanswered_cancel_is_transient_and_so_is_anything_unrecognised() {
+        // The asymmetry that decides the default: a wrong Transient costs one
+        // more round trip, a wrong Terminal abandons a live order on the book.
+        for reason in [
+            "502 Bad Gateway",
+            "503 Service Unavailable",
+            "request timed out",
+            "connection reset by peer",
+            "429 Too Many Requests",
+            "invalid nonce",
+            "unauthorized",
+            "insufficient balance",
+            "",
+            "something nobody has seen before",
+        ] {
+            assert_eq!(
+                classify_cancel_refusal(reason),
+                CancelRefusal::Transient,
+                "{reason:?}",
+            );
+        }
+    }
 
     fn meta(dp: u32) -> TokenMeta {
         TokenMeta {
