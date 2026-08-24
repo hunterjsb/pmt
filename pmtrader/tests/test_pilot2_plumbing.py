@@ -202,6 +202,24 @@ def test_grade_is_idempotent(tmp_path):
     assert len(list(state.iter_records(state.GRADED, tmp_path))) == 1
 
 
+def test_grade_never_books_one_window_side_twice_from_a_doubled_tape(tmp_path):
+    """A restart mid-window forgets `fired` (it is in memory only) and the next
+    poll writes a SECOND shadow row for a side already taken. Idempotency that
+    only holds across runs would grade both and double that window into the
+    ledger for good."""
+    _shadow_row(tmp_path)
+    _shadow_row(tmp_path)  # the post-restart duplicate
+    r = {"resolved": True, "winner": "up"}
+    out = grade.run(tmp_path, now=END + 1000.0, resolve=lambda s: r, log=lambda *_: None)
+    assert out["graded"] == 1, "one window-side is one graded row"
+    rows = list(state.iter_records(state.GRADED, tmp_path))
+    assert len(rows) == 1
+    assert out["pnl"] == pytest.approx(rows[0]["pnl"], abs=1e-4), "P&L is not doubled"
+    # and the second run still adds nothing
+    assert grade.run(tmp_path, now=END + 2000.0, resolve=lambda s: r,
+                     log=lambda *_: None)["graded"] == 0
+
+
 def test_grade_writes_the_weight_and_keeps_the_seed_below_the_fit_floor(tmp_path):
     _shadow_row(tmp_path)
     out = grade.run(tmp_path, now=END + 1000.0,

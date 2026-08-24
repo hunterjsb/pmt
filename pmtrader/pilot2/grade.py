@@ -37,7 +37,17 @@ def _graded_keys(home) -> set[tuple[str, str]]:
 
 
 def pending(home, now: float | None = None) -> list[dict]:
-    """Would-be trades whose window has settled and that are not graded yet."""
+    """Would-be trades whose window has settled and that are not graded yet.
+
+    De-duplicated by (slug, side) WITHIN the tape as well as against
+    `graded.jsonl`. The tape can hold the same window-side twice: the risk
+    book's `fired` set lives in memory only, so a restart mid-window forgets
+    that the side was already taken and the next poll writes a second
+    `shadow` row for it (the pilot restarted three times on 2026-08-23/24).
+    Grading both would append two rows to `graded.jsonl` and double that
+    window's P&L into every later run's ledger — an idempotency that only
+    holds ACROSS runs is not idempotency.
+    """
     now = time.time() if now is None else now
     done = _graded_keys(home)
     out = []
@@ -48,6 +58,7 @@ def pending(home, now: float | None = None) -> list[dict]:
             continue
         if now < end + GRADE_AFTER_S or (slug, side) in done:
             continue
+        done.add((slug, side))
         out.append(r)
     return out
 
