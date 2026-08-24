@@ -623,6 +623,31 @@ impl PolymarketClient {
             .body(body_str)
             .send()
             .await
+            // DESIGN NOTE — the un-acked ghost (money-path hunt, finding 3).
+            //
+            // A transport failure HERE is not a refusal. The POST may have
+            // reached the matching engine and matched; what failed is our
+            // side of hearing about it. The caller treats this `Err` exactly
+            // as it treats `success:false` — reservation released, order
+            // never tracked — and if the order did land, the engine now
+            // holds inventory it has no order id for, cannot cancel, and
+            // will not count until the trades poll or the position reconcile
+            // finds it. That is the same 12s-plus blind window the ack
+            // verdict above closes for the acked case, with no id to close
+            // it by.
+            //
+            // NOT fixed here, deliberately. The honest fix is a pre-send
+            // intent record (client order id or the signed order's own hash,
+            // written before the send) plus a reconcile pass that adopts an
+            // un-acked order the exchange did take — and the CLOB has no
+            // client-order-id field, so adoption has to key on the signed
+            // hash and needs its own study of what `GET /orders` returns for
+            // a match we never saw. Two things make the exposure bounded
+            // rather than open-ended today: `MAX_POSITION` and the fleet cap
+            // both read the position tracker, which the reconcile does seed,
+            // so a ghost is counted the moment it is discovered; and
+            // `spawn_unmanaged_check` already alarms on inventory no arm is
+            // managing. What is missing is the CANCEL, and the seconds.
             .map_err(|e| ClientError::OrderError(format!("Request failed: {}", e)))?;
 
         let status = response.status();
@@ -644,7 +669,7 @@ impl PolymarketClient {
         side: Side,
         price: Decimal,
         size: Decimal,
-    ) -> Result<String, ClientError> {
+    ) -> Result<OrderAck, ClientError> {
         self.place_limit_order_timed(token_id, side, price, size, false, &mut OrderTimings::start())
             .await
     }
@@ -658,6 +683,15 @@ impl PolymarketClient {
     /// immediately rather than repricing it (docs/maker-design.md §2), so
     /// the caller must have clamped the price inside the book already — a
     /// bounced order spends rate-limit budget and returns nothing.
+    ///
+    /// **The ack is a verdict.** `success: false` is a REFUSAL and comes back
+    /// as `Err` — the CLOB answers HTTP 200 to a rejected order, so the only
+    /// thing that distinguished "placed" from "refused" was this field, and
+    /// it was `#[allow(dead_code)]`. A refused order used to be tracked as
+    /// open, reserved against `max_total_exposure`, and cancelled later
+    /// against an id the book had never heard of. `status: matched` is the
+    /// opposite verdict and is just as load-bearing: it is a taker fill
+    /// notice at the wire, and a taker gets no other realtime one.
     pub async fn place_limit_order_timed(
         &self,
         token_id: &str,
@@ -666,7 +700,7 @@ impl PolymarketClient {
         size: Decimal,
         post_only: bool,
         t: &mut OrderTimings,
-    ) -> Result<String, ClientError> {
+    ) -> Result<OrderAck, ClientError> {
         if self.dry_run {
             let fake_id = format!("dry_run_{}", chrono::Utc::now().timestamp_millis());
             // Stamp every stage so a dry-run line is shaped like a real one
@@ -684,7 +718,12 @@ impl PolymarketClient {
                 post_only = post_only,
                 "[DRY RUN] Would place order"
             );
-            return Ok(fake_id);
+            return Ok(OrderAck {
+                order_id: fake_id,
+                filled_shares: Decimal::ZERO,
+                filled_price: price,
+                trade_ids: Vec::new(),
+            });
         }
 
         let sdk_side = match side {
@@ -726,17 +765,20 @@ impl PolymarketClient {
         let response: PostOrderResponse = self.l2_post("/order", &signed, &mut t.send).await?;
         t.ack = Some(std::time::Instant::now());
 
+        let ack = read_order_ack(response, side, price)?;
+
         tracing::info!(
-            order_id = %response.order_id,
+            order_id = %ack.order_id,
             token_id = token_id,
             side = ?side,
             price = %price,
             size = %size,
             post_only = post_only,
+            filled_shares = %ack.filled_shares,
             "Order placed"
         );
 
-        Ok(response.order_id)
+        Ok(ack)
     }
 
     /// Cancel an order.
@@ -1190,13 +1232,123 @@ impl BookRestResponse {
     }
 }
 
-/// Response from posting an order.
-#[derive(Debug, serde::Deserialize)]
+/// Response from posting an order — the exchange's VERDICT on it, not just
+/// an id it can be cancelled by.
+///
+/// Three of these fields were on the wire the whole time and none of them
+/// were read. `success` was `#[allow(dead_code)]`, so an order the CLOB
+/// REFUSED came back as a live tracked order with an id; `status` and
+/// `taking_amount` say a crossing clip already matched at ack, which is the
+/// fill notice that closes the ~12s window between the wire and the trades
+/// poll finding out (CLAUDE.md's oldest gotcha: a taker fill has no realtime
+/// notice at all). `trade_ids` are the SAME ids the trades poller dedupes
+/// on, which is what makes booking at ack safe rather than a double count.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PostOrderResponse {
     #[serde(alias = "orderID")]
     order_id: String,
-    #[allow(dead_code)]
     success: bool,
+    #[serde(default)]
+    error_msg: Option<String>,
+    /// `live` (resting), `matched`, `delayed`, `unmatched`. Compared
+    /// case-insensitively — the CLOB has shipped both casings.
+    #[serde(default)]
+    status: Option<String>,
+    /// The matched halves of the order, in the exchange's own frame: the
+    /// signer MAKES `making_amount` and TAKES `taking_amount`. On a BUY
+    /// that is USDC out / shares in; on a SELL it is the other way round.
+    /// Sometimes an empty string, hence the lenient parse.
+    #[serde(default)]
+    making_amount: Option<serde_json::Value>,
+    #[serde(default)]
+    taking_amount: Option<serde_json::Value>,
+    #[serde(default, alias = "tradeIDs")]
+    trade_ids: Vec<String>,
+}
+
+/// Turn one POST /order response into a verdict, or into the refusal it is.
+///
+/// Split out of the async path so both halves are testable against a recorded
+/// ack body with no live CLOB — the shapes here (an empty-string amount, a
+/// `success:false` with an `errorMsg`, an ack that matched) are exactly the
+/// ones a live-only code path never gets exercised on.
+fn read_order_ack(
+    r: PostOrderResponse,
+    side: Side,
+    submitted_px: Decimal,
+) -> Result<OrderAck, ClientError> {
+    if !r.success {
+        // A refusal, answered with HTTP 200. It must never become a tracked
+        // live order: the id (if any) names nothing on the book.
+        return Err(ClientError::OrderError(format!(
+            "order rejected: {} (status {})",
+            r.error_msg.as_deref().unwrap_or("no reason given"),
+            r.status.as_deref().unwrap_or("unknown"),
+        )));
+    }
+    let (making, taking) = (ack_amount(&r.making_amount), ack_amount(&r.taking_amount));
+    // The signer MAKES what it gives and TAKES what it gets, so which half
+    // is shares depends on the side.
+    let (shares, usdc) = match side {
+        Side::Buy => (taking, making),
+        Side::Sell => (making, taking),
+    };
+    let matched = r.status.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("matched"));
+    // Shares only count as filled when the exchange SAYS the order matched.
+    // A `live` ack carrying stray amounts is a resting order, and booking a
+    // fill off one would manufacture inventory that does not exist.
+    let filled_shares = if matched { shares.max(Decimal::ZERO) } else { Decimal::ZERO };
+    let filled_price = if filled_shares > Decimal::ZERO && usdc > Decimal::ZERO {
+        usdc / filled_shares
+    } else {
+        submitted_px
+    };
+    Ok(OrderAck {
+        order_id: r.order_id,
+        filled_shares,
+        filled_price,
+        trade_ids: r.trade_ids,
+    })
+}
+
+/// A number the CLOB may send as a JSON number, a decimal string, or an
+/// empty string meaning zero. Anything it cannot read is zero, which reads
+/// downstream as "the ack claims no fill" — the safe direction, since the
+/// trades poll still books it.
+fn ack_amount(v: &Option<serde_json::Value>) -> Decimal {
+    match v {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+            Decimal::from_str_exact(s.trim()).unwrap_or(Decimal::ZERO)
+        }
+        Some(serde_json::Value::Number(n)) => n
+            .as_f64()
+            .and_then(Decimal::from_f64_retain)
+            .unwrap_or(Decimal::ZERO),
+        _ => Decimal::ZERO,
+    }
+}
+
+/// What the exchange said when it took the order.
+///
+/// Returned instead of a bare order id so the caller cannot accidentally
+/// ignore a verdict it was handed: a refusal is already an `Err` by the time
+/// this exists, and a match arrives here as shares and a price rather than
+/// as silence until the poller catches up.
+#[derive(Debug, Clone)]
+pub struct OrderAck {
+    pub order_id: String,
+    /// Shares the ack says are already matched. Zero on a resting order,
+    /// and zero in dry-run.
+    pub filled_shares: Decimal,
+    /// What those shares cost per share, from the ack's own two amounts —
+    /// the price actually paid, not the limit that was asked for. Falls
+    /// back to the submitted price when the ack reports no amounts.
+    pub filled_price: Decimal,
+    /// Trade ids the match created, in the trades poller's namespace. A
+    /// caller that books this fill must claim these ids first or the poll
+    /// will book the same trade a second time.
+    pub trade_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1270,7 +1422,116 @@ impl std::error::Error for ClientError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // --- the ack is a verdict --------------------------------------------
+    //
+    // POST /order answers HTTP 200 to a REFUSAL, so `success` was the only
+    // thing separating "placed" from "rejected" — and it was
+    // `#[allow(dead_code)]`. The same body carries the opposite verdict:
+    // `status: matched` plus `takingAmount` is a taker fill notice at the
+    // wire, and a taker gets no other realtime one (CLAUDE.md's oldest
+    // gotcha), so until this the engine was blind to it for a whole 15s
+    // poll interval.
+
+    fn ack(body: &str) -> Result<OrderAck, ClientError> {
+        let parsed: PostOrderResponse =
+            serde_json::from_str(body).expect("the wire shape parses");
+        read_order_ack(parsed, Side::Buy, dec!(0.90))
+    }
+
+    #[test]
+    fn a_refused_order_is_never_a_placed_order() {
+        // The shape the CLOB returns when it will not take the order. It
+        // still carries an orderID; that id names nothing on the book.
+        let err = ack(
+            r#"{"success":false,"errorMsg":"not enough balance / allowance",
+                "orderID":"0xdead","status":"unmatched",
+                "makingAmount":"","takingAmount":""}"#,
+        )
+        .expect_err("a refusal must not come back as a placement");
+        let msg = err.to_string();
+        assert!(msg.contains("not enough balance"), "the reason survives: {msg}");
+        assert!(msg.contains("unmatched"), "and so does the status: {msg}");
+    }
+
+    #[test]
+    fn a_refusal_with_no_reason_still_refuses() {
+        assert!(ack(r#"{"success":false,"orderID":"0x0"}"#).is_err());
+    }
+
+    #[test]
+    fn a_matched_ack_is_a_fill_notice_at_the_wire() {
+        // 30 shares for $26.70 — a real average of 0.89 against a 0.90
+        // limit. The PRICE comes from the ack's own amounts, not from what
+        // was asked for, because the two are not the same number.
+        let a = ack(
+            r#"{"success":true,"status":"matched","orderID":"0xabc",
+                "makingAmount":"26.70","takingAmount":"30",
+                "tradeIDs":["t1","t2"]}"#,
+        )
+        .expect("a match is a success");
+        assert_eq!(a.order_id, "0xabc");
+        assert_eq!(a.filled_shares, Decimal::from(30));
+        assert_eq!(a.filled_price, dec!(0.89));
+        assert_eq!(a.trade_ids, vec!["t1", "t2"], "the poller's own dedup keys");
+    }
+
+    #[test]
+    fn a_resting_ack_books_no_fill() {
+        // A `live` order is on the book, not in the position. Booking one
+        // would manufacture inventory that does not exist — so stray
+        // amounts on a non-matched ack are ignored, deliberately.
+        let a = ack(
+            r#"{"success":true,"status":"live","orderID":"0xabc",
+                "makingAmount":"26.70","takingAmount":"30"}"#,
+        )
+        .unwrap();
+        assert_eq!(a.filled_shares, Decimal::ZERO);
+        assert!(a.trade_ids.is_empty());
+    }
+
+    #[test]
+    fn the_ack_reads_every_shape_the_clob_sends_its_amounts_in() {
+        // Empty string (the common "nothing matched" filler), a JSON number,
+        // and a decimal string all have to land on the same meaning.
+        assert_eq!(ack_amount(&None), Decimal::ZERO);
+        assert_eq!(ack_amount(&Some(serde_json::json!(""))), Decimal::ZERO);
+        assert_eq!(ack_amount(&Some(serde_json::json!("  "))), Decimal::ZERO);
+        assert_eq!(ack_amount(&Some(serde_json::json!("12.5"))), dec!(12.5));
+        assert_eq!(ack_amount(&Some(serde_json::json!(12.5))), dec!(12.5));
+        // Anything unreadable reads as "no fill", which the trades poll
+        // still books — the safe direction.
+        assert_eq!(ack_amount(&Some(serde_json::json!("banana"))), Decimal::ZERO);
+    }
+
+    #[test]
+    fn the_sides_name_their_own_halves_of_the_match() {
+        // The signer MAKES what it gives and TAKES what it gets, so a SELL
+        // reads the two amounts the other way round. Getting this backwards
+        // would book a 30-share sale as a $26.70-share one.
+        let parsed = |b: &str| serde_json::from_str::<PostOrderResponse>(b).unwrap();
+        let body = r#"{"success":true,"status":"matched","orderID":"x",
+                       "makingAmount":"30","takingAmount":"26.70"}"#;
+        let sell = read_order_ack(parsed(body), Side::Sell, Decimal::ONE).unwrap();
+        assert_eq!(sell.filled_shares, Decimal::from(30));
+        assert_eq!(sell.filled_price, dec!(0.89));
+    }
+
+    /// A matched ack with no trade ids: some CLOB deployments answer that
+    /// way. It must still book — the poll's own id check catches the trade
+    /// when it arrives, so the fill lands exactly once either way.
+    #[test]
+    fn a_matched_ack_without_trade_ids_is_still_a_fill() {
+        let a = ack(
+            r#"{"success":true,"status":"MATCHED","orderID":"x",
+                "makingAmount":"8.9","takingAmount":"10"}"#,
+        )
+        .unwrap();
+        assert_eq!(a.filled_shares, Decimal::from(10), "and the casing does not matter");
+        assert!(a.trade_ids.is_empty());
+    }
 
     /// The string Polymarket actually returns, byte-for-byte off
     /// `~/.pmt/engine/engine-systemd.log` — all 16,028 refusals in the
