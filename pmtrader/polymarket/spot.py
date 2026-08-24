@@ -36,8 +36,11 @@ Venue and stream choices, all settled by live probe rather than documentation
   crypto feeds aggregate transaction prices, not quotes.
 - **The quote arm is `@ticker` on Binance and `ticker` on Kraken** — both carry
   bid/ask *and* their own stamp, at ~1/s. That keeps "does the quote lead the
-  trade" an answerable question rather than an assumption, on both venues, and
-  1 Hz is ample against a lead measured in whole seconds.
+  trade" an answerable question rather than an assumption, on both venues.
+  What it answered (`spot_lead.md` §5b): the quote correlates with the oracle
+  just as well as the trade tape but peaks a second later in lag terms,
+  because a 1 Hz snapshot is half a second stale on average. Equal
+  information, one second less lead — cheap for a corpus, expensive live.
 - **Kraken as a second venue** disambiguates venue-specific noise from a real
   lead: a lead that appears on one venue and not the other is that venue's
   microstructure, not information about the oracle. Kraken v2 also lists all
@@ -392,10 +395,14 @@ def binance_url(symbols: list[str], base: str = BINANCE_WS,
     symbol, so the whole venue stays on one socket and one file.
 
     `kinds` exists because of a measured result, not for symmetry:
-    `analysis/spot_lead.md` §S5 finds the 1 Hz `@ticker` quote captures the
-    same lead as the full trade tape (btc r +0.934 at k=+2 against +0.919 at
-    k=+3) at **0.8 rows/s instead of 106** — a ~130x disk saving for equal
-    signal. A resident recorder should almost certainly run `--kinds book`.
+    `analysis/spot_lead.md` §5b finds the 1 Hz `@ticker` quote correlates with
+    the oracle as well as the full trade tape (btc r +0.9340 against +0.9241)
+    at **0.9 rows/s instead of 93** — a ~130x disk saving — but peaking one
+    second earlier (k=+2 against k=+3), because a 1 Hz snapshot is half a
+    second stale on average. For a corpus that is the right trade and a
+    resident recorder should run `--kinds book`; a LIVE consumer should not
+    give that second away, and wants `@bookTicker`, which this recorder
+    refuses because it carries no exchange stamp.
     """
     streams = "/".join(f"{BINANCE_SYMBOLS[s]}@{_BINANCE_STREAM[k]}"
                        for s in symbols for k in kinds if k in _BINANCE_STREAM)

@@ -89,19 +89,22 @@ Hyperliquid for HYPE. Every venue is its own thread and its own socket, so a
 stall on one cannot silence another.
 
 **It is the first unit here that could fill the disk, and a measurement is
-what stops it.** Binance's raw trade tape is ~370 rows/s and ~215 MB/h — ~5
-GB/day, three orders of magnitude past anything else in `~/.pmt/corpus`, and
-there is no `--retention-days` sweep here like the print recorder has. But
-`analysis/spot_lead.md` §S5 finds the 1 Hz `@ticker` **quote** carries the same
-lead as the full trade tape (btc r +0.934 at k=+2 against +0.919 at k=+3) at
-about **1/130th of the rows**, because the effect lives at 1–3 seconds and the
-oracle it is measured against only publishes at 1 Hz. There is nothing below a
-second to resolve, so the extra two orders of magnitude buy nothing.
+what stops it.** Binance's raw trade tape is ~93 rows/s per major symbol and
+~215 MB/h all told — ~5 GB/day, three orders of magnitude past anything else
+in `~/.pmt/corpus`, and there is no `--retention-days` sweep here like the
+print recorder has. `analysis/spot_lead.md` §5b measures what the cheap
+alternative costs: the 1 Hz `@ticker` **quote** correlates with the oracle
+just as well as the full trade tape (btc r +0.9340 against +0.9241) at about
+**1/130th of the rows**, but its peak sits one second earlier — k=+2 against
+k=+3 — because a 1 Hz snapshot is half a second stale on average.
 
-The unit therefore runs `--kinds book`, which turns ~5 GB/day into well under
-100 MB/day with no loss of the signal the corpus exists for. Anyone who later
-needs the full trade tape should run it **bounded** under a `.timer` with
-`--minutes N` rather than making it resident.
+For a corpus that is the right trade, so the unit runs `--kinds book` and
+~5 GB/day becomes well under 100 MB/day. For a **live** consumer it is not the
+right trade — a second is a third of the edge — which is why the engine spec
+points at `@bookTicker` instead, a stream this recorder cannot use precisely
+because it carries no exchange stamp. Anyone who needs the full trade tape
+should run it **bounded** under a `.timer` with `--minutes N` rather than
+making it resident.
 
 Unlike prints, this tape is **not backfillable**: neither Binance nor Kraken
 serves a free historical tick feed, so an hour nobody recorded is an hour the
