@@ -710,9 +710,26 @@ impl Engine {
                         if last_ts.map(|prev| ts > prev).unwrap_or(true) {
                             last_ts = Some(ts);
                         }
-                        // Compute fee: price * size * fee_rate_bps / 10_000.
-                        let fee = t.price * t.size * t.fee_rate_bps / Decimal::from(10_000u32);
                         use polymarket_client_sdk_v2::clob::types::TraderSide;
+                        // The exchange charges the TAKER and never the maker
+                        // (`crate::fees`: 1017/1017 fee-bearing wallet rows on
+                        // the taker curve, 526/526 resting rows charged exactly
+                        // 0.0). `trader_side` is the exchange's own answer to
+                        // which one we were, so the schedule is chosen from it
+                        // rather than assumed — running a resting fill through
+                        // the taker arithmetic books a fee the wallet never
+                        // charged and drifts the ledger off the scoreboard
+                        // (`analysis/bracket_exit.md` §9.4). Reachable on the
+                        // BUY side since maker step 0; a post-only exit ask is
+                        // what makes it reachable on the sell side too.
+                        let fee = match t.trader_side {
+                            TraderSide::Maker => crate::fees::maker_fee_dec(
+                                t.price,
+                                t.fee_rate_bps / Decimal::from(10_000u32),
+                            ),
+                            // price * size * fee_rate_bps / 10_000, as before.
+                            _ => t.price * t.size * t.fee_rate_bps / Decimal::from(10_000u32),
+                        };
                         // For our side of the trade we want the order id WE placed.
                         // If we were the taker, that's taker_order_id and size = t.size.
                         // If we were the maker, find our maker_orders entry (there
