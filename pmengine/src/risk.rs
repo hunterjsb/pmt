@@ -93,14 +93,28 @@ impl RiskManager {
     }
 
     /// Check P&L and trigger circuit breaker if needed.
+    ///
+    /// Reads `breaker_pnl`, NOT `total_realized + total_unrealized`: positions
+    /// whose mark has gone stale (a resolving binary whose book went one-sided
+    /// or dark) are excluded, because a frozen mid is not a loss and not a
+    /// price we could trade out at. Everything the engine can currently price
+    /// counts in full and immediately — the threshold and the sensitivity to
+    /// real losses are unchanged.
     pub fn check_pnl(&mut self, positions: &PositionTracker) {
         // Trigger once, not per 50ms tick — an already-tripped breaker
         // re-announcing the same fact wrote ~20 log lines/s on 2026-08-23.
         if self.circuit_breaker_triggered {
             return;
         }
-        let total_pnl = positions.total_realized_pnl() + positions.total_unrealized_pnl();
+        let total_pnl = positions.breaker_pnl();
         if total_pnl < -self.limits.max_loss {
+            let unpriceable = positions.stale_marked_tokens().len();
+            tracing::error!(
+                marked_pnl = %total_pnl,
+                max_loss = %self.limits.max_loss,
+                unpriceable_positions = unpriceable,
+                "Circuit breaker: marked loss over the limit"
+            );
             self.trigger_circuit_breaker(&format!(
                 "Max loss exceeded: {} < -{}",
                 total_pnl, self.limits.max_loss
@@ -455,5 +469,165 @@ impl Clone for RiskManager {
             pending_reservations: self.pending_reservations.clone(),
             reservation_counter: self.reservation_counter,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::position::MARK_STALE_PASSES;
+    use rust_decimal_macros::dec;
+
+    fn breaker(max_loss: Decimal) -> RiskManager {
+        RiskManager::new(RiskLimits {
+            max_position_size: Decimal::from(2500),
+            max_total_exposure: Decimal::from(2500),
+            max_loss,
+            max_order_size: Decimal::from(1250),
+        })
+    }
+
+    fn held(tracker: &mut PositionTracker, token: &str, size: Decimal, avg: Decimal) {
+        tracker.reconcile(token, size, avg);
+    }
+
+    fn mark(tracker: &mut PositionTracker, token: &str, price: Decimal) {
+        tracker.update_prices(&HashMap::from([(token.to_string(), price)]));
+    }
+
+    fn go_dark(tracker: &mut PositionTracker, passes: u64) {
+        for _ in 0..passes {
+            tracker.update_prices(&HashMap::new());
+        }
+    }
+
+    /// SENSITIVITY GATE. The breaker must be exactly as quick on real losses
+    /// as it ever was: a live, priceable, marked-down book crosses the
+    /// threshold and halts on the very tick it crosses.
+    #[test]
+    fn real_marked_losses_still_trip_at_the_threshold() {
+        let mut tracker = PositionTracker::new();
+        held(&mut tracker, "live", dec!(1000), dec!(0.90));
+
+        // -$390: under the limit, no halt.
+        let mut rm = breaker(dec!(400));
+        mark(&mut tracker, "live", dec!(0.51));
+        assert_eq!(tracker.breaker_pnl(), dec!(-390.00));
+        rm.check_pnl(&tracker);
+        assert!(!rm.is_halted(), "must not trip above the threshold");
+
+        // -$410: over the limit, halt on this tick.
+        mark(&mut tracker, "live", dec!(0.49));
+        assert_eq!(tracker.breaker_pnl(), dec!(-410.00));
+        rm.check_pnl(&tracker);
+        assert!(rm.is_halted(), "a real -$410 marked loss MUST still halt");
+    }
+
+    /// A realized loss counts in full even after the window that produced it
+    /// has been unsubscribed and its exposure released.
+    #[test]
+    fn banked_realized_losses_still_trip() {
+        use crate::position::Fill;
+        let mut tracker = PositionTracker::new();
+        tracker.apply_fill(&Fill {
+            order_id: "1".into(), token_id: "gone".into(), is_buy: true,
+            price: dec!(0.90), size: dec!(1000), timestamp: chrono::Utc::now(), fee: Decimal::ZERO,
+        });
+        tracker.apply_fill(&Fill {
+            order_id: "2".into(), token_id: "gone".into(), is_buy: false,
+            price: dec!(0.49), size: dec!(1000), timestamp: chrono::Utc::now(), fee: Decimal::ZERO,
+        });
+        tracker.remove("gone");
+
+        let mut rm = breaker(dec!(400));
+        rm.check_pnl(&tracker);
+        assert!(
+            rm.is_halted(),
+            "a -$410 realized loss must reach the breaker even after the \
+             token was unsubscribed"
+        );
+    }
+
+    /// THE INCIDENT, end to end. Held, genuinely-owned inventory in windows
+    /// that have just ended: the books have gone one-sided so the marks are
+    /// frozen at the collapsed prices that printed on the way down, a burst
+    /// of reconciles doubles the share counts off missed fills, and the
+    /// data-api starts zeroing the resolved rows.
+    ///
+    /// Nothing here is a trade and nothing here is a price. The breaker must
+    /// not fire.
+    #[test]
+    fn the_2026_08_24_reconcile_burst_does_not_halt_the_engine() {
+        let mut tracker = PositionTracker::new();
+        // Positions and avg costs as the engine held them at 00:09:30Z.
+        held(&mut tracker, "btc-down", dec!(88), dec!(0.5548));
+        held(&mut tracker, "eth-down", dec!(99), dec!(0.8016));
+        held(&mut tracker, "sol-down", dec!(81), dec!(0.504));
+        held(&mut tracker, "xrp-down", dec!(5), dec!(0.97));
+
+        // Last two-sided mids before the down books went dark.
+        tracker.update_prices(&HashMap::from([
+            ("btc-down".to_string(), dec!(0.025)),
+            ("eth-down".to_string(), dec!(0.19)),
+            ("sol-down".to_string(), dec!(0.025)),
+            ("xrp-down".to_string(), dec!(0.045)),
+        ]));
+
+        // Windows end; every book loses its quote.
+        go_dark(&mut tracker, MARK_STALE_PASSES + 1);
+
+        // The burst: genuine missed fills roughly double the share counts.
+        assert_eq!(
+            tracker.reconcile("sol-down", dec!(169), dec!(0.504)).delta(),
+            dec!(88)
+        );
+        assert_eq!(
+            tracker.reconcile("btc-down", dec!(184), dec!(0.5548)).delta(),
+            dec!(96)
+        );
+        assert_eq!(
+            tracker.reconcile("eth-down", dec!(120), dec!(0.8016)).delta(),
+            dec!(21)
+        );
+        // ...and the data-api starts zeroing the resolved rows.
+        assert!(matches!(
+            tracker.reconcile("xrp-down", dec!(0), dec!(0)),
+            crate::position::ReconcileOutcome::RefusedSettling(_)
+        ));
+
+        assert_eq!(
+            tracker.total_realized_pnl(),
+            dec!(0),
+            "not one dollar of this is realized — no trade happened"
+        );
+        assert_eq!(tracker.breaker_pnl(), dec!(0));
+
+        let mut rm = breaker(dec!(400));
+        rm.check_pnl(&tracker);
+        assert!(
+            !rm.is_halted(),
+            "the engine must NOT halt on frozen marks and accounting corrections"
+        );
+
+        // And the moment a real book comes back, the real mark counts again.
+        mark(&mut tracker, "btc-down", dec!(0.02));
+        assert_eq!(
+            tracker.breaker_pnl(),
+            dec!(184) * (dec!(0.02) - dec!(0.5548))
+        );
+    }
+
+    /// The halt is one-shot: an already-tripped breaker does not re-announce.
+    #[test]
+    fn check_pnl_is_idempotent_once_tripped() {
+        let mut tracker = PositionTracker::new();
+        held(&mut tracker, "live", dec!(1000), dec!(0.90));
+        mark(&mut tracker, "live", dec!(0.10));
+
+        let mut rm = breaker(dec!(400));
+        rm.check_pnl(&tracker);
+        assert!(rm.is_halted());
+        rm.check_pnl(&tracker);
+        assert!(rm.is_halted());
     }
 }
