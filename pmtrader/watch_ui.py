@@ -1821,6 +1821,58 @@ def _pnl_cell(net: float) -> str:
     return f"[dim]P&L[/dim] [{_pnl_color(_zero(net))}]{_zero(net):+,.2f}[/]"
 
 
+# The fleet row's trailing span, and the floor the peer wallet walk uses —
+# one constant so the number on the row and the walk that produced it cannot
+# disagree. 24h also keeps every peer walk inside wallet.IMMUTABLE_AFTER_S,
+# which is what stops this box's activity dump from being spliced onto
+# another account's rows (wallet.activity_since refuses deeper floors).
+FLEET_WINDOW_S = 24 * 3600.0
+
+
+def net_since(windows: list[dict] | None, floor: float) -> float:
+    """Wallet-graded net over windows settling at/after `floor`. A window's
+    money lands at its exit row, else its close; riding windows (pnl None)
+    contribute nothing — an undecided position is not P&L."""
+    return sum(float(w.get("pnl") or 0.0) for w in windows or []
+               if w.get("pnl") is not None
+               and (float(w.get("exit_ts") or 0.0)
+                    or float(w.get("end_ts") or 0.0)) >= floor)
+
+
+def fleet_row(snap: dict, now: float | None = None) -> tuple | None:
+    """`fleet 24h  P&L -812.45  eu -79.99 · …` — every engine's trailing day
+    on one line, or None on a box with no peer wallet configured (a fleet of
+    one is just the two money rows above this).
+
+    Peer books come off the worker's `peers` publication — the same
+    `_tape_scoreboard` walk as the header's own numbers, run against another
+    address. A peer whose ledger never landed (`windows: None`) is skipped
+    rather than shown as zero: "made nothing" and "cannot see the ledger" are
+    opposite facts and may not share a rendering.
+    """
+    peers = snap.get("peers") or {}
+    if not peers:
+        return None
+    # Not before the LOCAL ledger has landed either: a fleet total missing
+    # this box's own money is a confident number about a wallet not yet read.
+    if snap.get("sb_fetched_at") is None:
+        return None
+    now = time.time() if now is None else now
+    floor = now - FLEET_WINDOW_S
+    total = net_since((snap.get("sb") or {}).get("eff_windows"), floor)
+    parts = []
+    for label, book in sorted(peers.items()):
+        if not isinstance(book, dict) or book.get("windows") is None:
+            continue
+        n = net_since(book.get("windows"), floor)
+        total += n
+        parts.append(f"{label} {n:+,.2f}")
+    if not parts:
+        return None
+    return ("fleet 24h", _pnl_cell(total),
+            f"[dim]{' · '.join(parts)}[/dim]", "[dim]wallet-graded[/dim]")
+
+
 def header_rows(snap: dict) -> list[tuple]:
     """The top panel's rows as `(label, v1, v2, v3)` tuples.
 
@@ -1848,6 +1900,9 @@ def header_rows(snap: dict) -> list[tuple]:
         ("all-time", _record_cell(sb.get("wins", 0), sb.get("losses", 0)),
          _pnl_cell(sb.get("net", 0.0)), cap),
     ]
+    fleet = fleet_row(snap)
+    if fleet:
+        rows.append(fleet)
     rows += exposure_rows(snap.get("status"), sb)
     # `regime` is LAST among the data rows and deliberately so: it is the only
     # row that describes the market rather than us, it gates nothing, and a

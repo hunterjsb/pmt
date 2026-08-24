@@ -1289,58 +1289,11 @@ def test_downsample_ignores_samples_outside_the_axis():
     assert 99.0 not in cols
 
 
-# -- P&L: the wallet grade, cumulated --
+# -- the fleet header row: every engine's trailing day, one line --
 
 def _graded(pnl, end_ts, exit_ts=0.0):
     return {"pnl": pnl, "end_ts": end_ts, "exit_ts": exit_ts, "won": pnl > 0}
 
-
-def test_cumulative_pnl_is_the_running_wallet_grade_in_settlement_order():
-    now = 1_787_500_000.0
-    curve = wc.cumulative_pnl([_graded(-5.0, now - 100), _graded(+2.0, now - 300),
-                               _graded(+1.0, now - 50)])
-    assert curve == [(now - 300, 2.0), (now - 100, -3.0), (now - 50, -2.0)]
-
-
-def test_a_riding_window_is_not_pnl():
-    """An undecided position has no verdict, so it has no line on this chart.
-    Marking it to market here would put a number on the panel that the wallet
-    has never agreed to — the exact drift the header's ledger refuses."""
-    now = 1_787_500_000.0
-    riding = {"pnl": None, "end_ts": now - 60, "exit_ts": 0.0, "won": None}
-    assert wc.cumulative_pnl([riding, _graded(4.0, now - 30)]) == [(now - 30, 4.0)]
-
-
-def test_the_pnl_curve_rebases_at_the_trailing_floor():
-    """A 24h chart answers "what did today do". Opened at the all-time level
-    it would flatten the day into a rounding error."""
-    now = 1_787_500_000.0
-    windows = [_graded(-900.0, now - 40 * 3600), _graded(+3.0, now - 3600),
-               _graded(+2.0, now - 60)]
-    cols, net = wc.pnl_series(windows, 8, now, 24 * 3600)
-    assert net == 5.0                                # yesterday's -900 is not in it
-    assert cols[0] == 0.0                            # the line opens on the axis
-    assert cols[-1] == 5.0
-
-
-def test_the_closing_figure_is_not_read_off_the_last_column():
-    """A settlement landing inside the final column must not round the
-    headline figure away: the columns are the picture, the number is the
-    answer."""
-    now = 1_787_500_000.0
-    cols, net = wc.pnl_series([_graded(1.0, now - 3), _graded(1.0, now - 1)],
-                              4, now, 3600.0)
-    assert net == 2.0 and cols[-1] == 2.0
-
-
-def test_the_exit_row_is_when_the_money_landed():
-    now = 1_787_500_000.0
-    w = _graded(3.0, now - 500, exit_ts=now - 100)
-    assert wc.settle_ts(w) == now - 100
-    assert wc.settle_ts(_graded(3.0, now - 500)) == now - 500
-
-
-# -- P&L: one line per engine --
 
 def _snap_with(**kw):
     base = {"sb": {}, "sb_fetched_at": None, "peers": {}, "feeds": {},
@@ -1349,46 +1302,69 @@ def _snap_with(**kw):
     return base
 
 
-def test_both_engines_reach_the_pnl_panel_and_the_fleet_line_is_their_sum():
-    """Hunter's ask, literally: "line charts for both P&Ls". This box off the
-    scoreboard the header already prints, the peer off its own wallet walk,
-    and a fleet line that is the two ledgers summed — safe to sum because the
-    series partition means the two accounts never hold the same window."""
+def test_net_since_sums_only_windows_settling_inside_the_span():
+    now = 1_787_500_000.0
+    windows = [_graded(-900.0, now - 40 * 3600), _graded(+3.0, now - 3600),
+               _graded(+2.0, now - 60)]
+    assert watch_ui.net_since(windows, now - 24 * 3600) == 5.0
+
+
+def test_a_riding_window_is_not_pnl():
+    """An undecided position has no verdict, so it has no money on this row.
+    Marking it to market would put a number on the header that the wallet has
+    never agreed to — the exact drift the ledger rows refuse."""
+    now = 1_787_500_000.0
+    riding = {"pnl": None, "end_ts": now - 60, "exit_ts": 0.0, "won": None}
+    assert watch_ui.net_since([riding, _graded(4.0, now - 30)], 0.0) == 4.0
+
+
+def test_the_exit_row_is_when_the_money_landed():
+    """A window graded by a late redeem belongs to the day the capital came
+    back, which is the instant `eff_windows` records in exit_ts."""
+    now = 1_787_500_000.0
+    old_close_late_exit = _graded(3.0, now - 40 * 3600, exit_ts=now - 100)
+    assert watch_ui.net_since([old_close_late_exit], now - 3600) == 3.0
+
+
+def test_the_fleet_row_is_every_ledger_summed():
+    """Safe to sum because the series partition means the two accounts never
+    hold the same window."""
     now = 1_787_500_000.0
     snap = _snap_with(
         sb={"eff_windows": [_graded(+10.0, now - 600)]}, sb_fetched_at=now,
         peers={"eu": {"windows": [_graded(-4.0, now - 300)], "net": -4.0}})
-    rows = wc.pnl_rows(snap, 60, now)
-    labels = [r.split("[/dim]")[0].split("]")[-1].strip() for r in rows]
-    assert labels == ["desktop", "eu", "fleet"]
-    assert "+10.00" in rows[0] and "-4.00" in rows[1] and "+6.00" in rows[2]
+    row = watch_ui.fleet_row(snap, now)
+    assert row[0] == "fleet 24h"
+    assert "+6.00" in row[1] and "eu -4.00" in row[2]
 
 
-def test_a_lone_engine_gets_no_fleet_line():
+def test_a_lone_engine_gets_no_fleet_row():
     """A "fleet" that is one box restating itself is a second row saying
     nothing."""
     now = 1_787_500_000.0
     snap = _snap_with(sb={"eff_windows": [_graded(1.0, now - 10)]}, sb_fetched_at=now)
-    assert len(wc.pnl_rows(snap, 60, now)) == 1
+    assert watch_ui.fleet_row(snap, now) is None
 
 
-def test_an_unreachable_peer_has_no_line_rather_than_a_flat_one():
+def test_an_unreachable_peer_is_skipped_rather_than_shown_as_zero():
     """"this box made nothing today" and "we cannot reach this box's ledger"
     are opposite facts and may not share a rendering."""
     now = 1_787_500_000.0
     snap = _snap_with(sb={"eff_windows": []}, sb_fetched_at=now,
                       peers={"eu": {"windows": None}})
-    assert [e["label"] for e in wc.engine_curves(snap, now)] == ["desktop"]
-    # ...whereas a peer that answered with nothing to show DOES get its line.
+    assert watch_ui.fleet_row(snap, now) is None
+    # ...whereas a peer that answered with nothing to show DOES get its cell.
     snap["peers"] = {"eu": {"windows": []}}
-    assert [e["label"] for e in wc.engine_curves(snap, now)] == ["desktop", "eu", "fleet"]
+    row = watch_ui.fleet_row(snap, now)
+    assert row is not None and "eu +0.00" in row[2]
 
 
-def test_no_pnl_line_at_all_until_the_first_wallet_walk_lands():
-    """sb_fetched_at is the "—" the header's data-age already paints. A zero
-    line drawn before the first walk is a confident claim about a ledger we
-    have not read."""
-    assert wc.pnl_rows(_snap_with(), 60, 1_787_500_000.0) == []
+def test_no_fleet_row_until_the_local_wallet_walk_lands():
+    """A fleet total missing this box's own money is a confident number about
+    a wallet not yet read."""
+    now = 1_787_500_000.0
+    snap = _snap_with(peers={"eu": {"windows": [_graded(2.0, now - 30)]}})
+    assert watch_ui.fleet_row(snap, now) is None
 
 
 # -- the peer walk: same acquisition, another account --
@@ -1525,10 +1501,25 @@ def test_a_feed_row_carries_the_path_the_strike_and_our_bet():
     feeds = {"chain": {"btc": [(now - 30, 77_000.0), (now - 1, 77_077.0)]},
              "marks": {"btc": {start - 60: 77_000.0}}, "spot": {}, "venue": {}}
     snap = _armed_snap(now, feeds=feeds, start=start, side="up", entry_px=0.62)
-    row = wc.feed_row(wc.armed_windows(snap)[0], feeds, 60, now)
+    [row] = wc.feed_row(wc.armed_windows(snap)[0], feeds, 60, now)
     assert "btc 5m" in row and "▲" in row            # identity + the side we took
     assert "+10.0bp" in row                          # 77,077 vs a 77,000 strike
     assert "[green]" in row                          # up, and the price is above
+
+
+def test_a_tall_feed_row_is_one_chart_across_two_terminal_rows():
+    """The tall form buys vertical resolution, not a second chart: the stroke
+    continues onto the second row, the delta stays with the identity and the
+    countdown lands where the stroke ends."""
+    now = 1_787_500_100.0
+    start = int(now - 60)
+    feeds = {"chain": {"btc": [(now - 30, 77_000.0), (now - 1, 77_077.0)]},
+             "marks": {"btc": {start - 60: 77_000.0}}, "spot": {}, "venue": {}}
+    snap = _armed_snap(now, feeds=feeds, start=start, side="up", entry_px=0.62)
+    rows = wc.feed_row(wc.armed_windows(snap)[0], feeds, 60, now, h=2)
+    assert len(rows) == 2
+    assert "btc 5m" in rows[0] and "+10.0bp" in rows[0]
+    assert "btc 5m" not in rows[1] and "bp" not in rows[1]
 
 
 def test_a_symbol_the_corpus_cannot_price_gets_no_row_rather_than_an_empty_one():
@@ -1544,7 +1535,7 @@ def test_a_window_with_no_strike_still_plots_its_price_and_says_so():
     feeds = {"chain": {"btc": [(now - 10, 77_000.0), (now - 1, 77_050.0)]},
              "marks": {}}
     snap = _armed_snap(now, feeds=feeds)
-    row = wc.feed_row(wc.armed_windows(snap)[0], feeds, 60, now)
+    [row] = wc.feed_row(wc.armed_windows(snap)[0], feeds, 60, now)
     assert "tgt —" in row and "bp" not in row
 
 
@@ -1639,17 +1630,41 @@ def test_the_charts_row_never_costs_the_tape_its_floor_or_the_table_its_row():
 def test_a_panel_too_narrow_for_a_line_keeps_the_numbers():
     """A smudge is worse than no chart. The figures are the answer either
     way, and they never go."""
-    now = 1_787_500_000.0
-    snap = _snap_with(sb={"eff_windows": [_graded(3.0, now - 10)]}, sb_fetched_at=now)
-    wide, narrow = wc.pnl_rows(snap, 60, now), wc.pnl_rows(snap, 26, now)
-    assert "+3.00" in wide[0] and "+3.00" in narrow[0]
-    assert "⠀" not in narrow[0] and len(narrow[0]) < len(wide[0])
+    now = 1_787_500_100.0
+    start = int(now - 60)
+    feeds = {"chain": {"btc": [(now - 30, 77_000.0), (now - 1, 77_077.0)]},
+             "marks": {"btc": {start - 60: 77_000.0}}, "spot": {}, "venue": {}}
+    snap = _armed_snap(now, feeds=feeds, start=start, side="up", entry_px=0.62)
+    [wide] = wc.feed_row(wc.armed_windows(snap)[0], feeds, 80, now)
+    [narrow] = wc.feed_row(wc.armed_windows(snap)[0], feeds, 30, now)
+    assert "+10.0bp" in wide and "+10.0bp" in narrow
+    assert len(narrow) < len(wide)
 
 
-def test_the_two_panels_split_the_row():
-    assert wc.split_widths(120) == (60, 60)
-    assert sum(wc.split_widths(121)) == 121
-    assert wc.split_widths(0) == (0, 0)
+def test_the_tall_panel_doubles_the_budget_not_the_window_count():
+    """Every chart costs two rows in tall form, so the caps trade windows for
+    resolution one-for-one — and the lead block is still budgeted first and
+    drawn whole."""
+    now = 1_787_500_100.0
+    start = int(now - 60)
+    syms = ("btc", "eth", "sol", "xrp", "bnb", "doge", "hype")
+    feeds = {"chain": {s: [(now - 20, 100.0), (now - 1, 101.0)] for s in syms},
+             "spot": {"btc": [(now - 20, 100.0), (now - 1, 101.0)]},
+             "venue": {"btc": "binance"},
+             "marks": {s: {start - 60: 100.0} for s in syms}}
+    snap = _armed_snap(now, syms=syms, start=start, feeds=feeds)
+    rows = wc.feeds_rows(snap, 60, now, tall=True)
+    assert len(rows) <= wc.CHARTS_MAX_INNER_TALL
+    assert sum(1 for r in rows if "rtds" in r) == 1
+    assert sum(1 for r in rows if "binance" in r) == 1
+    assert any("more armed" in r for r in rows)
+    # Tall never shows MORE windows than compact on the same snapshot, and
+    # never a clipped half-chart: every ident row is followed by its
+    # continuation row.
+    compact_idents = sum(1 for r in wc.feeds_rows(snap, 60, now) if "5m" in r)
+    tall_idents = sum(1 for r in rows if "5m" in r)
+    assert 0 < tall_idents <= compact_idents
+    assert len(rows) == 2 * tall_idents + 1 + 4  # charts ×2 + note + lead block
 
 
 # -- the corpus tails: appended bytes only, on the worker --

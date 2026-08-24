@@ -15,14 +15,15 @@ the render loop seeks, and — when that file isn't this box's, because
 PMENGINE_CONTROL_URL points down an SSM tunnel — the engine's `GET /tape` on
 the worker.
 
-The charts row is two more views of data already on the worker: the P&L lines
-come off the SAME scoreboard the header prints (plus one `_tape_scoreboard`
-walk per peer wallet, same function, another account), and the feed lines come
-off watch_feeds' incremental tails of the rtds/spot corpora. Neither adds a
-call to the render path.
+The charts row is one more view of data already on the worker: the feed lines
+come off watch_feeds' incremental tails of the rtds/spot corpora, and the
+fleet header row's peer money comes off one `_tape_scoreboard` walk per peer
+wallet (same function as the header's own scoreboard, another account).
+Neither adds a call to the render path. The row is drawn tall (two terminal
+rows per chart) when the screen affords it and compact when it does not.
 
 Pairs with watch_ui.py, which owns every render function this uses, and
-watch_charts.py, which owns the chart math and the two chart panels.
+watch_charts.py, which owns the chart math and the feeds panel.
 """
 
 from __future__ import annotations
@@ -495,7 +496,7 @@ class WatchFetcher:
         """Every OTHER engine's wallet, graded through the SAME function.
 
         `_tape_scoreboard` with an address — not a second walk, not a lighter
-        one: the peer's P&L line on the charts row is scored by the same
+        one: the peer's money on the header's fleet row is scored by the same
         wallet-first grader `pmt crypto stats` runs, or the two engines' rows
         would be two different definitions of a win sitting one above the other.
 
@@ -513,7 +514,7 @@ class WatchFetcher:
         peers = wallet.peer_wallets()
         if not peers:
             return
-        floor = time.time() - watch_charts.PNL_WINDOW_S
+        floor = time.time() - watch_ui.FLEET_WINDOW_S
         books = dict(self.state.read().get("peers") or {})
         for label, addr in peers:
             try:
@@ -645,11 +646,12 @@ class WatchFetcher:
                    "All-time P&L, and the riding/windows-table figures, "
                    "always walk the full wallet history regardless of this.")
 @click.option("--charts/--no-charts", default=True,
-              help="The charts row (per-engine P&L over 24h, and each armed "
-                   "symbol's underlying against its window's strike). It "
-                   "already drops itself on a screen too short to hold it "
-                   "without squeezing the tape; --no-charts gives those rows "
-                   "back on a screen that can.")
+              help="The feeds chart row (each armed symbol's underlying "
+                   "against its window's strike, plus the rtds-vs-spot lead "
+                   "block), drawn tall when the screen affords it. It already "
+                   "drops itself on a screen too short to hold it without "
+                   "squeezing the tape; --no-charts gives those rows back on "
+                   "a screen that can.")
 def crypto_watch(since: float | None, charts: bool) -> None:
     """Full-screen live dashboard: risk header + charts + the windows table + streaming tape."""
     import time as _t
@@ -732,10 +734,10 @@ def crypto_watch(since: float | None, charts: bool) -> None:
         return Panel(body, title=tape_title(tape_feed.remote), border_style="dim")
 
     # Four slots, still exactly ONE table: header, the charts row, the windows
-    # table, the tape. The charts row holds two panels of plain text — braille
-    # lines, not a grid — so the "one table" rule the windows panel is built on
-    # is untouched, and the row sizes itself to nothing whenever it has neither
-    # a second engine's ledger nor an armed symbol to draw.
+    # table, the tape. The charts row is one full-width panel of plain text —
+    # braille lines, not a grid — so the "one table" rule the windows panel is
+    # built on is untouched, and the row sizes itself to nothing whenever it
+    # has no armed symbol to draw.
     layout = Layout()
     layout.split_column(
         Layout(name="head", size=HEAD_MIN_H),
@@ -743,7 +745,6 @@ def crypto_watch(since: float | None, charts: bool) -> None:
         Layout(name="windows", size=WINDOWS_MAX_ROWS + WINDOWS_CHROME),
         Layout(name="tape", ratio=1),
     )
-    layout["charts"].split_row(Layout(name="pnl"), Layout(name="feeds"))
 
     show_help = False
     next_render = 0.0
@@ -792,12 +793,23 @@ def crypto_watch(since: float | None, charts: bool) -> None:
                         snap, render_err, live.console.size.width)
                     # The charts row is sized to what it has to say and then
                     # to what the screen can spare — in that order, so a box
-                    # with nothing to chart never costs the tape a row.
+                    # with nothing to chart never costs the tape a row. Tall
+                    # is asked first; a screen that cannot seat the tall panel
+                    # whole gets the compact one before it gets nothing.
+                    tall = charts
                     inner = (watch_charts.charts_inner_height(
-                        snap, live.console.size.width, now) if charts else 0)
+                        snap, live.console.size.width, now, tall=True)
+                        if charts else 0)
                     charts_h = charts_rows_shown(
                         live.console.size.height, layout["head"].size,
                         inner + watch_charts.CHARTS_CHROME if inner else 0)
+                    if charts and not charts_h:
+                        tall = False
+                        inner = watch_charts.charts_inner_height(
+                            snap, live.console.size.width, now)
+                        charts_h = charts_rows_shown(
+                            live.console.size.height, layout["head"].size,
+                            inner + watch_charts.CHARTS_CHROME if inner else 0)
                     layout["charts"].size = charts_h
                     layout["charts"].visible = charts_h > 0
                     n_win = windows_rows_shown(
@@ -807,12 +819,9 @@ def crypto_watch(since: float | None, charts: bool) -> None:
                     layout["windows"].size = n_win + WINDOWS_CHROME
                     layout["head"].update(header())
                     if charts_h:
-                        left, right = watch_charts.split_widths(
-                            live.console.size.width)
-                        layout["pnl"].update(
-                            watch_charts.build_pnl_panel(snap, left, now))
-                        layout["feeds"].update(
-                            watch_charts.build_feeds_panel(snap, right, now))
+                        layout["charts"].update(
+                            watch_charts.build_feeds_panel(
+                                snap, live.console.size.width, now, tall))
                     layout["windows"].update(
                         windows_panel(n_win, live.console.size.width))
                     h = (live.console.size.height - layout["head"].size

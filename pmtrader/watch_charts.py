@@ -1,8 +1,13 @@
-"""Line-chart panels for `pmt crypto watch` — pure math, pure rendering.
+"""The feeds chart panel for `pmt crypto watch` — pure math, pure rendering.
 
-Two questions the tables could never answer, and both of them are SHAPES
-rather than numbers: is the money curve going up, and where is the underlying
-sitting relative to the strike we are betting into.
+One question the tables could never answer, because it is a SHAPE rather than
+a number: where is the underlying sitting relative to the strike we are
+betting into, and how did it get there. The whole charts row belongs to it —
+a cumulative P&L sparkline used to share this space and earned nothing (a
+day's curve at braille resolution is a flat line with one cliff in it; the
+header's money cells already say everything it said), so the fleet's
+cross-engine nets live on a header row now (watch_ui.fleet_row) and every
+terminal cell here goes to price.
 
 Nothing here opens a file, a socket or a clock it was not handed. watch_feeds
 does the tailing and cli_crypto_watch's fetch worker does the walking — same
@@ -10,12 +15,6 @@ split as watch_ui.py and for the same reason: the render loop is allowed ZERO
 I/O it can be blocked on (docs/LESSONS.md#L28). Hand these functions a dict,
 read the strings back; that is also why every one of them is unit-testable
 without a terminal.
-
-The scoreboard is the ONLY source of a P&L figure here. Nothing on these
-panels is priced off the tape's stated fairs or off a live mark —
-`eff_windows` is what cli_crypto_stats graded against the wallet and the
-outcomes corpus, and a chart drawn off anything else would disagree with the
-header two rows above it.
 """
 
 from __future__ import annotations
@@ -23,7 +22,6 @@ from __future__ import annotations
 import time
 
 import watch_ui
-from cli_common import _pnl_color
 from polymarket import updown_slugs
 
 # ---------- braille canvas ----------
@@ -143,55 +141,6 @@ def downsample(points: list[tuple[float, float]], n: int,
     return out
 
 
-# ---------- P&L: cumulative, wallet-graded, per engine ----------
-
-def settle_ts(w: dict) -> float:
-    """When a graded window's money actually landed: its redeem/exit row, else
-    the window's own close. The exit row is preferred because that is the
-    instant the capital came back, and it is the field `eff_windows` records."""
-    return float(w.get("exit_ts") or 0.0) or float(w.get("end_ts") or 0.0)
-
-
-def cumulative_pnl(windows: list[dict] | None, floor: float = 0.0
-                   ) -> list[tuple[float, float]]:
-    """[(settlement instant, running $)] over graded windows, oldest first.
-
-    Riding windows (`pnl` None) contribute NOTHING — an undecided position is
-    not P&L, and drawing a mark-to-market line here would put a number on this
-    panel the wallet has never agreed to.
-
-    `floor` re-bases the curve at zero: a trailing-24h chart answers "what did
-    today do", not "where does the all-time ledger stand", and starting it at
-    the all-time level would flatten the day into a rounding error.
-    """
-    graded = [(settle_ts(w), float(w.get("pnl") or 0.0))
-              for w in (windows or [])
-              if w.get("pnl") is not None and settle_ts(w) >= floor]
-    graded.sort(key=lambda p: p[0])
-    out: list[tuple[float, float]] = []
-    run = 0.0
-    for t, pnl in graded:
-        run += pnl
-        out.append((t, run))
-    return out
-
-
-def pnl_series(windows: list[dict] | None, width: int, now: float,
-               window_s: float) -> tuple[list[float | None], float]:
-    """(column values, closing P&L) for one engine's trailing window.
-
-    The closing figure is returned rather than re-read off the last column:
-    the columns are a picture and the number is the answer, and a settlement
-    landing inside the final column must not round the headline figure away.
-    """
-    floor = now - window_s
-    curve = cumulative_pnl(windows, floor)
-    # The curve opens at zero AT the floor so the line starts on the axis
-    # rather than jumping in wherever the first settlement happened to land.
-    cols = downsample([(floor, 0.0)] + curve, 2 * max(int(width), 1), floor, now)
-    return cols, (curve[-1][1] if curve else 0.0)
-
-
 # ---------- feeds: the underlying against the window's own strike ----------
 
 def delta_bp(px: float | None, target: float | None) -> float | None:
@@ -274,13 +223,11 @@ def span_with_zero(cols: list[float | None], floor_span: float = 2.0
 
 # ---------- panel geometry ----------
 
-PNL_WINDOW_S = 24 * 3600.0    # the trailing P&L chart's axis
 FEED_WINDOW_S = 120.0         # per-symbol path against the strike
 FOCUS_WINDOW_S = 30.0         # the rtds-vs-spot lead block: seconds, not minutes
-CHARTS_MAX_INNER = 6          # inner rows either panel may claim
+CHARTS_MAX_INNER = 6          # inner rows, compact: every chart one terminal row
+CHARTS_MAX_INNER_TALL = 12    # inner rows, tall: every chart two terminal rows
 CHARTS_CHROME = 2             # panel border, top and bottom
-_PNL_LABEL_W = 8
-_PNL_VALUE_W = 10
 _FEED_IDENT_W = 10            # "hype 15m ▲" — the side rides the identity cell
 _FEED_TAIL_W = 16             # "  -4.7bp   2:41"
 _MIN_CHART_W = 8              # below this a line is a smudge; the row drops it
@@ -300,61 +247,6 @@ def _px(v: float) -> str:
     if a >= 100:
         return f"{v:,.2f}"
     return f"{v:,.4f}" if a >= 1 else f"{v:,.6f}"
-
-
-# ---------- P&L panel ----------
-
-def engine_curves(snap: dict, now: float,
-                  window_s: float = PNL_WINDOW_S) -> list[dict]:
-    """One entry per engine whose ledger this box can actually see.
-
-    The local engine's rows come straight off the scoreboard the header is
-    already painting — the SAME `_tape_scoreboard` walk, no second acquisition
-    (cli_crypto_stats' single-source rule). A peer comes off the worker's
-    `peers` publication, which runs that same function against another wallet.
-
-    An engine with no graded window in the trailing span still gets its line,
-    flat at zero. An engine we cannot see gets no row at all: "this box made
-    nothing today" and "we cannot reach this box's ledger" are opposite facts
-    and may not share a rendering.
-    """
-    out: list[dict] = []
-    sb = snap.get("sb") or {}
-    if snap.get("sb_fetched_at") is not None:
-        out.append({"label": (snap.get("node") or "local"),
-                    "windows": sb.get("eff_windows") or []})
-    for label, book in sorted((snap.get("peers") or {}).items()):
-        if not isinstance(book, dict) or book.get("windows") is None:
-            continue
-        out.append({"label": label, "windows": book.get("windows") or []})
-    if len(out) > 1:
-        # The fleet line SUMS ledgers rather than averaging them: two engines
-        # under the series partition trade disjoint series, so their windows
-        # concatenate with no way to double-count one.
-        out.append({"label": "fleet",
-                    "windows": [w for e in out for w in e["windows"]]})
-    return out
-
-
-def pnl_rows(snap: dict, panel_w: int, now: float | None = None,
-             window_s: float = PNL_WINDOW_S) -> list[str]:
-    """`desktop  +12.34  ⣀⣠⣴⣶⣿` per engine, newest money on the right.
-
-    Rich markup, one string per terminal row. Empty when no engine's ledger
-    has landed yet — the panel says so rather than painting a confident zero.
-    """
-    now = time.time() if now is None else now
-    chart_w = _chart_width(panel_w, _PNL_LABEL_W + _PNL_VALUE_W + 2)
-    rows: list[str] = []
-    for e in engine_curves(snap, now, window_s):
-        cols, net = pnl_series(e["windows"], chart_w or 1, now, window_s)
-        style = _pnl_color(net)
-        label = e["label"][:_PNL_LABEL_W]
-        money = f"{net:+,.2f}"
-        cell = f"[{style}]{sparkline(cols, chart_w)}[/{style}]" if chart_w else ""
-        rows.append(f"[dim]{label:<{_PNL_LABEL_W}}[/dim] "
-                    f"[{style}]{money:>{_PNL_VALUE_W}}[/{style}] {cell}")
-    return rows
 
 
 # ---------- feeds panel ----------
@@ -397,8 +289,12 @@ def _feed_ident(w: dict, side: str | None) -> str:
     return f"{watch_ui._arm_label(w.get('slug', ''))} {arrow}".rstrip()
 
 
-def feed_row(w: dict, feeds: dict, panel_w: int, now: float) -> str | None:
-    """One armed window: its underlying's recent path against the strike.
+def feed_row(w: dict, feeds: dict, panel_w: int, now: float,
+             h: int = 1) -> list[str] | None:
+    """One armed window: its underlying's recent path against the strike, as
+    `h` terminal rows (the chart spans all of them — at h=2 a braille line has
+    eight vertical levels instead of four, which is the difference between
+    "above or below" and an actual shape).
 
     The chart's axis always contains the strike (span_with_zero), so the line's
     distance from that rail IS the margin the window settles on and its shape
@@ -432,13 +328,27 @@ def feed_row(w: dict, feeds: dict, panel_w: int, now: float) -> str | None:
     d_bp = delta_bp(samples[-1][1], target)
     style = _side_style(side, d_bp)
     delta = f"{d_bp:+.1f}bp" if d_bp is not None else "tgt —"
-    line = f"[{style}]{sparkline(cols, chart_w, lo, hi)}[/{style}]" if chart_w else ""
+    chart = (braille_rows(cols, chart_w, h, lo, hi) if chart_w
+             else [""] * max(h, 1))
     ident = _feed_ident(w, side)
-    return (f"{watch_ui._stage_cell(w)} [dim]{ident:<{_FEED_IDENT_W}}[/dim] {line} "
-            f"[{style}]{delta:>9}[/{style}] {watch_ui._countdown_markup(slug, now)}")
+    head = (f"{watch_ui._stage_cell(w)} [dim]{ident:<{_FEED_IDENT_W}}[/dim] "
+            f"[{style}]{chart[0]}[/{style}] [{style}]{delta:>9}[/{style}]")
+    if h <= 1:
+        return [f"{head} {watch_ui._countdown_markup(slug, now)}"]
+    # Continuation rows: the chart keeps its columns (the pad mirrors the
+    # stage-glyph + identity prefix exactly), the countdown lands on the last
+    # row where the eye ends the stroke.
+    pad = " " * (_FEED_IDENT_W + 3)
+    rows = [head]
+    for line in chart[1:-1]:
+        rows.append(f"{pad}[{style}]{line}[/{style}]")
+    rows.append(f"{pad}[{style}]{chart[-1]}[/{style}] "
+                f"{'':>9} {watch_ui._countdown_markup(slug, now)}")
+    return rows
 
 
-def focus_rows(w: dict | None, feeds: dict, panel_w: int, now: float) -> list[str]:
+def focus_rows(w: dict | None, feeds: dict, panel_w: int, now: float,
+               h: int = 1) -> list[str]:
     """The settlement stream against a spot venue, one window, one axis.
 
     This is the ~3s maker lead made visible rather than asserted: the two lines
@@ -465,22 +375,34 @@ def focus_rows(w: dict | None, feeds: dict, panel_w: int, now: float) -> list[st
     s_cols = deviation_cols(spot, chart_w, floor, now)
     lo, hi = shared_span(c_cols, s_cols)
     venue = (feeds.get("venue") or {}).get(sym) or "spot"
-    return [_focus_row("rtds", c_cols, chart_w, lo, hi, chain[-1][1],
-                       "cyan", "settles"),
-            _focus_row(venue[:7], s_cols, chart_w, lo, hi, spot[-1][1],
-                       "magenta", "leads")]
+    return (_focus_row("rtds", c_cols, chart_w, h, lo, hi, chain[-1][1],
+                       "cyan", "settles")
+            + _focus_row(venue[:7], s_cols, chart_w, h, lo, hi, spot[-1][1],
+                         "magenta", "leads"))
 
 
-def _focus_row(label: str, cols: list[float | None], chart_w: int,
-               lo: float, hi: float, last: float, style: str, note: str) -> str:
-    tail = f"{_px(last)} {note}"
-    return (f"[dim]{'  ' + label:<{_FEED_IDENT_W}}[/dim] "
-            f"[{style}]{sparkline(cols, chart_w, lo, hi)}[/{style}] "
-            f"[dim]{tail:>{_FEED_TAIL_W}}[/dim]")
+def _focus_row(label: str, cols: list[float | None], chart_w: int, h: int,
+               lo: float, hi: float, last: float, style: str,
+               note: str) -> list[str]:
+    tail = f" [dim]{f'{_px(last)} {note}':>{_FEED_TAIL_W}}[/dim]"
+    chart = braille_rows(cols, chart_w, h, lo, hi)
+    rows = [f"[dim]{'  ' + label:<{_FEED_IDENT_W}}[/dim] "
+            f"[{style}]{chart[0]}[/{style}]"]
+    pad = " " * (_FEED_IDENT_W + 1)
+    for line in chart[1:]:
+        rows.append(f"{pad}[{style}]{line}[/{style}]")
+    rows[-1] += tail
+    return rows
 
 
-def feeds_rows(snap: dict, panel_w: int, now: float | None = None) -> list[str]:
-    """The feeds panel's body: one line per armed window, then the lead block.
+def feeds_rows(snap: dict, panel_w: int, now: float | None = None,
+               tall: bool = False) -> list[str]:
+    """The feeds panel's body: each armed window's chart, then the lead block.
+
+    `tall` doubles every chart's terminal rows (eight braille levels instead
+    of four) and the row budget with it — the panel owns the whole charts row,
+    so the trade is windows-shown vs vertical resolution, and the caller picks
+    by what the screen affords.
 
     The lead block is budgeted FIRST and drawn whole or not at all — a
     comparison missing its second line is not a comparison, and truncating the
@@ -494,44 +416,43 @@ def feeds_rows(snap: dict, panel_w: int, now: float | None = None) -> list[str]:
     the rest of the panel still paints.
     """
     now = time.time() if now is None else now
+    h = 2 if tall else 1
+    cap = CHARTS_MAX_INNER_TALL if tall else CHARTS_MAX_INNER
     feeds = snap.get("feeds") or {}
     windows = armed_windows(snap)
-    built = [(w, line) for w in windows
-             if (line := feed_row(w, feeds, panel_w, now)) is not None]
+    built = [(w, lines) for w in windows
+             if (lines := feed_row(w, feeds, panel_w, now, h)) is not None]
     # The focus is the window closest to settling that has both feeds: the one
     # where three seconds of lead is still worth something.
-    focus = focus_rows(built[0][0] if built else None, feeds, panel_w, now)
-    cap = max(CHARTS_MAX_INNER - len(focus), 0)
-    if len(windows) > cap:
-        cap = max(cap - 1, 0)  # one row is owed to the "+N more" note
-    rows = [line for _, line in built[:cap]]
-    extra = len(windows) - len(rows)
+    focus = focus_rows(built[0][0] if built else None, feeds, panel_w, now, h)
+    budget = max(cap - len(focus), 0)
+    n_fit = budget // h
+    if len(windows) > n_fit:
+        n_fit = max((budget - 1) // h, 0)  # one row is owed to the "+N more" note
+    shown = built[:n_fit]
+    rows = [line for _, lines in shown for line in lines]
+    extra = len(windows) - len(shown)
     if rows and extra > 0:
         rows.append(f"[dim]{'':<{_FEED_IDENT_W}} +{extra} more armed[/dim]")
-    return (rows + focus)[:CHARTS_MAX_INNER]
+    return (rows + focus)[:cap]
 
 
-# ---------- the row of panels ----------
+# ---------- the panel ----------
 
-def split_widths(width: int) -> tuple[int, int]:
-    """(P&L width, feeds width) — Rich's own even split, computed here so the
-    row builders can size their charts before the Layout exists."""
-    width = max(int(width or 0), 0)
-    left = width // 2
-    return left, width - left
+def charts_inner_height(snap: dict, width: int, now: float | None = None,
+                        tall: bool = False) -> int:
+    """Inner rows the charts row wants at this height, or 0 when it has
+    nothing to say.
 
-
-def charts_inner_height(snap: dict, width: int, now: float | None = None) -> int:
-    """Inner rows the charts row wants, or 0 when it has nothing to say.
-
-    Zero is the whole degradation contract: a box with no peer wallet, no armed
-    symbol and no corpus paints no charts row at all rather than an empty box
-    taking rows off the tape.
+    Zero is the whole degradation contract: a box with no armed symbol and no
+    corpus paints no charts row at all rather than an empty box taking rows
+    off the tape. The caller asks tall first and falls back to compact — the
+    all-or-nothing rule in charts_rows_shown then means a short screen gets
+    one-row charts before it gets none.
     """
     now = time.time() if now is None else now
-    left, right = split_widths(width)
-    return min(max(len(pnl_rows(snap, left, now)),
-                   len(feeds_rows(snap, right, now))), CHARTS_MAX_INNER)
+    cap = CHARTS_MAX_INNER_TALL if tall else CHARTS_MAX_INNER
+    return min(len(feeds_rows(snap, width, now, tall)), cap)
 
 
 def _panel(rows: list[str], empty: str, title: str):
@@ -545,17 +466,9 @@ def _panel(rows: list[str], empty: str, title: str):
     return Panel(body, title=title, title_align="left", border_style="dim")
 
 
-def build_pnl_panel(snap: dict, width: int, now: float | None = None,
-                    window_s: float = PNL_WINDOW_S):
-    """Cumulative wallet-graded P&L per engine over the trailing window."""
-    span = f"{window_s / 3600:.0f}h" if window_s >= 3600 else f"{window_s / 60:.0f}m"
-    return _panel(pnl_rows(snap, width, now, window_s),
-                  "[dim]no graded window in the trailing span[/dim]",
-                  f"[bold]P&L[/bold] [dim]· {span} · wallet-graded[/dim]")
-
-
-def build_feeds_panel(snap: dict, width: int, now: float | None = None):
+def build_feeds_panel(snap: dict, width: int, now: float | None = None,
+                      tall: bool = False):
     """The underlying against each armed window's strike, plus the lead block."""
-    return _panel(feeds_rows(snap, width, now),
+    return _panel(feeds_rows(snap, width, now, tall),
                   "[dim]no armed symbol this box's corpus can price[/dim]",
                   "[bold]feeds[/bold] [dim]· price vs strike[/dim]")
