@@ -85,6 +85,22 @@ def test_banked_is_the_settlement_seconds_that_have_printed():
         "nothing is banked before the settlement window opens"
 
 
+def test_banked_is_clamped_at_the_window_end_not_at_now():
+    """[end-60, min(now, end)]. Past the close the settlement average is
+    finished, and a print stamped after it is a second the exchange did not
+    average — without the clamp a window polled after its own end banks MORE
+    than sixty seconds of mass, which is not a window that exists. The Rust
+    port has always clamped `to = now.min(end)`; this is the same rule.
+    """
+    s = a_state(n_spot=400, t_end=END + 60.0)
+    full = s.banked("doge/usd", END, END)
+    assert len(full) == 61, "[end-60, end] inclusive at both ends"
+    # Thirty seconds after the close, with the stream still printing: the same
+    # sixty seconds, not ninety.
+    assert s.banked("doge/usd", END, END + 30.0) == full
+    assert len(s.banked("doge/usd", END, END + 30.0)) <= 61
+
+
 def test_sigma_lookback_floors_at_start_minus_sixty():
     """[max(now-300, start-60), now]. Early in a window the lookback is only
     ~70s and the reported results were produced that way; a full trailing 300s

@@ -153,14 +153,23 @@ class StreamState:
         return spx[-1], age
 
     def banked(self, symbol: str, end: float, now: float) -> list[float]:
-        """Spot prints stamped in [end-60, now] — the settlement seconds that
-        have already printed. Width is 60s at EVERY duration."""
+        """Spot prints stamped in [end-60, min(now, end)] — the settlement
+        seconds that have already printed. Width is 60s at EVERY duration.
+
+        The upper bound is clamped at `end`, not left at `now`: past the close
+        the settlement average is finished, and a print stamped after it is a
+        second the exchange did not average. Without the clamp a window polled
+        after its own end banks MORE than sixty seconds of mass, which is not a
+        window that exists. The Rust port (`updown2.rs::price`) has always
+        clamped `to = now.min(end)`; this is the same rule on this side.
+        """
         snap = self._snapshot(symbol)
         if snap is None:
             return []
         sts, spx, _, _ = snap
         lo = end - SETTLE_WIDTH_S
-        return [px for ts, px in zip(sts, spx) if lo <= ts <= now]
+        hi = min(now, end)
+        return [px for ts, px in zip(sts, spx) if lo <= ts <= hi]
 
     def sigma(self, symbol: str, start: float, now: float) -> float:
         """Per-second log-return stdev over [max(now-300, start-60), now].

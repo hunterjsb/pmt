@@ -107,6 +107,18 @@ Shadow and live keep **separate exposure ledgers**. A shadow window obeys every
 law the live one does (that is what makes the tape faithful), but paper
 inventory never spends live budget.
 
+**The live book survives a restart.** `RiskBook` is in memory, so a fresh
+process used to forget every `(slug, side)` it had fired — a still-open window
+could be bought a *second* time, which is §1.1's −9.48% RoN shape rebuilt by a
+systemd restart, and the $40 cap read as fully free with real positions open.
+On startup the live book is **rehydrated from `live-tape.jsonl`'s `ev:order`
+rows** (`Pilot.rehydrate`), which is the right authority because that row is
+written *before* the send: a clip that reached the tape is a clip that was
+spent, ack or no ack. Only windows still inside their settlement grace come
+back as positions; anything older was already retired and queued. Shadow does
+not rehydrate — paper exposure outliving the process would seize the shadow
+budget at boot and stop the pilot producing the record it exists to produce.
+
 **The kill file**: `touch ~/.pmt/pilot2/HALT`. Checked at the top of every poll
 AND again immediately before any order leaves the process. Present → the pilot
 writes a `halt` marker and exits 0. Filled positions ride to resolution, which
@@ -133,10 +145,23 @@ visibly stopped. `pilot2 series` checks the partition without starting anything.
 
 **This is what was built.** There is no relayer batch-redeem path in pmtrader,
 and inventing a money-moving code path nobody has reviewed for a $40 book is
-the wrong trade. Instead: when a live window's settlement grace (300s) passes,
-the position's exposure is released and the position is appended to
-`~/.pmt/pilot2/redeem-queue.jsonl`. `pilot2 status` reports the queue depth and
-notional under `MANUAL SWEEP`. The operator sweeps by hand.
+the wrong trade. Instead the position is written to
+`~/.pmt/pilot2/redeem-queue.jsonl` **twice**, and the first write is the one
+that matters:
+
+- `redeem_candidate` — the moment the clip is booked, *before* the order leaves
+  the process. The queue used to be written only at settlement, by a `_retire`
+  running 300s after the close, so a process that died in between left a filled
+  position with nothing anywhere saying it needed sweeping. Writing early can
+  only ever queue a position that turns out not to have filled — the sweep sees
+  that and skips it; writing late can lose one, which is money left on chain.
+- `redeem_due` — the same position when its settlement grace passes and its
+  exposure is released.
+
+`pilot2 status` reports the queue depth and notional under `MANUAL SWEEP`,
+counting each `(slug, side)` **once** — the newest row wins, so a candidate
+superseded by its `redeem_due` is one position, not two. The operator sweeps by
+hand.
 
 Note the EU wallet's redeem accounting quirk from RETROSPECTIVE.md §0: a bare
 EOA's redeems post as $0/0-share rows, so wins are graded but not paid until

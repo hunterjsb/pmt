@@ -36,6 +36,14 @@ EV_WINDOW = "window"       # per-window summary written at close
 EV_CALIB = "calib"         # blend-fit sample, one per window, gate-independent
 EV_ORDER = "order"         # live: an order was built and sent
 EV_ACK = "ack"             # live: the exchange answered
+# Redeem-queue rows. A CANDIDATE is written the moment a live clip is booked,
+# before the order leaves the process: a position that filled and then lost its
+# process was invisible to the sweep, because the only row was written at
+# settlement by a `_retire` the dead process never ran. DUE is that settlement
+# row, and it supersedes the candidate for the same (slug, side).
+EV_REDEEM_CANDIDATE = "redeem_candidate"
+EV_REDEEM_DUE = "redeem_due"
+EV_REHYDRATE = "rehydrate"  # live: the risk book was rebuilt from this tape
 EV_ERROR = "error"
 EV_START = "start"
 EV_STOP = "stop"
