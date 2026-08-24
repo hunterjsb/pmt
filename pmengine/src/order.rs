@@ -109,19 +109,63 @@ pub(crate) fn wire_price(urgency: Urgency, is_buy: bool, price: Decimal, dp: u32
     wire_shape(urgency, is_buy, scrubbed, dp).1
 }
 
+/// Trade ids already booked into positions, shared between the order path
+/// and the trades poller.
+///
+/// One set, two writers, and that is the whole point: an ack that reports
+/// `status: matched` is booked at the wire, and the poll that finds the same
+/// trade fifteen seconds later must recognise it as already booked. Trade ids
+/// are the exchange's own identity for a match and appear in both places
+/// (`PostOrderResponse::trade_ids`, `TradeResponse::id`), so the claim is
+/// exact rather than a heuristic on size and price.
+pub type BookedTrades = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+/// Claim these trade ids for booking. `true` when at least one was new,
+/// which is the caller's licence to book the fill; `false` means the trades
+/// poller already has them and booking again would double-count.
+///
+/// An ack with NO trade ids is claimable — some CLOB deployments answer
+/// `matched` without them — and the trades poll's own check still catches
+/// the trade by id when it arrives, so the fill lands exactly once.
+///
+/// Free rather than a method so it is testable without a live CLOB behind
+/// an `OrderManager`: the claim is the whole safety argument for booking a
+/// fill at ack, and it must not be provable only by re-writing it in a test.
+pub(crate) fn claim_trades(booked: &BookedTrades, trade_ids: &[String]) -> bool {
+    let Ok(mut seen) = booked.lock() else { return false };
+    if trade_ids.is_empty() {
+        return true;
+    }
+    // A plain loop, not `any`: `any` short-circuits on the first new id and
+    // would leave the tail of a multi-trade match unclaimed, which is
+    // precisely the double-book this set exists to prevent. Every id gets
+    // inserted; the answer is whether ANY of them was new.
+    let mut fresh = false;
+    for id in trade_ids {
+        fresh |= seen.insert(id.clone());
+    }
+    fresh
+}
+
 /// Order manager wraps the SDK and tracks orders.
 pub struct OrderManager {
     client: Arc<PolymarketClient>,
     orders: HashMap<String, Order>,
     fill_sender: mpsc::Sender<Fill>,
+    booked_trades: BookedTrades,
 }
 
 impl OrderManager {
-    pub fn new(client: Arc<PolymarketClient>, fill_sender: mpsc::Sender<Fill>) -> Self {
+    pub fn new(
+        client: Arc<PolymarketClient>,
+        fill_sender: mpsc::Sender<Fill>,
+        booked_trades: BookedTrades,
+    ) -> Self {
         Self {
             client,
             orders: HashMap::new(),
             fill_sender,
+            booked_trades,
         }
     }
 
@@ -187,12 +231,15 @@ impl OrderManager {
 
         let side = if is_buy { Side::Buy } else { Side::Sell };
 
-        // Place order via SDK (handles dry-run internally)
-        let order_id = self
+        // Place order via SDK (handles dry-run internally). A REFUSAL is an
+        // Err here now, so nothing below runs for an order the CLOB never
+        // took — it is not tracked, and the caller releases its reservation.
+        let ack = self
             .client
             .place_limit_order_timed(token_id, side, price, size, post_only, &mut timings)
             .await
             .map_err(|e| OrderError::SdkError(e.to_string()))?;
+        let order_id = ack.order_id.clone();
 
         // Track order locally
         let order = Order {
@@ -207,6 +254,34 @@ impl OrderManager {
         };
 
         self.orders.insert(order_id.clone(), order);
+
+        // The ack said it already matched. Book it NOW rather than waiting
+        // for the trades poll: a crossing clip has no realtime fill notice
+        // at all, so until this the engine's own budget, its exposure ledger
+        // and every strategy's committed number were blind to a fill that
+        // had already happened, for up to a full poll interval.
+        if ack.filled_shares > Decimal::ZERO {
+            // Claim the trade ids first. Whatever this books, the poller
+            // must not book again; claiming before the send means even an
+            // interleaved poll loses the race rather than duplicating.
+            let unseen = self.claim_trades(&ack.trade_ids);
+            if unseen {
+                self.process_fill(
+                    &order_id,
+                    ack.filled_price,
+                    ack.filled_shares,
+                    // The ack carries no fee rate, and `crate::fees` is the
+                    // one place a fee may be priced (L18) — inventing a rate
+                    // here would be a second schedule. `Fill::fee` is
+                    // informational (no ledger reads it; the wallet dump is
+                    // what grades fees), so it is left at zero rather than
+                    // guessed.
+                    Decimal::ZERO,
+                )
+                .await?;
+            }
+        }
+
         Ok(Some(Placement {
             order_id,
             price,
@@ -214,6 +289,10 @@ impl OrderManager {
             post_only,
             timings,
         }))
+    }
+
+    fn claim_trades(&self, trade_ids: &[String]) -> bool {
+        claim_trades(&self.booked_trades, trade_ids)
     }
 
     /// Cancel all orders for a token.
@@ -438,6 +517,55 @@ mod tests {
     use super::*;
     use rust_decimal::prelude::FromPrimitive;
     use rust_decimal_macros::dec;
+
+    // --- booking an ack's fill without booking it twice -------------------
+
+    fn booked_set(seen: &[&str]) -> BookedTrades {
+        Arc::new(std::sync::Mutex::new(seen.iter().map(|s| s.to_string()).collect()))
+    }
+
+    /// The REAL claim, not a re-statement of it — `claim_trades` is free
+    /// exactly so this test drives the code the order path runs.
+    fn claim(booked: &BookedTrades, ids: &[&str]) -> bool {
+        let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        claim_trades(booked, &ids)
+    }
+
+    #[test]
+    fn an_ack_claims_its_trades_so_the_poll_cannot_rebook_them() {
+        let booked = booked_set(&[]);
+        assert!(claim(&booked, &["t1", "t2"]), "a fresh match books");
+        // The trades poll arrives fifteen seconds later with the same rows.
+        // It shares this set, so it recognises them as already booked.
+        let seen = booked.lock().unwrap();
+        assert!(seen.contains("t1") && seen.contains("t2"));
+    }
+
+    #[test]
+    fn a_trade_the_poll_already_booked_is_not_booked_again() {
+        let booked = booked_set(&["t1"]);
+        assert!(!claim(&booked, &["t1"]), "the poll won the race; the ack stands down");
+    }
+
+    #[test]
+    fn a_partly_seen_match_claims_the_rest_of_its_trades() {
+        // The half-booked case, and why this is a `fold` and not an `any`:
+        // stopping at the first new id would leave the tail unclaimed and
+        // the poll would book it a second time.
+        let booked = booked_set(&["t1"]);
+        assert!(claim(&booked, &["t1", "t2", "t3"]));
+        let seen = booked.lock().unwrap();
+        assert!(seen.contains("t2") && seen.contains("t3"), "every id is claimed, not just one");
+    }
+
+    #[test]
+    fn a_match_that_named_no_trades_is_still_claimable() {
+        // Some CLOB deployments answer `matched` with no ids at all. The
+        // fill is real, so it books; the poll's own id check still catches
+        // the trade when it arrives, so it lands exactly once.
+        let booked = booked_set(&[]);
+        assert!(claim(&booked, &[]));
+    }
 
     #[test]
     fn only_low_urgency_goes_out_post_only() {

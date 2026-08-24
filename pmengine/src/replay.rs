@@ -423,6 +423,30 @@ struct FillSim {
     resting_asks: HashMap<String, RestingAsk>,
 }
 
+impl FillSim {
+    /// One token's held inventory at what it COST — the sim's stand-in for
+    /// the live position tracker's `shares x proven avg entry`. Replay is
+    /// the one driver that always knew the true entry price, which is why
+    /// `committed` here was honest while the live read was not.
+    fn basis(&self, token: &str) -> f64 {
+        self.cost_basis.get(token).copied().unwrap_or(0.0)
+    }
+
+    /// The inventory half of an `ArmView` — everything `committed_cost`
+    /// reads, with no book behind it. The pool pre-pass needs exactly this
+    /// and nothing else, and building it here keeps the fleet's definition
+    /// of committed identical to the tick's (L18).
+    fn view_for(&self, p: &ArmParams) -> ArmView {
+        ArmView {
+            held_up: self.shares.get(&p.token_up).copied().unwrap_or(0.0),
+            held_dn: self.shares.get(&p.token_down).copied().unwrap_or(0.0),
+            basis_up: self.basis(&p.token_up),
+            basis_dn: self.basis(&p.token_down),
+            ..ArmView::default()
+        }
+    }
+}
+
 /// One post-only ask standing on the simulated book.
 #[derive(Clone, Copy, Debug)]
 struct RestingAsk {
@@ -680,7 +704,7 @@ fn default_book_tape_path() -> PathBuf {
 /// ask size recorded) — the clip sizer caps by clip_usdc/room regardless,
 /// so an unbounded size just means "no book-depth limit," matching what
 /// actually gated real fires.
-fn view_from_sides(sides: &Value, sim: &FillSim) -> ArmView {
+fn view_from_sides(sides: &Value, sim: &FillSim, p: &ArmParams) -> ArmView {
     let mut up = TopOfBook::default();
     let mut dn = TopOfBook::default();
     if let Some(arr) = sides.as_array() {
@@ -693,7 +717,17 @@ fn view_from_sides(sides: &Value, sim: &FillSim) -> ArmView {
             }
         }
     }
-    ArmView { up, dn, held_up: 0.0, held_dn: 0.0, position_floor: sim.cost_basis.values().sum() }
+    // Evals mode has no share counts on the tape, so held stays 0 and the
+    // arm's own `spent_usdc` is the whole committed number — which is what
+    // this mode always effectively read, `filled_usdc` being the max.
+    ArmView {
+        up,
+        dn,
+        held_up: 0.0,
+        held_dn: 0.0,
+        basis_up: sim.basis(&p.token_up),
+        basis_dn: sim.basis(&p.token_down),
+    }
 }
 
 fn replay_evals_window(
@@ -734,7 +768,7 @@ pub(crate) fn replay_evals_window_traced(
                 let p_up = rec["p_up"].as_f64().unwrap_or(0.5);
                 last_p_up = Some(p_up);
                 let model = model_from_eval_record(rec, p_up, p, &arm.tunables);
-                let view = view_from_sides(&rec["sides"], &sim);
+                let view = view_from_sides(&rec["sides"], &sim, p);
                 let out = arm.decide(&view, Ok(model), now);
                 trace.extend(out.tape.iter().cloned());
                 apply_fills(&mut arm, &mut sim, &out, now, p.fee_rate, &view);
@@ -1228,7 +1262,8 @@ fn view_from_book_record(rec: &Value, sim: &FillSim, p: &ArmParams) -> ArmView {
         dn: TopOfBook { bid: level("dn_bid", "dn_bid_sz"), ask: level("dn_ask", "dn_ask_sz") },
         held_up: sim.shares.get(&p.token_up).copied().unwrap_or(0.0),
         held_dn: sim.shares.get(&p.token_down).copied().unwrap_or(0.0),
-        position_floor: sim.cost_basis.values().sum(),
+        basis_up: sim.basis(&p.token_up),
+        basis_dn: sim.basis(&p.token_down),
     }
 }
 
@@ -1389,7 +1424,7 @@ impl FleetArm {
     /// basis where the live tick hands it the position tracker, so there is
     /// one definition of the pool and not two (L18).
     fn undecided(&self, now: f64) -> f64 {
-        self.arm.undecided_committed(self.sim.cost_basis.values().sum(), now)
+        self.arm.undecided_committed(&self.sim.view_for(&self.p), now)
     }
 
     fn fleet_braked(&self) -> bool {
@@ -1564,7 +1599,7 @@ fn run_fleet(opts: &ReplayOpts, cap: f64, full: bool) -> Result<(), String> {
                     let p_up = rec["p_up"].as_f64().unwrap_or(0.5);
                     a.last_p_up = Some(p_up);
                     let model = model_from_eval_record(rec, p_up, &a.p, &a.arm.tunables);
-                    let view = view_from_sides(&rec["sides"], &a.sim);
+                    let view = view_from_sides(&rec["sides"], &a.sim, &a.p);
                     tick_view = view;
                     Some(a.arm.decide_fleet(&view, Ok(model), now, &mut fleet_room))
                 }

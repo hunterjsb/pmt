@@ -277,7 +277,11 @@ impl RiskManager {
     }
 
 
-    /// Remove order tracking on fill/cancel.
+    /// Remove order tracking on cancel, or on an order that is fully done.
+    ///
+    /// Callers holding a PARTIAL fill must use `order_filled` instead — this
+    /// releases the whole reservation, and a partial that releases the whole
+    /// reservation hands back exposure that is still standing on the book.
     pub fn order_closed(&mut self, order_id: &str) {
         if let Some(order) = self.open_orders.remove(order_id) {
             tracing::debug!(
@@ -287,6 +291,35 @@ impl RiskManager {
                 "Untracking order"
             );
         }
+    }
+
+    /// Release the filled FRACTION of an order's reserved exposure.
+    ///
+    /// A fill moves notional out of "reserved for an order on the book" and
+    /// into "a position the tracker holds" — so the reservation must shrink
+    /// by exactly what filled, and by nothing else. Releasing it whole on
+    /// the first partial (which is what happened before this existed) says
+    /// the book is clear while 25 of 30 shares are still working: the
+    /// remainder is then exposure nothing accounts for, and `max_total_
+    /// exposure` waves through a signal that should have been refused.
+    ///
+    /// The entry is untracked only once nothing is left of it, so a cancel
+    /// arriving later still finds an order to close and a fully-filled one
+    /// leaves no residue behind.
+    pub fn order_filled(&mut self, order_id: &str, filled_notional: Decimal) {
+        let Some(order) = self.open_orders.get_mut(order_id) else { return };
+        order.notional = (order.notional - filled_notional).max(Decimal::ZERO);
+        let (token_id, left) = (order.token_id.clone(), order.notional);
+        if left <= Decimal::ZERO {
+            self.open_orders.remove(order_id);
+        }
+        tracing::debug!(
+            order_id = order_id,
+            token_id = token_id,
+            filled = %filled_notional,
+            still_reserved = %left,
+            "Releasing the filled share of an order's exposure"
+        );
     }
 
     /// Get total notional value of open orders (excluding pending reservations).
@@ -629,5 +662,62 @@ mod tests {
         assert!(rm.is_halted());
         rm.check_pnl(&tracker);
         assert!(rm.is_halted());
+    }
+
+    // --- a partial fill releases a partial reservation -------------------
+
+    /// An order for 30 shares at 0.90, reserved and confirmed the way the
+    /// engine's signal path does it.
+    fn with_open_order(rm: &mut RiskManager) {
+        let positions = PositionTracker::new();
+        let id = rm
+            .reserve_exposure("t", dec!(27), &positions)
+            .expect("a fresh manager has room");
+        rm.confirm_reservation(&id, "o1");
+        assert_eq!(rm.open_order_notional(), dec!(27));
+    }
+
+    #[test]
+    fn a_partial_fill_releases_only_its_own_share_of_the_reservation() {
+        // 5 of 30 shares land. 25 are still working on the book, so 22.50 of
+        // the reservation is still real exposure. `order_closed` — what this
+        // path called — released all 27 and told the manager the book was
+        // clear, which is exposure nothing accounted for and a ceiling that
+        // waved through the next signal.
+        let mut rm = breaker(dec!(400));
+        with_open_order(&mut rm);
+
+        rm.order_filled("o1", dec!(4.5));
+        assert_eq!(rm.open_order_notional(), dec!(22.5));
+        assert_eq!(rm.total_open_orders(), 1, "the order is still on the book");
+
+        // The rest lands and nothing is left behind.
+        rm.order_filled("o1", dec!(22.5));
+        assert_eq!(rm.open_order_notional(), Decimal::ZERO);
+        assert_eq!(rm.total_open_orders(), 0);
+    }
+
+    #[test]
+    fn an_overfilled_or_unknown_order_never_goes_negative() {
+        let mut rm = breaker(dec!(400));
+        with_open_order(&mut rm);
+        // A fill priced above the reservation (a pay-up, a rounding) may not
+        // credit the manager with exposure it never had.
+        rm.order_filled("o1", dec!(99));
+        assert_eq!(rm.open_order_notional(), Decimal::ZERO);
+        // And a fill for an order this manager never tracked is a no-op,
+        // not a panic — external and CLI orders exist.
+        rm.order_filled("never-seen", dec!(10));
+        assert_eq!(rm.open_order_notional(), Decimal::ZERO);
+    }
+
+    /// `order_closed` still exists and still means "this order is gone" —
+    /// it is what a CANCEL calls, and a cancel really does free the lot.
+    #[test]
+    fn a_cancel_still_frees_the_whole_reservation() {
+        let mut rm = breaker(dec!(400));
+        with_open_order(&mut rm);
+        rm.order_closed("o1");
+        assert_eq!(rm.open_order_notional(), Decimal::ZERO);
     }
 }

@@ -76,6 +76,9 @@ pub struct Engine {
     /// engine-placed orders for the unified `/orders/all` view, and
     /// available as cancel targets via `POST /orders/:id/cancel`.
     external_orders: HashMap<String, crate::control::ExternalOrder>,
+    /// Trade ids already booked into positions — see `order::BookedTrades`.
+    /// Held here so the trades poller gets a clone at spawn.
+    booked_trades: crate::order::BookedTrades,
     /// (deadline, order_id) pairs scheduled via `POST /orders/:id/schedule-cancel`.
     /// Drained at the top of every tick — entries whose deadline has passed
     /// trigger a `cancel_order` call. Backs `pmt buy/sell --ttl`.
@@ -272,8 +275,16 @@ impl Engine {
         let (fill_sender, fill_receiver) = mpsc::channel(1000);
         let (fill_event_sender, fill_event_receiver) = mpsc::channel::<FillEvent>(100);
 
+        // Trade ids already booked into positions. Shared by the order path
+        // (which books an ack that says `matched` at the wire) and the
+        // trades poller (which must not book the same trade again).
+        let booked_trades: crate::order::BookedTrades = Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        ));
+
         // Create order manager with client
-        let order_manager = OrderManager::new(client.clone(), fill_sender);
+        let order_manager =
+            OrderManager::new(client.clone(), fill_sender, booked_trades.clone());
 
         // Create risk manager with limits from config
         let risk_limits = RiskLimits {
@@ -331,6 +342,7 @@ impl Engine {
             alert_queue: AlertQueue::new(),
             notifier: Arc::new(Notifier::from_env()),
             external_orders: HashMap::new(),
+            booked_trades,
             pending_cancellations: Vec::new(),
             cancel_backoff: CancelBackoff::default(),
         })
@@ -682,8 +694,10 @@ impl Engine {
         let trades_handle = {
             let client = self.client.clone();
             let tx = self.fill_event_sender.clone();
-            // Track which trade IDs we've already processed to dedupe across polls.
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Which trade IDs have already been booked — shared with the
+            // order path, so a fill booked AT ACK is recognised here rather
+            // than booked a second time when the poll catches up.
+            let seen = self.booked_trades.clone();
             let mut last_ts: Option<i64> = None;
             // We need to know which order_ids belong to the engine. Wrap the
             // OrderManager's `orders` map behind a shared snapshot — but easier
@@ -703,8 +717,12 @@ impl Engine {
                         }
                     };
                     for t in trades {
-                        if !seen.insert(t.id.clone()) {
-                            continue; // already processed
+                        let fresh = seen
+                            .lock()
+                            .map(|mut s| s.insert(t.id.clone()))
+                            .unwrap_or(false);
+                        if !fresh {
+                            continue; // already booked (an ack, or an earlier poll)
                         }
                         let ts = t.match_time.timestamp();
                         if last_ts.map(|prev| ts > prev).unwrap_or(true) {
@@ -1679,8 +1697,13 @@ impl Engine {
                     // Notify strategies
                     self.strategy_runtime.on_fill(&fill);
 
-                    // Update risk manager - close tracked order
-                    self.risk_manager.order_closed(&fill.order_id);
+                    // Update risk manager — release exactly the share of the
+                    // order's reservation that just filled. `order_closed`
+                    // here released the WHOLE reservation on the first
+                    // partial, so 5 shares landing out of a 30-share clip
+                    // freed all 30 while 25 were still on the book.
+                    self.risk_manager
+                        .order_filled(&fill.order_id, fill.price * fill.size);
 
                     // Log current exposure
                     let exposure = self.risk_manager.current_exposure(&self.positions);
@@ -2115,7 +2138,12 @@ impl Engine {
             Err(e) => return Err(format!("tick lookup failed: {}", e)),
         };
         match self.client.place_limit_order(token_id, sdk_side, rounded_price, size).await {
-            Ok(order_id) => {
+            // The CLI path books nothing itself — an operator order is not in
+            // any strategy's budget — but a REFUSAL now arrives as `Err` and
+            // is reported as one instead of returning an id for an order the
+            // book never took.
+            Ok(ack) => {
+                let order_id = ack.order_id;
                 self.external_orders.insert(order_id.clone(), crate::control::ExternalOrder {
                     id: order_id.clone(),
                     token_id: token_id.to_string(),
