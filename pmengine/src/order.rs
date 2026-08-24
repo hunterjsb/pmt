@@ -246,15 +246,31 @@ impl OrderManager {
     }
 
     /// Cancel a specific order.
+    ///
+    /// A terminal refusal ("already canceled or matched", not found) is a
+    /// SUCCESS, not an error: the order is off the book, which is the only
+    /// thing a cancel wanted. Returning `Err` here left the order `Open` in
+    /// the map forever, and an order that is permanently active but
+    /// permanently dead is exactly what the delta matcher re-cancels every
+    /// tick — this path is one of the storm's feeders, not just its victim.
     pub async fn cancel_order(&mut self, order_id: &str) -> Result<(), OrderError> {
         if let Some(order) = self.orders.get_mut(order_id) {
             if order.is_active() {
                 // Cancel via SDK (handles dry-run internally)
-                self.client
-                    .cancel_order(order_id)
-                    .await
-                    .map_err(|e| OrderError::SdkError(e.to_string()))?;
-
+                match self.client.cancel_order(order_id).await {
+                    Ok(()) => {}
+                    Err(e)
+                        if crate::client::classify_cancel_refusal(&e.to_string())
+                            == crate::client::CancelRefusal::Terminal =>
+                    {
+                        tracing::debug!(
+                            order_id = order_id,
+                            reason = %e,
+                            "Cancel: order was already off the book"
+                        );
+                    }
+                    Err(e) => return Err(OrderError::SdkError(e.to_string())),
+                }
                 order.status = OrderStatus::Cancelled;
             }
         }
@@ -295,9 +311,11 @@ impl OrderManager {
                 .await
                 .map_err(|e| OrderError::SdkError(e.to_string()))?;
 
-            // Only what the CLOB confirmed is off the book gets marked
-            // cancelled locally; anything it refused is still live and must
-            // keep saying so (docs/LESSONS.md#L6). Refusals are logged loud
+            // What the CLOB confirmed is off the book gets marked cancelled
+            // locally — and so does anything it refused TERMINALLY, because
+            // "already canceled or matched" is the exchange confirming the
+            // same fact in different words. Only an unanswered refusal is
+            // still live and must keep saying so. Those are logged loud
             // rather than returned — an `Err` here would abort the rest of
             // shutdown (strategy cleanup, final P&L) over orders the
             // operator now needs the log to go find.
@@ -305,11 +323,20 @@ impl OrderManager {
             for order_id in &report.cancelled {
                 self.mark_cancelled(order_id);
             }
-            if !report.failed.is_empty() {
+            let mut still_live = std::collections::HashMap::new();
+            for (order_id, why) in &report.failed {
+                match crate::client::classify_cancel_refusal(why) {
+                    crate::client::CancelRefusal::Terminal => self.mark_cancelled(order_id),
+                    crate::client::CancelRefusal::Transient => {
+                        still_live.insert(order_id.clone(), why.clone());
+                    }
+                }
+            }
+            if !still_live.is_empty() {
                 tracing::error!(
                     requested,
                     cancelled = count,
-                    still_live = ?report.failed,
+                    still_live = ?still_live,
                     "Shutdown cancel left orders ON THE BOOK"
                 );
             }
