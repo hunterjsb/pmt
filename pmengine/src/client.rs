@@ -285,7 +285,7 @@ const PREWARM_BACKOFF: std::time::Duration = std::time::Duration::from_millis(25
 /// change order latency silently, and this is the one client whose round trip
 /// is the trade. Built ONCE per engine (see `new_internal`) — a client built
 /// per order would pool nothing and hand every fire a fresh handshake.
-fn build_order_http_client() -> reqwest::Result<reqwest::Client> {
+pub fn build_order_http_client() -> reqwest::Result<reqwest::Client> {
     order_http_builder().build()
 }
 
