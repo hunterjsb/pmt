@@ -18,10 +18,23 @@ Method, per ROADMAP's shadow-ledger spec:
   2. Ticks sharing (window, side, category) collapse into EPISODES — the
      tape re-records every ~5s, so a >20s gap means the refusal cleared and
      came back, not one continuous stretch.
-  3. Each episode prices as ONE hypothetical clip at its best (lowest)
-     recorded ask, sized at that window's real clip notional (inferred from
-     its actual fires) or the arm default. WIN pays $1/share net of fee;
-     LOSS forfeits the whole clip.
+  3. Each episode prices as ONE hypothetical clip at its ENTRY ask — the
+     first ask recorded in the episode, i.e. the price on the book at the
+     moment the gate said no — sized at that window's real clip notional
+     (inferred from its actual fires) or the arm default. WIN pays $1/share
+     net of fee; LOSS forfeits the whole clip.
+
+     NOT the episode's lowest ask, which is what this priced on until
+     2026-08-24 and which biases the ledger in ONE direction only. A win
+     pays `clip/ask` shares, so it grows without bound as the ask falls; a
+     loss is `-clip` flat, untouched by the ask. Taking the minimum over an
+     episode therefore inflates `missed_wins` and cannot move
+     `avoided_losses` by a cent. Measured on the live tape (10,385 priced
+     episodes): min-ask reported net +$40,514 ("every gate over-tight"),
+     while the entry ask on the SAME episodes reports -$16,238, the median
+     ask -$22,854 and the last ask -$29,052. The convention, not the gates,
+     was producing the verdict. `best_ask` is still carried for diagnostics
+     and is never what prices a clip.
   4. `unfilled_fires` is a separate, simpler category: the gap between a
      window's intended fire notional and what the wallet shows actually
      filled — no gap-collapsing needed, a window's fires already are the
@@ -197,9 +210,12 @@ def collapse_episodes(ticks: list[dict], gap_s: float = EPISODE_GAP_S) -> list[d
     """Group ticks sharing (slug, side, category) into episodes: consecutive
     in time, split whenever the gap to the previous tick exceeds gap_s.
 
-    Each episode: {slug, side, category, start, end, n_ticks, best_ask,
-    last_fair, last_net}. best_ask is the lowest recorded ask seen in the
-    episode (None if every tick in it lacked one).
+    Each episode: {slug, side, category, start, end, n_ticks, entry_ask,
+    best_ask, last_fair, last_net}. `entry_ask` is the FIRST recorded ask —
+    what the clip would have paid at the moment of refusal, and the only one
+    that prices it. `best_ask` is the lowest ask seen, carried for
+    diagnostics only (module docstring §3: it is one-directional). Both are
+    None if every tick in the episode lacked an ask.
     """
     by_key: dict[tuple[str, str, str], list[dict]] = {}
     for tk in ticks:
@@ -220,13 +236,28 @@ def collapse_episodes(ticks: list[dict], gap_s: float = EPISODE_GAP_S) -> list[d
 
 
 def _finish_episode(slug: str, side: str, category: str, tks: list[dict]) -> dict:
+    # tks arrives sorted by t (collapse_episodes sorts before running), so the
+    # first ask here is the ask at the moment the gate refused.
     asks = [t["ask"] for t in tks if t.get("ask") is not None]
     return {
         "slug": slug, "side": side, "category": category,
         "start": tks[0]["t"], "end": tks[-1]["t"], "n_ticks": len(tks),
+        "entry_ask": asks[0] if asks else None,
         "best_ask": min(asks) if asks else None,
         "last_fair": tks[-1].get("fair"), "last_net": tks[-1].get("net"),
     }
+
+
+def priced_ask(ep: dict) -> float | None:
+    """The ask one episode's hypothetical clip pays.
+
+    `entry_ask` — the book at the moment of refusal. Falls back to
+    `best_ask` only for an episode dict built without one (older callers,
+    and `unfilled_episodes`, which has a single volume-weighted ask and sets
+    both to it).
+    """
+    ask = ep.get("entry_ask")
+    return ep.get("best_ask") if ask is None else ask
 
 
 # ---------- clip sizing ----------
@@ -251,15 +282,19 @@ def price_episode(ep: dict, winner: str | None, clip_notional: float) -> dict:
     status: "unpriced" (no recorded ask — can't price regardless of outcome),
     "unresolved" (priceable but the window's winner isn't known — never
     guessed), or "priced" (both known; `won`/`pnl` are set).
+
+    Prices at `priced_ask(ep)` — the entry ask, never the episode's minimum.
+    See the module docstring §3 for the measured size of that difference.
     """
-    if ep["best_ask"] is None:
+    ask = priced_ask(ep)
+    if ask is None:
         return {**ep, "status": "unpriced", "clip_notional": clip_notional,
                 "won": None, "pnl": None}
     if winner is None:
         return {**ep, "status": "unresolved", "clip_notional": clip_notional,
                 "won": None, "pnl": None}
     won = ep["side"] == winner
-    pnl = shadow_value(ep["best_ask"], clip_notional, won)
+    pnl = shadow_value(ask, clip_notional, won)
     return {**ep, "status": "priced", "clip_notional": clip_notional, "won": won, "pnl": pnl}
 
 
@@ -311,7 +346,10 @@ def unfilled_episodes(fires: list[dict], fills: dict[tuple[str, str], float],
         ep = {
             "slug": slug, "side": side, "category": "unfilled_fires",
             "start": min(f["t"] for f in fs), "end": max(f["t"] for f in fs),
-            "n_ticks": len(fs), "best_ask": avg_ask,
+            "n_ticks": len(fs),
+            # One volume-weighted ask across the window's fires — already the
+            # price actually asked for, so entry and best are the same number.
+            "entry_ask": avg_ask, "best_ask": avg_ask,
             "last_fair": None, "last_net": None,
         }
         clip_notional = unfilled_shares * avg_ask
