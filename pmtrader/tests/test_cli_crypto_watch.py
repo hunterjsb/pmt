@@ -1033,16 +1033,100 @@ def test_every_roll_reaches_the_panel_as_the_consolidated_line():
                for ln in roll_lines[:-1])  # the last may be a half pair at the cut
 
 
+_ID_AT = _AGG_AT + watch_ui._TAPE_AGG_WIDTH + 1   # the identity cell's column
+
+
+def _ident(ln: str) -> tuple:
+    """(symbols, duration) off a tape line's identity cell — one window's own
+    label ("btc 5m 23:40") or a merged line's symbol set ("btc,eth+2 5m")."""
+    parts = ln[_ID_AT:_ID_AT + watch_ui._TAPE_SLUG_WIDTH].strip().split(" ")
+    if len(parts) < 2:
+        return (), ""
+    return tuple(parts[0].split("+")[0].split(",")), parts[1]
+
+
 def test_no_armed_symbol_is_starved_off_the_panel():
     """Four of seven armed symbols never appeared at all: the cursor kept the
     lexically-first slug of each tick and threw the rest of the fleet away, so
     a quiet panel read as a quiet fleet."""
     raws = _fleet_tape(5000)
     _, lines = _replay(raws)
-    plain = [_click.unstyle(ln) for ln in lines]
+    idents = [_ident(_click.unstyle(ln)) for ln in lines]
     for base in _FLEET:
         sym, _, dur = base.split("-")
-        assert any(f"{sym} {dur} " in ln for ln in plain), f"{sym} {dur} is missing"
+        assert any(sym in syms and d == dur for syms, d in idents), \
+            f"{sym} {dur} is missing"
+
+
+# ---------- cross-crypto aggregation ----------
+#
+# The fleet evaluates every arm on ONE tick, so five arms hitting the same gate
+# for the same reason printed five near-identical rows, and the busiest series
+# filled the visible tail on its own. The operator's read of that panel was
+# that the other cryptos were not being evaluated at all. These pin the fix:
+# one line, the symbols it covers, the combined count — and conservation still
+# holding over it, because a merge SUMMARISES and a drop LOSES.
+
+_LOCKSTEP = ("btc", "eth", "sol", "xrp", "bnb")
+
+
+def _lockstep_tape(ticks: int = 40, t0: float = 1787500000.0) -> list[str]:
+    """A quiet fleet: every arm refused by the same gate on every tick, its own
+    margin steady inside tolerance. The shape that flooded the panel."""
+    out = []
+    for i in range(ticks):
+        t = t0 + i * _TICK_S
+        for j, sym in enumerate(_LOCKSTEP):
+            out.append({"t": t, "ev": "gated", "slug": f"{sym}-updown-5m-{int(t0)}",
+                        "margin_bp": -4.0 - j * 0.1 + (i % 3) * 0.1, "guard_bp": 6.0,
+                        "reason": "basis guard: projected margin inside"})
+    return [_json.dumps(r) for r in out]
+
+
+def test_one_gate_across_the_fleet_is_one_line_naming_every_symbol():
+    raws = _lockstep_tape(40)
+    accepted, lines = _replay(raws)
+    assert accepted == len(raws)
+    assert len(lines) == 1, [_click.unstyle(ln) for ln in lines]
+    ln = _click.unstyle(lines[0])
+    assert _ident(ln) == (("bnb", "btc", "eth"), "5m")   # +2 counts the rest
+    assert "×200" in ln                                  # 5 arms × 40 ticks
+    assert "-4.4…-4.0/6.0bp" in ln    # the fleet's spread, not one per symbol
+
+
+def test_a_merged_line_still_accounts_for_every_record_it_absorbed():
+    """Conservation over the merge: a line standing for five arms must claim
+    exactly the records it swallowed, no more and no fewer."""
+    raws = _lockstep_tape(40)
+    _, lines = _replay(raws)
+    assert _absorbed(lines) == len(raws)
+
+
+def test_a_quiet_arm_stays_visible_under_a_loud_ones_flood():
+    """The operator's actual report: "I literally only see btc". One busy
+    series used to fill the tail with a row per tick while four steady arms
+    each added a fifth of the same. Merged, the fleet holds one line — and it
+    reopens when its own line scrolls past _OWN_LOOKBACK, so it keeps a place
+    in the last screenful rather than drifting off the top of it."""
+    raws = []
+    for i in range(60):
+        t = 1787500000.0 + i * _TICK_S
+        # btc's read moves past tolerance every tick: a fresh line each time
+        raws.append(_json.dumps({
+            "t": t, "ev": "eval", "slug": "btc-updown-5m-1787500000",
+            "p_up": 0.40 + i * 0.005, "rho": 0.1, "committed": 12.0,
+            "sides": [{"side": "up", "ask": 0.52, "net": 0.01, "safety": 0.4},
+                      {"side": "down", "ask": 0.49, "net": -0.01, "safety": -0.4}]}))
+        for sym in ("eth", "sol", "xrp", "bnb"):
+            raws.append(_json.dumps({
+                "t": t, "ev": "gated", "slug": f"{sym}-updown-5m-1787500000",
+                "margin_bp": -4.0, "guard_bp": 6.0,
+                "reason": "basis guard: projected margin inside"}))
+    _, lines = _replay(raws)
+    assert _absorbed(lines) == len(raws)
+    tail = [_ident(_click.unstyle(ln)) for ln in lines[-20:]]
+    for sym in ("eth", "sol", "xrp", "bnb"):
+        assert any(sym in syms for syms, _ in tail), f"{sym} scrolled off the tail"
 
 
 def test_a_collapsed_line_never_claims_more_records_than_it_absorbed():
