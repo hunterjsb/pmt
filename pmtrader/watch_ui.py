@@ -191,7 +191,10 @@ def _gated_reason_compact(reason: str | None, e: dict | None = None) -> str:
     return reason[:60] if reason else "gated"
 
 
-_GATE_NUM_W = 13  # "  -4.0/ 6.0bp" — signed margin over its guard, fixed width
+# "-20.0…+10.0/6.0bp" — a merged line's margin RANGE is the widest thing this
+# field holds; one arm's "  -4.0/ 6.0bp" left-justifies inside it so the reason
+# after it starts at the same column either way.
+_GATE_NUM_W = 17
 
 
 def _gate_margin(r: dict) -> str:
@@ -277,6 +280,10 @@ def _mode_text(e: dict) -> str:
 
 _TAPE_TAG_WIDTH = 9   # "FIRE DOWN"/"FLIP DOWN"/etc — the widest natural tag
 _TAPE_AGG_WIDTH = 15  # "→23:43:20 ×9999" — the widest a collapsed line's cell gets
+# The identity cell: one window ("doge 60m 23:40", 14) or the symbol set a
+# merged line covers ("btc,eth,sol+2 15m"). Sized for the second — it is the
+# cell that answers "is the rest of the fleet even being evaluated".
+_TAPE_SLUG_WIDTH = 18
 
 
 def _tape_tag(text: str) -> str:
@@ -314,18 +321,32 @@ def _zero(v: float) -> float:
     return 0.0 if abs(v) < 0.005 else v
 
 
-def _tape_head(r: dict, n: int = 1, t0: float | None = None) -> str:
-    """`HH:MM:SS →HH:MM:SS ×12  slug-padded-to-14` — the fixed-width prefix
-    shared by every tape-line renderer, so eval/fire/gated/roll/exit lines all
-    column-align. 14 is the widest display() form (e.g. "doge 60m 23:40").
+def _tape_head(r: dict, n: int = 1, t0: float | None = None,
+               label: str | None = None) -> str:
+    """`HH:MM:SS →HH:MM:SS ×12  identity-padded-to-_TAPE_SLUG_WIDTH` — the
+    fixed-width prefix shared by every tape-line renderer, so
+    eval/fire/gated/roll/exit lines all column-align.
 
     A collapsed line opens on its run's FIRST record and closes the span in
     the aggregation cell; an uncollapsed one prints its own clock and leaves
-    that cell blank but occupied.
+    that cell blank but occupied. `label` overrides the identity cell for a
+    line that stands for several arms at once (_group_label).
     """
     t1 = r.get("t", 0)
+    ident = _tape_slug(r.get("slug", "")) if label is None else label
     return (f"{_hms(t1 if t0 is None else t0)} {_tape_agg(n, t1)}"
-            f" {_tape_slug(r.get('slug', '')):<14}")
+            f" {ident:<{_TAPE_SLUG_WIDTH}}")
+
+
+def _tagged(head: str, tag: str, body: str, **tag_style) -> str:
+    """`head  TAG  body` — the shape EVERY tape line has, built in one place so
+    no event type (and no merged group line) can drift out of the geometry."""
+    label = click.style(_tape_tag(tag), **tag_style) if tag_style else _tape_tag(tag)
+    return f"{head} {label}{body}"
+
+
+def _money(v: float) -> str:
+    return f"${_zero(v):,.2f}".rstrip("0").rstrip(".")
 
 
 def _tape_render(line: str) -> str | None:
@@ -348,14 +369,9 @@ def _render_record(r: dict, raw: str, n: int = 1, t0: float | None = None) -> st
     head = _tape_head(r, n, t0)
 
     def tagged(tag: str, body: str, **tag_style) -> str:
-        """`head  TAG  body` — the shape EVERY tape line has, built in one
-        place so no event type can drift out of the column geometry."""
-        label = click.style(_tape_tag(tag), **tag_style) if tag_style else _tape_tag(tag)
-        return f"{head} {label}{body}"
+        return _tagged(head, tag, body, **tag_style)
 
-    def money(v: float) -> str:
-        return f"${_zero(v):,.2f}".rstrip("0").rstrip(".")
-
+    money = _money
     ev = r.get("ev")
     if ev == tape.EV_FIRE:
         tag = {"flip": "FLIP", "spec": "SPEC"}.get(r.get("mode", "safe"), "FIRE")
@@ -411,11 +427,25 @@ def _render_record(r: dict, raw: str, n: int = 1, t0: float | None = None) -> st
 # which is what the tolerances below are sized for and what every rule's
 # signature exists to catch.
 #
-# ONE grouping rule for evals and gates alike: a lane per arm, a signature that
-# is the line's own discrete state, anchored tolerances the width of the
-# numbers as displayed, and a lifetime that ends on the arm's next contrary
-# record. A fleet-wide gate lane would read as a second mechanism on the same
-# screen, and would break every time another arm spoke between two gates.
+# ONE grouping rule for evals and gates alike: a lane keyed on the line's own
+# discrete state with the SYMBOL FACTORED OUT, anchored tolerances the width of
+# the numbers as displayed, and a lifetime that ends on an arm's next contrary
+# record.
+#
+# The symbol is out of the key because the fleet moves in lockstep: the engine
+# stamps one `t` per tick and every armed arm speaks on it, so btc, eth, xrp,
+# sol and bnb hitting the same gate for the same reason printed five
+# near-identical rows, and the highest-volume series alone filled the visible
+# tail. An operator reading that panel concluded the other cryptos were not
+# being evaluated at all. So they merge: ONE line, the symbols it covers, the
+# combined count. What is per-crypto (p↑, margins, asks, dollars) collapses to
+# a range or a total — never one figure per symbol, which would put the flood
+# straight back on the line the merge exists to remove. Per-arm figures are
+# still a keystroke away in the windows table.
+#
+# Duration stays IN the key: a 5m and a 15m arm are not reading the same thing.
+# Tolerances are anchored PER ARM (see _CollapseRule.anchor_key) — one shared
+# anchor would let btc's book decide when eth's line breaks.
 
 _NUM_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
 
@@ -428,23 +458,68 @@ _OWN_LOOKBACK = 16
 
 
 def _within(anchor: dict, met: dict, tol: dict) -> bool:
-    """True while every metric is still within tolerance of the run's FIRST
-    record. Anchored, not chained: p_up creeping 0.002 a tick is a 0.6 move
-    across five minutes, and a tick-to-tick comparison would never once call
-    that material."""
+    """True while every metric is still within tolerance of this ARM's first
+    record in the run. Anchored, not chained: p_up creeping 0.002 a tick is a
+    0.6 move across five minutes, and a tick-to-tick comparison would never
+    once call that material."""
     if anchor.keys() != met.keys():
         return False  # a field appearing or vanishing is itself a state change
     return all(abs(met[k] - v) <= tol.get(k, 0.0) for k, v in anchor.items())
 
 
+def _sym(slug: str) -> str:
+    """`btc` off an updown slug; anything else stands for itself."""
+    parsed = updown_slugs.parse(slug or "")
+    return parsed[0] if parsed else (slug or "?")
+
+
+def _dur(slug: str) -> str:
+    """`5m`/`4h` off an updown slug, "" for a slug that isn't one."""
+    parsed = updown_slugs.parse(slug or "")
+    return updown_slugs.dur_label(parsed[1]) if parsed else ""
+
+
+def _group_label(slugs) -> str:
+    """`btc,eth,sol+2 5m` — which arms a merged line stands for, packed into the
+    same identity cell one window's label gets.
+
+    Sorted, so a stable set of arms renders a stable string in a line that is
+    updated in place. The `+N` overflow is the part that matters: it is what
+    says the fleet is bigger than the names that fit.
+    """
+    syms = sorted({_sym(s) for s in slugs})
+    dur = _dur(next(iter(slugs), "") or "")
+    budget = _TAPE_SLUG_WIDTH - len(dur) - 1
+    shown = 1
+    while shown < len(syms):
+        rest = len(syms) - shown - 1
+        cand = ",".join(syms[:shown + 1]) + (f"+{rest}" if rest else "")
+        if len(cand) > budget:
+            break
+        shown += 1
+    rest = len(syms) - shown
+    return f"{','.join(syms[:shown])}{f'+{rest}' if rest else ''} {dur}".strip()
+
+
+def _span(vals, fmt) -> str:
+    """`0.31…0.68`, or the single value when both ends print the same — a range
+    whose ends are identical is a number wearing a costume."""
+    lo, hi = fmt(min(vals)), fmt(max(vals))
+    return lo if lo == hi else f"{lo}…{hi}"
+
+
 class _Run:
-    """One in-flight run: what it is keyed on, its anchor, and the exact string
-    it owns in the caller's deque."""
+    """One in-flight run: what it is keyed on, its per-arm anchors and freshest
+    records, and the exact string it owns in the caller's deque."""
 
-    __slots__ = ("rule", "arm", "sig", "anchor", "rec", "raw", "state", "n", "t0", "t1", "out")
+    __slots__ = ("rule", "sig", "arms", "anchors", "latest", "rec", "raw",
+                 "state", "n", "t0", "t1", "out")
 
-    def __init__(self, rule: _CollapseRule, arm: str | None, sig: tuple, anchor: dict) -> None:
-        self.rule, self.arm, self.sig, self.anchor = rule, arm, sig, anchor
+    def __init__(self, rule: _CollapseRule, sig: tuple) -> None:
+        self.rule, self.sig = rule, sig
+        self.arms: set = set()          # every arm folded into this line
+        self.anchors: dict = {}         # anchor_key -> that arm's FIRST metrics
+        self.latest: dict = {}          # arm -> its freshest record, what renders
         self.rec: dict = {}
         self.raw = ""
         self.state: dict = {}   # rule-private accumulation across the run
@@ -457,10 +532,11 @@ class _CollapseRule:
     """One repetitive tape shape that may collapse.
 
     `lane` is the run's identity: records in different lanes never join the
-    same run, and every lane is per-arm so interleaved arms don't tear each
-    other's runs apart. Within a lane the run continues while `signature` is
-    identical AND every `metrics` value stays within `tolerances` of the run's
-    first record.
+    same run. The repetition rules key it on the line's discrete state WITHOUT
+    the symbol, so arms saying the same thing share a line; the roll rule keys
+    it per series. Within a lane the run continues while `signature` is
+    identical AND every `metrics` value stays within `tolerances` of the FIRST
+    record from that same arm (`anchor_key`).
     """
 
     name = ""
@@ -469,8 +545,15 @@ class _CollapseRule:
     def matches(self, r: dict) -> bool:
         raise NotImplementedError
 
-    def lane(self, r: dict) -> str:
-        return f"{self.name}:{r.get('slug')}"
+    def lane(self, r: dict, sig: tuple) -> tuple:
+        return (self.name, r.get("slug"))
+
+    def anchor_key(self, r: dict) -> str:
+        """Whose tolerances this record is measured against. Per ARM on a
+        fleet-wide lane: p↑ and basis margin are per-crypto numbers, and a
+        shared anchor would have one arm's book decide when another's line
+        breaks."""
+        return r.get("slug") or ""
 
     def signature(self, r: dict) -> tuple:
         return ()
@@ -491,20 +574,36 @@ class _CollapseRule:
         return _render_record(run.rec, run.raw, run.n, run.t0)
 
 
-class _EvalRun(_CollapseRule):
-    """Consecutive evals of ONE arm whose read hasn't moved.
+class _FleetRun(_CollapseRule):
+    """A repetition rule whose lane is the fleet, not one arm.
+
+    Same discrete state + same window duration = same line, whichever crypto
+    said it. See the design note above for why the symbol is out of the key.
+    """
+
+    def lane(self, r: dict, sig: tuple) -> tuple:
+        return (self.name, _dur(r.get("slug") or "") or (r.get("slug") or ""), sig)
+
+
+class _EvalRun(_FleetRun):
+    """Consecutive evals — of one arm or of the whole fleet — whose read hasn't
+    moved.
 
     An armed arm evaluates every tick and prints the same sentence until
     something happens. What counts as "something" is the whole safety
     argument for this rule: the tolerances are the width of the numbers as
     DISPLAYED, so anything a reader could see change on the line breaks the
-    run and renders fresh.
+    run and renders fresh — and they are anchored per arm, so one crypto's
+    move can never hide inside another's.
     """
 
     name = "eval"
     # p_up to 2dp, committed to the cent, best-side net to the half-cent it is
-    # printed in — below these the line would repaint identically anyway.
-    tolerances = {"p_up": 0.01, "committed": 0.01, "net": 0.005}
+    # printed in — below these the line would repaint identically anyway. A
+    # maker bid's rest price is finer: it is quoted to 3dp and a reprice is an
+    # action, not drift.
+    tolerances = {"p_up": 0.01, "committed": 0.01, "net": 0.005,
+                  "maker_rest": 0.0005}
 
     def matches(self, r: dict) -> bool:
         return r.get("ev") == tape.EV_EVAL
@@ -512,7 +611,6 @@ class _EvalRun(_CollapseRule):
     def signature(self, r: dict) -> tuple:
         sides = r.get("sides") or []
         best = _best_side(sides)
-        rest = r.get("maker_rest")
         return (
             bool(r.get("banked_decided")),
             tuple(_brake_sides(sides)),
@@ -520,7 +618,9 @@ class _EvalRun(_CollapseRule):
             # which sides even have a book: a side going dark is a transition
             tuple(s.get("side") for s in sides if s.get("safety") is not None),
             best.get("side") if best else None,
-            None if rest is None else round(rest, 3),  # a repriced maker bid is an action
+            # WHETHER a maker bid is resting is posture and shared; its price is
+            # a per-crypto number and lives in the tolerances instead.
+            r.get("maker_rest") is not None,
             bool(r.get("maker_candidate")),
             _mode_text(r),
         )
@@ -528,15 +628,22 @@ class _EvalRun(_CollapseRule):
     def metrics(self, r: dict) -> dict:
         best = _best_side(r.get("sides") or [])
         m = {"p_up": r.get("p_up"), "committed": r.get("committed"),
-             "net": best.get("net") if best else None}
+             "net": best.get("net") if best else None,
+             "maker_rest": r.get("maker_rest")}
         return {k: v for k, v in m.items() if v is not None}
 
+    def render(self, run: _Run) -> str:
+        if len(run.latest) < 2:
+            return _render_record(run.rec, run.raw, run.n, run.t0)
+        return _group_eval(run)
 
-class _GateRun(_CollapseRule):
-    """Consecutive gates of ONE arm — basis guard, theta, safety, feed stale,
-    elapsed-percent alike. A gated arm ticks for minutes saying the same thing.
 
-    The eval rule's twin, deliberately: one arm's lane, one signature, one set
+class _GateRun(_FleetRun):
+    """Consecutive gates — basis guard, theta, safety, feed stale,
+    elapsed-percent alike. A gated arm ticks for minutes saying the same thing,
+    and on a fleet tick every arm says it at once.
+
+    The eval rule's twin, deliberately: one lane rule, one signature, one set
     of anchored tolerances, one lifetime. An arm emits an eval OR a gate on a
     tick and never both, so the two rules tile the quiet tape between them and
     a reader learns ONE collapse behaviour rather than one per reason family.
@@ -557,7 +664,7 @@ class _GateRun(_CollapseRule):
         return r.get("ev") == tape.EV_GATED
 
     def signature(self, r: dict) -> tuple:
-        return (_NUM_RE.sub("#", r.get("reason") or ""),
+        return (_reason_shape(r),
                 "up_ask" in r, r.get("up_ask") is None, r.get("dn_ask") is None)
 
     def metrics(self, r: dict) -> dict:
@@ -568,6 +675,88 @@ class _GateRun(_CollapseRule):
         if mg and "margin_bp" not in met:
             met["margin_bp"], met["guard_bp"] = mg
         return met
+
+    def render(self, run: _Run) -> str:
+        if len(run.latest) < 2:
+            return _render_record(run.rec, run.raw, run.n, run.t0)
+        return _group_gate(run)
+
+
+def _reason_shape(r: dict) -> str:
+    """A gate's sentence with its counters AND its own symbol masked out — what
+    two arms refused for the same reason have in common.
+
+    Today's reasons name no crypto, so the symbol mask is belt: a reason that
+    starts saying "btc spot stale" must still merge with eth's copy of it
+    rather than quietly splitting the fleet back into one line per arm.
+    """
+    reason = r.get("reason") or ""
+    sym = _sym(r.get("slug") or "")
+    if sym and sym != "?":
+        reason = re.sub(rf"\b{re.escape(sym)}\b", "#sym", reason, flags=re.I)
+    return _NUM_RE.sub("#", reason)
+
+
+def _group_eval(run: _Run) -> str:
+    """One eval line for every arm reading the same way on this tick.
+
+    The discrete posture is identical by construction — it IS the lane key — so
+    only the per-crypto numbers need collapsing: p↑, the best side's edge and ρ
+    render as the fleet's range and the dollars as its total. The per-side
+    safety figures collapse to the one bit the lane already agrees on (past
+    theta or not); a symbol's own numbers are on its windows-table row.
+    """
+    recs = list(run.latest.values())
+    head = _tape_head(run.rec, run.n, run.t0, _group_label(run.latest))
+    best = [b for b in (_best_side(r.get("sides") or []) for r in recs) if b]
+    p_ups = [r["p_up"] for r in recs if r.get("p_up") is not None]
+    rhos = [r["rho"] for r in recs if r.get("rho") is not None]
+    bits = []
+    if p_ups:
+        bits.append(f"p↑{_span(p_ups, lambda v: f'{v:.2f}')}")
+    bits.append(f"{best[0]['side']} "
+                f"{_span([b['net'] * 100 for b in best], lambda v: f'{v:+.1f}')}¢"
+                if best else "no book")
+    if rhos:
+        bits.append(f"ρ{_span(rhos, lambda v: f'{v:+.2f}')}")
+    bits.append(f"{_money(sum(r.get('committed') or 0.0 for r in recs))} in")
+    tags = click.style("  BANKED", fg="cyan") if run.rec.get("banked_decided") else ""
+    if run.rec.get("maker_rest") is not None:
+        tags += click.style("  ◇RESTING", fg="cyan", bold=True)
+    elif run.rec.get("maker_candidate"):
+        tags += click.style("  ◇maker-candidate", fg="cyan")
+    sides = run.rec.get("sides") or []
+    extras = "  ".join(x for x in (
+        _paint("saf✓", "green", True)
+        if _safety_is_strong(sides, run.rec.get("p_up")) else "",
+        _brake_badge(sides, True)) if x)
+    return (click.style(_tagged(head, "eval", "  ".join(bits)), dim=True)
+            + tags + ("  " + extras if extras else ""))
+
+
+def _group_gate(run: _Run) -> str:
+    """One gate line for every arm the same gate is holding back.
+
+    The reason is identical by shape (it is the lane key) so the freshest one
+    speaks for all of them. The per-symbol asks are dropped: they are a fact
+    about one book and say nothing about a line covering several.
+    """
+    head = _tape_head(run.rec, run.n, run.t0, _group_label(run.latest))
+    return click.style(
+        _tagged(head, "gated",
+                f"{_group_margin(run):<{_GATE_NUM_W}}  {_gate_reason(run.rec)}"),
+        fg="yellow", dim=True)
+
+
+def _group_margin(run: _Run) -> str:
+    """`-9.0…+1.0/6.0bp` — how far the merged arms sit from their guard, as the
+    fleet's range. One margin per symbol would put the whole flood back on the
+    line the merge exists to remove."""
+    mgs = [m for m in (_margin_guard(r) for r in run.latest.values()) if m]
+    if not mgs:
+        return ""
+    return (f"{_span([m[0] for m in mgs], lambda v: f'{v:+.1f}')}"
+            f"/{_span([m[1] for m in mgs], lambda v: f'{v:.1f}')}bp")
 
 
 class _RollClosePair(_CollapseRule):
@@ -582,6 +771,11 @@ class _RollClosePair(_CollapseRule):
     Keyed on the SERIES (`btc 5m`), not the slug, because the two records
     deliberately name different windows of it. Anchored on `t`: a later close
     is a later roll, never a continuation of this one.
+
+    Deliberately NOT merged across cryptos, unlike the eval and gate rules: a
+    roll names two specific windows and a size, and a line standing for five of
+    them could state none of the three. The repetition rules merge because
+    their per-crypto figures collapse to a range; these do not.
     """
 
     name = "roll"
@@ -590,9 +784,15 @@ class _RollClosePair(_CollapseRule):
     def matches(self, r: dict) -> bool:
         return r.get("ev") in (tape.EV_ROLL, tape.EV_CLEANUP)
 
-    def lane(self, r: dict) -> str:
+    def lane(self, r: dict, sig: tuple) -> tuple:
         parsed = updown_slugs.parse(r.get("slug") or "")
-        return f"roll:{parsed[4] if parsed else r.get('slug')}"
+        return ("roll", parsed[4] if parsed else r.get("slug"))
+
+    def anchor_key(self, r: dict) -> str:
+        # ONE anchor for the pair: its two records name DIFFERENT windows, so a
+        # per-arm anchor would never compare them and a later close could
+        # continue an earlier roll's line.
+        return ""
 
     def metrics(self, r: dict) -> dict:
         return {"t": r.get("t") or 0.0}
@@ -658,14 +858,17 @@ class TapeCollapser:
     survive across its own window boundary.
 
     A record also ends the runs it contradicts rather than only its own: an
-    arm's eval and gate runs die on each other, since one arm cannot be both
-    at once. Another arm's runs survive — that is what per-arm lanes buy.
+    arm's eval and gate runs die on each other, since one arm cannot be both at
+    once. Because eval and gate lanes are fleet-wide, that retires the merged
+    line the arm was folded into — its count and its symbol list stand, and the
+    arms still in that state open a fresh line on their next record. An arm
+    changing posture IS a transition, and one extra line is what shows it.
     """
 
     _RULES: tuple[_CollapseRule, ...] = (_EvalRun(), _GateRun(), _RollClosePair())
 
     def __init__(self) -> None:
-        self._runs: dict[str, _Run] = {}
+        self._runs: dict[tuple, _Run] = {}
 
     def break_runs(self) -> None:
         """End every open run without rendering anything.
@@ -718,12 +921,15 @@ class TapeCollapser:
         rule = next((ru for ru in self._RULES if ru.matches(r)), None)
         if rule is None:
             return None
-        lane, arm = rule.lane(r), r.get("slug")
-        sig, met = rule.signature(r), rule.metrics(r)
+        sig, arm = rule.signature(r), r.get("slug")
+        lane, key, met = rule.lane(r, sig), rule.anchor_key(r), rule.metrics(r)
         self._end_conflicting(lane, arm)
         run = self._runs.get(lane)
-        if (run is None or run.sig != sig
-                or not _within(run.anchor, met, rule.tolerances)
+        # An arm new to this lane joins on its own terms: it brings its own
+        # anchor rather than being measured against whoever opened the line.
+        anchor = run.anchors.get(key) if run is not None else None
+        if (run is None
+                or (anchor is not None and not _within(anchor, met, rule.tolerances))
                 or not rule.continues(run, r)
                 # Its line has scrolled past _OWN_LOOKBACK and can no longer be
                 # updated. Continuing the run would append a SECOND line
@@ -731,7 +937,10 @@ class TapeCollapser:
                 # the panel would then add up to more than the tape. Start
                 # fresh: the records above stay counted above.
                 or self._own_slot(run, lines) is None):
-            run = self._runs[lane] = _Run(rule, arm, sig, met)
+            run = self._runs[lane] = _Run(rule, sig)
+        run.anchors.setdefault(key, met)
+        run.arms.add(arm)
+        run.latest[arm] = r
         run.n += 1
         run.t1 = r.get("t", 0.0)
         if run.n == 1:
@@ -740,12 +949,16 @@ class TapeCollapser:
         rule.fold(run, r)
         return run
 
-    def _end_conflicting(self, lane: str, arm: str | None) -> None:
-        """Drop this arm's other runs. Other arms' runs survive, which is the
-        whole point of per-arm lanes — arms interleaving on the tape must not
-        thrash each other's lines."""
+    def _end_conflicting(self, lane: tuple, arm: str | None) -> None:
+        """Retire every OTHER run this arm is folded into.
+
+        An arm is gated or armed, never both, and it cannot be reading two ways
+        at once — so a contrary record ends the lines it contradicts, merged
+        ones included. Nothing is lost: those lines keep the count already on
+        screen, and the arms still in that state reopen on their next record.
+        """
         for k, run in list(self._runs.items()):
-            if k != lane and run.arm == arm:
+            if k != lane and arm in run.arms:
                 del self._runs[k]
 
     @staticmethod
@@ -1444,6 +1657,10 @@ _MODAL_LEGEND = (
                 "(gate reason, evidence, p↑, ρ), what we took once it is settled[/dim]"),
     ("", "[dim]position: entry→mark, and →1.00/0.00 once the binary settles · "
          "$ dims while it is the engine's own figure · ~ marks an estimated P&L[/dim]"),
+    ("tape", "[dim]arms reading the same way share ONE line — "
+             "`btc,eth,sol+2 5m` names them, ×N counts every record it stands "
+             "for, and per-crypto figures show as a range. One arm's own "
+             "numbers are its row in the table above[/dim]"),
     ("refresh", f"[dim]{_REFRESH_LINE}[/dim]"),
     ("--since", "[dim]moves the header's `recent` floor only (default 6h) — "
                 "all-time, riding and the windows table always walk the full "

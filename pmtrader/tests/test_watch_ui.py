@@ -127,8 +127,11 @@ def test_tape_head_is_fixed_width_regardless_of_slug_length():
     rec = {"t": 1700000100, "slug": "btc-updown-5m-1700000000"}
     short = cc._tape_head(rec)
     long = cc._tape_head({**rec, "slug": "doge-updown-60m-1700000000"})
-    # "HH:MM:SS " (9) + the aggregation cell + " " + slug padded to 14
-    assert len(short) == len(long) == 8 + 1 + cc._TAPE_AGG_WIDTH + 1 + 14
+    # "HH:MM:SS " (9) + the aggregation cell + " " + the identity cell
+    assert len(short) == len(long) == (8 + 1 + cc._TAPE_AGG_WIDTH + 1
+                                       + cc._TAPE_SLUG_WIDTH)
+    # a merged line's symbol set lands in that same cell, at that same width
+    assert len(cc._tape_head(rec, 9, 1700000000, "btc,eth,sol+2 5m")) == len(short)
     # ...and a collapsed head is the same width as an uncollapsed one
     assert len(cc._tape_head(rec, 4, 1700000000)) == len(short)
 
@@ -935,19 +938,18 @@ def _fire(i=0, slug=_BTC, **over):
 
 # --- basis guard: grouped per-arm, exactly like an eval ---
 
-def test_basis_gates_collapse_per_arm_exactly_like_evals():
-    """ONE grouping rule for both line types. A basis gate joins its OWN arm's
-    run and never another's — the same lane rule two arms' evals live by. It
-    used to collapse fleet-wide on a lane of its own, which read as a second
-    mechanism and lost the collapse entirely whenever another arm spoke."""
+def test_basis_gates_merge_across_cryptos_with_their_margins_as_a_range():
+    """ONE grouping rule for both line types, and it spans the fleet: btc and
+    eth refused by the same guard are ONE line naming both. The margins are
+    per-crypto, so they collapse to a range rather than one figure per symbol —
+    printing both would put the flood back on the line."""
     out = _collapse(_basis(0, _BTC, margin=1.0), _basis(1, _ETH, margin=-4.9),
                     _basis(2, _BTC, margin=1.2))
-    assert len(out) == 2, out
-    btc = next(ln for ln in out if "btc" in ln)
-    eth = next(ln for ln in out if "eth" in ln)
-    assert btc[_agg_col():].startswith(f"→{cc._hms(_T0 + 2)} ×2")
-    assert "×" not in eth  # one record, and no other arm folded into it
-    assert "  +1.2/ 6.0bp" in btc and "  -4.9/ 6.0bp" in eth  # freshest margin
+    assert len(out) == 1, out
+    assert "btc,eth 5m" in out[0]
+    assert out[0][_agg_col():].startswith(f"→{cc._hms(_T0 + 2)} ×3")
+    # freshest margin from each arm, as the fleet's spread against its guard
+    assert "-4.9…+1.2/6.0bp" in out[0]
 
 
 def test_basis_guard_run_ends_on_any_other_event():
@@ -1037,24 +1039,35 @@ def test_a_slow_drift_still_breaks_the_run_because_tolerance_is_anchored():
     assert "×2" in out[0] and "0.9960" in out[1]
 
 
-def test_interleaved_arms_collapse_independently_instead_of_thrashing():
+def test_interleaved_arms_merge_into_one_line_instead_of_one_each():
     recs = []
     for i in range(6):
         recs += [_eval(i, _BTC), _eval(i, _ETH)]
     out = _collapse(*recs)
-    assert len(out) == 2, out  # one live line per arm, not twelve
-    assert all("×6" in ln for ln in out)
-    assert "btc" in out[0] and "eth" in out[1]
+    assert len(out) == 1, out  # one live line for the fleet, not twelve
+    assert "×12" in out[0] and "btc,eth 5m" in out[0]
 
 
-def test_one_arms_material_change_leaves_the_other_arms_run_alone():
+def test_one_arms_material_change_ends_the_merged_line_and_opens_a_fresh_one():
+    """A merged line covers arms that agree; the moment one stops agreeing the
+    line is over. Nothing is lost — the closed line keeps the records it
+    absorbed, and the arms still in that read reopen on their next tick."""
     recs = [_eval(0, _BTC), _eval(0, _ETH), _eval(1, _BTC), _eval(1, _ETH),
             _eval(2, _BTC, p_up=0.5), _eval(2, _ETH)]
     out = _collapse(*recs)
-    assert len(out) == 3, out
-    assert "×2" in out[0] and "btc" in out[0]      # btc's run, closed
-    assert "×3" in out[1] and "eth" in out[1]      # eth's run, still running
-    assert "btc" in out[2] and "×" not in out[2]   # btc's fresh line
+    assert len(out) == 2, out
+    assert "×4" in out[0] and "btc,eth 5m" in out[0]   # the merged run, closed
+    assert "×2" in out[1] and "btc,eth 5m" in out[1]   # reopened on btc's move
+    assert "p↑0.50…0.98" in out[1]   # both arms' freshest reads, as a range
+
+
+def test_a_merged_eval_line_shows_the_fleet_range_and_total_not_one_per_symbol():
+    out = _collapse(_eval(0, _BTC, p_up=0.31, rho=-0.40, committed=5.0),
+                    _eval(0, _ETH, p_up=0.68, rho=0.10, committed=20.0))
+    assert len(out) == 1, out
+    assert "p↑0.31…0.68" in out[0] and "ρ-0.40…+0.10" in out[0]
+    assert "$25 in" in out[0]        # the fleet's committed dollars, summed
+    assert "btc,eth 5m" in out[0] and out[0].count("p↑") == 1
 
 
 # --- non-basis gate runs ---
@@ -1096,9 +1109,44 @@ def test_a_gate_and_an_eval_on_one_arm_never_share_a_run():
     assert "×2" in out[0] and "×2" in out[1] and "×" not in out[2]
 
 
-def test_a_gate_run_is_per_arm_not_fleet_wide():
+def test_a_gate_run_is_fleet_wide_not_per_arm():
     out = _collapse(_gate(0, _BTC), _gate(0, _ETH), _gate(1, _BTC), _gate(1, _ETH))
-    assert len(out) == 2 and all("×2" in ln for ln in out)
+    assert len(out) == 1 and "×4" in out[0] and "btc,eth 5m" in out[0]
+
+
+def test_two_different_gate_reasons_never_merge_however_they_interleave():
+    """The key is the reason's SHAPE, so it cannot over-merge: two arms refused
+    for different reasons are two lines, whatever order they arrive in."""
+    out = _collapse(_gate(0, _BTC, reason="theta 0.12 below band 0.30"),
+                    _gate(0, _ETH, reason="feed stale"),
+                    _gate(1, _BTC, reason="theta 0.13 below band 0.30"),
+                    _gate(1, _ETH, reason="feed stale"))
+    assert len(out) == 2, out
+    theta = next(ln for ln in out if "theta" in ln)
+    stale = next(ln for ln in out if "feed stale" in ln)
+    assert "×2" in theta and "btc 5m" in theta
+    assert "×2" in stale and "eth 5m" in stale
+
+
+def test_a_5m_and_a_15m_arm_never_merge_even_saying_the_same_thing():
+    """Duration stays in the key: one line names one duration, and a 5m and a
+    15m arm are not reading the same market."""
+    out = _collapse(_gate(0, _BTC), _gate(0, "btc-updown-15m-1700000000"),
+                    _gate(1, _BTC), _gate(1, "btc-updown-15m-1700000000"))
+    assert len(out) == 2, out
+    assert any("btc 5m" in ln for ln in out) and any("btc 15m" in ln for ln in out)
+
+
+def test_a_merged_line_names_the_overflow_it_could_not_fit():
+    """Five arms, one gate: the symbols that fit are named and the rest are
+    counted. A truncated list that said nothing about the remainder is how the
+    panel read as a fleet of three."""
+    fleet = [f"{s}-updown-5m-1700000000" for s in ("btc", "eth", "sol", "xrp", "bnb")]
+    out = _collapse(*[_gate(i, s) for i in range(3) for s in fleet])
+    assert len(out) == 1, out
+    ident = out[0][_agg_col() + cc._TAPE_AGG_WIDTH + 1:][:cc._TAPE_SLUG_WIDTH]
+    assert ident.strip() == "bnb,btc,eth+2 5m", ident
+    assert "×15" in out[0]
 
 
 # --- the aggregation cell's ONE column ---
@@ -1142,14 +1190,14 @@ def test_the_span_sits_beside_the_count_and_never_trails_the_body():
 
 
 def test_a_basis_gate_line_reports_its_aggregation_like_every_other_line():
-    # The fleet-wide basis line was the one collapsed line with no span at all:
-    # every arm's margin on one row left no width for it. Per-arm it fits, so
-    # no line type reports its aggregation differently any more.
+    # The fleet-wide basis line used to be the one collapsed line with no span
+    # at all: every arm's margin on one row left no width for it. With the
+    # margins as a range there is width, so no line type reports its
+    # aggregation differently any more.
     out = _collapse(*[_basis(i, slug=s) for i in range(3)
                       for s in (_BTC, _ETH, "sol-updown-5m-1700000000")])
-    assert len(out) == 3, out
-    for ln in out:
-        assert ln[_agg_col():].startswith(f"→{cc._hms(_T0 + 2)} ×3"), ln
+    assert len(out) == 1, out
+    assert out[0][_agg_col():].startswith(f"→{cc._hms(_T0 + 2)} ×9"), out[0]
 
 
 # --- roll + window-close consolidation ---
@@ -1245,8 +1293,10 @@ def test_loud_events_never_collapse(rec):
 
 def test_a_fire_ends_every_open_run():
     out = _collapse(_eval(0, _BTC), _eval(0, _ETH), _fire(1), _eval(2, _BTC), _eval(2, _ETH))
-    assert len(out) == 5, out          # 2 evals, the fire, 2 fresh evals
-    assert all("×" not in ln for ln in out)
+    assert len(out) == 3, out          # the merged eval, the fire, a fresh merged eval
+    assert "FIRE UP" in out[1] and "×" not in out[1]
+    # the fire did not fold into either side of it
+    assert "×2" in out[0] and "×2" in out[2]
 
 
 def test_a_torn_line_is_dropped_without_ending_a_run():
