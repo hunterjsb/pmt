@@ -81,8 +81,10 @@ RENEW_INTERVAL_S = 30.0
 FENCE_CHECK_S = 5.0
 
 # Decide-to-quiet: from "I am past my fence" to "no order of mine is live on
-# that book". A cancel round-trip to the CLOB plus an engine tick, generously.
-STOP_LATENCY_S = 30.0
+# that book". MEASURED, not assumed: 13 graceful stops on 2026-08-23/24 ran
+# p50 7s, max 31s — which breached the original 30s allowance by a second.
+# 60s is 2x the observed worst; re-derive if a stop ever logs past 45s.
+STOP_LATENCY_S = 60.0
 
 # Default store-outage tolerance for a HOME holder. Ten minutes covers every
 # realistic DynamoDB blip (throttles, transient 5xx, an SDK retry storm) while
