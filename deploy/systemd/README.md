@@ -1,6 +1,6 @@
 # systemd user units (proposal)
 
-Five units, none installed. They are checked in as a proposal so adopting
+Six units, none installed. They are checked in as a proposal so adopting
 them is a decision with a diff behind it, not a thing that happened.
 
 | unit | what it runs | restarts? |
@@ -9,7 +9,40 @@ them is a decision with a diff behind it, not a thing that happened.
 | `pmt-rtds-recorder.service` | `uv run python -m polymarket.rtds` in `pmtrader/` | on failure, 10s→300s backoff, 10 tries / 10min |
 | `pmt-print-recorder.service` | `uv run python -m polymarket.prints` in `pmtrader/` | on failure, 10s→300s backoff, 10 tries / 10min |
 | `pmt-pilot2.service` | `uv run python -m pilot2 run` in `pmtrader/` — **SHADOW, places no orders** | on failure, 10s→300s backoff; **never** on exit 2 |
+| `pmt-fleet-doctor.service` | `uv run python -m orchestrator beat` in `pmtrader/` — **observation only, places no orders** | on failure, 10s→300s backoff; **never** on exit 2 |
 | `pmt-backup.service` + `.timer` | `scripts/pmt-backup.sh` — ~/.pmt corpus + tapes → `s3://xanmc/pmt-backups/YYYY-MM-DD.tar.zst` | no. oneshot, daily 03:30, `Persistent=true` |
+
+## The fleet doctor, and the stamp that keeps the nightly poweroff quiet
+
+`pmt-fleet-doctor.service` writes one row to the `pmt-fleet` DynamoDB table
+every 30 seconds saying what this node can see about itself — engine up, feed
+age, balance, which series are armed. That is all it does. It takes no lease,
+places no order and touches no arm; the lease protocol it will eventually run
+(`orchestrator/DESIGN.md`) is built and tested but nothing calls its mutating
+path yet.
+
+Like the backup unit and unlike the other four, **this one has no caveat
+section**. It cannot bring a position back, cannot re-enter the market and
+cannot stop the engine. Enabling it is not a risk decision.
+
+The one thing to know is the clean-shutdown stamp. On SIGTERM the daemon writes
+a final heartbeat carrying `shutdown`, which is how the checker tells "Hunter
+turned the box off" from "the box wedged" — the same marker discipline the mubs
+worker uses, for the same reason. Two consequences:
+
+- **`TimeoutStopSec=20` is leaving room for that last write.** Do not trim it.
+- **`systemctl --user kill -s SIGKILL` skips it**, and the node then looks
+  wedged for as long as the checker's staleness window. Use `stop`.
+
+The stamp self-clears — the heartbeat write replaces the row whole, so the first
+live beat after the next boot removes it with nobody having to remember.
+
+Before enabling, the two commands worth running:
+
+```sh
+(cd pmtrader && uv run python -m orchestrator map)          # validates the assignment map
+(cd pmtrader && uv run python -m orchestrator check)        # what the fleet looks like now
+```
 
 ## The pilot unit, and the two switches it deliberately does not throw
 
@@ -170,6 +203,7 @@ cp deploy/systemd/pmengine.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-rtds-recorder.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-print-recorder.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-pilot2.service ~/.config/systemd/user/
+cp deploy/systemd/pmt-fleet-doctor.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-backup.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-backup.timer ~/.config/systemd/user/
 systemctl --user daemon-reload

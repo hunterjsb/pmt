@@ -22,6 +22,9 @@ pmt = "cli:cli"
 # own risk law — not a `pmt crypto` subcommand. Wiring it into the engine's CLI
 # would put it one typo away from the fleet's arms.
 pilot2 = "pilot2.cli:main"
+# The fleet doctor is likewise standalone — its own unit, its own exit-code
+# contract, and `pmt crypto fleet` already names the R7 exposure cap.
+pmt-fleet = "orchestrator.cli:main"
 
 [dependency-groups]
 dev = [
@@ -34,7 +37,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["polymarket*", "scanners*", "pilot2*"]
+include = ["polymarket*", "scanners*", "pilot2*", "orchestrator*"]
 
 [tool.setuptools.package-data]
 # The frozen predictor vectors ship WITH the code. A build that drops them

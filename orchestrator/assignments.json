@@ -1,0 +1,105 @@
+{
+  "version": 1,
+
+  "_comment": [
+    "Who is home for what, who covers it, and on what terms. Read identically by",
+    "every node; validated by `pmt-fleet map` before anything acts on it.",
+    "",
+    "Safety does NOT rest on both boxes holding the same copy of this file. There is",
+    "exactly one lease item per series and it names exactly one holder, so a diverged",
+    "map costs a refused acquire and a confusing log line, never a self-match. See",
+    "orchestrator/DESIGN.md and pmtrader/orchestrator/assign.py.",
+    "",
+    "PHASE 1 DOES NOT READ THIS TO TRADE. The heartbeat daemon uses it only to know",
+    "which node it is and what to print. Nothing acquires a lease yet."
+  ],
+
+  "leases_active": false,
+  "_leases_active": [
+    "FALSE through phase 1: the table holds heartbeats and no lease items, and the",
+    "engines run on their static PMENGINE_SERIES_ALLOWLIST exactly as they do today.",
+    "Flip to true at rollout step 6 (DESIGN.md §8.3), when the claim daemon starts",
+    "taking real leases. Until then the checker treats series rows as informational.",
+    "",
+    "Explicit rather than inferred from 'there are no lease items': inferring it would",
+    "read a catastrophically emptied table as a quiet phase-1 fleet and suppress the",
+    "one alarm that would have caught it (failure matrix row 17)."
+  ],
+
+  "nodes": {
+    "desktop": {
+      "label": "Bazzite desktop (hunter)",
+      "wallet": "desktop deposit wallet",
+      "nightly_poweroff": true,
+      "_note": "Powers off nightly on purpose. Its SIGTERM path is the designed-for handover: release the lease, hand over instantly, never page."
+    },
+    "euw": {
+      "label": "eu-west-1 t4g.micro (pmt-eu-ssm)",
+      "wallet": "0x6da3e7Dd76cE67B32ae7911e19da0c00550F1D71",
+      "failover_budget_usdc": 60,
+      "doctor_active": false,
+      "_doctor_active": "false until the pmt-fleet-doctor IAM policy is approved and attached to pmt-eu-ssm. A node that has not been brought up is not a dark node, and paging about it every cadence until then trains the wrong reflex. Flip to true at rollout step 2.",
+      "_note": "PMENGINE_MAX_TOTAL_EXPOSURE=60 against ~182 pUSD. It can meaningfully cover TWO of the desktop's series at these template sizes, not eight — hence failover_priority. Covering more would mean arms that cannot fill."
+    }
+  },
+
+  "series": {
+    "bnb-updown-5m": {
+      "home": "euw",
+      "failover": "desktop",
+      "grace_s": 420,
+      "home_extension_s": 600,
+      "failover_priority": 1,
+      "arm_template": {
+        "size": 40,
+        "clip": 10,
+        "roll": true,
+        "feed": "binance",
+        "_note": "The desktop has capital to spare but no tuning history on bnb. Conservative because it is covering, not competing."
+      }
+    },
+
+    "btc-updown-5m": {
+      "home": "desktop", "failover": "euw",
+      "grace_s": 420, "home_extension_s": 600, "failover_priority": 1,
+      "arm_template": {"size": 25, "clip": 10, "roll": true, "feed": "binance"}
+    },
+    "eth-updown-5m": {
+      "home": "desktop", "failover": "euw",
+      "grace_s": 420, "home_extension_s": 600, "failover_priority": 2,
+      "arm_template": {"size": 25, "clip": 10, "roll": true, "feed": "binance"}
+    },
+    "sol-updown-5m": {
+      "home": "desktop", "failover": "euw",
+      "grace_s": 420, "home_extension_s": 600, "failover_priority": 3,
+      "arm_template": {"size": 25, "clip": 10, "roll": true, "feed": "binance"}
+    },
+    "xrp-updown-5m": {
+      "home": "desktop", "failover": "euw",
+      "grace_s": 420, "home_extension_s": 600, "failover_priority": 4,
+      "arm_template": {"size": 25, "clip": 10, "roll": true, "feed": "binance"}
+    },
+    "hype-updown-5m": {
+      "home": "desktop", "failover": null,
+      "grace_s": 420, "home_extension_s": 600,
+      "_note": "No failover: pilot2's live default names hype, and a covering engine on a series the pilot may also trade is a third participant on one book."
+    },
+
+    "btc-updown-15m": {
+      "home": "desktop", "failover": "euw",
+      "grace_s": 1200, "home_extension_s": 600, "failover_priority": 5,
+      "arm_template": {"size": 25, "clip": 10, "roll": true, "feed": "binance"},
+      "_note": "grace 1200s = one 15m window (900) + fence check + stop latency + pair skew, rounded up. A 15m holder may only be able to stop at a window boundary."
+    },
+    "eth-updown-15m": {
+      "home": "desktop", "failover": "euw",
+      "grace_s": 1200, "home_extension_s": 600, "failover_priority": 6,
+      "arm_template": {"size": 25, "clip": 10, "roll": true, "feed": "binance"}
+    },
+    "sol-updown-15m": {
+      "home": "desktop", "failover": "euw",
+      "grace_s": 1200, "home_extension_s": 600, "failover_priority": 7,
+      "arm_template": {"size": 25, "clip": 10, "roll": true, "feed": "binance"}
+    }
+  }
+}
