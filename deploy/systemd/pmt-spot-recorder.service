@@ -1,0 +1,84 @@
+# pmt spot recorder — live exchange tick capture, as a systemd USER service.
+#
+# PROPOSAL, not installed. See README.md in this directory.
+#
+# The THIRD recorder, and a sibling of pmt-rtds-recorder for the same reason
+# the print recorder is one: separate processes cannot stall each other. This
+# one holds three websocket connections (Binance, Kraken, Hyperliquid) and its
+# whole job is to not miss a frame on any of them.
+#
+# What it records and why it cannot be backfilled: opponent_model.md §1d
+# measures the makers leading our settlement feed by ~3s, of which ~1.3s is
+# genuine information — they price the underlying spot market that Chainlink
+# then follows. Reading that same underlying is the only thing that closes it.
+# `klines-1m-*.jsonl` cannot stand in: a 1-minute bar has no opinion about a
+# 3-second lead. Neither Binance nor Kraken serves a historical TICK feed for
+# free, so an hour nobody recorded is an hour the lead estimate can never be
+# measured on. Same argument as the RTDS unit, and restart-on-failure is
+# equally uncontroversial: it writes tapes, it never places an order.
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE INSTALLING: the FULL form writes ~5 GB/day. This unit
+# does not run the full form, and the reason is a measurement, not caution.
+# ---------------------------------------------------------------------------
+# Row rates on the 2026-08-24 study run, six symbols, weekday European
+# afternoon:
+#
+#     binance  trade   ~285 rows/s  (btc 93/s, eth 94/s)  ~215 MB/h
+#     binance  book      ~5.5 rows/s (1 Hz @ticker x6)     ~0.6 MB/h
+#     kraken   both      ~5 rows/s                         ~0.5 MB/h
+#     hyperliquid       ~1.2 rows/s                        ~0.1 MB/h
+#
+# `analysis/spot_lead.md` §5b then settles which of those is worth keeping,
+# and the answer has two sides. The 1 Hz `@ticker` QUOTE correlates with the
+# oracle just as well as the full trade tape — btc r +0.9340 against +0.9241 —
+# at roughly **1/130th of the rows**. But its peak sits one second EARLIER
+# (k=+2 against k=+3), because a 1 Hz snapshot costs ~half a second of
+# freshness, which on a 1-second grid reads as a whole second of lead.
+#
+# For a CORPUS that is the right trade: the measurement is about the
+# mechanism, and equal correlation at 1/130th the disk is worth a second of
+# lead nobody is acting on. For a LIVE engine it is not — one second is a
+# third of the edge, and spot_lead_spec.md §2 accordingly points the engine at
+# `@bookTicker` instead, which this recorder cannot use precisely because it
+# carries no exchange stamp.
+#
+# Hence `--kinds book` below: it turns ~5 GB/day into well under 100 MB/day
+# with no loss of what this corpus exists to measure. Hyperliquid serves
+# `trade` only and is skipped under `--kinds book`; it is listed anyway so
+# widening `--kinds` picks it up.
+#
+# If someone later needs the full trade tape (microstructure work, a
+# sub-second question against a different target), run it BOUNDED with
+# `--minutes N` under a .timer rather than making it resident — this recorder
+# has no `--retention-days` sweep, unlike the print recorder.
+
+[Unit]
+Description=pmt spot recorder — live exchange tick capture (Binance/Kraken/Hyperliquid)
+Documentation=file:///var/home/hunter/Desktop/code/pmt/deploy/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/var/home/hunter/Desktop/code/pmt/pmtrader
+# `uv run` resolves the pmtrader venv from the cwd's pyproject.toml, so the
+# WorkingDirectory above is load-bearing, not cosmetic.
+#
+# --kinds book is the 130x disk saving with no signal loss; see the header.
+ExecStart=/var/home/hunter/.local/bin/uv run python -m polymarket.spot --kinds book
+
+Restart=on-failure
+RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=300
+
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+SyslogIdentifier=pmt-spot
+
+[Install]
+WantedBy=default.target

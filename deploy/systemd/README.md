@@ -1,6 +1,6 @@
 # systemd user units (proposal)
 
-Six units, none installed. They are checked in as a proposal so adopting
+Seven units, none installed. They are checked in as a proposal so adopting
 them is a decision with a diff behind it, not a thing that happened.
 
 | unit | what it runs | restarts? |
@@ -8,6 +8,7 @@ them is a decision with a diff behind it, not a thing that happened.
 | `pmengine.service` | `pmengine ... run updown --skip-warmup`, same as `pmt engine start` | on failure, 5s→120s backoff, 5 tries / 5min |
 | `pmt-rtds-recorder.service` | `uv run python -m polymarket.rtds` in `pmtrader/` | on failure, 10s→300s backoff, 10 tries / 10min |
 | `pmt-print-recorder.service` | `uv run python -m polymarket.prints` in `pmtrader/` | on failure, 10s→300s backoff, 10 tries / 10min |
+| `pmt-spot-recorder.service` | `uv run python -m polymarket.spot --kinds book` in `pmtrader/` — **read its header before widening `--kinds`** | on failure, 10s→300s backoff, 10 tries / 10min |
 | `pmt-pilot2.service` | `uv run python -m pilot2 run` in `pmtrader/` — **SHADOW, places no orders** | on failure, 10s→300s backoff; **never** on exit 2 |
 | `pmt-fleet-doctor.service` | `uv run python -m orchestrator beat` in `pmtrader/` — **observation only, places no orders** | on failure, 10s→300s backoff; **never** on exit 2 |
 | `pmt-backup.service` + `.timer` | `scripts/pmt-backup.sh` — ~/.pmt corpus + tapes → `s3://xanmc/pmt-backups/YYYY-MM-DD.tar.zst` | no. oneshot, daily 03:30, `Persistent=true` |
@@ -73,6 +74,46 @@ Three things about this unit that differ from the recorders:
 It shares nothing mutable with `pmengine.service`: separate process, separate
 state directory (`~/.pmt/pilot2`), separate wallet when live, and a series
 partition checked at startup.
+
+## The spot recorder, and why it records quotes rather than trades
+
+`pmt-spot-recorder.service` records the underlying the oracle follows.
+`opponent_model.md` §1d splits the makers' ~3s lead over our settlement feed
+into ~1.7s of our own relay and **~1.3s of real information**: they are pricing
+the spot market Chainlink is a lagging function of. The relay half is plumbing;
+the other half is only closed by reading the same spot they read.
+
+Three connections, three files, one process — Binance (`data-stream.binance.vision`,
+because `stream.binance.com` answers **HTTP 451** from this box), Kraken v2, and
+Hyperliquid for HYPE. Every venue is its own thread and its own socket, so a
+stall on one cannot silence another.
+
+**It is the first unit here that could fill the disk, and a measurement is
+what stops it.** Binance's raw trade tape is ~93 rows/s per major symbol and
+~215 MB/h all told — ~5 GB/day, three orders of magnitude past anything else
+in `~/.pmt/corpus`, and there is no `--retention-days` sweep here like the
+print recorder has. `analysis/spot_lead.md` §5b measures what the cheap
+alternative costs: the 1 Hz `@ticker` **quote** correlates with the oracle
+just as well as the full trade tape (btc r +0.9340 against +0.9241) at about
+**1/130th of the rows**, but its peak sits one second earlier — k=+2 against
+k=+3 — because a 1 Hz snapshot is half a second stale on average.
+
+For a corpus that is the right trade, so the unit runs `--kinds book` and
+~5 GB/day becomes well under 100 MB/day. For a **live** consumer it is not the
+right trade — a second is a third of the edge — which is why the engine spec
+points at `@bookTicker` instead, a stream this recorder cannot use precisely
+because it carries no exchange stamp. Anyone who needs the full trade tape
+should run it **bounded** under a `.timer` with `--minutes N` rather than
+making it resident.
+
+Unlike prints, this tape is **not backfillable**: neither Binance nor Kraken
+serves a free historical tick feed, so an hour nobody recorded is an hour the
+lead estimate can never be measured on. Same argument as the RTDS unit.
+
+`--once` is the smoke test: one connection attempt per venue, no reconnect,
+and a **nonzero exit** if any venue received zero frames or nothing parsed.
+That exit contract exists because the btc1h sampler produced a zero-byte file
+and a zero exit code for a day before anyone noticed.
 
 ## The print recorder, and why it is a second unit
 
@@ -202,6 +243,8 @@ mkdir -p ~/.config/systemd/user
 cp deploy/systemd/pmengine.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-rtds-recorder.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-print-recorder.service ~/.config/systemd/user/
+# read the disk note in this one's header before widening --symbols/--venues
+cp deploy/systemd/pmt-spot-recorder.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-pilot2.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-fleet-doctor.service ~/.config/systemd/user/
 cp deploy/systemd/pmt-backup.service ~/.config/systemd/user/
