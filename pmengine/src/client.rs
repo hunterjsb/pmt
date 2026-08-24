@@ -193,6 +193,42 @@ impl TokenMetaCache {
         Ok(meta)
     }
 
+    /// `resolve`, re-asking a failed fetch a few times before giving up.
+    ///
+    /// Only the PREWARM path uses this. The order path must never sleep, so
+    /// `resolve` stays the call inside `token_meta`: on the hot path a cold
+    /// miss fetches once and flies with whatever it gets.
+    ///
+    /// Generic over the fetch for the same reason `resolve` is — the retry
+    /// policy is testable without a live CLOB.
+    pub async fn resolve_retrying<F, Fut, E>(
+        &self,
+        token_id: &str,
+        attempts: u32,
+        backoff: std::time::Duration,
+        mut fetch: F,
+    ) -> Result<TokenMeta, E>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<TokenMeta, E>>,
+    {
+        let mut wait = backoff;
+        let mut last: Option<E> = None;
+        for attempt in 0..attempts.max(1) {
+            if attempt > 0 {
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                wait = wait.saturating_mul(2);
+            }
+            match self.resolve(token_id, &mut fetch).await {
+                Ok(meta) => return Ok(meta),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("attempts.max(1) guarantees one attempt ran"))
+    }
+
     /// Number of tokens resolved so far.
     pub async fn len(&self) -> usize {
         self.map.read().await.len()
@@ -228,6 +264,19 @@ const H2_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Generous next to the ~30ms the CLOB round trip actually takes: this must
 /// only fire on a genuinely gone connection, never on a slow one.
 const H2_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many times `prewarm_token` re-asks for a token's metadata.
+///
+/// Four attempts at a doubling 250ms backoff finish inside ~1.75s. The budget
+/// is set by what prewarm is racing — a window opens minutes before its first
+/// clip — so this can afford to be patient, and it only ever runs off the
+/// order path.
+const PREWARM_ATTEMPTS: u32 = 4;
+
+/// First prewarm backoff; doubles per attempt. Long enough that a retry is
+/// not simply the same failing instant again, short enough that four of them
+/// disappear inside the gap before a fire.
+const PREWARM_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The order path's HTTP client.
 ///
@@ -428,8 +477,26 @@ impl PolymarketClient {
     /// is p10 150s). Cost lands there instead of inside decision->ack.
     /// Best-effort: a failure just leaves the order path to fetch it cold,
     /// exactly as it did before.
+    ///
+    /// It RETRIES because one attempt was not enough in practice. A cache
+    /// stores successes only, so a single transient failure here left the
+    /// token cold until an order paid for it — and it did: 20 of the 1462
+    /// orders on the desktop tape spent 100-175ms inside `sign`, and 20 of
+    /// those 21 slow signs were the FIRST order on their token
+    /// (analysis/order_latency_eu.md). The whole retry chain finishes in
+    /// under two seconds, far inside the minutes this has before a fire.
     pub async fn prewarm_token(&self, token_id: &str) {
-        match self.token_meta(token_id).await {
+        let meta = match U256::from_str(token_id) {
+            Ok(t) => {
+                self.meta
+                    .resolve_retrying(token_id, PREWARM_ATTEMPTS, PREWARM_BACKOFF, || {
+                        self.fetch_token_meta(t)
+                    })
+                    .await
+            }
+            Err(e) => Err(ClientError::OrderError(format!("Invalid token_id: {}", e))),
+        };
+        match meta {
             Ok(meta) => {
                 // A V1 CLOB also resolves a per-token fee rate inside
                 // `build()`; V2 carries fees in the market info instead.
@@ -1446,6 +1513,91 @@ mod tests {
                 .resolve("tok", || async { Ok::<_, &str>(meta(2)) })
                 .await,
             Ok(meta(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn prewarm_retries_a_transient_failure_and_then_caches() {
+        // The real bug: a cache stores successes only, so ONE failed prewarm
+        // left the token cold and handed the first order a ~130ms round trip
+        // inside sign.
+        let cache = TokenMetaCache::new();
+        let calls = AtomicUsize::new(0);
+        let got = cache
+            .resolve_retrying("tok", 4, std::time::Duration::ZERO, || async {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err("clob hiccup")
+                } else {
+                    Ok(meta(3))
+                }
+            })
+            .await;
+        assert_eq!(got, Ok(meta(3)));
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "should have re-asked twice");
+        assert_eq!(
+            cache.get("tok").await,
+            Some(meta(3)),
+            "a retry that succeeded must warm the cache like any other resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn prewarm_giving_up_leaves_the_token_cold_not_poisoned() {
+        // Exhausting the retries must not be worse than never trying: the
+        // order path still has to be able to fetch it cold and trade.
+        let cache = TokenMetaCache::new();
+        let calls = AtomicUsize::new(0);
+        let out: Result<TokenMeta, &str> = cache
+            .resolve_retrying("tok", 4, std::time::Duration::ZERO, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err("clob down")
+            })
+            .await;
+        assert_eq!(out, Err("clob down"));
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "must use its whole budget");
+        assert_eq!(cache.get("tok").await, None);
+        // ...and the order path's own single-shot resolve still works.
+        assert_eq!(
+            cache.resolve("tok", || async { Ok::<_, &str>(meta(2)) }).await,
+            Ok(meta(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prewarm_of_an_already_known_token_never_fetches() {
+        // Re-subscribing a token the engine already traded must not spend a
+        // request, let alone four.
+        let cache = TokenMetaCache::new();
+        cache
+            .resolve("tok", || async { Ok::<_, &str>(meta(4)) })
+            .await
+            .unwrap();
+        let calls = AtomicUsize::new(0);
+        let got = cache
+            .resolve_retrying("tok", 4, std::time::Duration::ZERO, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err("must not be called")
+            })
+            .await;
+        assert_eq!(got, Ok(meta(4)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_prewarm_retry_chain_finishes_long_before_a_fire() {
+        // Prewarm is racing the window's first clip, which the latency report
+        // puts at p10 150s after open. If the chain ever grew past that it
+        // would be doing its work on the order path's clock.
+        let mut total = std::time::Duration::ZERO;
+        let mut wait = PREWARM_BACKOFF;
+        for _ in 1..PREWARM_ATTEMPTS {
+            total += wait;
+            wait *= 2;
+        }
+        assert!(
+            total < std::time::Duration::from_secs(10),
+            "prewarm backoff chain is {total:?} — too slow to beat a first fire"
         );
     }
 
